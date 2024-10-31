@@ -12,7 +12,6 @@ use serde_yaml;
 
 use tauri::Manager;
 
-use log::{debug, error};
 use std::fs;
 
 
@@ -65,7 +64,7 @@ pub fn get_config_path() -> io::Result<PathBuf> {
     match home_dir {
         Ok(home) => config_path.push(home),
         Err(e) => {
-            error!("Failed to get home directory environment variable: {}", e);
+            log::error!("Failed to get home directory environment variable: {}", e);
             return Err(io::Error::new(io::ErrorKind::Other, "Failed to get home directory environment variable"));
         }
     }
@@ -74,7 +73,7 @@ pub fn get_config_path() -> io::Result<PathBuf> {
     config_path.push("tba");
 
     if let Err(e) = fs::create_dir_all(&config_path) {
-        error!("Failed to create directories: {}", e);
+        log::error!("Failed to create directories: {}", e);
         return Err(e);
     }
 

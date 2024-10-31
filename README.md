@@ -1,6 +1,6 @@
 # Tacho Bridge Application
 
-The application is designed for use with the flespi platform. Communication with the server is organized through an MQTT channel that must be created in the user's account. For each card, objects in the form of company cards must be created.
+The application is designed for use with the flespi platform. Communication with the server is organized through an MQTT channel 'tacho-bridge' that must be created in the user's account. Each card is should be represented in flespi as a separate device of type 'Tacho Bridge Card'.
 
 ## Specifications
 
