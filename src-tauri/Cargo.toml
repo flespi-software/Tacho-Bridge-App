@@ -1,0 +1,37 @@
+[package]
+name = "tacho-bridge-application"
+version = "0.5.4"
+description = "Tachograph authentication application"
+authors = ["Shatilo Evgeny"]
+license = ""
+repository = "https://git.gurtam.net/shev/flespi_tca"
+default-run = "tacho-bridge-application"
+edition = "2021"
+rust-version = "1.60"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[build-dependencies]
+tauri-build = { version = "1.5.2", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tauri = { version = "1.6.5", features = [] }
+tokio = { version = "1.38.0", features = ["full"] }
+pcsc = "2.8.2"
+hex = "0.4.3"
+rumqttc = { version = "0.22.0", features = ["use-native-tls"] }
+fern = "0.6.2"
+log = "0.4.22"
+chrono = "0.4.31"
+serde_yaml = "0.9.21"
+lazy_static = "1.5.0"
+native-tls = "0.2.12"
+tokio-native-tls = "0.3.1"
+
+[features]
+# this feature is used for production builds or when `devPath` points to the filesystem and the built-in dev server is disabled.
+# If you use cargo directly instead of tauri's cli you can use this feature flag to switch between tauri's `dev` and `build` modes.
+# DO NOT REMOVE!!
+custom-protocol = [ "tauri/custom-protocol" ]
