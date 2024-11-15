@@ -84,9 +84,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     //////////////////////////////////////////////////
     let mut mqtt_options = MqttOptions::new(&client_id, &host, port);
     // mqtt_options.set_credentials(flespi_token, "");
-    mqtt_options.set_keep_alive(Duration::from_secs(300));
+    mqtt_options.set_keep_alive(Duration::from_secs(550));
     // log::debug!("mqtt_options: {:?}", mqtt_options);
-    println!("mqtt_options: {:?}", mqtt_options);
+    log::debug!("mqtt_options: {:?}", mqtt_options);
 
     ////////////// TLS ////////////////
     // let connector = TlsConnector::new().unwrap();
@@ -171,7 +171,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             // serializable data to interpret it as json
                             match serde_json::from_slice::<Value>(&publish.payload) {
                                 Ok(json_payload) => {
-                                    println!("Parsed JSON payload: {:?}", json_payload);
+                                    log::debug!("Parsed JSON payload: {:?}", json_payload);
 
                                     let mut payload_ack = String::new();
 
@@ -206,7 +206,6 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     println!("Card reconnected successfully.");
                                                 }
                                                 Err(e) => {
-                                                    println!("Failed to reconnect card: {:?}", e);
                                                     log::error!(
                                                         "{} Failed to reconnect card: {:?}",
                                                         log_header,
@@ -256,7 +255,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     match crate::smart_card::send_apdu_to_card_command(&card, &hex_value) {
                                                         Ok(response) => {
                                                             rapdu_mqtt_hex = response;
-                                                            println!("{} APDU response: {:?}", client_id_cloned, rapdu_mqtt_hex);
+                                                            log::debug!("{} APDU response: {:?}", client_id_cloned, rapdu_mqtt_hex);
                                                         }
                                                         Err(err) => {
                                                             log::error!("Failed to send APDU command to card: {}", err);
@@ -276,7 +275,6 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                 }
 
                                                 payload_ack = process_rapdu_mqtt_hex(rapdu_mqtt_hex);
-
 
                                                 // log::info!("finish_value: {}", finish_value);
                                             } else {
@@ -307,7 +305,6 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                             Err(e) => println!("Error sending message: {:?}", e),
                                         }
                                     } else {
-                                        println!("Finish parameter not found or is not a boolean");
                                         log::error!(
                                             "{} Finish parameter not found or is not a boolean",
                                             log_header
@@ -412,7 +409,7 @@ fn process_rapdu_mqtt_hex(rapdu_mqtt_hex: String) -> String {
     let payload_ack = json_value.to_string();
 
     // Print the acknowledgment payload to the console
-    println!("Payload ack: {}", payload_ack);
+    log::debug!("Payload ack: {}", payload_ack);
 
     payload_ack
 }

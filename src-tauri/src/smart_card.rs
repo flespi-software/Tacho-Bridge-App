@@ -288,7 +288,7 @@ pub fn send_apdu_to_card_command(card: &Card, apdu_hex: &str) -> Result<String, 
 
     // Decoding response from binary array to HEX string
     let rapdu_hex = encode(rapdu);
-    println!("APDU response: {:?}", rapdu_hex);
+    log::debug!("APDU response: {:?}", rapdu_hex);
 
     Ok(rapdu_hex)
 }

@@ -14,7 +14,6 @@ use tauri::Manager;
 
 use std::fs;
 
-
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize)]
 pub struct ConfigurationFile {
