@@ -4,6 +4,10 @@
 
 The application is designed for use with the flespi platform. Communication with the server is organized through an MQTT channel that must be created in the user's account. For each card, objects in the form of company cards must be created.
 
+## Download
+
+You can always find the latest release here: [<kbd>↴ DOWNLOAD</kbd>](https://github.com/flespi-software/Tacho-Bridge-App/releases/latest)
+
 ## Specifications
 
 Project uses [Tauri framework](https://tauri.app/) = [Rust](https://www.rust-lang.org/) + [Typescript](https://www.typescriptlang.org/) + [Vue 3](https://vuejs.org/) + [Quasar](https://quasar.dev/)
