@@ -13,3 +13,4 @@ All notable changes to this project will be documented in this file.
 [fix] Improved debugging  
 [fix] The MQTT keep-alive package interval has been increased from 300 to 550 seconds.  
 [feature] Added CHANGELOG
+[feature] Transition of Tauri from version 1x to 2x. Updating all related dependencies, as well as cargo libraries. Version 2х of Tauri has many significant changes, including the structure and configuration of the project. More details [here](https://v2.tauri.app/start/migrate/from-tauri-1/).

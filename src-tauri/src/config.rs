@@ -10,7 +10,7 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use serde_yaml;
 
-use tauri::Manager;
+use tauri::Emitter;
 
 use std::fs;
 
@@ -490,7 +490,7 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     config_app_payload.insert("dark_theme", appearance);
 
     // Emit this data as a global event to update fornt-end fields
-    if let Err(e) = app.emit_all("global-config-server", config_app_payload) {
+    if let Err(e) = app.emit("global-config-server", config_app_payload) {
         return Err(Box::new(e));
     }
 
