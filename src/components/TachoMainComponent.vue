@@ -36,7 +36,12 @@
             <q-dialog v-model="EnterCardNumberDialog" class="card-number-dialog">
               <q-card>
                 <q-card-section>
-                  <q-input v-model="cardNumberInput" label="Enter the company card number" />
+                  <q-input
+                    v-model="cardNumberInput"
+                    label="Enter the company card number"
+                    :error="!isCardNumberValid"
+                    error-message="The number must contain only characters A-Z, 0-9 and be 16 characters long."
+                  />
                 </q-card-section>
 
                 <q-card-actions align="right">
@@ -46,6 +51,7 @@
                     label="Save"
                     color="primary"
                     @click="saveCardNumber(currentcardATR)"
+                    :disable="!isCardNumberValid"
                   />
                 </q-card-actions>
               </q-card>
@@ -88,15 +94,18 @@
 .card-number-dialog .q-card {
   width: 300px; /* Window width */
   max-width: 90vw; /* Maximum window width */
-  height: 150px; /* Window height */
+  height: 160px; /* Window height */
   max-height: 90vh; /* Maximum window height */
 }
 </style>
 
 <script setup lang="ts">
-import { ref, reactive, defineComponent } from 'vue'
+import { ref, computed, reactive, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { Notify } from 'quasar'
+
+const TACHO_COMPANY_CARD_REGEX = /^[A-Z0-9]{16}$/ // Regular expression for the company card number
 
 // Blinking status for the card icon during authentication.
 const isBlinking = ref(true) // controls the blinking status of the icon
@@ -136,9 +145,6 @@ listen('global-cards-sync', (event) => {
 
   const splitted = payload.card_state?.split('|') ?? ['']
   const status = splitted[1]?.trim() ?? splitted[0] ?? ''
-  // const status = payload.card_state.includes('|')
-  //   ? payload.card_state.split('|')[1].trim()
-  //   : payload.card_state
 
   const cardATR = payload.atr
   // Find the index of the reader with the same name
@@ -174,19 +180,29 @@ listen('global-cards-sync', (event) => {
 
 ///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
 const EnterCardNumberDialog = ref(false)
-const cardNumberInput = ref('') // Init cardNumber
-let currentcardATR = '' // Variable to hold the current card data
+const cardNumberInput = ref('') // Поле ввода номера карты
+const isCardNumberValid = computed(() => TACHO_COMPANY_CARD_REGEX.test(cardNumberInput.value))
+const currentcardATR = ref('')
 
 // Open the dialog window for entering the Card Number value
 const editCompanyCardNumberDialog = (cardATR: string) => {
-  currentcardATR = cardATR // Set the current card data
+  currentcardATR.value = cardATR // Set the current card data
   EnterCardNumberDialog.value = true // Open the dialog window
 }
 
 const saveCardNumber = async (cardATR: string) => {
+  if (!isCardNumberValid.value) {
+    // Notify.create({
+    //   message: 'Wrong company card number input!',
+    //   color: 'negative',
+    //   position: 'bottom',
+    //   timeout: 2000,
+    // })
+    return
+  }
+
   // Find the index of the reader with the same cardATR
   const readerIndex = state.readers.findIndex((reader) => reader.cardATR === cardATR)
-
   if (readerIndex === -1) {
     console.error('Reader not found')
     return
@@ -198,23 +214,37 @@ const saveCardNumber = async (cardATR: string) => {
     `typeof currentcardATR.value: ${typeof cardATR}`,
     `typeof cardNumberInput.value: ${typeof cardNumberInput.value}`,
   )
-  EnterCardNumberDialog.value = false // Close the dialog window
+
   // update the configuration with the new card number in the dynamic cache
   const update_result = await invoke('update_card', {
     atr: cardATR,
     cardnumber: cardNumberInput.value,
   })
 
-  if (state.readers[readerIndex]) {
-    state.readers[readerIndex].cardNumber = cardNumberInput.value
+  // Update the card number in the state if configuration update was successful
+  if (update_result) {
+    if (state.readers[readerIndex]) {
+      state.readers[readerIndex].cardNumber = cardNumberInput.value
+    } else {
+      console.error(`Reader at index ${readerIndex} does not exist`)
+    }
+
+    // Launch a manual refresh of server connections.
+    await invoke('manual_sync_cards', {})
+
+    console.log('Card number updated successfully')
+
+    EnterCardNumberDialog.value = false // Close the dialog window when the card number is saved
   } else {
-    console.error(`Reader at index ${readerIndex} does not exist`)
+    Notify.create({
+      message:
+        'This number is already in use by another card. According to Annex 1C, (EU) 2016/799, the company card number must be unique.',
+      color: 'negative',
+      position: 'bottom',
+      timeout: 3000,
+    })
+    console.error('Failed to update card number')
   }
-
-  console.log('update_result:', update_result)
-
-  // Launch a manual refresh of server connections.
-  await invoke('manual_sync_cards', {})
 }
 
 // Function to change the color of the icon depending on the card status

@@ -139,14 +139,24 @@ fn update_card_config(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config(config_path)?;
 
-    config
-        .cards
-        .get_or_insert_with(HashMap::new)
-        .insert(atr.to_string(), cardnumber.to_string());
-
-    save_config(config_path, &config)?;
-
-    load_config_to_cache(config_path)?;
+    // Check for duplicate cardnumber
+    if let Some(cards) = &config.cards {
+        if cards.values().any(|number| number == cardnumber) {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Card with this cardnumber already exists",
+            )));
+        } else {
+            config
+            .cards
+            .get_or_insert_with(HashMap::new)
+            .insert(atr.to_string(), cardnumber.to_string());
+    
+            save_config(config_path, &config)?;
+        
+            load_config_to_cache(config_path)?;
+        }
+    }
 
     Ok(())
 }

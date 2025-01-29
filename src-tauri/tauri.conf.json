@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "tba",
   "version": "0.5.5",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.flespi.tba.dev",
   "build": {
     "frontendDist": "../dist/spa",
     "devUrl": "http://localhost:9000",
