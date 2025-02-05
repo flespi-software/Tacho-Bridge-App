@@ -16,7 +16,7 @@ use crate::config::get_from_cache; // Function to get data from cache for syncin
 use crate::config::CacheSection;
 use crate::global_app_handle::emit_event;
 // Enum for cache sections for getting data from cache.
-use crate::mqtt::{ensure_connection, remove_connections}; // MQTT module functions for managing connections with the readers.
+use crate::mqtt::{ensure_connection, remove_connections, remove_connections_all}; // MQTT module functions for managing connections with the readers.
 
 // import set for async task_pool under mutex
 use lazy_static::lazy_static; // Importing the lazy_static macro
@@ -309,8 +309,8 @@ pub fn create_card_object(reader_name: &CStr) -> Result<Card, Box<dyn StdError>>
 // This function is used to manually sync cards from anywhere in the program.
 // Manually sync cards. Clicking on the button in the frontend will trigger this function
 #[tauri::command]
-pub async fn manual_sync_cards() -> () {
-    log::debug!("Manual sync cards function is called");
+pub async fn manual_sync_cards(restart: bool) -> () {
+    log::debug!("Manual sync cards function is called. Restart {}", restart);
     let ctx = Context::establish(Scope::User).expect("failed to establish context");
 
     let mut readers_buf = [0; 2048];
@@ -326,6 +326,11 @@ pub async fn manual_sync_cards() -> () {
     // waiting fot the status change
     ctx.get_status_change(None, &mut reader_states)
         .expect("failed to get status change");
+
+    if restart {
+        // remove all connections
+        remove_connections_all().await;
+    }
 
     for rs in reader_states {
         if rs.name() != PNP_NOTIFICATION() {

@@ -230,7 +230,7 @@ const saveCardNumber = async (cardATR: string) => {
     }
 
     // Launch a manual refresh of server connections.
-    await invoke('manual_sync_cards', {})
+    await invoke('manual_sync_cards', { restart: false })
 
     console.log('Card number updated successfully')
 

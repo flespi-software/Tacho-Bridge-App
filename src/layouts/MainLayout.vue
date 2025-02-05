@@ -62,7 +62,7 @@
 </template>
 
 <script setup lang="ts">
-import { useQuasar } from 'quasar'
+import { useQuasar, Notify } from 'quasar'
 import { ref, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit } from '@tauri-apps/api/event'
@@ -102,15 +102,34 @@ const changeTheme = (value: string) => {
 const saveServerConfig = async (host: string, ident: string, theme: string) => {
   console.log(`server_address: ${host}, ident: ${ident}, theme: ${theme}`)
 
-  // update the configuration with the new card number in the dynamic cache
-  await invoke('update_server', {
-    host: host,
-    ident: ident,
-    theme: theme,
-  })
+  try {
+    // Update the configuration with the new card number in the dynamic cache
+    const response = await invoke('update_server', {
+      host: host,
+      ident: ident,
+      theme: theme,
+    })
 
-  // Launch a manual refresh of server connections.
-  await invoke('manual_sync_cards', {})
+    console.log('Response from update_server:', response)
+
+    Notify.create({
+      message: 'Server configuration has been updated.',
+      color: 'green',
+      position: 'bottom',
+      timeout: 3000,
+    })
+
+    // Launch a manual refresh of server connections.
+    await invoke('manual_sync_cards', { restart: true })
+  } catch (error) {
+    console.error('Error updating server configuration:', error)
+    Notify.create({
+      message: 'Failed to update server configuration.',
+      color: 'red',
+      position: 'bottom',
+      timeout: 3000,
+    })
+  }
 }
 
 defineOptions({
@@ -126,7 +145,7 @@ defineComponent({
 })
 
 listen('global-config-server', (event) => {
-  // Структура с полями от Rust back-end
+  // Global configuration event
   const payload = event.payload as {
     host: string
     ident: string
@@ -137,7 +156,7 @@ listen('global-config-server', (event) => {
   host.value = payload.host
   ident.value = payload.ident
 
-  // Обновление темы на основе значения dark_theme
+  // update the theme value in the application
   changeTheme(payload.dark_theme)
   selectedTheme.value = payload.dark_theme
 }).catch((error) => {

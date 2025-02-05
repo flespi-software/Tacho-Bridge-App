@@ -40,7 +40,7 @@ pub async fn app_connection() {
         }
     };
 
-    // Getting the flespi token from the cache
+    // Getting ident from the cache
     let ident = get_from_cache(CacheSection::Ident, "ident");
 
     //////////////////////////////////////////////////

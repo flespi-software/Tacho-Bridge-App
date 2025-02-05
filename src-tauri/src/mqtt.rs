@@ -330,19 +330,15 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                     }
                 }
                 Err(e) => {
-                    if is_online {
-                        is_online = false;
-
-                        // Send the global-cards-sync event to the frontend that card is connected
-                        emit_event("global-cards-sync",
-                            atr.clone().into(),
-                            reader_name.to_string_lossy().into(),
-                            "PRESENT".into(),
-                            client_id_cloned.clone(),
-                            Some(false),
-                            None
-                        );
-                    }
+                    // Send the global-cards-sync event to the frontend that card is connected
+                    emit_event("global-cards-sync",
+                        atr.clone().into(),
+                        reader_name.to_string_lossy().into(),
+                        "PRESENT".into(),
+                        client_id_cloned.clone(),
+                        Some(false),
+                        None
+                    );
 
                     match e {
                         ConnectionError::Io(ref io_err) => match io_err.kind() {
@@ -397,6 +393,18 @@ pub async fn remove_connections(client_ids: Vec<String>) {
             );
         }
     }
+}
+
+pub async fn remove_connections_all() {
+    log::debug!("removing all conn's ");
+    // Unlock task_pool mutex
+    let mut task_pool = TASK_POOL.lock().await;
+
+    // Abort all tasks in the pool
+    for (_, _, handle) in task_pool.drain(..) {
+        handle.abort();
+    }
+    log::info!("All connections to the server have been terminated.");
 }
 
 fn process_rapdu_mqtt_hex(rapdu_mqtt_hex: String) -> String {

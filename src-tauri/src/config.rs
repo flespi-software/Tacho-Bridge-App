@@ -255,7 +255,7 @@ pub fn update_server(host: &str, ident: &str, theme: &str) -> bool {
 
     match update_server_config(&config_path, host, ident, theme) {
         Ok(_) => {
-            log::info!("The server address is updated to '{}'. It is needed to restart the application for the changes to take effect.", host);
+            log::info!("The server address is updated to '{}'.", host);
             true
         }
         Err(e) => {
