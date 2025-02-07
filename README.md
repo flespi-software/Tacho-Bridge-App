@@ -6,7 +6,9 @@ The application is designed for use with the flespi platform. Communication with
 
 ## Download
 
-You can always find the latest release here: [<kbd>↴ DOWNLOAD</kbd>](https://github.com/flespi-software/Tacho-Bridge-App/releases/latest)
+You can always find the latest release here: [<kbd>↴ DOWNLOAD</kbd>](https://github.com/flespi-software/Tacho-Bridge-App/releases/latest)  
+**MAC**: tba_x.x.x_universal.dmg _(Universal means that the binary can be run under both ARM and x86 architectures)_  
+**Windows**: tba_x.x.x_x64_en-US.msi
 
 ## Specifications
 
