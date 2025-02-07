@@ -31,3 +31,6 @@ yarn-error.log*
 
 # local .env files
 .env.local*
+
+# Tauri related chemas for components
+/src-tauri/gen/
