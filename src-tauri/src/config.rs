@@ -10,11 +10,9 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use serde_yaml;
 
-use tauri::Manager;
+use tauri::Emitter;
 
-use log::{debug, error};
 use std::fs;
-
 
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize)]
@@ -65,7 +63,7 @@ pub fn get_config_path() -> io::Result<PathBuf> {
     match home_dir {
         Ok(home) => config_path.push(home),
         Err(e) => {
-            error!("Failed to get home directory environment variable: {}", e);
+            log::error!("Failed to get home directory environment variable: {}", e);
             return Err(io::Error::new(io::ErrorKind::Other, "Failed to get home directory environment variable"));
         }
     }
@@ -74,7 +72,7 @@ pub fn get_config_path() -> io::Result<PathBuf> {
     config_path.push("tba");
 
     if let Err(e) = fs::create_dir_all(&config_path) {
-        error!("Failed to create directories: {}", e);
+        log::error!("Failed to create directories: {}", e);
         return Err(e);
     }
 
@@ -141,14 +139,24 @@ fn update_card_config(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config(config_path)?;
 
-    config
-        .cards
-        .get_or_insert_with(HashMap::new)
-        .insert(atr.to_string(), cardnumber.to_string());
-
-    save_config(config_path, &config)?;
-
-    load_config_to_cache(config_path)?;
+    // Check for duplicate cardnumber
+    if let Some(cards) = &config.cards {
+        if cards.values().any(|number| number == cardnumber) {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Card with this cardnumber already exists",
+            )));
+        } else {
+            config
+            .cards
+            .get_or_insert_with(HashMap::new)
+            .insert(atr.to_string(), cardnumber.to_string());
+    
+            save_config(config_path, &config)?;
+        
+            load_config_to_cache(config_path)?;
+        }
+    }
 
     Ok(())
 }
@@ -247,7 +255,7 @@ pub fn update_server(host: &str, ident: &str, theme: &str) -> bool {
 
     match update_server_config(&config_path, host, ident, theme) {
         Ok(_) => {
-            log::info!("The server address is updated to '{}'. It is needed to restart the application for the changes to take effect.", host);
+            log::info!("The server address is updated to '{}'.", host);
             true
         }
         Err(e) => {
@@ -424,17 +432,28 @@ pub fn trace_cache(cache: &CacheConfigData) {
 ///
 /// * `io::Result<()>` - Returns `Ok` if the configuration was successfully initialized, otherwise returns an error.
 pub fn init_config() -> io::Result<()> {
-    log::debug!("config: init_config");
     let config_path = get_config_path()?;
-    log::debug!("config: init_config_2");
     if Path::new(&config_path).exists() {
-        log::debug!("config: path exists");
         // Load existing configuration
         let mut config_contents = String::new();
         File::open(&config_path)?.read_to_string(&mut config_contents)?;
 
         let mut config: ConfigurationFile = serde_yaml::from_str(&config_contents)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Remove duplicate card numbers
+        if let Some(cards) = &mut config.cards {
+            let mut seen = HashMap::new();
+            cards.retain(|atr, cardnumber| {
+                if seen.contains_key(cardnumber) {
+                    log::info!("Duplicate card number {} with ATR {} removed", cardnumber, atr);
+                    false
+                } else {
+                    seen.insert(cardnumber.clone(), atr.clone());
+                    true
+                }
+            });
+        }
 
         // Update the version
         config.version = env!("CARGO_PKG_VERSION").to_string();
@@ -492,7 +511,7 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     config_app_payload.insert("dark_theme", appearance);
 
     // Emit this data as a global event to update fornt-end fields
-    if let Err(e) = app.emit_all("global-config-server", config_app_payload) {
+    if let Err(e) = app.emit("global-config-server", config_app_payload) {
         return Err(Box::new(e));
     }
 

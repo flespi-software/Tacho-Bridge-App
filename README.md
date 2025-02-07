@@ -1,8 +1,8 @@
 # Tacho Bridge Application
 
-![Tacho Bridge Application](src/assets/logo.svg "Tacho Bridge Application")
+![Tacho Bridge Application](src/assets/logo.svg 'Tacho Bridge Application')
 
-The application is designed for use with the flespi platform. Communication with the server is organized through an MQTT channel that must be created in the user's account. For each card, objects in the form of company cards must be created.
+The application is designed for use with the flespi platform. Communication with the server is organized through an MQTT channel 'tacho-bridge' that must be created in the user's account. Each card is should be represented in flespi as a separate device of type 'Tacho Bridge Card'.
 
 ## Download
 
@@ -68,11 +68,12 @@ npm run tauri icon src-tauri/icons/app-icon.png
 
 ## Card connection states
 
-![Online](src/assets/credit_card_30dp_GREEN.svg "Online") Online connection to the server (OK)
+![Online](src/assets/credit_card_30dp_GREEN.svg 'Online') Online connection to the server (OK)
 
-![Connected](src/assets/credit_card_30dp_GRAY.svg "Connected") Physical connection to the computer (OK). *It is needed to check server address in the App config*
+![Connected](src/assets/credit_card_30dp_GRAY.svg 'Connected') Physical connection to the computer (OK). _It is needed to check server address in the App config_
 
-![Disconnected](src/assets/credit_card_off_30dp_GRAY.svg "Disconnected") Has no physical connection to the computer and there is no connection to the server (Not OK). *Need to check everything :(*
+![Disconnected](src/assets/credit_card_off_30dp_GRAY.svg 'Disconnected') Has no physical connection to the computer and there is no connection to the server (Not OK). _Need to check everything :(_
 
 ## License
+
 [MIT](LICENSE) license.

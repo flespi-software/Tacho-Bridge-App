@@ -40,7 +40,7 @@ pub async fn app_connection() {
         }
     };
 
-    // Getting the flespi token from the cache
+    // Getting ident from the cache
     let ident = get_from_cache(CacheSection::Ident, "ident");
 
     //////////////////////////////////////////////////
@@ -48,7 +48,7 @@ pub async fn app_connection() {
     //////////////////////////////////////////////////
     let mut mqtt_options = MqttOptions::new(ident.clone(), &host, port);
     // mqtt_options.set_credentials(flespi_token, "");
-    mqtt_options.set_keep_alive(Duration::from_secs(300));
+    mqtt_options.set_keep_alive(Duration::from_secs(550));
     // log::debug!("mqtt_options: {:?}", mqtt_options);
 
     // Create a new asynchronous MQTT client and its associated event loop

@@ -17,10 +17,6 @@ node_modules
 /src-capacitor/www
 /src-capacitor/node_modules
 
-# BEX related directories and files
-/src-bex/www
-/src-bex/js/core
-
 # Log files
 npm-debug.log*
 yarn-debug.log*
@@ -35,3 +31,6 @@ yarn-error.log*
 
 # local .env files
 .env.local*
+
+# Tauri related chemas for components
+/src-tauri/gen/

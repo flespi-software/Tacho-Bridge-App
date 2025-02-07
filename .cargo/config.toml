@@ -1,5 +1,0 @@
-# [target.x86_64-pc-windows-msvc]   // for the windows cross-compilation with MSVC on MacOS
-# linker = "/opt/homebrew/opt/llvm/bin/clang-cl"
-# ar = "/opt/homebrew/opt/llvm/bin/llvm-ar"
-[target.x86_64-unknown-linux-musl]
-linker = "x86_64-linux-musl-gcc"

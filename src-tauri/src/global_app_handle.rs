@@ -1,6 +1,6 @@
 use lazy_static::lazy_static;
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager};
+use tauri::{Emitter, AppHandle};
 
 use crate::smart_card::TachoState;
 
@@ -31,7 +31,7 @@ pub fn emit_event(event_name: &str, atr: String, reader_name: String, card_state
     };
 
     if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit_all(event_name, payload) {
+        if let Err(e) = app_handle.emit(event_name, payload) {
             println!("Error: {:?}", e);
         }
         println!("{} has been sent", event_name);
