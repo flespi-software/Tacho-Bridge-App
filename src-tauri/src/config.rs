@@ -432,17 +432,28 @@ pub fn trace_cache(cache: &CacheConfigData) {
 ///
 /// * `io::Result<()>` - Returns `Ok` if the configuration was successfully initialized, otherwise returns an error.
 pub fn init_config() -> io::Result<()> {
-    log::debug!("config: init_config");
     let config_path = get_config_path()?;
-    log::debug!("config: init_config_2");
     if Path::new(&config_path).exists() {
-        log::debug!("config: path exists");
         // Load existing configuration
         let mut config_contents = String::new();
         File::open(&config_path)?.read_to_string(&mut config_contents)?;
 
         let mut config: ConfigurationFile = serde_yaml::from_str(&config_contents)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Remove duplicate card numbers
+        if let Some(cards) = &mut config.cards {
+            let mut seen = HashMap::new();
+            cards.retain(|atr, cardnumber| {
+                if seen.contains_key(cardnumber) {
+                    log::info!("Duplicate card number {} with ATR {} removed", cardnumber, atr);
+                    false
+                } else {
+                    seen.insert(cardnumber.clone(), atr.clone());
+                    true
+                }
+            });
+        }
 
         // Update the version
         config.version = env!("CARGO_PKG_VERSION").to_string();
