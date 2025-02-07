@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 [release] App is added to the repo
 
-### [0.5.5] - 2024-11-01
+### [0.5.5] - 2025-02-07
 
 [fix] Fixed configuration.  
 [fix] Fixed README.  
