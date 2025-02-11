@@ -15,7 +15,7 @@ use tauri::Emitter;
 use std::fs;
 
 /// Represents the configuration settings for the application.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ConfigurationFile {
     name: String,                           // The name of the application.
     version: String,                        // The version of the application.
@@ -27,7 +27,7 @@ pub struct ConfigurationFile {
 }
 
 // Server Configuration structure, part of ConfigurationFile that contains data about the server.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerConfig {
     pub host: String,
 }
@@ -137,25 +137,37 @@ fn update_card_config(
     atr: &str,
     cardnumber: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    log::debug!("Loading configuration from {:?}", config_path);
     let mut config = load_config(config_path)?;
+    log::debug!("Loaded configuration: {:?}", config);
 
-    // Check for duplicate cardnumber
-    if let Some(cards) = &config.cards {
-        if cards.values().any(|number| number == cardnumber) {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "Card with this cardnumber already exists",
-            )));
-        } else {
-            config
+    // Ensure the cards field is initialized
+    if config.cards.is_none() {
+        config.cards = Some(HashMap::new());
+    }
+
+    let cards = config.cards.as_mut().unwrap();
+
+    if cards.values().any(|number| number == cardnumber) {
+        log::info!("Card with cardnumber {} already exists", cardnumber);
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "Card with this cardnumber already exists",
+        )));
+    } else {
+        log::debug!("Adding new card with ATR {} and cardnumber {}", atr, cardnumber);
+        config
             .cards
             .get_or_insert_with(HashMap::new)
             .insert(atr.to_string(), cardnumber.to_string());
-    
-            save_config(config_path, &config)?;
-        
-            load_config_to_cache(config_path)?;
-        }
+
+        log::debug!("Saving updated configuration to {:?}", config_path);
+        save_config(config_path, &config)?;
+        log::debug!("Configuration saved successfully");
+
+        log::debug!("Loading updated configuration to cache");
+        load_config_to_cache(config_path)?;
+        log::debug!("Configuration loaded to cache successfully");
     }
 
     Ok(())
@@ -184,7 +196,7 @@ pub fn update_card(atr: &str, cardnumber: &str) -> bool {
 
     match update_card_config(&config_path, atr, cardnumber) {
         Ok(_) => {
-            log::info!("The card, {} is added to the configuration! It is needed to restart the application to connect the card to the server. Automation will be implemented later.", cardnumber);
+            log::info!("The card, {} is added to the configuration!", cardnumber);
             true
         }
         Err(e) => {

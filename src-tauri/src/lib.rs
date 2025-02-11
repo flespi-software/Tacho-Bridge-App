@@ -17,8 +17,6 @@ pub fn run() {
     // need to debug later. Add checking for the init result
     //
     logger::setup_logging();
-    // Log the application launch
-    log::info!("-== Application is launched ==-");
 
     // Initialize configuration. This function reads the configuration file and initializes the configuration structure.
     // The configuration file is located in the `assets` directory and is named `config.yaml`.

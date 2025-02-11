@@ -84,7 +84,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     //////////////////////////////////////////////////
     let mut mqtt_options = MqttOptions::new(&client_id, &host, port);
     // mqtt_options.set_credentials(flespi_token, "");
-    mqtt_options.set_keep_alive(Duration::from_secs(550));
+    mqtt_options.set_keep_alive(Duration::from_secs(120));
     // log::debug!("mqtt_options: {:?}", mqtt_options);
     log::debug!("mqtt_options: {:?}", mqtt_options);
 

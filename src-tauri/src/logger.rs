@@ -4,6 +4,15 @@ use std::path::PathBuf;
 
 use fern;
 use log;
+use sys_info;
+use reqwest::Error;
+use serde::Deserialize;
+use tauri::async_runtime;
+
+#[derive(Deserialize, Debug)]
+struct Release {
+    tag_name: String,
+}
 
 /// Sets up logging for the application.
 ///
@@ -59,4 +68,85 @@ pub fn setup_logging() {
     {
         eprintln!("Failed to initialize logging: {}", e);
     }
+
+    // Log the application launch
+    log::info!("-== Application is launched ==-");
+
+    // Check for the latest version asynchronously
+    async_runtime::spawn(async {
+        if let Err(e) = check_latest_version().await {
+            log::error!("Error checking latest version: {}", e);
+        }
+    });
+
+    // Log system information
+    log_system_info();
+}
+
+fn log_system_info() {
+    let os_type = sys_info::os_type().unwrap_or_else(|_| "Unknown".to_string());
+    let os_release = sys_info::os_release().unwrap_or_else(|_| "Unknown".to_string());
+    let hostname = sys_info::hostname().unwrap_or_else(|_| "Unknown".to_string());
+    let cpu_num = sys_info::cpu_num().unwrap_or_else(|_| 0);
+    let cpu_speed = sys_info::cpu_speed().map_or_else(|_| "Unknown".to_string(), |speed| format!("{} MHz", speed));
+    let mem_info = sys_info::mem_info().map_or_else(|_| "Unknown".to_string(), |mem| format!("total {} KB, free {} KB", mem.total, mem.free));
+
+    log::info!(
+        "OS Type: {}, OS Release: {}, Hostname: {}, Number of CPUs: {} ({}), Memory: {}",
+        os_type, os_release, hostname, cpu_num, cpu_speed, mem_info
+    );
+}
+
+async fn check_latest_version() -> Result<(), Error> {
+    let url = "https://api.github.com/repos/flespi-software/Tacho-Bridge-App/releases/latest";
+    let client = reqwest::Client::new();
+    let response = client
+        .get(url)
+        .header("User-Agent", "reqwest")
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        let release: Release = response.json().await?;
+        // log::info!("Latest release info: {:?}", release);
+
+        let latest_version = release.tag_name;
+        let current_version = env!("CARGO_PKG_VERSION");
+
+        let latest_version_num = version_to_number(&latest_version);
+        let current_version_num = version_to_number(current_version);
+
+        if current_version_num > latest_version_num {
+            log::info!(
+                "Version (current: {}, latest: {})",
+                current_version,
+                latest_version
+            );
+        } else if current_version_num < latest_version_num {
+            log::info!(
+                "Version (current: {}, latest: {}). New one is available, use the link to download: {}",
+                current_version,
+                latest_version,
+                url
+            );
+        } else {
+            log::info!(
+                "Version (current: {}, latest: {}). You are using the latest version.",
+                current_version,
+                latest_version
+            );
+        }
+    } else {
+        log::warn!("Versioin. Failed to fetch the latest release info: {}", response.status());
+    }
+
+    Ok(())
+}
+
+fn version_to_number(version: &str) -> u32 {
+    version
+        .trim_start_matches('v')
+        .split('.')
+        .filter_map(|s| s.parse::<u32>().ok())
+        .fold(0, |acc, num| acc * 100 + num)
 }
