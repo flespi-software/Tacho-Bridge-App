@@ -1,13 +1,18 @@
 use std::env;
-// use std::fs::OpenOptions;
 use std::path::PathBuf;
+// use std::fs;
+// use std::error::Error; // Импортируем трэйт Error
 
 use fern;
 use log;
 use sys_info;
-use reqwest::Error;
+use reqwest;
 use serde::Deserialize;
 use tauri::async_runtime;
+// use tauri::Emitter;
+
+use crate::global_app_handle::emit_notification_event;
+use crate::global_app_handle::NotificationPayload;
 
 #[derive(Deserialize, Debug)]
 struct Release {
@@ -23,6 +28,8 @@ struct Release {
 ///
 /// * On macOS, the log file is created in the `~/Documents/tba` directory.
 /// * On Windows, the log file is created in the `%USERPROFILE%\Documents\tba` directory.
+/// 
+
 pub fn setup_logging() {
     let mut log_path = PathBuf::new();
 
@@ -52,7 +59,23 @@ pub fn setup_logging() {
 
     log_path.push("log.txt");
 
-    if let Err(e) = fern::Dispatch::new()
+    match fern::log_file(&log_path) {   // Check if the log file can be created. Permission check.
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("Failed to create log file: {}", e);
+            log::warn!("No permission to write log file at: {:?}", log_path);
+
+            let payload = NotificationPayload {
+                notification_type: "access".to_string(),
+                message: "No permission to write log file".to_string(),
+            };
+            emit_notification_event("global-notification", payload);
+
+            return;
+        }
+    };
+
+    match fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
                 "{}[{}][{}] {}",
@@ -63,10 +86,14 @@ pub fn setup_logging() {
             ))
         })
         .level(log::LevelFilter::Debug)  // For debugging it is needed to set up 'Debug' filter level
-        .chain(fern::log_file(log_path).unwrap())
+        .chain(fern::log_file(&log_path).unwrap())
         .apply()
     {
-        eprintln!("Failed to initialize logging: {}", e);
+        Ok(_) => log::info!("-== Application is launched ==-"),
+        Err(e) => {
+            eprintln!("Failed to initialize logging: {}", e);
+            log::warn!("No permission to write log file at: {:?}", log_path);
+        }
     }
 
     // Log the application launch
@@ -97,7 +124,7 @@ fn log_system_info() {
     );
 }
 
-async fn check_latest_version() -> Result<(), Error> {
+async fn check_latest_version() -> Result<(), reqwest::Error> {
     let url = "https://api.github.com/repos/flespi-software/Tacho-Bridge-App/releases/latest";
     let client = reqwest::Client::new();
     let response = client
@@ -129,6 +156,12 @@ async fn check_latest_version() -> Result<(), Error> {
                 latest_version,
                 url
             );
+
+            let payload = NotificationPayload {
+                notification_type: "version".to_string(),
+                message: format!("New version {} is available, use the link to download: {}", latest_version, url).into(),
+            };
+            emit_notification_event("global-notification", payload);
         } else {
             log::info!(
                 "Version (current: {}, latest: {}). You are using the latest version.",

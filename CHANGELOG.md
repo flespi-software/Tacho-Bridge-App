@@ -24,5 +24,6 @@ All notable changes to this project will be documented in this file.
 
 [fix] Fixed potential issue with saving/updating configuration. Added extended debug log when saving configuration.  
 [fix] Changing the frequency of ping packets for MQTT sessions from 550 to 120 seconds.  
+[fix] Added handling of behavior when the OS does not grant permission to write the configuration and log. Added user notification.  
 [feature] Added logging of information about the operating system on which the application is running.  
-[feature] Added a mechanism for getting the latest version of the application from the repository. For now, the output is in the log without UI notification.
+[feature] Added a mechanism for getting the latest version of the application from the repository. Notification to the user in the form of a notification in the UI.   
