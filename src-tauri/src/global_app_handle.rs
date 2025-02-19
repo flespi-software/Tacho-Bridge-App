@@ -1,6 +1,7 @@
 use lazy_static::lazy_static;
 use std::sync::Mutex;
 use tauri::{Emitter, AppHandle};
+use serde::Serialize;
 
 use crate::smart_card::TachoState;
 
@@ -36,6 +37,23 @@ pub fn emit_event(event_name: &str, atr: String, reader_name: String, card_state
         }
         println!("{} has been sent", event_name);
     } else {
-        println!("App handle is not set");
+        println!("App card handle is not set");
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct NotificationPayload {
+    pub notification_type: String,
+    pub message: String,
+}
+
+pub fn emit_notification_event(event_name: &str, payload: NotificationPayload) {
+    if let Some(app_handle) = get_app_handle() {
+        if let Err(e) = app_handle.emit(event_name, payload) {
+            println!("Error: {:?}", e);
+        }
+        println!("{} has been sent", event_name);
+    } else {
+        println!("App notification handle is not set");
     }
 }

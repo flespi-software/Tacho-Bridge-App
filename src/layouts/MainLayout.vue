@@ -66,6 +66,7 @@ import { useQuasar, Notify } from 'quasar'
 import { ref, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit } from '@tauri-apps/api/event'
+import 'animate.css';
 
 // Server configuration dialog
 const config = ref(false) // Config dialog
@@ -162,6 +163,39 @@ listen('global-config-server', (event) => {
 }).catch((error) => {
   console.error('Error listening to global-config-server:', error)
 })
+
+listen('global-notification', (event) => {
+  // Global configuration event
+  const payload = event.payload as {
+    notification_type: string
+    message: string
+  }
+
+  console.log('global-notification:', payload.notification_type, 'message:', payload.message)
+
+  if (payload.notification_type === "access") {
+    Notify.create({
+      message: "The application cannot access the directory '~/Documents/tba' and cannot continue to operate. Perhaps such a directory has already been created by another version of the program, therefore it has local access restrictions. A possible solution may be: rename the current directory, for example, to tba1 and restart the application. It will create a new directory with the necessary access rights.",
+      color: 'red',
+      position: 'bottom',
+      timeout: 999000,
+    })
+  } else if (payload.notification_type === "version") {
+    Notify.create({
+      message: "The application cannot access the directory '~/Documents/tba' and cannot continue to operate. Perhaps such a directory has already been created by another version of the program, therefore it has local access restrictions. A possible solution may be: rename the current directory, for example, to tba1 and restart the application. It will create a new directory with the necessary access rights.",
+      color: 'green',
+      position: 'bottom',
+      timeout: 15000,
+      classes: 'animate__animated animate__shakeX'
+    })
+  } else {
+    console.log('global-notification: unknown type:', payload.notification_type)
+  }
+
+}).catch((error) => {
+  console.error('Error listening to global-notification:', error)
+})
+
 // Generate an event to inform the back-end that the front-end is loaded.
 // To correctly display states in the application.
 emit('frontend-loaded', { message: 'Hello from frontend!' }).catch((error) => {

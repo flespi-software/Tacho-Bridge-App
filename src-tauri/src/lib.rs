@@ -13,22 +13,6 @@ use tauri::{async_runtime, Manager, WindowEvent, Listener}; // Tauri application
 mod global_app_handle;
 
 pub fn run() {
-    // Initialize logging. This function configures the logging system using the `fern` crate.
-    // need to debug later. Add checking for the init result
-    //
-    logger::setup_logging();
-    // Log the application launch
-    log::info!("-== Application is launched ==-");
-
-    // Initialize configuration. This function reads the configuration file and initializes the configuration structure.
-    // The configuration file is located in the `assets` directory and is named `config.yaml`.
-    match config::init_config() {
-        Ok(_) => log::info!("Config initialized successfully."),
-        Err(e) => {
-            log::error!("Failed to initialize config: {}", e);
-        }
-    }
-
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
     tauri::Builder::default()
         .setup(|app| {
@@ -58,6 +42,20 @@ pub fn run() {
                     }
                     #[cfg(target_os = "windows")] {
                         std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+
+                    // Initialize logging. This function configures the logging system using the `fern` crate.
+                    // need to debug later. Add checking for the init result
+                    //
+                    logger::setup_logging();
+
+                    // Initialize configuration. This function reads the configuration file and initializes the configuration structure.
+                    // The configuration file is located in the `assets` directory and is named `config.yaml`.
+                    match config::init_config() {
+                        Ok(_) => log::info!("Config initialized successfully."),
+                        Err(e) => {
+                            log::error!("Failed to initialize config: {}", e);
+                        }
                     }
 
                     println!("Received event with payload: {:?}", event.payload());
