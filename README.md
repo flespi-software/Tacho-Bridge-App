@@ -46,7 +46,12 @@ npm run tauri dev
 Build
 
 ```
+# Current native platform and architecture
 npm run tauri build
+
+# MacOS
+tauri build --target aarch64-apple-darwin # targets Apple silicon machines.
+tauri build --target x86_64-apple-darwin # targets Intel-based machines.
 ```
 
 Cargo can be updated only from the ./src-tauri directory
