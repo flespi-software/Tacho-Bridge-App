@@ -9,6 +9,10 @@ mod smart_card; // PCSC module for smart card operations. // Application connect
 
 // External crate imports
 use tauri::{async_runtime, Manager, WindowEvent, Listener}; // Tauri application framework and async runtime.
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+  };
 
 mod global_app_handle;
 
@@ -16,6 +20,27 @@ pub fn run() {
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
     tauri::Builder::default()
         .setup(|app| {
+            // // Create a tray icon for the application
+            // let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            // let menu = Menu::with_items(app, &[&quit_i])?;
+            
+            // let tray = TrayIconBuilder::new()
+            //   .menu(&menu)
+            //   .menu_on_left_click(true)
+            //   .build(app)?;
+
+            // TrayIconBuilder::new()
+            // .on_menu_event(|app, event| match event.id.as_ref() {
+            // "quit" => {
+            //     println!("quit menu item was clicked");
+            //     app.exit(0);
+            // }
+            // _ => {
+            //     println!("menu item {:?} not handled", event.id);
+            // }
+            // });
+            
+            
             // Obtain a lightweight reference to the app for convenient interaction
             let app_handle = app.app_handle();
 

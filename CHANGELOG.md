@@ -27,3 +27,7 @@ All notable changes to this project will be documented in this file.
 [fix] Added handling of behavior when the OS does not grant permission to write the configuration and log. Added user notification.  
 [feature] Added logging of information about the operating system on which the application is running.  
 [feature] Added a mechanism for getting the latest version of the application from the repository. Notification to the user in the form of a notification in the UI.   
+
+### [0.5.7] - 2025-02-20
+
+[fix] 
