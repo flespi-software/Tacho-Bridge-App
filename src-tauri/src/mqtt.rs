@@ -251,7 +251,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     );
 
                                                 } else {
-                                                    // Otherwise, the logic for exchanging messages with the map.
+                                                    // Otherwise, the logic for exchanging messages with the card.
                                                     match crate::smart_card::send_apdu_to_card_command(&card, &hex_value) {
                                                         Ok(response) => {
                                                             rapdu_mqtt_hex = response;
@@ -325,6 +325,22 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                 "{} Сonnection to the server has been successfully established.",
                                 log_header
                             )
+                        }
+                        Event::Incoming(Incoming::PingResp(..)) => {
+                            log::info!(
+                                "{} Ping response received from the server.",
+                                log_header
+                            );
+                            
+                            // Send the global-cards-sync event to the frontend that card is connected
+                            emit_event("global-cards-sync",
+                                atr.clone().into(),
+                                reader_name.to_string_lossy().into(),
+                                "PRESENT".into(),
+                                client_id_cloned.clone(),
+                                Some(true),
+                                Some(false)
+                            );
                         }
                         _ => {} // This handles any other events that you haven't explicitly matched above
                     }

@@ -20,7 +20,7 @@ All notable changes to this project will be documented in this file.
 [feature] added mechanism for deleting duplicate cards from config  
 [feature] Upgrade Tauri from version 1x to 2x. Updating all related dependencies, as well as cargo libraries. Version 2х of Tauri has many significant changes, including the structure and configuration of the project. More details [here](https://v2.tauri.app/start/migrate/from-tauri-1/).
 
-### [0.5.6] - 2025-02-11
+### [0.5.6] - 2025-02-19
 
 [fix] Fixed potential issue with saving/updating configuration. Added extended debug log when saving configuration.  
 [fix] Changing the frequency of ping packets for MQTT sessions from 550 to 120 seconds.  
