@@ -30,4 +30,4 @@ All notable changes to this project will be documented in this file.
 
 ### [0.5.7] - 2025-02-20
 
-[fix] 
+[fix] Improved authorization control. Added handling of unfinished authorization process due to the fault of the tracker.

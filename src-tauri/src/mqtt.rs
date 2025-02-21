@@ -125,8 +125,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
         }
     };
 
-    // flag to control the card connection (to the server) status
-    let mut is_online: bool = false;
+    let mut is_online: bool = false;    // flag to control the card connection (to the server) status
+    let mut was_online = false;   // Flag to track the previous connection status
+    let mut auth_process: bool = false;  // Flag to control the authentication process
 
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
@@ -135,16 +136,18 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                 Ok(notification) => {
                     if !is_online {
                         is_online = true;
-
-                        // Send the global-cards-sync event to the frontend that card is connected
-                        emit_event("global-cards-sync",
-                            atr.clone().into(),
-                            reader_name.to_string_lossy().into(),
-                            "PRESENT".into(),
-                            client_id_cloned.clone(),
-                            Some(true),
-                            None
-                        );
+                        if !was_online {
+                            was_online = true;
+                            // Send the global-cards-sync event to the frontend that card is connected
+                            emit_event("global-cards-sync",
+                                atr.clone().into(),
+                                reader_name.to_string_lossy().into(),
+                                "PRESENT".into(),
+                                client_id_cloned.clone(),
+                                Some(true),
+                                None
+                            );
+                        }
                     }
 
                     log::debug!("{} Notification: {:?}", log_header, notification);
@@ -216,6 +219,8 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
                                             payload_ack = process_rapdu_mqtt_hex("".to_string());
 
+                                            auth_process = false;   // Authorization process is finished
+
                                             // handle the case when finish == true
                                         } else {
                                             // finish flag is false here
@@ -234,6 +239,27 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                 let mut rapdu_mqtt_hex = String::new(); // empty string for the response
 
                                                 if hex_value.is_empty() {
+                                                    // This case is needed to reset the card when authorization is not completed, otherwise the card will not respond to commands correctly.
+                                                    if auth_process { 
+                                                        // Reset the card to its original state
+                                                        match card.reconnect(
+                                                            ShareMode::Shared,
+                                                            Protocols::ANY,
+                                                            Disposition::ResetCard,
+                                                        ) {
+                                                            Ok(_) => {
+                                                                println!("Card reconnected successfully.");
+                                                            }
+                                                            Err(e) => {
+                                                                log::error!(
+                                                                    "{} Failed to reconnect card: {:?}",
+                                                                    log_header,
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+
                                                     // If the input value is empty, then pass the ATR to the server.
                                                     rapdu_mqtt_hex = atr.clone();
                                                     // finish_value = true;    // This is a crutch, temporary solution to not include the visual effect of authorization.
@@ -272,6 +298,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                         Some(true)
                                                     );
 
+                                                    auth_process = true;    // Authorization process is in progress
                                                 }
 
                                                 payload_ack = process_rapdu_mqtt_hex(rapdu_mqtt_hex);
@@ -355,6 +382,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                         Some(false),
                         None
                     );
+
+                    is_online = false;
+                    was_online = false; // Reset the flag when the connection is lost
 
                     match e {
                         ConnectionError::Io(ref io_err) => match io_err.kind() {
