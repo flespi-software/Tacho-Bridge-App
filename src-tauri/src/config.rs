@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
@@ -166,7 +167,7 @@ fn update_card_config(
         log::debug!("Configuration saved successfully");
 
         log::debug!("Loading updated configuration to cache");
-        load_config_to_cache(config_path)?;
+        load_config_to_cache(&config)?;
         log::debug!("Configuration loaded to cache successfully");
     }
 
@@ -240,7 +241,7 @@ pub fn update_server_config(
 
     save_config(config_path, &config)?;
 
-    load_config_to_cache(config_path)?;
+    load_config_to_cache(&config)?;
 
     Ok(())
 }
@@ -386,27 +387,22 @@ pub fn split_host_to_parts(host: &str) -> Result<(String, u16), String> {
 ///
 /// # Arguments
 ///
-/// * `config_path` - The path to the configuration file.
+/// * `config` - link to the loaded configuration file object.
 ///
 /// # Returns
 ///
 /// * `Result<(), Box<dyn std::error::Error + Send + Sync>>` - Returns `Ok` if the configuration was successfully loaded, otherwise returns an error.
 pub fn load_config_to_cache(
-    config_path: &Path,
+    config: &ConfigurationFile,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut file: File = File::open(config_path)?;
     log::debug!("load_config_to_cache");
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-
-    let config: ConfigurationFile = serde_yaml::from_str(&contents)?;
 
     let mut cache = CACHE.lock().unwrap();
     *cache = CacheConfigData {
-        cards: config.cards.unwrap_or_default(),
-        server: config.server,
-        ident: config.ident,
-        appearance: config.appearance,
+        cards: config.cards.clone().unwrap_or_default(),
+        server: config.server.clone(),
+        ident: config.ident.clone(),
+        appearance: config.appearance.clone(),
     };
 
     trace_cache(&*cache);
@@ -435,6 +431,15 @@ pub fn trace_cache(cache: &CacheConfigData) {
     } else {
         log::info!("No appearance configuration found.");
     }
+}
+
+/// Generates a unique ident value based on the current time in microseconds.
+/// The ident value is in the format "TBA" followed by 13 digits.
+fn generate_ident() -> String {
+    let start = SystemTime::now();
+    let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
+    let micros = since_the_epoch.as_micros();
+    format!("TBA{:013}", micros % 1_000_000_000_000u128)
 }
 
 /// Initializes the configuration file.
@@ -470,13 +475,13 @@ pub fn init_config() -> io::Result<()> {
         // Update the version
         config.version = env!("CARGO_PKG_VERSION").to_string();
 
-        // Save the updated configuration
-        let yaml =
-            serde_yaml::to_string(&config).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        File::create(&config_path)?.write_all(yaml.as_bytes())?;
+        // save updated config
+        save_config(&config_path, &config)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        // Load updated config to cache
-        load_config_to_cache(&config_path).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        // load cache to the object `ConfigurationFile`
+        load_config_to_cache(&config)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         return Ok(());
     }
@@ -491,19 +496,20 @@ pub fn init_config() -> io::Result<()> {
         appearance: Some(AppearanceConfig {
             dark_theme: DarkTheme::Auto,
         }),
-        ident: Some("".to_string()),
+        ident: Some(generate_ident()),
         server: None,
         cards: None,
     };
 
-    log::debug!("config: default config created");
-
-    let yaml = serde_yaml::to_string(&config).unwrap();
-
-    let mut file = File::create(config_path)?;
-    file.write_all(yaml.as_bytes())?;
+    // save new config
+    save_config(&config_path, &config)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     log::debug!("config: default config saved");
+
+    // load to cache
+    load_config_to_cache(&config)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     Ok(())
 }

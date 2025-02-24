@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "tba",
-        "width": 700,
-        "height": 500,
+        "width": 620,
+        "height": 400,
         "resizable": true,
         "fullscreen": false
       }

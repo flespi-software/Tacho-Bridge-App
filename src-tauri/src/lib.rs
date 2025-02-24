@@ -102,9 +102,14 @@ pub fn run() {
                             The fact is that the back-end starts faster than the front, and the sent event with card data arrives at the front-end before it has time to load.
                             *** In the near future, I will add a flag for the state of readiness to receive events from the backend. ***
                         */
-                        // Start monitoring smart cards. This function will run forever with the loop
+                        // Start monitoring smart cards. This function will run fсorever with the loop
                         smart_card::sc_monitor().await;
                     });
+
+                    // async_runtime::spawn(async {
+                    //     // Start Main MQTT App client connection
+                    //     app_connect::app_connection().await;
+                    // });
                 });
 
                 // Handle the application close event to log this.
@@ -114,11 +119,6 @@ pub fn run() {
                     }
                 });
             }
-
-            async_runtime::spawn(async {
-                // Start Main MQTT App client connection
-                app_connect::app_connection().await;
-            });
 
             Ok(())
         })

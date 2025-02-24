@@ -33,7 +33,7 @@ use serde_json::Value; // For working with JSON data structures.
 const SLEEP_DURATION_SECS: u64 = 10;
 
 // Import TASK_POOL from the smart_card module
-use crate::smart_card::TASK_POOL;
+use crate::smart_card::TASK_POOL;   // Task pool for managing MQTT connections.
 
 // Importing specific functionality from local modules
 use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
@@ -414,6 +414,13 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     });
 
     task_pool.push((client_id, mqtt_clinet_cloned, handle));
+
+    // Логирование содержимого task_pool после добавления новой задачи
+    log::info!("Current tasks in the pool:");
+    for (id, _, _) in task_pool.iter() {
+        log::info!("Client ID: {}", id);
+    }
+
 }
 
 /// Removes specified MQTT connections.

@@ -22,10 +22,13 @@
                 <q-input
                   label="App ident"
                   :dense="dense"
-                  v-model="ident"
+                  v-model="identInput"
                   autofocus
                   @keyup.enter="config = false"
-                />
+                  :error="!isIndetValid"
+                  error-message="The identifier must have the prefix TBA + 13 digits. For example: TBA0000000000001."
+                >
+              </q-input>
                 <q-input
                   label="Server address"
                   :dense="dense"
@@ -46,7 +49,7 @@
                   flat
                   label="Save"
                   v-close-popup
-                  @click="saveServerConfig(host, ident, selectedTheme)"
+                  @click="saveServerConfig(host, identInput, selectedTheme)"
                 />
               </q-card-actions>
             </q-card>
@@ -63,15 +66,24 @@
 
 <script setup lang="ts">
 import { useQuasar, Notify } from 'quasar'
-import { ref, defineComponent } from 'vue'
+import { ref, computed, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit } from '@tauri-apps/api/event'
 import 'animate.css';
 
+const TBA_IDENT_REGEXP = /^TBA\d{13}$/ // Regular expression for the company card number
+const isIndetValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))
+// const ident = ref('') // App ident. The unique identifier of the application. Config
+const ident = ref('') // Input field for ident without prefix
+const identInput = computed({
+  get: () => `TBA${ident.value}`, // Без пробела
+  set: (val) => {
+    ident.value = val.replace(/^TBA/, ''); // Убираем "TBA", если пользователь вводит его вручную
+  }
+});
 // Server configuration dialog
 const config = ref(false) // Config dialog
 const host = ref('') // Server address. Config
-const ident = ref('') // App ident. The unique identifier of the application. Config
 // const dark_theme = ref(''); // dark_theme of the application (dark or light). Config
 const dense = ref(true) // Dense mode
 
@@ -155,7 +167,7 @@ listen('global-config-server', (event) => {
   console.log('host:', payload.host, 'ident:', payload.ident, 'dark_theme:', payload.dark_theme)
 
   host.value = payload.host
-  ident.value = payload.ident
+  identInput.value = payload.ident
 
   // update the theme value in the application
   changeTheme(payload.dark_theme)
