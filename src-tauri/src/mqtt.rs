@@ -33,7 +33,7 @@ use serde_json::Value; // For working with JSON data structures.
 const SLEEP_DURATION_SECS: u64 = 10;
 
 // Import TASK_POOL from the smart_card module
-use crate::smart_card::TASK_POOL;
+use crate::smart_card::TASK_POOL;   // Task pool for managing MQTT connections.
 
 // Importing specific functionality from local modules
 use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
@@ -125,8 +125,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
         }
     };
 
-    // flag to control the card connection (to the server) status
-    let mut is_online: bool = false;
+    let mut is_online: bool = false;    // flag to control the card connection (to the server) status
+    let mut was_online = false;   // Flag to track the previous connection status
+    let mut auth_process: bool = false;  // Flag to control the authentication process
 
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
@@ -135,16 +136,18 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                 Ok(notification) => {
                     if !is_online {
                         is_online = true;
-
-                        // Send the global-cards-sync event to the frontend that card is connected
-                        emit_event("global-cards-sync",
-                            atr.clone().into(),
-                            reader_name.to_string_lossy().into(),
-                            "PRESENT".into(),
-                            client_id_cloned.clone(),
-                            Some(true),
-                            None
-                        );
+                        if !was_online {
+                            was_online = true;
+                            // Send the global-cards-sync event to the frontend that card is connected
+                            emit_event("global-cards-sync",
+                                atr.clone().into(),
+                                reader_name.to_string_lossy().into(),
+                                "PRESENT".into(),
+                                client_id_cloned.clone(),
+                                Some(true),
+                                None
+                            );
+                        }
                     }
 
                     log::debug!("{} Notification: {:?}", log_header, notification);
@@ -207,14 +210,34 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                 }
                                                 Err(e) => {
                                                     log::error!(
-                                                        "{} Failed to reconnect card: {:?}",
+                                                        "{} Failed to reconnect card: {:?}. Trying to recreate the card object...",
                                                         log_header,
                                                         e
                                                     );
+                                                
+                                                    // attempt to recreate card object
+                                                    match crate::smart_card::create_card_object(&reader_name) {
+                                                        Ok(new_card) => {
+                                                            log::info!(
+                                                                "Successfully recreated card object for reader: {}",
+                                                                reader_name.to_string_lossy()
+                                                            );
+                                                            card = new_card; // change old card object to new one
+                                                        }
+                                                        Err(err) => {
+                                                            log::error!(
+                                                                "Failed to recreate card object: {} for the reader: {}. Giving up.",
+                                                                err,
+                                                                reader_name.to_string_lossy()
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
 
                                             payload_ack = process_rapdu_mqtt_hex("".to_string());
+
+                                            auth_process = false;   // Authorization process is finished
 
                                             // handle the case when finish == true
                                         } else {
@@ -234,6 +257,45 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                 let mut rapdu_mqtt_hex = String::new(); // empty string for the response
 
                                                 if hex_value.is_empty() {
+                                                    // This case is needed to reset the card when authorization is not completed, otherwise the card will not respond to commands correctly.
+                                                    if auth_process { 
+                                                        // Reset the card to its original state
+                                                        match card.reconnect(
+                                                            ShareMode::Shared,
+                                                            Protocols::ANY,
+                                                            Disposition::ResetCard,
+                                                        ) {
+                                                            Ok(_) => {
+                                                                println!("Card reconnected successfully.");
+                                                            }
+                                                            Err(e) => {
+                                                                log::error!(
+                                                                    "{} Failed to reconnect card: {:?}. Trying to recreate the card object...",
+                                                                    log_header,
+                                                                    e
+                                                                );
+                                                            
+                                                                // attempt to recreate card object
+                                                                match crate::smart_card::create_card_object(&reader_name) {
+                                                                    Ok(new_card) => {
+                                                                        log::info!(
+                                                                            "Successfully recreated card object for reader: {}",
+                                                                            reader_name.to_string_lossy()
+                                                                        );
+                                                                        card = new_card; // change old card object to new one
+                                                                    }
+                                                                    Err(err) => {
+                                                                        log::error!(
+                                                                            "Failed to recreate card object: {} for the reader: {}. Giving up.",
+                                                                            err,
+                                                                            reader_name.to_string_lossy()
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+
                                                     // If the input value is empty, then pass the ATR to the server.
                                                     rapdu_mqtt_hex = atr.clone();
                                                     // finish_value = true;    // This is a crutch, temporary solution to not include the visual effect of authorization.
@@ -272,6 +334,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                         Some(true)
                                                     );
 
+                                                    auth_process = true;    // Authorization process is in progress
                                                 }
 
                                                 payload_ack = process_rapdu_mqtt_hex(rapdu_mqtt_hex);
@@ -356,6 +419,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                         None
                     );
 
+                    is_online = false;
+                    was_online = false; // Reset the flag when the connection is lost
+
                     match e {
                         ConnectionError::Io(ref io_err) => match io_err.kind() {
                             ErrorKind::ConnectionAborted => log::warn!("{} Can't establish a connection to a remote server.", log_header),
@@ -384,6 +450,13 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     });
 
     task_pool.push((client_id, mqtt_clinet_cloned, handle));
+
+    // Логирование содержимого task_pool после добавления новой задачи
+    log::info!("Current tasks in the pool:");
+    for (id, _, _) in task_pool.iter() {
+        log::info!("Client ID: {}", id);
+    }
+
 }
 
 /// Removes specified MQTT connections.

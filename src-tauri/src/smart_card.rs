@@ -18,6 +18,8 @@ use crate::global_app_handle::emit_event;
 // Enum for cache sections for getting data from cache.
 use crate::mqtt::{ensure_connection, remove_connections, remove_connections_all}; // MQTT module functions for managing connections with the readers.
 
+use crate::app_connect; // Application connection to the MQTT broker.
+
 // import set for async task_pool under mutex
 use lazy_static::lazy_static; // Importing the lazy_static macro
 use rumqttc::v5::AsyncClient;
@@ -162,6 +164,9 @@ async fn process_reader_states(
             );
             // check the inserted cards and their connections. If the card is removed, it deletes the task in which the mqtt connection is running.
             remove_connections(readers_list).await;
+
+            // Temporarily process Application connection to the broker
+            app_connect::app_connection().await;
 
             // send an event to the frontend to update the state of the card
             emit_event("global-cards-sync", atr.into(), reader_name_string.into(), card_state_string.into(), card_number_clone.into(), None, None);

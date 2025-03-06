@@ -105,7 +105,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { Notify } from 'quasar'
 
-const TACHO_COMPANY_CARD_REGEX = /^[A-Z0-9]{16}$/ // Regular expression for the company card number
+const TACHO_COMPANY_CARD_REGEXP = /^[A-Z0-9]{16}$/ // Regular expression for the company card number
 
 // Blinking status for the card icon during authentication.
 const isBlinking = ref(true) // controls the blinking status of the icon
@@ -180,14 +180,19 @@ listen('global-cards-sync', (event) => {
 
 ///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
 const EnterCardNumberDialog = ref(false)
-const cardNumberInput = ref('') // Поле ввода номера карты
-const isCardNumberValid = computed(() => TACHO_COMPANY_CARD_REGEX.test(cardNumberInput.value))
+const cardNumberInput = ref('') // card number field
+const isCardNumberValid = computed(() => TACHO_COMPANY_CARD_REGEXP.test(cardNumberInput.value))
 const currentcardATR = ref('')
 
 // Open the dialog window for entering the Card Number value
 const editCompanyCardNumberDialog = (cardATR: string) => {
-  currentcardATR.value = cardATR // Set the current card data
-  EnterCardNumberDialog.value = true // Open the dialog window
+  currentcardATR.value = cardATR // ATR of the current card
+
+  // find the card number by ATR and fill the input field
+  const reader = state.readers.find((reader) => reader.cardATR === cardATR)
+  cardNumberInput.value = reader?.cardNumber || '' // if the card number is not found, the field will be empty
+
+  EnterCardNumberDialog.value = true // open dialog window
 }
 
 const saveCardNumber = async (cardATR: string) => {
