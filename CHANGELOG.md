@@ -28,7 +28,7 @@ All notable changes to this project will be documented in this file.
 [feature] Added logging of information about the operating system on which the application is running.  
 [feature] Added a mechanism for getting the latest version of the application from the repository. Notification to the user in the form of a notification in the UI.   
 
-### [0.5.7] - 2025-02-24
+### [0.5.7] - 2025-03-06
 
 [fix] Improved authorization control. Added handling of unfinished authorization process due to the fault of the tracker.  
 [fix] Tacho Bridge App device connection issue is fixed.  
