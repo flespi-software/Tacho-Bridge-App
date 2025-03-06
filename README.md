@@ -50,8 +50,8 @@ Build
 npm run tauri build
 
 # MacOS
-npm run tauri build --target aarch64-apple-darwin # targets Apple silicon machines.
-npm run tauri build --target x86_64-apple-darwin # targets Intel-based machines.
+npm run tauri build -- --target aarch64-apple-darwin # targets Apple silicon machines.
+npm run tauri build -- --target x86_64-apple-darwin # targets Intel-based machines.
 ```
 
 Cargo can be updated only from the ./src-tauri directory
