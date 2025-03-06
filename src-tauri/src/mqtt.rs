@@ -210,10 +210,28 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                 }
                                                 Err(e) => {
                                                     log::error!(
-                                                        "{} Failed to reconnect card: {:?}",
+                                                        "{} Failed to reconnect card: {:?}. Trying to recreate the card object...",
                                                         log_header,
                                                         e
                                                     );
+                                                
+                                                    // attempt to recreate card object
+                                                    match crate::smart_card::create_card_object(&reader_name) {
+                                                        Ok(new_card) => {
+                                                            log::info!(
+                                                                "Successfully recreated card object for reader: {}",
+                                                                reader_name.to_string_lossy()
+                                                            );
+                                                            card = new_card; // change old card object to new one
+                                                        }
+                                                        Err(err) => {
+                                                            log::error!(
+                                                                "Failed to recreate card object: {} for the reader: {}. Giving up.",
+                                                                err,
+                                                                reader_name.to_string_lossy()
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
 
@@ -252,10 +270,28 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                             }
                                                             Err(e) => {
                                                                 log::error!(
-                                                                    "{} Failed to reconnect card: {:?}",
+                                                                    "{} Failed to reconnect card: {:?}. Trying to recreate the card object...",
                                                                     log_header,
                                                                     e
                                                                 );
+                                                            
+                                                                // attempt to recreate card object
+                                                                match crate::smart_card::create_card_object(&reader_name) {
+                                                                    Ok(new_card) => {
+                                                                        log::info!(
+                                                                            "Successfully recreated card object for reader: {}",
+                                                                            reader_name.to_string_lossy()
+                                                                        );
+                                                                        card = new_card; // change old card object to new one
+                                                                    }
+                                                                    Err(err) => {
+                                                                        log::error!(
+                                                                            "Failed to recreate card object: {} for the reader: {}. Giving up.",
+                                                                            err,
+                                                                            reader_name.to_string_lossy()
+                                                                        );
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     }
