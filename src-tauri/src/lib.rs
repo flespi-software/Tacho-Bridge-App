@@ -9,10 +9,10 @@ mod smart_card; // PCSC module for smart card operations. // Application connect
 
 // External crate imports
 use tauri::{async_runtime, Manager, WindowEvent, Listener}; // Tauri application framework and async runtime.
-use tauri::{
-    menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-  };
+// use tauri::{
+//     menu::{Menu, MenuItem},
+//     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+//   };
 
 mod global_app_handle;
 
