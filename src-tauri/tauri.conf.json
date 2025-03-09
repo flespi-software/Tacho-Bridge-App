@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "tba",
-  "version": "0.5.7",
+  "version": "0.5.8",
   "identifier": "com.flespi.tba.dev",
   "build": {
     "frontendDist": "../dist/spa",
@@ -32,6 +32,13 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "frameworks": [],
+      "minimumSystemVersion": "10.13",
+      "signingIdentity": "@env:APPLE_IDENTITY",
+      "entitlements": "entitlements.plist",
+      "providerShortName": "@env:APPLE_TEAM_ID"
+    }
   }
 }
