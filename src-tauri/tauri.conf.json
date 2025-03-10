@@ -37,8 +37,8 @@
       "frameworks": [],
       "minimumSystemVersion": "10.13",
       "signingIdentity": "@env:APPLE_IDENTITY",
-      "entitlements": "entitlements.plist",
-      "providerShortName": "@env:APPLE_TEAM_ID"
+      "providerShortName": "@env:APPLE_TEAM_ID",
+      "entitlements": "entitlements.plist"
     }
   }
 }
