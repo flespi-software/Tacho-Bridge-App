@@ -44,18 +44,40 @@ npm run tauri dev
 ```
 
 Build
-
 ```
-# Current native platform and architecture
-npm run tauri build
+# default build command for the current OS. 
+npm run tauri build 
 
-# MacOS
-npm run tauri build -- --target aarch64-apple-darwin # targets Apple silicon machines.
-npm run tauri build -- --target x86_64-apple-darwin # targets Intel-based machines.
+# Build MacOS without signature and notarization.
+npm run tauri build -- --target aarch64-apple-darwin    # targets Apple silicon machines.
+npm run tauri build -- --target x86_64-apple-darwin     # targets Intel-based machines.
+npm run tauri build -- --target universal-apple-darwin  # unversal app for x86 and ARM machines.
+```
+
+### MacOS code signing and notarization
+Сreate a .env file with the variables described below with the specified credentials. IMPORTANT: this file is added to .gitignore, it will not be sent to the repository for the security purposes.
+```
+APPLE_IDENTITY="Developer ID Application: Your Name (YOUR_TEAM_ID)"
+APPLE_TEAM_ID=YOUR_TEAM_ID
+APPLE_ID=your.email@example.com
+APPLE_PASSWORD=your-app-specific-password
+
+# Enable notarization in Tauri 2.0
+ENABLE_NOTARIZE=true
+```
+Then just run the *build-mac.sh* script which will check for the necessary variables, settings and start building a universal bundle that can run on all Mac architectures (x86 & ARM). The binary file will contain code for both architectures, the required one will be selected for launch.
+
+If everything went well, you will see something like:
+```
+🔄 Restoring original configuration
+✅ Build completed successfully!
+📊 Application architecture information:
+Architectures in the fat file: ./src-tauri/target/universal-apple-darwin/release/bundle/macos/tba.app/Contents/MacOS/tacho-bridge-application are: x86_64 arm64 
+
+🏁 Script execution completed
 ```
 
 Cargo can be updated only from the ./src-tauri directory
-
 ```
 cargo update
 ```

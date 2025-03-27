@@ -78,7 +78,7 @@ pub async fn app_connection() {
     // `10` is the capacity of the internal channel used by the event loop for buffering operations
     let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
     let mqtt_clinet_cloned = mqtt_client.clone();
-    let client_id_cloned = client_id.clone();
+    // let client_id_cloned = client_id.clone();
 
     let log_header: String = format!("{} |", client_id);
 

@@ -313,14 +313,61 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     );
 
                                                 } else {
-                                                    // Otherwise, the logic for exchanging messages with the card.
+                                                    // // Otherwise, the logic for exchanging messages with the card.
+                                                    // match crate::smart_card::send_apdu_to_card_command(&card, &hex_value) {
+                                                    //     Ok(response) => {
+                                                    //         rapdu_mqtt_hex = response;
+                                                    //         log::debug!("{} APDU response: {:?}", client_id_cloned, rapdu_mqtt_hex);
+                                                    //     }
+                                                    //     Err(err) => {
+                                                    //         log::error!("Failed to send APDU command to card: {}", err);
+                                                    //     }
+                                                    // }
+
                                                     match crate::smart_card::send_apdu_to_card_command(&card, &hex_value) {
                                                         Ok(response) => {
                                                             rapdu_mqtt_hex = response;
                                                             log::debug!("{} APDU response: {:?}", client_id_cloned, rapdu_mqtt_hex);
                                                         }
                                                         Err(err) => {
-                                                            log::error!("Failed to send APDU command to card: {}", err);
+                                                            log::error!("Failed to send APDU command to card: {}. Trying to recreate card object...", err);
+                                                            
+                                                            // Try to recreate card object
+                                                            match crate::smart_card::create_card_object(&reader_name) {
+                                                                Ok(new_card) => {
+                                                                    log::info!(
+                                                                        "Successfully recreated card object for reader: {}. Retrying APDU command.",
+                                                                        reader_name.to_string_lossy()
+                                                                    );
+                                                                    card = new_card; // Replace old card object with new one
+                                                                    
+                                                                    // Retry sending APDU command with new card object
+                                                                    match crate::smart_card::send_apdu_to_card_command(&card, &hex_value) {
+                                                                        Ok(response) => {
+                                                                            rapdu_mqtt_hex = response;
+                                                                            log::debug!("{} APDU response (after reconnect): {:?}", client_id_cloned, rapdu_mqtt_hex);
+                                                                        }
+                                                                        Err(retry_err) => {
+                                                                            log::error!(
+                                                                                "{} Failed to send APDU command even after card reconnection: {}",
+                                                                                client_id_cloned,
+                                                                                retry_err
+                                                                            );
+                                                                            // Set empty response or error code if needed
+                                                                            rapdu_mqtt_hex = "6F00".to_string(); // Generic error response
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(create_err) => {
+                                                                    log::error!(
+                                                                        "Failed to recreate card object: {} for the reader: {}",
+                                                                        create_err,
+                                                                        reader_name.to_string_lossy()
+                                                                    );
+                                                                    // Set empty response or error code
+                                                                    rapdu_mqtt_hex = "6F00".to_string(); // Generic error response
+                                                                }
+                                                            }
                                                         }
                                                     }
 
