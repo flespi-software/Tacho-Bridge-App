@@ -41,3 +41,5 @@ All notable changes to this project will be documented in this file.
 ### [0.5.8] - 2025-03-09
 
 [feature] Add configuration to sign and notarize Apple bundle! The build has been verified and signed by Apple, so the application no longer generates warning messages or suspicious actions. For more details, see README.md in the section "MacOS code signing and notarization".
+[fix] Fixed minor bugs.
+[fix] Improved stability of working with cards during long-term operation of the application.
