@@ -43,3 +43,8 @@ All notable changes to this project will be documented in this file.
 [feature] Add configuration to sign and notarize Apple bundle! The build has been verified and signed by Apple, so the application no longer generates warning messages or suspicious actions. For more details, see README.md in the section "MacOS code signing and notarization".
 [fix] Fixed minor bugs.
 [fix] Improved stability of working with cards during long-term operation of the application.
+
+### [0.5.9] - 2025-4-28
+
+[fix] Fixed the problem of connecting Tacho Bridge App connection without connected cards to the computer.
+[fix] Fixed the problem of incorrect card initialization in the application configuration. Cards that are mistakenly defined with an empty ATR will not be saved. 

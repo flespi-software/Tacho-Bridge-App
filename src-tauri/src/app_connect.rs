@@ -32,7 +32,9 @@ use crate::config::split_host_to_parts; // Function to split the host into parts
 use crate::config::CacheSection; // Enum for cache sections for getting data from cache.
 
 /// Ensures an MQTT connection for the specified client ID.
+#[tauri::command]
 pub async fn app_connection() {
+    log::debug!("Ensuring APP MQTT connection...");
     // Getting server data from the cache
     let full_host = get_from_cache(CacheSection::Server, "host");
     let (host, port) = match split_host_to_parts(&full_host) {

@@ -133,7 +133,10 @@ const saveServerConfig = async (host: string, ident: string, theme: string) => {
     })
 
     // Launch a manual refresh of server connections.
-    await invoke('manual_sync_cards', { restart: true })
+    await invoke('manual_sync_cards', { restart: true })  // restart CARDS connections
+    console.log('Server configuration updated successfully_1')
+    await invoke('app_connection')  // restart APP connection
+    console.log('Server configuration updated successfully_2')
   } catch (error) {
     console.error('Error updating server configuration:', error)
     Notify.create({
