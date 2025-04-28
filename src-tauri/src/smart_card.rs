@@ -121,6 +121,11 @@ async fn process_reader_states(
 
     for rs in reader_states {
         if rs.name() != PNP_NOTIFICATION() {
+            if is_virtual_reader(rs.name()) {
+                log::warn!("Virtual reader {:?} detected. Skipping...", rs.name());
+                continue; // Skipping virtual reader processing
+            }        
+
             // convert ATR to hex string value
             let atr = hex::encode(rs.atr());
             // Checking if card number is in the cache
@@ -171,6 +176,17 @@ async fn process_reader_states(
     }
 
     Ok(())
+}
+
+/// Check if the reader is a virtual reader. This usually only applies to Windows.
+fn is_virtual_reader(reader_name: &CStr) -> bool {
+    // Convert the reader name to a lowercase string
+    let reader_name_lower = reader_name.to_string_lossy().to_lowercase();
+
+    // Check if the name contains keywords indicating a virtual reader
+    reader_name_lower.contains("microsoft")
+        || reader_name_lower.contains("virtual")
+        || reader_name_lower.contains("remote")
 }
 
 // Automatically sync cards
