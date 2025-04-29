@@ -1,6 +1,6 @@
 {
   "name": "tacho-bridge-application",
-  "version": "0.5.8",
+  "version": "0.5.9",
   "description": "Tachograph authentication application",
   "productName": "Tacho Bridge Application",
   "author": "shev <shev@gurtam.com>",

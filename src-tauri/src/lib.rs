@@ -1,7 +1,7 @@
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 
 // Module imports
-mod app_connect;
+mod app_connect;    // Application connection to the MQTT broker.
 mod config; // Configuration handling.
 mod logger; // Logging functionality.
 mod mqtt; // MQTT communication.
@@ -106,10 +106,10 @@ pub fn run() {
                         smart_card::sc_monitor().await;
                     });
 
-                    // async_runtime::spawn(async {
-                    //     // Start Main MQTT App client connection
-                    //     app_connect::app_connection().await;
-                    // });
+                    async_runtime::spawn(async {
+                        // Start Main MQTT App client connection
+                        app_connect::app_connection().await;
+                    });
                 });
 
                 // Handle the application close event to log this.
@@ -126,6 +126,7 @@ pub fn run() {
             config::update_card,           // update list of cards from the frontend
             config::update_server,         // update server config from the frontend
             smart_card::manual_sync_cards, // manual sync cards from the frontend
+            app_connect::app_connection,     // App connection to the MQTT broker
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

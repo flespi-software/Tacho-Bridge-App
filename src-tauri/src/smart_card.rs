@@ -121,6 +121,11 @@ async fn process_reader_states(
 
     for rs in reader_states {
         if rs.name() != PNP_NOTIFICATION() {
+            if is_virtual_reader(rs.name()) {
+                log::warn!("Virtual reader {:?} detected. Skipping...", rs.name());
+                continue; // Skipping virtual reader processing
+            }        
+
             // convert ATR to hex string value
             let atr = hex::encode(rs.atr());
             // Checking if card number is in the cache
@@ -165,9 +170,6 @@ async fn process_reader_states(
             // check the inserted cards and their connections. If the card is removed, it deletes the task in which the mqtt connection is running.
             remove_connections(readers_list).await;
 
-            // Temporarily process Application connection to the broker
-            app_connect::app_connection().await;
-
             // send an event to the frontend to update the state of the card
             emit_event("global-cards-sync", atr.into(), reader_name_string.into(), card_state_string.into(), card_number_clone.into(), None, None);
         };
@@ -176,14 +178,29 @@ async fn process_reader_states(
     Ok(())
 }
 
+/// Check if the reader is a virtual reader. This usually only applies to Windows.
+fn is_virtual_reader(reader_name: &CStr) -> bool {
+    // Convert the reader name to a lowercase string
+    let reader_name_lower = reader_name.to_string_lossy().to_lowercase();
+
+    // Check if the name contains keywords indicating a virtual reader
+    reader_name_lower.contains("microsoft")
+        || reader_name_lower.contains("virtual")
+        || reader_name_lower.contains("remote")
+}
+
 // Automatically sync cards
 pub async fn sc_monitor() -> ! {
     loop {
+        log::trace!("Starting the outer loop to establish context...");
         let ctx = match Context::establish(Scope::User) {
-            Ok(ctx) => ctx,
+            Ok(ctx) => {
+                log::trace!("Successfully established context.");
+                ctx
+            }
             Err(e) => {
                 log::error!(
-                    "Failed to establish context: {:?}. Try to reinit in a 5 seconds.",
+                    "Failed to establish context: {:?}. Retrying in 5 seconds...",
                     e
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -197,20 +214,38 @@ pub async fn sc_monitor() -> ! {
             ReaderState::new(PNP_NOTIFICATION(), State::UNAWARE),
         ];
 
+        log::trace!("Initialized readers buffer and reader states.");
+
         // Vector that stores the connected states of the reader + card (so that it would be possible to understand that the card has been removed)
         let mut reader_cards_pool = Vec::new();
 
         loop {
+            log::trace!("Starting the inner loop to monitor reader states...");
             if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
                 log::error!("Failed to setup_reader_states: {:?}", e);
+                log::trace!("Exiting inner loop to re-establish context...");
                 break; // Exit the inner loop to re-establish context
             }
+            log::trace!(
+                "Successfully set up reader states: {:?}",
+                reader_states
+                    .iter()
+                    .map(|rs| rs.name().to_string_lossy())
+                    .collect::<Vec<_>>()
+            );
+
             if let Err(e) =
                 process_reader_states(&ctx, &mut reader_states, &mut reader_cards_pool).await
             {
                 log::error!("Failed to process reader states: {:?}", e);
+                log::trace!("Exiting inner loop to re-establish context...");
                 break; // Exit the inner loop to re-establish context
             }
+            log::trace!(
+                "Successfully processed reader states. Current reader_cards_pool: {:?}",
+                reader_cards_pool
+            );
+
             log::debug!("Waiting for the next status change...");
             tokio::task::yield_now().await;
         }
@@ -316,9 +351,30 @@ pub fn create_card_object(reader_name: &CStr) -> Result<Card, Box<dyn StdError>>
 #[tauri::command]
 pub async fn manual_sync_cards(restart: bool) -> () {
     log::debug!("Manual sync cards function is called. Restart {}", restart);
+
+    if restart {
+        // remove all connections
+        remove_connections_all().await;
+    }
+
     let ctx = Context::establish(Scope::User).expect("failed to establish context");
+    log::debug!("Context established successfully.");
 
     let mut readers_buf = [0; 2048];
+    match ctx.list_readers(&mut readers_buf) {
+        Ok(readers) => {
+            if readers.count() == 0 {
+                log::warn!("No readers found. Exiting manual_sync_cards function.");
+                return; // Завершаем выполнение функции, если ридеров нет
+            }
+            log::debug!("Available readers found");
+        }
+        Err(e) => {
+            log::error!("Failed to list readers: {:?}", e);
+            return; // Завершаем выполнение функции в случае ошибки
+        }
+    }
+
     let mut reader_states = vec![
         // Listen for reader insertions/removals, if supported.
         ReaderState::new(PNP_NOTIFICATION(), State::UNAWARE),
@@ -331,11 +387,6 @@ pub async fn manual_sync_cards(restart: bool) -> () {
     // waiting fot the status change
     ctx.get_status_change(None, &mut reader_states)
         .expect("failed to get status change");
-
-    if restart {
-        // remove all connections
-        remove_connections_all().await;
-    }
 
     for rs in reader_states {
         if rs.name() != PNP_NOTIFICATION() {

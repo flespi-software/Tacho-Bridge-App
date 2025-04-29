@@ -462,8 +462,11 @@ pub fn init_config() -> io::Result<()> {
         if let Some(cards) = &mut config.cards {
             let mut seen = HashMap::new();
             cards.retain(|atr, cardnumber| {
-                if seen.contains_key(cardnumber) {
-                    log::info!("Duplicate card number {} with ATR {} removed", cardnumber, atr);
+                if atr.is_empty() {
+                    log::warn!("Invalid entry with empty ATR and card number {} removed", cardnumber);
+                    false
+                } else if seen.contains_key(cardnumber) {
+                    log::warn!("Duplicate card number {} with ATR {} removed", cardnumber, atr);
                     false
                 } else {
                     seen.insert(cardnumber.clone(), atr.clone());
