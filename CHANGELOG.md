@@ -48,3 +48,4 @@ All notable changes to this project will be documented in this file.
 
 [fix] Fixed the problem of connecting Tacho Bridge App connection without connected cards to the computer.
 [fix] Fixed the problem of incorrect card initialization in the application configuration. Cards that are mistakenly defined with an empty ATR will not be saved. 
+[fix] Fixed an issue where Windows Virtual Reader was incorrectly identified as the primary reader to use.
