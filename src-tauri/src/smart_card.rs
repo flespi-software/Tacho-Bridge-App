@@ -338,7 +338,7 @@ pub fn create_card_object(reader_name: &CStr) -> Result<Card, Box<dyn StdError>>
     let ctx = Context::establish(Scope::User).expect("Failed to establish context");
 
     // Directly use the reader name to connect to the card.
-    ctx.connect(reader_name, ShareMode::Shared, Protocols::ANY)
+    ctx.connect(reader_name, ShareMode::Shared, Protocols::T0)
         .map_err(|err| {
             log::error!("Failed to connect to card: {}", err);
             Box::new(err) as Box<dyn StdError>
