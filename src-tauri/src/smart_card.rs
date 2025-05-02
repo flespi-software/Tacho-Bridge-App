@@ -124,7 +124,7 @@ async fn process_reader_states(
             if is_virtual_reader(rs.name()) {
                 log::warn!("Virtual reader {:?} detected. Skipping...", rs.name());
                 continue; // Skipping virtual reader processing
-            }        
+            }
 
             // convert ATR to hex string value
             let atr = hex::encode(rs.atr());
@@ -333,12 +333,12 @@ pub fn send_apdu_to_card_command(card: &Card, apdu_hex: &str) -> Result<String, 
     Ok(rapdu_hex)
 }
 
-pub fn create_card_object(reader_name: &CStr) -> Result<Card, Box<dyn StdError>> {
-    // Establish a PC/SC context.
+pub fn create_card_object(reader_name: &CStr, protocol: Protocols) -> Result<Card, Box<dyn StdError>> {
+    // Устанавливаем контекст
     let ctx = Context::establish(Scope::User).expect("Failed to establish context");
 
-    // Directly use the reader name to connect to the card.
-    ctx.connect(reader_name, ShareMode::Shared, Protocols::ANY)
+    // Подключаемся к карте с выбранным протоколом
+    ctx.connect(reader_name, ShareMode::Shared, protocol)
         .map_err(|err| {
             log::error!("Failed to connect to card: {}", err);
             Box::new(err) as Box<dyn StdError>

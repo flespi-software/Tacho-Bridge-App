@@ -43,6 +43,50 @@ use crate::config::CacheSection; // Enum for cache sections for getting data fro
 // Import the global_app_handle module to send events to the frontend
 use crate::global_app_handle::emit_event;
 
+/// Parses the ATR and extracts the communication protocol (T=0 or T=1).
+///
+/// # Arguments
+/// - `atr`: A string containing the ATR in hexadecimal format.
+///
+/// # Returns
+/// - `String`: The communication protocol ("T0", "T1", or "Unknown").
+fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
+    let atr_bytes = match hex::decode(atr) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            log::error!("Invalid ATR format: {}", atr);
+            return Protocols::T0; // fallback
+        }
+    };
+
+    if atr_bytes.len() < 2 {
+        log::error!("ATR is too short: {:?}", atr_bytes);
+        return Protocols::T0;
+    }
+
+    let mut index = 1;
+    let y1 = atr_bytes[index] >> 4;
+    index += 1;
+
+    // Skip TA1, TB1, TC1
+    if y1 & 0x1 != 0 { index += 1; }
+    if y1 & 0x2 != 0 { index += 1; }
+    if y1 & 0x4 != 0 { index += 1; }
+
+    if y1 & 0x8 != 0 && index < atr_bytes.len() {
+        let td1 = atr_bytes[index];
+        let proto = td1 & 0x0F;
+        return match proto {
+            0x00 => Protocols::T0,
+            0x01 => Protocols::T1,
+            _ => Protocols::T0, // fallback
+        };
+    }
+
+    // Если TD1 нет — по умолчанию T=0
+    Protocols::T0
+}
+
 /// Ensures an MQTT connection for the specified client ID.
 pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: String) {
     // Return early if the client_id is empty, as we cannot ensure a connection without a valid ID
@@ -50,6 +94,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
         log::warn!("Reader: {:?}. ClientID is empty. Cannot ensure connection.", reader_name);
         return;
     }
+
+    let protocol = parse_atr_and_get_protocol(&atr);
+    log::info!("Reader: {:?}. ATR: {}. Protocol: {:?}", reader_name, atr, protocol);
 
     // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
@@ -106,7 +153,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     let log_header: String = format!("{} |", client_id);
 
     // init card fot the following using in the loop
-    let mut card = match crate::smart_card::create_card_object(&reader_name) {
+    let mut card = match crate::smart_card::create_card_object(&reader_name, protocol) {
         Ok(card) => {
             log::debug!(
                 "Card object created successfully for the reader: {}",
@@ -216,7 +263,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     );
                                                 
                                                     // attempt to recreate card object
-                                                    match crate::smart_card::create_card_object(&reader_name) {
+                                                    match crate::smart_card::create_card_object(&reader_name, protocol) {
                                                         Ok(new_card) => {
                                                             log::info!(
                                                                 "Successfully recreated card object for reader: {}",
@@ -276,7 +323,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                                 );
                                                             
                                                                 // attempt to recreate card object
-                                                                match crate::smart_card::create_card_object(&reader_name) {
+                                                                match crate::smart_card::create_card_object(&reader_name, protocol) {
                                                                     Ok(new_card) => {
                                                                         log::info!(
                                                                             "Successfully recreated card object for reader: {}",
@@ -333,7 +380,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                             log::error!("Failed to send APDU command to card: {}. Trying to recreate card object...", err);
                                                             
                                                             // Try to recreate card object
-                                                            match crate::smart_card::create_card_object(&reader_name) {
+                                                            match crate::smart_card::create_card_object(&reader_name, protocol) {
                                                                 Ok(new_card) => {
                                                                     log::info!(
                                                                         "Successfully recreated card object for reader: {}. Retrying APDU command.",
