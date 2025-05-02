@@ -333,23 +333,12 @@ pub fn send_apdu_to_card_command(card: &Card, apdu_hex: &str) -> Result<String, 
     Ok(rapdu_hex)
 }
 
-pub fn create_card_object(reader_name: &CStr, protocol: &str) -> Result<Card, Box<dyn StdError>> {
-    // Выбор нужного enum на основе строки (уже без "T=")
-    let proto = match protocol {
-        "T0" => Protocols::T0,
-        "T1" => Protocols::T1,
-        "T0,T1" | "T1,T0" => Protocols::T0 | Protocols::T1, // если ты захочешь это позже использовать
-        _ => {
-            log::error!("Unsupported protocol: {}", protocol);
-            return Err(format!("Unsupported protocol: {}", protocol).into());
-        }
-    };
-
+pub fn create_card_object(reader_name: &CStr, protocol: Protocols) -> Result<Card, Box<dyn StdError>> {
     // Устанавливаем контекст
     let ctx = Context::establish(Scope::User).expect("Failed to establish context");
 
     // Подключаемся к карте с выбранным протоколом
-    ctx.connect(reader_name, ShareMode::Shared, proto)
+    ctx.connect(reader_name, ShareMode::Shared, protocol)
         .map_err(|err| {
             log::error!("Failed to connect to card: {}", err);
             Box::new(err) as Box<dyn StdError>
