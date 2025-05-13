@@ -50,12 +50,12 @@ use crate::global_app_handle::emit_event;
 ///
 /// # Returns
 /// - `String`: The communication protocol ("T0", "T1", or "Unknown").
-fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
+pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
     let atr_bytes = match hex::decode(atr) {
         Ok(bytes) => bytes,
         Err(_) => {
             log::error!("Invalid ATR format: {}", atr);
-            return Protocols::T0; // fallback
+            return Protocols::T0;
         }
     };
 
@@ -68,13 +68,49 @@ fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
     let y1 = atr_bytes[index] >> 4;
     index += 1;
 
-    // Skip TA1, TB1, TC1
-    if y1 & 0x1 != 0 { index += 1; }
-    if y1 & 0x2 != 0 { index += 1; }
-    if y1 & 0x4 != 0 { index += 1; }
+    // Skip TA1, TB1, TC1 depends on Y1
+    if y1 & 0x1 != 0 { index += 1; } // TA1
+    if y1 & 0x2 != 0 { index += 1; } // TB1
+    if y1 & 0x4 != 0 { index += 1; } // TC1
 
-    if y1 & 0x8 != 0 && index < atr_bytes.len() {
+    // TD1
+    let td1 = if y1 & 0x8 != 0 && index < atr_bytes.len() {
         let td1 = atr_bytes[index];
+        index += 1;
+        Some(td1)
+    } else {
+        None
+    };
+
+    // TD2 (if was TD1)
+    let td2 = if let Some(td1) = td1 {
+        let y2 = td1 >> 4;
+        // Skip TA2, TB2, TC2
+        if y2 & 0x1 != 0 { index += 1; } // TA2
+        if y2 & 0x2 != 0 { index += 1; } // TB2
+        if y2 & 0x4 != 0 { index += 1; } // TC2
+
+        if y2 & 0x8 != 0 && index < atr_bytes.len() {
+            Some(atr_bytes[index])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // If TD2 exists — it is default protocol
+    if let Some(td2) = td2 {
+        let proto = td2 & 0x0F;
+        return match proto {
+            0x00 => Protocols::T0,
+            0x01 => Protocols::T1,
+            _ => Protocols::T0, // fallback
+        };
+    }
+
+    // If TD2 is not presented, but TD1 it is — use it
+    if let Some(td1) = td1 {
         let proto = td1 & 0x0F;
         return match proto {
             0x00 => Protocols::T0,
@@ -83,7 +119,7 @@ fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
         };
     }
 
-    // Если TD1 нет — по умолчанию T=0
+    // Default value if have no TD1 and TD2
     Protocols::T0
 }
 
