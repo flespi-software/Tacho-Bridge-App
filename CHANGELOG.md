@@ -53,3 +53,7 @@ All notable changes to this project will be documented in this file.
 ### [0.6.0] - 2025-05-02
 
 [feature] Added functionality for automatic protocol detection for communication with a smart card, which allows working with any version of the tachograph. In simpler terms, authentication now works with **Stonerdige** hardware.  
+
+### [0.6.1] - 2025-05-13
+
+[feature] Protocol detection mechanism is improved. Now the protocol is selected based on the card's preferences, which improves the stability of authorization with old-generation tachographs and Stoneridge.
