@@ -57,3 +57,7 @@ All notable changes to this project will be documented in this file.
 ### [0.6.1] - 2025-05-13
 
 [feature] Protocol detection mechanism is improved. Now the protocol is selected based on the card's preferences, which improves the stability of authorization with old-generation tachographs and Stoneridge.
+
+### [0.6.2] - 2025-05-14
+
+[feature] Something important  

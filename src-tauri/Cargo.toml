@@ -1,6 +1,6 @@
 [package]
 name = "tacho-bridge-application"
-version = "0.6.1"
+version = "0.6.2"
 description = "Tachograph authentication application"
 authors = ["Shatilo Evgeny"]
 license = ""
