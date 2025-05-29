@@ -21,9 +21,9 @@ pub fn get_app_handle() -> Option<AppHandle> {
     app_handle.clone()
 }
 
-pub fn emit_event(event_name: &str, atr: String, reader_name: String, card_state: String, card_number: String, online: Option<bool>, authentication: Option<bool>) {
+pub fn emit_event(event_name: &str, iccid: String, reader_name: String, card_state: String, card_number: String, online: Option<bool>, authentication: Option<bool>) {
     let payload = TachoState {
-        atr,
+        iccid,
         reader_name,
         card_state,
         card_number,

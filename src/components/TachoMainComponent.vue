@@ -14,7 +14,7 @@
             <span>{{ reader.name }}</span>
           </q-item-label>
           <q-item-label lines="1" v-if="!reader.cardNumber">
-            <span>ATR: {{ reader.cardATR }}</span>
+            <span>ICCID: {{ reader.cardICCID }}</span>
           </q-item-label>
           <q-item-label lines="1" v-if="reader.cardNumber">
             <span class="text-weight-medium">CN: {{ reader.cardNumber }}</span>
@@ -30,7 +30,16 @@
               dense
               round
               icon="add"
-              @click="editCompanyCardNumberDialog(reader.cardATR)"
+              @click="editCompanyCardNumberDialog(reader.cardICCID)"
+            />
+            <q-btn
+              size="12px"
+              flat
+              dense
+              round
+              color="red"
+              icon="delete"
+              @click="removeCard(reader.cardNumber)"
             />
             <!-- Dialog window for the entering the Card Number value -->
             <q-dialog v-model="EnterCardNumberDialog" class="card-number-dialog">
@@ -50,7 +59,7 @@
                     flat
                     label="Save"
                     color="primary"
-                    @click="saveCardNumber(currentcardATR)"
+                    @click="saveCardNumber(currentcardICCID)"
                     :disable="!isCardNumberValid"
                   />
                 </q-card-actions>
@@ -100,10 +109,12 @@
 </style>
 
 <script setup lang="ts">
-import { ref, computed, reactive, defineComponent } from 'vue'
+import { ref, computed, reactive } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { Notify } from 'quasar'
+// import { useQuasar} from 'quasar'
+
+// import { Notify } from 'quasar'
 
 const TACHO_COMPANY_CARD_REGEXP = /^[A-Z0-9]{16}$/ // Regular expression for the company card number
 
@@ -114,7 +125,7 @@ const isBlinking = ref(true) // controls the blinking status of the icon
 interface Reader {
   name: string
   status: string
-  cardATR: string
+  cardICCID: string
   cardNumber: string
   online?: boolean | undefined
   authentication?: boolean | undefined
@@ -131,7 +142,7 @@ listen('global-cards-sync', (event) => {
   console.log('event payload: ', event.payload) // log event payload from backend to the console
   // structure has fields from the Rust back-end with the 'snake_case' naming convention
   const payload = event.payload as {
-    atr: string
+    iccid: string
     reader_name: string
     card_state: string
     card_number: string
@@ -146,7 +157,7 @@ listen('global-cards-sync', (event) => {
   const splitted = payload.card_state?.split('|') ?? ['']
   const status = splitted[1]?.trim() ?? splitted[0] ?? ''
 
-  const cardATR = payload.atr
+  const cardICCID = payload.iccid
   // Find the index of the reader with the same name
   const index = state.readers.findIndex((reader) => reader.name === name)
   if (index !== -1) {
@@ -157,7 +168,7 @@ listen('global-cards-sync', (event) => {
     state.readers[index] = {
       name,
       status,
-      cardATR,
+      cardICCID,
       cardNumber,
       online: payload.online !== null ? payload.online : existingReader.online,
       authentication:
@@ -168,7 +179,7 @@ listen('global-cards-sync', (event) => {
     state.readers.push({
       name,
       status,
-      cardATR,
+      cardICCID,
       cardNumber,
       online: payload.online,
       authentication: payload.authentication,
@@ -182,20 +193,20 @@ listen('global-cards-sync', (event) => {
 const EnterCardNumberDialog = ref(false)
 const cardNumberInput = ref('') // card number field
 const isCardNumberValid = computed(() => TACHO_COMPANY_CARD_REGEXP.test(cardNumberInput.value))
-const currentcardATR = ref('')
+const currentcardICCID = ref('')
 
 // Open the dialog window for entering the Card Number value
-const editCompanyCardNumberDialog = (cardATR: string) => {
-  currentcardATR.value = cardATR // ATR of the current card
+const editCompanyCardNumberDialog = (cardICCID: string) => {
+  currentcardICCID.value = cardICCID // ATR of the current card
 
   // find the card number by ATR and fill the input field
-  const reader = state.readers.find((reader) => reader.cardATR === cardATR)
+  const reader = state.readers.find((reader) => reader.cardICCID === cardICCID)
   cardNumberInput.value = reader?.cardNumber || '' // if the card number is not found, the field will be empty
 
   EnterCardNumberDialog.value = true // open dialog window
 }
 
-const saveCardNumber = async (cardATR: string) => {
+const saveCardNumber = async (cardICCID: string) => {
   if (!isCardNumberValid.value) {
     // Notify.create({
     //   message: 'Wrong company card number input!',
@@ -206,8 +217,8 @@ const saveCardNumber = async (cardATR: string) => {
     return
   }
 
-  // Find the index of the reader with the same cardATR
-  const readerIndex = state.readers.findIndex((reader) => reader.cardATR === cardATR)
+  // Find the index of the reader with the same cardICCID
+  const readerIndex = state.readers.findIndex((reader) => reader.cardICCID === cardICCID)
   if (readerIndex === -1) {
     console.error('Reader not found')
     return
@@ -215,46 +226,38 @@ const saveCardNumber = async (cardATR: string) => {
 
   // Save the card number to the currentReader object
   console.log(
-    `Card Number: ${cardNumberInput.value}, Card Data: ${cardATR}`,
-    `typeof currentcardATR.value: ${typeof cardATR}`,
-    `typeof cardNumberInput.value: ${typeof cardNumberInput.value}`,
+    `Card Number: ${cardNumberInput.value}, ICCID: ${cardICCID}`
   )
 
   // update the configuration with the new card number in the dynamic cache
   const update_result = await invoke('update_card', {
-    atr: cardATR,
+    iccid: cardICCID,
     cardnumber: cardNumberInput.value,
   })
 
   // Update the card number in the state if configuration update was successful
   if (update_result) {
-    if (state.readers[readerIndex]) {
-      state.readers[readerIndex].cardNumber = cardNumberInput.value
+    const reader = state.readers[readerIndex]
+    if (reader) {
+      reader.cardNumber = cardNumberInput.value
+
+      // Запускаем обновление только если reader точно существует
+      await invoke('manual_sync_cards', {
+        readername: reader.name,
+        restart: false,
+      })
+
+      console.log('Card number updated successfully')
+      EnterCardNumberDialog.value = false
     } else {
       console.error(`Reader at index ${readerIndex} does not exist`)
     }
-
-    // Launch a manual refresh of server connections.
-    await invoke('manual_sync_cards', { restart: false })
-
-    console.log('Card number updated successfully')
-
-    EnterCardNumberDialog.value = false // Close the dialog window when the card number is saved
-  } else {
-    Notify.create({
-      message:
-        'This number is already in use by another card. According to Annex 1C, (EU) 2016/799, the company card number must be unique.',
-      color: 'negative',
-      position: 'bottom',
-      timeout: 3000,
-    })
-    console.error('Failed to update card number')
   }
 }
 
 // Function to change the color of the icon depending on the card status
 const cardConnectedStatus = (reader: Reader) => {
-  if (reader.cardATR && reader.online) {
+  if (reader.cardICCID && reader.online) {
     // If the card is connected and online
 
     if (reader.authentication) {
@@ -273,7 +276,7 @@ const cardConnectedStatus = (reader: Reader) => {
         size: '25px',
       }
     }
-  } else if (reader.cardATR) {
+  } else if (reader.cardICCID) {
     // If the card is connected to the app but not online
     return {
       name: 'credit_card',
@@ -290,13 +293,15 @@ const cardConnectedStatus = (reader: Reader) => {
   }
 }
 
-defineComponent({
-  setup() {
-    return {
-      EnterCardNumberDialog,
-      editCompanyCardNumberDialog,
-      saveCardNumber,
-    }
-  },
-})
+// remove card func from the config
+const removeCard = async (cardNumber: string) => {
+  state.readers = state.readers.filter((reader) => reader.cardNumber !== cardNumber)
+
+  try {
+    await invoke('remove_card', { cardnumber: cardNumber })
+    console.log('Card removed:', cardNumber)
+  } catch (error) {
+    console.error('Failed to remove card:', error)
+  }
+}
 </script>

@@ -9,38 +9,19 @@ mod smart_card; // PCSC module for smart card operations. // Application connect
 
 // External crate imports
 use tauri::{async_runtime, Manager, WindowEvent, Listener}; // Tauri application framework and async runtime.
-// use tauri::{
-//     menu::{Menu, MenuItem},
-//     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-//   };
-
+use tokio::sync::watch;
+use smart_card::{SharedReaderCardsPool};
 mod global_app_handle;
 
 pub fn run() {
+    // Declare a Watch channel to manage reader_cards_pool which stores the current state of connected readers.
+    // In order to be able to control in manual mode.
+    let (pool_tx, pool_rx) = watch::channel::<SharedReaderCardsPool>(vec![]);
+
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
     tauri::Builder::default()
-        .setup(|app| {
-            // // Create a tray icon for the application
-            // let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            // let menu = Menu::with_items(app, &[&quit_i])?;
-            
-            // let tray = TrayIconBuilder::new()
-            //   .menu(&menu)
-            //   .menu_on_left_click(true)
-            //   .build(app)?;
-
-            // TrayIconBuilder::new()
-            // .on_menu_event(|app, event| match event.id.as_ref() {
-            // "quit" => {
-            //     println!("quit menu item was clicked");
-            //     app.exit(0);
-            // }
-            // _ => {
-            //     println!("menu item {:?} not handled", event.id);
-            // }
-            // });
-            
-            
+        .manage(pool_tx) // <--- Pass channel's sender to commands as a state
+        .setup(move |app| {            
             // Obtain a lightweight reference to the app for convenient interaction
             let app_handle = app.app_handle();
 
@@ -58,8 +39,12 @@ pub fn run() {
                     .expect("Failed to set window title");
 
                 let front_app_handle = app_handle.clone();
+                let pool_rx_cloned = pool_rx.clone(); // temporary solution with clone before and after move
+
                 // Frontend loading is late, so we execute a callback to the "frontend-loaded" event which the front sends when it is loaded
                 window.listen("frontend-loaded", move |event: tauri::Event| {
+                    let pool_rx = pool_rx_cloned.clone(); // temporary solution with clone before and after move
+
                     #[cfg(target_os = "linux")]
                     {   // Temporary solution only for linux because webview does not load even after response from front.
                         // Apparently loading occurs later, not like Windows and MacOS. Fix later.
@@ -78,20 +63,14 @@ pub fn run() {
                     // The configuration file is located in the `assets` directory and is named `config.yaml`.
                     match config::init_config() {
                         Ok(_) => log::info!("Config initialized successfully."),
-                        Err(e) => {
-                            log::error!("Failed to initialize config: {}", e);
-                        }
+                        Err(e) => log::error!("Failed to initialize config: {}", e),
                     }
 
                     println!("Received event with payload: {:?}", event.payload());
                     // Load server configuration from cache to frontend using event
                     match config::emit_global_config_server(&front_app_handle) {
-                        Ok(_) => {
-                            println!("Global config server emitted successfully.");
-                        }
-                        Err(e) => {
-                            println!("Failed to emit global config server: {:?}", e);
-                        }
+                        Ok(_) => println!("Global config server emitted successfully."),
+                        Err(e) => println!("Failed to emit global config server: {:?}", e),
                     }
 
                     // Run async function in the background with the Tauri runtime
@@ -103,7 +82,7 @@ pub fn run() {
                             *** In the near future, I will add a flag for the state of readiness to receive events from the backend. ***
                         */
                         // Start monitoring smart cards. This function will run fсorever with the loop
-                        smart_card::sc_monitor().await;
+                        smart_card::sc_monitor(pool_rx).await;
                     });
 
                     async_runtime::spawn(async {
@@ -125,6 +104,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             config::update_card,           // update list of cards from the frontend
             config::update_server,         // update server config from the frontend
+            config::remove_card,            // remove card from config
             smart_card::manual_sync_cards, // manual sync cards from the frontend
             app_connect::app_connection,     // App connection to the MQTT broker
         ])

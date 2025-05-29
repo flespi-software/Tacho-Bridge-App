@@ -35,4 +35,5 @@ lazy_static = "1.5.0"
 native-tls = "0.2.13"
 tokio-native-tls = "0.3.1"
 sys-info = "0.9.1"
+once_cell = "1.21.3"
 
