@@ -624,10 +624,20 @@ pub fn init_config() -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     log::debug!("config: saved config");
+    
+    /*
+        Send data of all cards in events one by one to the front.
+    */
+    for (cardnumber, card_config) in &config.cards {
+        emit_card_config_event(
+            "global-card-config-updated",
+            cardnumber.clone(),
+            Some(card_config.clone()),
+        );
+    }
 
     load_config_to_cache(&config)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
 
     Ok(())
 }

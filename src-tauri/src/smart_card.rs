@@ -4,22 +4,20 @@ use std::ffi::CStr;
 use std::sync::Arc;
 use std::mem;
 
-use pcsc::*; // Importing pcsc module for smart card reader operations.
-
 use tauri::async_runtime::JoinHandle; // Async runtime join handles for managing async tasks in Tauri.
 use tauri::async_runtime::Mutex;
-use tokio::sync::MutexGuard;
-use tokio::sync::watch;
 
+use pcsc::*; // Importing pcsc module for smart card reader operations.
 use pcsc::State as PcscState;
 use pcsc::{Card, Protocols};
 // use tauri::Manager; // Tauri application manager for app lifecycle and window management. // There is a Mutex implementation for the standard from the std lib, but it blocks the current thread and is not integrated with the Tauri async framework we are using, so we will use what is intended: Tauri mutex.
 
 use once_cell::sync::OnceCell;
 
+use tokio::sync::watch;
 use tokio::sync::watch::Sender;
 
-use hex::{decode, encode}; // Hexadecimal encoding and decoding utilities.
+// use hex::{decode, encode}; // Hexadecimal encoding and decoding utilities.
 
 // Importing specific functionality from local modules
 use crate::config::get_from_cache; // Function to get data from cache for syncing cards.
@@ -28,8 +26,6 @@ use crate::global_app_handle::emit_event;
 // Enum for cache sections for getting data from cache.
 use crate::mqtt::{ensure_connection, remove_connections, remove_connections_all}; // MQTT module functions for managing connections with the readers.
 // use crate::mqtt::{remove_connections, remove_connections_all}; // MQTT module functions for managing connections with the readers.
-
-use crate::app_connect; // Application connection to the MQTT broker.
 
 // import set for async task_pool under mutex
 use lazy_static::lazy_static; // Importing the lazy_static macro
@@ -693,7 +689,7 @@ impl ManagedCard {
     pub async fn disconnect(&self) -> Result<(), Box<dyn StdError + Send + Sync>> {
         let mut guard = self.inner.lock().await;
 
-        let mut dummy_card = mem::replace(
+        let dummy_card = mem::replace(
             &mut *guard,
             Context::establish(Scope::User)?
                 .connect(&self.reader_name, ShareMode::Shared, self.protocol)?

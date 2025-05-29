@@ -7,6 +7,8 @@ mod logger; // Logging functionality.
 mod mqtt; // MQTT communication.
 mod smart_card; // PCSC module for smart card operations. // Application connection to the MQTT broker.
 
+use std::thread::sleep;
+
 // External crate imports
 use tauri::{async_runtime, Manager, WindowEvent, Listener}; // Tauri application framework and async runtime.
 use tokio::sync::watch;

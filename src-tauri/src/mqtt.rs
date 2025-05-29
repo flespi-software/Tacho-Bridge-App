@@ -13,10 +13,10 @@ use rumqttc::v5::ConnectionError; // For handling MQTT connection errors.
 use rumqttc::v5::StateError::{self, AwaitPingResp, ServerDisconnect};
 use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions}; // Core MQTT async client and options. // Specific error for server disconnection.
 
-use pcsc::{Card, Disposition};
+// use pcsc::{Card, Disposition};
 
 // Tauri application framework imports
-use tauri::async_runtime::{self, JoinHandle, Mutex}; // Async runtime and task join handles for Tauri apps.
+use tauri::async_runtime::{self, JoinHandle}; // Async runtime and task join handles for Tauri apps.
 
 // Serialization/Deserialization library imports
 use serde_json::Value; // For working with JSON data structures.
@@ -27,14 +27,12 @@ use serde_json::Value; // For working with JSON data structures.
 /// to the MQTT server in case of connection loss.
 const SLEEP_DURATION_SECS: u64 = 10;
 
-// Import TASK_POOL from the smart_card module
-use crate::smart_card::TASK_POOL;   // Task pool for managing MQTT connections.
-
 // Importing specific functionality from local modules
 use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
 use crate::config::split_host_to_parts;
 use crate::config::CacheSection; // Enum for cache sections for getting data from cache. // Function to split the host into parts for MQTT connection.
 
+use crate::smart_card::TASK_POOL;   // Task pool for managing MQTT connections.
 use crate::smart_card::ManagedCard;
 
 // Import the global_app_handle module to send events to the frontend
