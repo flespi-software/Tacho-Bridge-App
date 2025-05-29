@@ -60,27 +60,6 @@ lazy_static! {
 pub type SharedReaderCardsPool = Vec<(String, String, String)>;
 pub type SharedReaderCardsPoolReceiver = watch::Receiver<SharedReaderCardsPool>;
 
-/// Represents the state of a tachograph card.
-///
-/// This structure holds information about a tachograph card currently being
-/// interacted with through a smart card reader.
-///
-/// # Fields
-///
-/// * `atr` - A string representing the Answer To Reset (ATR) of the card. The ATR is a sequence
-///   of bytes returned by the card upon reset, identifying the card's communication parameters.
-/// * `reader_name` - The name of the smart card reader through which the card is being accessed.
-/// * `card_state` - A string describing the current state of the card (e.g., "Inserted", "Removed").
-/// * `card_number` - The identification number of the tachograph card.
-#[derive(Clone, serde::Serialize)]
-pub struct TachoState {
-    pub iccid: String,
-    pub reader_name: String,
-    pub card_state: String,
-    pub card_number: String,
-    pub online: Option<bool>,
-    pub authentication: Option<bool>,
-}
 
 fn setup_reader_states(
     ctx: &Context,

@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use tauri::{Emitter, AppHandle};
 use serde::Serialize;
 
-use crate::smart_card::TachoState;
+use crate::config::CardConfig;
 
 lazy_static! {
     static ref APP_HANDLE: Mutex<Option<AppHandle>> = Mutex::new(None);
@@ -21,6 +21,28 @@ pub fn get_app_handle() -> Option<AppHandle> {
     app_handle.clone()
 }
 
+/// Represents the state of a tachograph card.
+///
+/// This structure holds information about a tachograph card currently being
+/// interacted with through a smart card reader.
+///
+/// # Fields
+///
+/// * `atr` - A string representing the Answer To Reset (ATR) of the card. The ATR is a sequence
+///   of bytes returned by the card upon reset, identifying the card's communication parameters.
+/// * `reader_name` - The name of the smart card reader through which the card is being accessed.
+/// * `card_state` - A string describing the current state of the card (e.g., "Inserted", "Removed").
+/// * `card_number` - The identification number of the tachograph card.
+#[derive(Clone, serde::Serialize)]
+pub struct TachoState {
+    pub iccid: String,
+    pub reader_name: String,
+    pub card_state: String,
+    pub card_number: String,
+    pub online: Option<bool>,
+    pub authentication: Option<bool>,
+}
+
 pub fn emit_event(event_name: &str, iccid: String, reader_name: String, card_state: String, card_number: String, online: Option<bool>, authentication: Option<bool>) {
     let payload = TachoState {
         iccid,
@@ -36,6 +58,29 @@ pub fn emit_event(event_name: &str, iccid: String, reader_name: String, card_sta
             println!("Error: {:?}", e);
         }
         println!("{} has been sent", event_name);
+    } else {
+        println!("App card handle is not set");
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CardConfigPayload {
+    pub card_number: String,
+    pub context: Option<CardConfig>,
+}
+
+pub fn emit_card_config_event(event_name: &str, card_number: String, config: Option<CardConfig>) {
+    let payload = CardConfigPayload {
+        card_number,
+        context: config,
+    };
+
+    if let Some(app_handle) = get_app_handle() {
+        if let Err(e) = app_handle.emit(event_name, payload) {
+            println!("Error emitting {}: {:?}", event_name, e);
+        } else {
+            println!("{} has been sent", event_name);
+        }
     } else {
         println!("App card handle is not set");
     }

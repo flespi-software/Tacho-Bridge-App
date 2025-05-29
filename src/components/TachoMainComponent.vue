@@ -304,4 +304,11 @@ const removeCard = async (cardNumber: string) => {
     console.error('Failed to remove card:', error)
   }
 }
+
+listen('global-card-config-updated', (event) => {
+  console.log('event payload: ', event.payload)
+}).catch((error) => {
+  console.error('Error listening to global-card-config-updated:', error)
+})
+
 </script>

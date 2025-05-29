@@ -19,6 +19,8 @@ use tauri::Emitter;
 use tokio::sync::watch::Sender;
 use crate::SharedReaderCardsPool;
 
+use crate::global_app_handle::emit_card_config_event;
+
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ConfigurationFile {
@@ -211,6 +213,10 @@ fn update_card_config(
 
         load_config_to_cache(&config)?;
         log::debug!("Configuration loaded to cache successfully");
+
+        if let Some(card_config) = config.cards.get(cardnumber) {
+            emit_card_config_event("global-card-config-updated", cardnumber.to_string(), Some(card_config.clone()));
+        }
     }
 
     Ok(())
@@ -307,16 +313,16 @@ pub async fn remove_card(
 
     log::info!("Card {} removed from config", &cardnumber);
 
-    // 1. Получаем текущий пул из канала
+    // getting current pool from the channel
     let current_pool = pool_tx.borrow().clone();
 
-    // 2. Удаляем нужный cardnumber
+    // delete card_number
     let updated_pool: SharedReaderCardsPool = current_pool
         .into_iter()
         .filter(|(_, _, cn)| cn != &cardnumber)
         .collect();
 
-    // 3. Отправляем обновлённый пул
+    // send updated pool to the channel
     if let Err(e) = pool_tx.send(updated_pool) {
         log::error!("Failed to send updated reader_cards_pool: {}", e);
         return Err(format!("Failed to send updated reader_cards_pool: {}", e));
@@ -345,6 +351,8 @@ pub async fn remove_card_from_config(
         // Kill card task with the specified client_id (card number)
         remove_connections(vec![cardnumber.to_string()]).await;
         log::info!("Removed connection for card {}", cardnumber);
+
+        emit_card_config_event("global-card-config-updated", cardnumber.to_string(), None);
 
         Ok(())
     } else {
