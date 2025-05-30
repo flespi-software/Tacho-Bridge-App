@@ -89,7 +89,7 @@
         </q-card-section>
 
         <q-card-actions align="right">
-          <q-btn flat label="Cancel" color="primary" v-close-popup />
+          <q-btn flat label="Cancel" color="primary" v-close-popup @click="closeCard" />
           <q-btn flat label="Save" color="primary" @click="saveCard" />
         </q-card-actions>
       </q-card>
@@ -222,6 +222,11 @@ function saveCard(): void {
   linkICCID.value = ''
 }
 
+function closeCard(): void {
+  isDialogOpen.value = false
+  isLinkMode.value = false
+  linkICCID.value = ''
+}
 // Delete
 function removeCard(number: string): void {
   emit('delete-card', number)
