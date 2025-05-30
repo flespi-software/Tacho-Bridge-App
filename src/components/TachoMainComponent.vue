@@ -110,7 +110,7 @@ import SmartCardList from './SmartCardList.vue'
 import type { SmartCard, Reader } from './models'
 import { ref, reactive, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { listen, emit } from '@tauri-apps/api/event'
 // import { useQuasar} from 'quasar'
 
 // import { Notify } from 'quasar'
@@ -314,6 +314,13 @@ listen('global-card-config-updated', (event) => {
 }).catch((error) => {
   console.error('Error listening to global-card-config-updated:', error)
 })
+
+// Generate an event to inform the back-end that the front-end is loaded.
+// To correctly display states in the application.
+emit('frontend-loaded', { message: 'Hello from frontend!' }).catch((error) => {
+  console.error('Error emitting frontend-loaded event:', error)
+})
+
 
 defineComponent({
   setup() {

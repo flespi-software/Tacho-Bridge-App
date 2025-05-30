@@ -67,7 +67,7 @@
 import { useQuasar, Notify } from 'quasar'
 import { ref, computed, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { listen, emit } from '@tauri-apps/api/event'
+import { listen } from '@tauri-apps/api/event'
 import 'animate.css'
 
 const TBA_IDENT_REGEXP = /^TBA\d{13}$/ // Regular expression for the company card number
@@ -215,9 +215,4 @@ listen('global-notification', (event) => {
   console.error('Error listening to global-notification:', error)
 })
 
-// Generate an event to inform the back-end that the front-end is loaded.
-// To correctly display states in the application.
-emit('frontend-loaded', { message: 'Hello from frontend!' }).catch((error) => {
-  console.error('Error emitting frontend-loaded event:', error)
-})
 </script>

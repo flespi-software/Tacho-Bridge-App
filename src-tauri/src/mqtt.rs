@@ -39,7 +39,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
         log::warn!("Reader: {:?}. ClientID is empty. Cannot ensure connection.", reader_name);
         return;
     }
-
+    
     // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
 
