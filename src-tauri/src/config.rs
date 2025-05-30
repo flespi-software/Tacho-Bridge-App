@@ -1,25 +1,25 @@
-use std::fs;
-use std::fs::File;
+// ───── Std Lib ─────
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
-use std::collections::HashMap;
+use std::fs;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// ───── External Crates ─────
 use serde::{Deserialize, Serialize};
 use serde_yaml;
-
 use lazy_static::lazy_static;
-
-use crate::mqtt::remove_connections;
-
-use tauri::Emitter;
 use tokio::sync::watch::Sender;
-use crate::SharedReaderCardsPool;
+use tauri::Emitter;
 
+// ───── Local Modules ─────
 use crate::global_app_handle::emit_card_config_event;
+use crate::mqtt::remove_connections;
+use crate::SharedReaderCardsPool;
 
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize, Debug)]
@@ -75,7 +75,7 @@ pub fn get_config_path() -> io::Result<PathBuf> {
 
     match &home_dir {
         Ok(home) => {
-            log::trace!("Home directory found: {}", home);
+            log::debug!("Home directory found: {}", home);
             config_path.push(home);
         }
         Err(e) => {
@@ -90,7 +90,7 @@ pub fn get_config_path() -> io::Result<PathBuf> {
     config_path.push("Documents");
     config_path.push("tba");
 
-    log::trace!("Config directory path resolved to: {:?}", config_path);
+    log::debug!("Config directory path resolved to: {:?}", config_path);
 
     if let Err(e) = fs::create_dir_all(&config_path) {
         log::error!("Failed to create config directory {:?}: {}", config_path, e);
@@ -99,10 +99,11 @@ pub fn get_config_path() -> io::Result<PathBuf> {
 
     config_path.push("config.yaml");
 
-    log::trace!("Final config file path: {:?}", config_path);
+    log::debug!("Final config file path: {:?}", config_path);
 
     Ok(config_path)
 }
+
 /// Load the configuration from the file.
 /// This function reads the configuration file and parses it.
 ///
@@ -288,7 +289,6 @@ pub fn update_server_config(
     });
 
     save_config(config_path, &config)?;
-
     load_config_to_cache(&config)?;
 
     Ok(())
@@ -677,7 +677,6 @@ fn migrate_old_config(contents: &str) -> Option<ConfigurationFile> {
         cards: new_cards,
     })
 }
-
 
 // Default structure config
 fn generate_default_config() -> ConfigurationFile {

@@ -2,41 +2,35 @@
 //!
 //! This module provides functionality for creating and managing MQTT connections.
 
-// Standard library imports
-use std::ffi::CStr; // For handling C-style strings in Rust.
-use std::io::ErrorKind;
-use std::time::Duration; // For specifying time durations. // For categorizing I/O errors.
+// ───── Std Lib ─────
+use std::ffi::CStr;                  // For handling C-style strings in Rust.
+use std::io::ErrorKind;             // For categorizing I/O errors.
+use std::time::Duration;            // For specifying time durations.
 
-// MQTT client library imports
-use rumqttc::v5::mqttbytes::QoS; // Quality of Service levels for MQTT.
-use rumqttc::v5::ConnectionError; // For handling MQTT connection errors.
-use rumqttc::v5::StateError::{self, AwaitPingResp, ServerDisconnect};
-use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions}; // Core MQTT async client and options. // Specific error for server disconnection.
+// ───── MQTT Client Library (rumqttc) ─────
+use rumqttc::v5::mqttbytes::QoS;                    // Quality of Service levels for MQTT.
+use rumqttc::v5::ConnectionError;                   // For handling MQTT connection errors.
+use rumqttc::v5::StateError::{self, AwaitPingResp, ServerDisconnect}; // Specific error for server disconnection.
+use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};        // Core MQTT async client and options.
 
-// use pcsc::{Card, Disposition};
+// ───── Tauri ─────
+use tauri::async_runtime::{self, JoinHandle};       // Async runtime and task join handles for Tauri apps.
 
-// Tauri application framework imports
-use tauri::async_runtime::{self, JoinHandle}; // Async runtime and task join handles for Tauri apps.
+// ───── Serde (Serialization / Deserialization) ─────
+use serde_json::Value;                              // For working with JSON data structures.
 
-// Serialization/Deserialization library imports
-use serde_json::Value; // For working with JSON data structures.
+// ───── Local Modules ─────
+use crate::config::get_from_cache;                  // Function to get data from cache for syncing server data.
+use crate::config::split_host_to_parts;             // Function to split the host into parts for MQTT connection.
+use crate::config::CacheSection;                    // Enum for cache sections for getting data from cache.
+use crate::smart_card::{ManagedCard, TASK_POOL};    // Managed card object and global task pool for MQTT handling.
+use crate::global_app_handle::emit_event;           // Sends events to the frontend via global app handle.
 
 /// Timeout in seconds to wait before reconnecting to the server.
 ///
 /// This value is used to set the interval between reconnection attempts
 /// to the MQTT server in case of connection loss.
 const SLEEP_DURATION_SECS: u64 = 10;
-
-// Importing specific functionality from local modules
-use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
-use crate::config::split_host_to_parts;
-use crate::config::CacheSection; // Enum for cache sections for getting data from cache. // Function to split the host into parts for MQTT connection.
-
-use crate::smart_card::TASK_POOL;   // Task pool for managing MQTT connections.
-use crate::smart_card::ManagedCard;
-
-// Import the global_app_handle module to send events to the frontend
-use crate::global_app_handle::emit_event;
 
 // /// Ensures an MQTT connection for the specified client ID.
 pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: String, managed_card: ManagedCard) {

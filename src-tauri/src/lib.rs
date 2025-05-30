@@ -1,19 +1,22 @@
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 
-// Module imports
-mod app_connect;    // Application connection to the MQTT broker.
-mod config; // Configuration handling.
-mod logger; // Logging functionality.
-mod mqtt; // MQTT communication.
-mod smart_card; // PCSC module for smart card operations. // Application connection to the MQTT broker.
+// ───── Modules ─────
+mod app_connect;        // Application connection to the MQTT broker.
+mod config;             // Configuration handling.
+mod logger;             // Logging functionality.
+mod mqtt;               // MQTT communication.
+mod smart_card;         // PCSC module for smart card operations.
+mod global_app_handle;  // Global access to app state and emitters.
 
+// ───── Std Lib ─────
 use std::thread::sleep;
 
-// External crate imports
-use tauri::{async_runtime, Manager, WindowEvent, Listener}; // Tauri application framework and async runtime.
+// ───── External Crates ─────
+use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application framework and async runtime.
 use tokio::sync::watch;
-use smart_card::{SharedReaderCardsPool};
-mod global_app_handle;
+
+// ───── Local Imports ─────
+use smart_card::SharedReaderCardsPool;
 
 pub fn run() {
     // Declare a Watch channel to manage reader_cards_pool which stores the current state of connected readers.

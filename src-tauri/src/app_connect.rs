@@ -2,34 +2,34 @@
 //!
 //! This module provides functionality for creating and managing MQTT connections.
 
-// Standard library imports
-use std::io::ErrorKind; // For categorizing I/O errors.
-use std::time::Duration; // For specifying time durations.
+// ───── Std Lib ─────
+use std::io::ErrorKind;                  // For categorizing I/O errors.
+use std::time::Duration;                 // For specifying time durations.
 
-// MQTT client library imports
-use rumqttc::v5::ConnectionError; // For handling MQTT connection errors.
+// ───── MQTT Client Library (rumqttc) ─────
+use rumqttc::v5::ConnectionError;        // For handling MQTT connection errors.
 use rumqttc::v5::StateError::{self, AwaitPingResp, ServerDisconnect}; // Specific error for server disconnection.
-use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions}; // Core MQTT async client and options.
+use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};         // Core MQTT async client and options.
 
-// Import TASK_POOL from the smart_card module
-use crate::smart_card::TASK_POOL;   // Task pool for managing MQTT connections.
+// ───── Smart Card ─────
+use crate::smart_card::TASK_POOL;        // Task pool for managing MQTT connections.
 
-// Tauri application framework imports
+// ───── Tauri ─────
 use tauri::async_runtime::{self, JoinHandle}; // Async runtime and task join handles for Tauri apps.
 
-// Serialization/Deserialization library imports
-use serde_json::Value; // For working with JSON data structures.
+// ───── Serialization ─────
+use serde_json::Value;                   // For working with JSON data structures.
+
+// ───── Local Modules ─────
+use crate::config::get_from_cache;       // Function to get data from cache for syncing server data.
+use crate::config::split_host_to_parts;  // Function to split the host into parts for MQTT connection.
+use crate::config::CacheSection;         // Enum for cache sections for getting data from cache.
 
 /// Timeout in seconds to wait before reconnecting to the server.
 ///
 /// This value is used to set the interval between reconnection attempts
 /// to the MQTT server in case of connection loss.
 const SLEEP_DURATION_SECS: u64 = 10;
-
-// Importing specific functionality from local modules
-use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
-use crate::config::split_host_to_parts; // Function to split the host into parts for MQTT connection.
-use crate::config::CacheSection; // Enum for cache sections for getting data from cache.
 
 /// Ensures an MQTT connection for the specified client ID.
 #[tauri::command]

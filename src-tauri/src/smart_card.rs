@@ -1,58 +1,40 @@
+// ───── Std Lib ─────
 use std::error::Error;
 use std::error::Error as StdError;
 use std::ffi::CStr;
-use std::sync::Arc;
 use std::mem;
+use std::sync::Arc;
 
-use tauri::async_runtime::JoinHandle; // Async runtime join handles for managing async tasks in Tauri.
-use tauri::async_runtime::Mutex;
-
-use pcsc::*; // Importing pcsc module for smart card reader operations.
-use pcsc::State as PcscState;
-use pcsc::{Card, Protocols};
-// use tauri::Manager; // Tauri application manager for app lifecycle and window management. // There is a Mutex implementation for the standard from the std lib, but it blocks the current thread and is not integrated with the Tauri async framework we are using, so we will use what is intended: Tauri mutex.
-
+// ───── Crates ─────
+use log::{debug, error, info, warn};
 use once_cell::sync::OnceCell;
-
-use tokio::sync::watch;
-use tokio::sync::watch::Sender;
-
-// use hex::{decode, encode}; // Hexadecimal encoding and decoding utilities.
-
-// Importing specific functionality from local modules
-use crate::config::get_from_cache; // Function to get data from cache for syncing cards.
-use crate::config::CacheSection;
-use crate::global_app_handle::emit_event;
-// Enum for cache sections for getting data from cache.
-use crate::mqtt::{ensure_connection, remove_connections, remove_connections_all}; // MQTT module functions for managing connections with the readers.
-// use crate::mqtt::{remove_connections, remove_connections_all}; // MQTT module functions for managing connections with the readers.
-
-// import set for async task_pool under mutex
-use lazy_static::lazy_static; // Importing the lazy_static macro
+use lazy_static::lazy_static;
 use rumqttc::v5::AsyncClient;
+use tokio::sync::watch::{self, Sender};
 
-use log::{info, debug, error, trace, warn};
+use tauri::async_runtime::{JoinHandle, Mutex};
 
+// ───── PCSC ─────
+use pcsc::*;
+use pcsc::{Card, Protocols, State as PcscState};
+
+// ───── Local Modules ─────
+use crate::config::{get_from_cache, CacheSection};
+use crate::global_app_handle::emit_event;
+use crate::mqtt::{ensure_connection, remove_connections, remove_connections_all};
+// use crate::mqtt::{remove_connections, remove_connections_all}; // Alternative import style for flexibility.
+
+// ───── Constants ─────
 const MAX_BUFFER_SIZE: usize = 260; // Example buffer size for smart card communication.
+
+// ───── Statics ─────
 lazy_static! {
     /// Global static vector to store active MQTT client connections and their associated tasks.
-    ///
-    /// This vector is protected by a `Mutex` to ensure that only one task can modify it at a time,
-    /// preventing data races and ensuring thread safety in an asynchronous environment.
-    ///
-    /// The `TASK_POOL` is an `Arc` (Atomic Reference Counted) pointer, which allows it to be shared
-    /// safely among multiple tasks. Each task can clone the `Arc`, increasing the reference count,
-    /// and decrement it when done, ensuring the memory is cleaned up when no longer in use.
-    ///
-    /// The vector stores tuples of three elements:
-    /// - `String`: The client ID, a unique identifier for each MQTT client connection.
-    /// - `AsyncClient`: The MQTT client instance, which handles the actual communication with the MQTT broker.
-    /// - `JoinHandle<usize>`: A handle to the asynchronous task associated with this client. The task runs in the
-    ///    background, handling incoming MQTT messages and other asynchronous operations.
-    pub static ref TASK_POOL: Arc<Mutex<Vec<(String, AsyncClient, JoinHandle<()>)>>> = Arc::new(Mutex::new(Vec::new()));
+    pub static ref TASK_POOL: Arc<Mutex<Vec<(String, AsyncClient, JoinHandle<()>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
 }
 
-// Тип для reader_cards_pool
+// ───── Type Aliases ─────
 pub type SharedReaderCardsPool = Vec<(String, String, String)>;
 pub type SharedReaderCardsPoolReceiver = watch::Receiver<SharedReaderCardsPool>;
 
@@ -640,7 +622,7 @@ impl ManagedCard {
     }
 
     pub async fn reconnect(&self) {
-        trace!(
+        debug!(
             "Attempting to reconnect card for reader: {}",
             self.reader_name.to_string_lossy()
         );
@@ -703,7 +685,7 @@ impl ManagedCard {
     pub async fn apdu_transmit(&self, apdu_hex: &str) -> Result<String, Box<dyn StdError + Send + Sync>> {
         use crate::smart_card::MAX_BUFFER_SIZE;
 
-        trace!(
+        debug!(
             "apdu_transmit() called for reader: {} with APDU HEX: {}",
             self.reader_name.to_string_lossy(),
             apdu_hex
@@ -711,7 +693,7 @@ impl ManagedCard {
 
         let apdu = match hex::decode(apdu_hex) {
             Ok(data) => {
-                trace!("APDU decoded successfully: {:?}", data);
+                debug!("APDU decoded successfully: {:?}", data);
                 data
             }
             Err(err) => {
@@ -723,7 +705,7 @@ impl ManagedCard {
         let card = Arc::clone(&self.inner);
         let apdu_cloned = apdu.clone();
 
-        trace!(
+        debug!(
             "Cloned card for blocking transmission. Sending to spawn_blocking..."
         );
 
@@ -732,7 +714,7 @@ impl ManagedCard {
 
             let mut rapdu_buf = [0u8; MAX_BUFFER_SIZE];
 
-            let mut locked = card.blocking_lock();
+            let locked = card.blocking_lock();
             debug!("Lock acquired. Transmitting...");
 
             match locked.transmit(&apdu_cloned, &mut rapdu_buf) {
@@ -749,7 +731,7 @@ impl ManagedCard {
         })
         .await??;
 
-        trace!(
+        debug!(
             "apdu_transmit() complete for reader: {}. Final response: {}",
             self.reader_name.to_string_lossy(),
             response

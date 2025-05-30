@@ -1,10 +1,16 @@
-use lazy_static::lazy_static;
+// ───── Std Lib ─────
 use std::sync::Mutex;
-use tauri::{Emitter, AppHandle};
-use serde::Serialize;
 
+// ───── External Crates ─────
+use lazy_static::lazy_static;
+use serde::Serialize;
+use tauri::{AppHandle, Emitter};
+
+// ───── Local Modules ─────
 use crate::config::CardConfig;
 
+// Global application handle used for emitting events from anywhere.
+// Wrapped in a Mutex to ensure safe concurrent access.
 lazy_static! {
     static ref APP_HANDLE: Mutex<Option<AppHandle>> = Mutex::new(None);
 }
