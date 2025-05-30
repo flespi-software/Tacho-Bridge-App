@@ -19,7 +19,6 @@ use tauri::Emitter;
 // ───── Local Modules ─────
 use crate::global_app_handle::emit_card_config_event;
 use crate::mqtt::remove_connections;
-use crate::SharedReaderCardsPool;
 
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize, Debug)]
@@ -300,7 +299,6 @@ pub fn update_server_config(
 #[tauri::command]
 pub async fn remove_card(
     cardnumber: String,
-    pool_tx: tauri::State<'_, Sender<SharedReaderCardsPool>>,
 ) -> Result<(), String> {
     let config_path = get_config_path().map_err(|e| {
         log::error!("Failed to get config path: {}", e);
@@ -315,23 +313,6 @@ pub async fn remove_card(
         })?;
 
     log::info!("Card {} removed from config", &cardnumber);
-
-    // getting current pool from the channel
-    let current_pool = pool_tx.borrow().clone();
-
-    // delete card_number
-    let updated_pool: SharedReaderCardsPool = current_pool
-        .into_iter()
-        .filter(|(_, _, cn)| cn != &cardnumber)
-        .collect();
-
-    // send updated pool to the channel
-    if let Err(e) = pool_tx.send(updated_pool) {
-        log::error!("Failed to send updated reader_cards_pool: {}", e);
-        return Err(format!("Failed to send updated reader_cards_pool: {}", e));
-    }
-
-    log::info!("Card {} removed from reader_cards_pool", &cardnumber);
 
     Ok(())
 }

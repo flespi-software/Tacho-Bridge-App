@@ -24,6 +24,7 @@ use serde_json::Value;                   // For working with JSON data structure
 use crate::config::get_from_cache;       // Function to get data from cache for syncing server data.
 use crate::config::split_host_to_parts;  // Function to split the host into parts for MQTT connection.
 use crate::config::CacheSection;         // Enum for cache sections for getting data from cache.
+use crate::smart_card::ProcessingCard;
 
 /// Timeout in seconds to wait before reconnecting to the server.
 ///
@@ -61,7 +62,7 @@ pub async fn app_connection() {
     // This part of function checks if a connection already exists for the given client ID
     // in the task pool. If not, it initiates a new connection. This is useful for maintaining
     // a list of active MQTT connections and ensuring that each client ID is only connected once.
-    let exists = task_pool.iter().any(|(id, _, _)| *id == client_id);
+    let exists = task_pool.iter().any(|card| card.client_id == client_id);
     // If existing connection is found, then return, no add a new connection for this client_id
     if exists {
         return;
@@ -157,12 +158,21 @@ pub async fn app_connection() {
         }
     });
 
-    task_pool.push((client_id, mqtt_clinet_cloned, handle));
+    task_pool.push(ProcessingCard {
+        client_id,
+        reader_name: None,
+        atr: None,
+        mqtt_client: mqtt_clinet_cloned,
+        task_handle: handle,
+    });
 
-    // Логирование содержимого task_pool после добавления новой задачи
-    log::info!("Current tasks in the pool:");
-    for (id, _, _) in task_pool.iter() {
-        log::info!("Client ID: {}", id);
-    }
- 
+    for (i, card) in task_pool.iter().enumerate() {
+        log::info!(
+            "TASK_POOL: [{}] Client ID: {}, Reader: {}, ATR: {}",
+            i,
+            card.client_id,
+            card.reader_name.as_deref().unwrap_or("unknown"),
+            card.atr.as_deref().unwrap_or("unknown"),
+        );
+    } 
 }

@@ -13,19 +13,10 @@ use std::thread::sleep;
 
 // ───── External Crates ─────
 use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application framework and async runtime.
-use tokio::sync::watch;
-
-// ───── Local Imports ─────
-use smart_card::SharedReaderCardsPool;
 
 pub fn run() {
-    // Declare a Watch channel to manage reader_cards_pool which stores the current state of connected readers.
-    // In order to be able to control in manual mode.
-    let (pool_tx, pool_rx) = watch::channel::<SharedReaderCardsPool>(vec![]);
-
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
     tauri::Builder::default()
-        .manage(pool_tx) // <--- Pass channel's sender to commands as a state
         .setup(move |app| {            
             // Obtain a lightweight reference to the app for convenient interaction
             let app_handle = app.app_handle();
@@ -44,12 +35,9 @@ pub fn run() {
                     .expect("Failed to set window title");
 
                 let front_app_handle = app_handle.clone();
-                let pool_rx_cloned = pool_rx.clone(); // temporary solution with clone before and after move
 
                 // Frontend loading is late, so we execute a callback to the "frontend-loaded" event which the front sends when it is loaded
                 window.listen("frontend-loaded", move |event: tauri::Event| {
-                    let pool_rx = pool_rx_cloned.clone(); // temporary solution with clone before and after move
-
                     #[cfg(target_os = "linux")]
                     {   // Temporary solution only for linux because webview does not load even after response from front.
                         // Apparently loading occurs later, not like Windows and MacOS. Fix later.
@@ -87,7 +75,7 @@ pub fn run() {
                             *** In the near future, I will add a flag for the state of readiness to receive events from the backend. ***
                         */
                         // Start monitoring smart cards. This function will run fсorever with the loop
-                        smart_card::sc_monitor(pool_rx).await;
+                        smart_card::sc_monitor().await;
                     });
 
                     async_runtime::spawn(async {

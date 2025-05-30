@@ -25,6 +25,7 @@ use crate::config::split_host_to_parts;             // Function to split the hos
 use crate::config::CacheSection;                    // Enum for cache sections for getting data from cache.
 use crate::smart_card::{ManagedCard, TASK_POOL};    // Managed card object and global task pool for MQTT handling.
 use crate::global_app_handle::emit_event;           // Sends events to the frontend via global app handle.
+use crate::smart_card::ProcessingCard;
 
 /// Timeout in seconds to wait before reconnecting to the server.
 ///
@@ -46,7 +47,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     // This part of function checks if a connection already exists for the given client ID
     // in the task pool. If not, it initiates a new connection. This is useful for maintaining
     // a list of active MQTT connections and ensuring that each client ID is only connected once.
-    let exists = task_pool.iter().any(|(id, _, _)| *id == client_id);
+    let exists = task_pool.iter().any(|card| card.client_id == client_id);
     // If existing connection is found, then return, no add a new connection for this client_id
     if exists {
         return;
@@ -81,7 +82,11 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
     let mqtt_clinet_cloned = mqtt_client.clone();
     let client_id_cloned = client_id.clone();
+
     let reader_name = reader_name.to_owned(); // clonning the reader name for the async task
+    let reader_name_str = reader_name.to_string_lossy().into_owned(); // for using outside async_runtime task
+
+    let atr_clone = atr.clone(); // Using ATR inside async_runtime
 
     // format of the logging header
     let log_header: String = format!("{} |", client_id);
@@ -195,7 +200,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     }
 
                                                     // If the input value is empty, then pass the ATR to the server.
-                                                    rapdu_mqtt_hex = atr.clone();
+                                                    rapdu_mqtt_hex = atr_clone.clone();
                                                     // finish_value = true;    // This is a crutch, temporary solution to not include the visual effect of authorization.
                                                     //                         // Because the ATR request is not always the beginning of authorization.
                                                     //                         // Sometimes it is a part of the command that can be rejected by the tracker, so this part should be ignored
@@ -340,50 +345,73 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
         }
     });
 
-    task_pool.push((client_id, mqtt_clinet_cloned, handle));
+    // task_pool.push((client_id, mqtt_clinet_cloned, handle));
+    task_pool.push(ProcessingCard {
+        client_id,
+        reader_name: Some(reader_name_str),
+        atr: Some(atr),
+        mqtt_client: mqtt_clinet_cloned,
+        task_handle: handle,
+    });
 
     // Логирование содержимого task_pool после добавления новой задачи
-    log::info!("Current tasks in the pool:");
-    for (id, _, _) in task_pool.iter() {
-        log::info!("Client ID: {}", id);
+    // log::info!("Current tasks in the pool:");
+    // for (id, _, _) in task_pool.iter() {
+    //     log::info!("Client ID: {}", id);
+    // }
+    for (i, card) in task_pool.iter().enumerate() {
+        log::info!(
+            "TASK_POOL: [{}] Client ID: {}, Reader: {}, ATR: {}",
+            i,
+            card.client_id,
+            card.reader_name.as_deref().unwrap_or("unknown"),
+            card.atr.as_deref().unwrap_or("unknown"),
+        );
     }
 }
 
-/// Removes specified MQTT connections.
-///
-/// This function iterates over a list of client IDs, finds the corresponding
-/// tasks in the task pool, and cancels them. It ensures that any active connection
-/// associated with the given client IDs is terminated.
+/// Terminates connections for the specified client IDs (card numbers).
 pub async fn remove_connections(client_ids: Vec<String>) {
-    log::debug!("removing conn {:?}", client_ids);
-    // Unlock task_pool mutex
+    log::debug!("Removing connections for client_ids: {:?}", client_ids);
+
+    // Lock the task pool
     let mut task_pool = TASK_POOL.lock().await;
 
     for client_id in client_ids {
-        // Attempt to find a task associated with the current client ID
-        if let Some(index) = task_pool.iter().position(|(id, _, _)| *id == client_id) {
-            // If found, remove the task from the pool and abort it
-            let (_, _, handle) = task_pool.remove(index);
-            handle.abort();
-            // Log the termination of the connection
+        // Find the index of the card with the matching client_id
+        if let Some(index) = task_pool.iter().position(|card| card.client_id == client_id) {
+            let card = task_pool.remove(index);
+            card.task_handle.abort();
+
             log::info!(
-                "{} Connection to the server has been terminated.",
-                client_id
+                "TASK_POOL: Connection terminated for client_id: {}, reader: {}, atr: {}",
+                card.client_id,
+                card.reader_name.as_deref().unwrap_or("unknown"),
+                card.atr.as_deref().unwrap_or("unknown"),
             );
         }
     }
 }
 
+/// Terminates all active card-related MQTT connections and clears the task pool.
 pub async fn remove_connections_all() {
-    log::debug!("removing all conn's ");
-    // Unlock task_pool mutex
+    log::debug!("Removing all card connections...");
+
+    // Lock the task pool
     let mut task_pool = TASK_POOL.lock().await;
 
-    // Abort all tasks in the pool
-    for (_, _, handle) in task_pool.drain(..) {
-        handle.abort();
+    // Abort each task and log which client is being disconnected
+    for card in task_pool.drain(..) {
+        log::info!(
+            "TASK_POOL: Aborting task for client_id: {}, reader: {}, atr: {}",
+            card.client_id,
+            card.reader_name.as_deref().unwrap_or("unknown"),
+            card.atr.as_deref().unwrap_or("unknown"),
+        );
+        card.task_handle.abort();
     }
-    log::info!("All connections to the server have been terminated.");
+
+    log::info!("All card connections have been terminated and the task pool has been cleared.");
 }
 
 fn process_rapdu_mqtt_hex(rapdu_mqtt_hex: String) -> String {

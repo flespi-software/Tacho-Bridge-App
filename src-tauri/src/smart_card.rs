@@ -23,22 +23,26 @@ use pcsc::{Card, Protocols, State as PcscState};
 use crate::config::{get_from_cache, CacheSection};
 use crate::global_app_handle::emit_event;
 use crate::mqtt::{ensure_connection, remove_connections, remove_connections_all};
-// use crate::mqtt::{remove_connections, remove_connections_all}; // Alternative import style for flexibility.
 
 // ───── Constants ─────
 const MAX_BUFFER_SIZE: usize = 260; // Example buffer size for smart card communication.
 
-// ───── Statics ─────
-lazy_static! {
-    /// Global static vector to store active MQTT client connections and their associated tasks.
-    pub static ref TASK_POOL: Arc<Mutex<Vec<(String, AsyncClient, JoinHandle<()>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+/// Represents a card currently being processed (i.e., connected and active).
+#[derive(Debug)]
+pub struct ProcessingCard {
+    pub client_id: String,              // it is Card number. Uses as client_id for mqtt connection
+    pub reader_name: Option<String>,    // Name of the smart card reader (e.g., "Alcor Micro AU9540 00 00").
+    pub atr: Option<String>,            // ATR of the inserted card (hex-encoded).
+    pub mqtt_client: AsyncClient,       // MQTT client instance.
+    pub task_handle: JoinHandle<()>,    // Async task handle managing communication for this card.
 }
 
-// ───── Type Aliases ─────
-pub type SharedReaderCardsPool = Vec<(String, String, String)>;
-pub type SharedReaderCardsPoolReceiver = watch::Receiver<SharedReaderCardsPool>;
-
+// ───── Statics ─────
+lazy_static! {
+    /// Global list of cards currently being processed (i.e., connected and active).
+    pub static ref TASK_POOL: Arc<Mutex<Vec<ProcessingCard>>> =
+        Arc::new(Mutex::new(Vec::new()));
+}
 
 /// Represents errors that can occur while interacting with smart card readers.
 #[derive(Debug)] // Enables use of `{:?}` for logging and debugging
@@ -124,16 +128,7 @@ fn setup_reader_states(
 async fn process_reader_states(
     ctx: &Context,
     reader_states: &mut [ReaderState],
-    reader_cards_pool: &mut Vec<(String, String, String)>,
 ) -> Result<(), SmartCardError> {
-    // match ctx.get_status_change(None, reader_states) {
-    //     Ok(_) => {}
-    //     Err(e) => {
-    //         log::error!("Failed to get reader status change: {:?}", e);
-    //         return Err(Box::new(e));
-    //     }
-    // }
-
     ctx.get_status_change(None, reader_states)?;
 
     for rs in reader_states {
@@ -169,50 +164,47 @@ async fn process_reader_states(
             let mut iccid: String = String::new();
 
             // 'PRESENT' ensures that the card is in the reader and accessible
-            // if rs.event_state().contains(PcscState::PRESENT) {
-            if rs.event_state().contains(PcscState::PRESENT) && !rs.event_state().contains(PcscState::INUSE) {
-                if !is_card_connected(reader_cards_pool, reader_name_string) {
-                    // The card may not be created initially
-                    match ManagedCard::new(reader_name, protocol) {
-                        Ok(managed_card) => {
-                            match managed_card.get_iccid().await {
-                                Ok(received_iccid) => {
-                                    log::info!("ICCID: {}", received_iccid);
+            if should_register_new_card(reader_name_string, &atr).await {
+                // The card may not be created initially
+                match ManagedCard::new(reader_name, protocol) {
+                    Ok(managed_card) => {
+                        match managed_card.get_iccid().await {
+                            Ok(received_iccid) => {
+                                log::info!("ICCID: {}", received_iccid);
 
-                                    // Save the ICCID to an external variable
-                                    iccid = received_iccid.clone();
+                                // Save the ICCID to an external variable
+                                iccid = received_iccid.clone();
 
-                                    // Checking if card number is in the cache
-                                    card_number = get_from_cache(CacheSection::Cards, &iccid);
+                                // Checking if card number is in the cache
+                                card_number = get_from_cache(CacheSection::Cards, &iccid);
 
-                                    // Only if the map and ICCID are received successfully - run the task
-                                    ensure_connection(
-                                        rs.name(),
-                                        card_number.clone(),
-                                        atr.clone(),
-                                        managed_card,
-                                    ).await;
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to get ICCID: {}", e);
-                                    log::warn!(
-                                        "Card for reader {} failed to return ICCID. Will not start connection.",
-                                        reader_name_string
-                                    );
-                                }
+                                // Only if the map and ICCID are received successfully - run the task
+                                ensure_connection(
+                                    rs.name(),
+                                    card_number.clone(),
+                                    atr.clone(),
+                                    managed_card,
+                                ).await;
+                            }
+                            Err(e) => {
+                                log::error!("Failed to get ICCID: {}", e);
+                                log::warn!(
+                                    "Card for reader {} failed to return ICCID. Will not start connection.",
+                                    reader_name_string
+                                );
                             }
                         }
-                        Err(e) => {
-                            log::error!(
-                                "Failed to create ManagedCard for reader {}: {}",
-                                reader_name_string,
-                                e
-                            );
-                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to create ManagedCard for reader {}: {}",
+                            reader_name_string,
+                            e
+                        );
                     }
                 }
             }
-
+        
             //  Trace status of the reader & card
             log::info!(
                 "{:?} {:?} {:?}, {:?}",
@@ -222,32 +214,99 @@ async fn process_reader_states(
                 card_number
             );
 
-            let cards_to_remove = reader_cards_pool_update(
-                reader_cards_pool,
-                reader_name_string,
-                &card_state_string,
-                &card_number,
+            emit_event(
+                "global-cards-sync",
+                iccid.into(),
+                reader_name_string.into(),
+                card_state_string.into(),
+                card_number.clone().into(),
+                None,
+                None,
             );
-            remove_connections(cards_to_remove).await;
-
-            // INUSE state is a temporary workaround, because after the map is initialized, when the ICCID is read, the context detects a change in the map's behavior
-            // and sends another event that is not needed and spoils the correct sequence of sending events. Will be fixed later.
-            if ! rs.event_state().contains(PcscState::INUSE) {
-                // send an event to the frontend to update the state of the card
-                emit_event(
-                    "global-cards-sync",
-                    iccid.into(),
-                    reader_name_string.into(),
-                    card_state_string.into(),
-                    card_number.clone().into(),
-                    None,
-                    None,
-                );
-            }
         };
     }
 
     Ok(())
+}
+
+/// Determines if a card with the given reader name and ATR should be registered.
+/// Also removes any stale entries with the same reader name but empty ATR.
+pub async fn should_register_new_card(reader_name: &str, atr: &str) -> bool {
+    log::debug!("should_register_new_card");
+    let mut pool = TASK_POOL.lock().await;
+    log::debug!("TASK_POOL len: {}", pool.len());
+
+    for (i, card) in pool.iter().enumerate() {
+        log::debug!(
+            "Checking index {}: client_id = {}, reader_name = {:?}, atr = {:?}",
+            i,
+            card.client_id,
+            card.reader_name,
+            card.atr
+        );
+    }
+
+
+
+    // Условие 1: Если и reader_name, и atr заданы, и таких нет в пуле → return true
+    if !reader_name.is_empty() && !atr.is_empty() {
+        let exists = pool.iter().any(|c| {
+            c.reader_name.as_deref() == Some(reader_name) &&
+            c.atr.as_deref() == Some(atr)
+        });
+        if !exists {
+            return true;
+        }
+    }
+
+    // Condition 2: If atr is empty, but reader_name is in the pool with filled atr -> delete such card
+    if atr.is_empty() {
+        log::debug!("ATR is empty. Checking for stale entries with reader_name = '{}'", reader_name);
+
+        for (i, card) in pool.iter().enumerate() {
+            log::debug!(
+                "Checking index {}: client_id = {}, reader_name = {:?}, atr = {:?}",
+                i,
+                card.client_id,
+                card.reader_name,
+                card.atr
+            );
+        }
+
+        let to_remove = pool.iter().position(|c| {
+            let reader_match = c.reader_name.as_deref() == Some(reader_name);
+            let atr_filled = c.atr.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+
+            log::debug!(
+                "Match check: reader_match = {}, atr_filled = {} for reader = {:?}, atr = {:?}",
+                reader_match,
+                atr_filled,
+                c.reader_name,
+                c.atr
+            );
+
+            reader_match && atr_filled
+        });
+
+        if let Some(index) = to_remove {
+            let removed = pool.remove(index);
+
+            removed.task_handle.abort();
+
+            log::warn!(
+                "Removed stale ProcessingCard for reader {} with old ATR {}",
+                removed.reader_name.as_deref().unwrap_or("unknown"),
+                removed.atr.as_deref().unwrap_or("unknown"),
+            );
+        } else {
+            log::debug!(
+                "No stale ProcessingCard found for reader '{}'. Nothing removed.",
+                reader_name
+            );
+        }
+    }
+
+    false
 }
 
 /// Check if the reader is a virtual reader. This usually only applies to Windows.
@@ -261,38 +320,8 @@ fn is_virtual_reader(reader_name: &CStr) -> bool {
         || reader_name_lower.contains("remote")
 }
 
-pub fn is_card_connected(
-    reader_cards_pool: &Vec<(String, String, String)>, 
-    reader_name: &str,
-) -> bool {
-    debug!(
-        "Checking if card is connected for reader: '{}'. Pool size: {}",
-        reader_name,
-        reader_cards_pool.len()
-    );
-
-    for (name, state, card) in reader_cards_pool {
-        debug!(
-            "Checking pool entry -> Reader: '{}', State: '{}', Card: '{}'",
-            name, state, card
-        );
-    }
-
-    let connected = reader_cards_pool.iter().any(|(name, _, _)| name == reader_name);
-
-    debug!(
-        "Result of is_card_connected for reader '{}': {}",
-        reader_name,
-        connected
-    );
-
-    connected
-}
-
 // Automatically sync cards
-pub async fn sc_monitor(mut pool_rx: SharedReaderCardsPoolReceiver) -> ! {
-    let mut reader_cards_pool: SharedReaderCardsPool = pool_rx.borrow().clone();
-
+pub async fn sc_monitor() -> ! {
     loop {
         log::debug!("Starting the outer loop to establish context...");
         let ctx = match Context::establish(Scope::User) {
@@ -319,15 +348,6 @@ pub async fn sc_monitor(mut pool_rx: SharedReaderCardsPoolReceiver) -> ! {
         log::debug!("Initialized readers buffer and reader states.");
 
         loop {
-            if pool_rx.has_changed().unwrap_or(false) {
-                match pool_rx.borrow_and_update().clone() {
-                    updated_pool => {
-                        log::info!("Received updated reader_cards_pool via channel.");
-                        reader_cards_pool = updated_pool;
-                    }
-                }
-            }
-
             log::debug!("Starting the inner loop to monitor reader states...");
             if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
                 log::error!("Failed to setup_reader_states: {:?}", e);
@@ -343,7 +363,7 @@ pub async fn sc_monitor(mut pool_rx: SharedReaderCardsPoolReceiver) -> ! {
             );
             
             if let Err(e) =
-                process_reader_states(&ctx, &mut reader_states, &mut reader_cards_pool).await
+                process_reader_states(&ctx, &mut reader_states).await
             {
                 match e {
                     SmartCardError::UnknownReader => {
@@ -358,80 +378,12 @@ pub async fn sc_monitor(mut pool_rx: SharedReaderCardsPoolReceiver) -> ! {
                 break;
             }
 
-            log::debug!(
-                "Successfully processed reader states. Current reader_cards_pool: {:?}",
-                reader_cards_pool
-            );
-
             log::debug!("Waiting for the next status change...");
             tokio::task::yield_now().await;
         }
 
         log::debug!("Re-establishing context...");
     }
-}
-
-pub fn reader_cards_pool_update(
-    reader_cards_pool: &mut Vec<(String, String, String)>,
-    reader_name: &str,
-    card_state: &str,
-    card_number: &str,
-) -> Vec<String> {
-    let mut company_card_numbers = Vec::new();
-
-    println!(
-        "Updating reader cards pool. Reader name: '{}', Card state: '{}', Card number: '{}'",
-        reader_name, card_state, card_number
-    );
-
-    if !reader_name.is_empty() && !card_number.is_empty() {
-        let exists = reader_cards_pool
-            .iter()
-            .any(|(reader, _, _)| reader == reader_name);
-        if !exists {
-            println!(
-                "Reader '{}' does not exist in the pool. Adding new entry.",
-                reader_name
-            );
-            reader_cards_pool.push((
-                reader_name.to_string(),
-                card_state.to_string(),
-                card_number.to_string(),
-            ));
-        }
-    } else if !reader_name.is_empty()
-        && card_number.is_empty()
-        && (card_state.contains("EMPTY") || card_state.contains("UNKNOWN"))
-    {
-        let entries_to_remove: Vec<_> = reader_cards_pool
-            .iter()
-            .enumerate()
-            .filter(|(_, (reader, _, _))| reader == reader_name)
-            .map(|(i, (_, _, card))| {
-                company_card_numbers.push(card.clone());
-                i
-            })
-            .collect();
-
-        if !entries_to_remove.is_empty() {
-            println!(
-                "Removing {} entries for reader '{}'.",
-                entries_to_remove.len(),
-                reader_name
-            );
-            for i in entries_to_remove.into_iter().rev() {
-                reader_cards_pool.remove(i);
-            }
-        }
-    } else {
-        println!(
-            "Reader name is empty or state not EMPTY/UNKNOWN. No action taken."
-        );
-    }
-
-    info!("Final state of reader_cards_pool: {:?}", reader_cards_pool);
-
-    company_card_numbers
 }
 
 /// Parses the ATR and extracts the communication protocol (T=0 or T=1).
@@ -451,7 +403,7 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
     };
 
     if atr_bytes.len() < 2 {
-        log::error!("ATR is too short: {:?}", atr_bytes);
+        log::warn!("ATR is too short: {:?}", atr_bytes);
         return Protocols::T0;
     }
 
@@ -522,20 +474,12 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
 pub async fn manual_sync_cards(
     readername: String,
     restart: bool,
-    pool_tx: tauri::State<'_, Sender<SharedReaderCardsPool>>,
 ) -> Result<(), String> {
     log::debug!("Manual sync cards function is called. Restart: {}", restart);
 
     if restart {
         // remove all connections
         remove_connections_all().await;
-
-        // Send empty vector to the channel
-        if let Err(e) = pool_tx.send(vec![]) {
-            log::error!("Failed to clear reader_cards_pool: {}", e);
-        } else {
-            log::info!("Cleared reader_cards_pool via watch channel.");
-        }
 
         return Ok(());
     }
