@@ -133,17 +133,17 @@ listen('global-cards-sync', (event) => {
   // structure has fields from the Rust back-end with the 'snake_case' naming convention
   const payload = event.payload as {
     iccid: string
-    reader_name: string
-    card_state: string
-    card_number: string
+    readerName: string
+    cardState: string
+    cardNumber: string
     online?: boolean
     authentication?: boolean
   }
 
-  const name = payload.reader_name
-  const cardNumber = payload.card_number
+  const name = payload.readerName
+  const cardNumber = payload.cardNumber
   // Split the status by the pipe character and get the second element
-  const splitted = (payload.card_state?.match(/\((.*)\)/i) ?? [])[1]?.split('|') ?? []
+  const splitted = (payload.cardState?.match(/\((.*)\)/i) ?? [])[1]?.split('|') ?? []
   const status = splitted[1]?.trim() ?? splitted[0] ?? ''
 
   const cardICCID = payload.iccid
@@ -194,7 +194,7 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
   // update the configuration with the new card number in the dynamic cache
   const update_result = await invoke('update_card', {
     content,
-    card_number: cardNumber,
+    cardnumber: cardNumber,
   })
 
   // Update the card number in the state if configuration update was successful
@@ -286,7 +286,7 @@ const removeCard = async (cardNumber: string) => {
   state.readers = state.readers.filter((reader) => reader.cardNumber !== cardNumber)
 
   try {
-    await invoke('remove_card', { card_number: cardNumber })
+    await invoke('remove_card', { cardnumber: cardNumber })
     console.log('Card removed:', cardNumber)
   } catch (error) {
     console.error('Failed to remove card:', error)
@@ -297,13 +297,13 @@ listen('global-card-config-updated', (event) => {
   console.log('event payload: ', event.payload)
   const payload = event.payload as {
     content: object
-    card_number: string
+    cardNumber: string
   }
-  if (payload.card_number) {
+  if (payload.cardNumber) {
     if (payload.content) {
-      state.cards[payload.card_number] = { ...payload.content }
+      state.cards[payload.cardNumber] = { ...payload.content }
     } else {
-      delete state.cards[payload.card_number]
+      delete state.cards[payload.cardNumber]
     }
   }
 }).catch((error) => {
