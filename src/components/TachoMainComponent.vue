@@ -58,7 +58,7 @@
       :cards="state.cards"
       @add-card="addCard"
       @update-card="updateCard"
-      @delete-card="deleteCard"
+      @delete-card="removeCard"
     />
   </div>
 </template>
@@ -180,21 +180,21 @@ listen('global-cards-sync', (event) => {
 
 ///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
 
-const saveCardNumber = async (cardICCID: string, cardNumber?: string) => {
+const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
   // Find the index of the reader with the same cardICCID
-  const readerIndex = state.readers.findIndex((reader) => reader.cardICCID === cardICCID)
+  const readerIndex = state.readers.findIndex((reader) => reader.cardICCID === content.ICCID)
   if (readerIndex === -1) {
     console.error('Reader not found')
     return
   }
 
   // Save the card number to the currentReader object
-  console.log(`Card Number: ${cardNumber}, Card ICCID: ${cardICCID}`)
+  console.log(`Card Number: ${cardNumber}, Card ICCID: ${content.ICCID}`)
 
   // update the configuration with the new card number in the dynamic cache
   const update_result = await invoke('update_card', {
-    iccid: cardICCID,
-    cardnumber: cardNumber,
+    content,
+    card_number: cardNumber,
   })
 
   // Update the card number in the state if configuration update was successful
@@ -273,17 +273,12 @@ function linkMode(ICCID: string) {
 }
 async function addCard(number: string, data: SmartCard) {
   state.cards[number] = data
-  await saveCardNumber(data.ICCID || '', number)
+  await saveCardNumber(number, data)
 }
 
 async function updateCard(number: string, data: SmartCard) {
   state.cards[number] = data
-  await saveCardNumber(data.ICCID || '', number)
-}
-
-async function deleteCard(number: string) {
-  // delete state.cards[number]
-  await removeCard(number)
+  await saveCardNumber(number, data)
 }
 
 // remove card func from the config
@@ -291,7 +286,7 @@ const removeCard = async (cardNumber: string) => {
   state.readers = state.readers.filter((reader) => reader.cardNumber !== cardNumber)
 
   try {
-    await invoke('remove_card', { cardnumber: cardNumber })
+    await invoke('remove_card', { card_number: cardNumber })
     console.log('Card removed:', cardNumber)
   } catch (error) {
     console.error('Failed to remove card:', error)
@@ -301,12 +296,12 @@ const removeCard = async (cardNumber: string) => {
 listen('global-card-config-updated', (event) => {
   console.log('event payload: ', event.payload)
   const payload = event.payload as {
-    context: object
+    content: object
     card_number: string
   }
   if (payload.card_number) {
-    if (payload.context) {
-      state.cards[payload.card_number] = { ...payload.context }
+    if (payload.content) {
+      state.cards[payload.card_number] = { ...payload.content }
     } else {
       delete state.cards[payload.card_number]
     }
@@ -320,7 +315,6 @@ listen('global-card-config-updated', (event) => {
 emit('frontend-loaded', { message: 'Hello from frontend!' }).catch((error) => {
   console.error('Error emitting frontend-loaded event:', error)
 })
-
 
 defineComponent({
   setup() {
