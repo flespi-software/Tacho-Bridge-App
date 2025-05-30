@@ -11,6 +11,7 @@ use once_cell::sync::OnceCell;
 use lazy_static::lazy_static;
 use rumqttc::v5::AsyncClient;
 use tokio::sync::watch::{self, Sender};
+use tokio::time::Duration;
 
 use tauri::async_runtime::{JoinHandle, Mutex};
 
@@ -38,6 +39,45 @@ lazy_static! {
 pub type SharedReaderCardsPool = Vec<(String, String, String)>;
 pub type SharedReaderCardsPoolReceiver = watch::Receiver<SharedReaderCardsPool>;
 
+
+/// Represents errors that can occur while interacting with smart card readers.
+#[derive(Debug)] // Enables use of `{:?}` for logging and debugging
+pub enum SmartCardError {
+    /// Error indicating that the specified reader is no longer available or not recognized.
+    UnknownReader,
+
+    /// A catch-all for other types of errors, represented as a string message.
+    Other(String),
+}
+
+impl std::fmt::Display for SmartCardError {
+    /// Provides a user-friendly string representation of the error.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SmartCardError::UnknownReader => write!(f, "UnknownReader"),
+            SmartCardError::Other(s) => write!(f, "Other: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for SmartCardError {
+    // This enables interoperability with other error-handling APIs,
+    // such as `?` operator, logging, and integration with `anyhow` or `thiserror`.
+}
+
+impl From<pcsc::Error> for SmartCardError {
+    /// Converts a `pcsc::Error` into a `SmartCardError`.
+    ///
+    /// Attempts to classify `UnknownReader` errors specifically,
+    /// all other errors are wrapped in `SmartCardError::Other`.
+    fn from(err: pcsc::Error) -> Self {
+        if err.to_string().contains("UnknownReader") {
+            SmartCardError::UnknownReader
+        } else {
+            SmartCardError::Other(err.to_string())
+        }
+    }
+}
 
 fn setup_reader_states(
     ctx: &Context,
@@ -85,14 +125,16 @@ async fn process_reader_states(
     ctx: &Context,
     reader_states: &mut [ReaderState],
     reader_cards_pool: &mut Vec<(String, String, String)>,
-) -> Result<(), Box<dyn Error>> {
-    match ctx.get_status_change(None, reader_states) {
-        Ok(_) => {}
-        Err(e) => {
-            log::error!("Failed to get reader status change: {:?}", e);
-            return Err(Box::new(e));
-        }
-    }
+) -> Result<(), SmartCardError> {
+    // match ctx.get_status_change(None, reader_states) {
+    //     Ok(_) => {}
+    //     Err(e) => {
+    //         log::error!("Failed to get reader status change: {:?}", e);
+    //         return Err(Box::new(e));
+    //     }
+    // }
+
+    ctx.get_status_change(None, reader_states)?;
 
     for rs in reader_states {
         if rs.name() != PNP_NOTIFICATION() {
@@ -303,10 +345,19 @@ pub async fn sc_monitor(mut pool_rx: SharedReaderCardsPoolReceiver) -> ! {
             if let Err(e) =
                 process_reader_states(&ctx, &mut reader_states, &mut reader_cards_pool).await
             {
-                log::error!("Failed to process reader states: {:?}", e);
-                log::debug!("Exiting inner loop to re-establish context...");
-                break; // Exit the inner loop to re-establish context
+                match e {
+                    SmartCardError::UnknownReader => {
+                        log::warn!("Detected UnknownReader. Sleeping 3s to avoid busy loop!");
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                    SmartCardError::Other(msg) => {
+                        log::error!("SmartCard error: {}", msg);
+                    }
+                }
+
+                break;
             }
+
             log::debug!(
                 "Successfully processed reader states. Current reader_cards_pool: {:?}",
                 reader_cards_pool

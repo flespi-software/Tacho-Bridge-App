@@ -65,3 +65,4 @@ All notable changes to this project will be documented in this file.
 [fix] Changed the main card identifier, previously it was ATR, now it's ICCID. ATR does not provide the proper level of uniqueness as ICCID, so collisions and crashes in the application could occur where different cards were defined as one, now this problem has been fixed. Now ICCID is used as a unique card identifier.
 [fix] Due to changes in the identifier, changes have been made to the configuration structure that is stored locally on the computer. Previously, this was a combination of ATR = Card_number, now the card identifier is card_number, which is an object and contains information available to it, such as iccid, expire date, etc.
 [fix] Refactoring and bug fixes.
+[fix] Fixed a critical bug with the application looping if a physically faulty reader or broken drivers are connected.
