@@ -51,6 +51,7 @@ pub enum DarkTheme {
 pub struct CardConfig {
     pub iccid: String,          // ICCID
     pub expire: Option<u64>,    // Expire date
+    pub name: Option<String>,    // Custom card name (for ease of user identification)
 }
 // UI Configuration structure, part of ConfigurationFile that contains data about how UI looks like.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -160,6 +161,7 @@ fn update_card_config(
     iccid: &str,
     cardnumber: &str,
     expire: Option<u64>,
+    name: Option<String>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::debug!("Loading configuration from {:?}", config_path);
     let mut config = load_config(config_path)?;
@@ -202,6 +204,7 @@ fn update_card_config(
                 CardConfig {
                     iccid: iccid.to_string(),
                     expire,
+                    name
                 },
             );
             updated = true;
@@ -235,7 +238,7 @@ fn update_card_config(
 ///
 /// * `bool` - Returns `true` if the configuration was successfully updated, otherwise `false`.
 #[tauri::command]
-pub fn update_card(iccid: &str, cardnumber: &str, expire: Option<u64>) -> bool {
+pub fn update_card(iccid: &str, cardnumber: &str, expire: Option<u64>, name: Option<String>) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -244,7 +247,7 @@ pub fn update_card(iccid: &str, cardnumber: &str, expire: Option<u64>) -> bool {
         }
     };
 
-    match update_card_config(&config_path, iccid, cardnumber, expire) {
+    match update_card_config(&config_path, iccid, cardnumber, expire, name) {
         Ok(_) => {
             log::info!("The card, {} is added to the configuration!", cardnumber);
             true
@@ -662,6 +665,7 @@ fn migrate_old_config(contents: &str) -> Option<ConfigurationFile> {
             let card_config = CardConfig {
                 iccid: String::new(),
                 expire: None,
+                name: None
             };
             new_cards.insert(card_number, card_config);
         }
