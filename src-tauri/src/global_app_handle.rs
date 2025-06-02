@@ -72,13 +72,13 @@ pub fn emit_event(event_name: &str, iccid: String, reader_name: String, card_sta
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CardConfigPayload {
     pub card_number: String,
-    pub context: Option<CardConfig>,
+    pub content: Option<CardConfig>,
 }
 
 pub fn emit_card_config_event(event_name: &str, card_number: String, config: Option<CardConfig>) {
     let payload = CardConfigPayload {
         card_number,
-        context: config,
+        content: config,
     };
 
     if let Some(app_handle) = get_app_handle() {

@@ -7,8 +7,8 @@ export interface SmartCard {
 export interface Reader {
   name: string
   status: string
-  cardICCID: string
-  cardNumber: string
+  iccid: string
+  card_number: string
   online?: boolean | undefined
   authentication?: boolean | undefined
 }

@@ -24,21 +24,21 @@
           </q-item-section>
 
           <q-item-section>
-            <template v-if="!reader.cardNumber && reader.cardICCID">
+            <template v-if="!reader.card_number && reader.iccid">
               <q-item-label lines="1">UNKNOWN CARD</q-item-label>
               <q-item-label lines="1" caption>
-                <span>ICCID: {{ reader.cardICCID }}</span>
+                <span>ICCID: {{ reader.iccid }}</span>
               </q-item-label>
             </template>
-            <q-item-label lines="1" v-if="reader.cardNumber">
-              <span class="text-weight-medium">{{ reader.cardNumber }}</span>
+            <q-item-label lines="1" v-if="reader.card_number">
+              <span class="text-weight-medium">{{ reader.card_number }}</span>
             </q-item-label>
 
-            <q-item-label lines="1" v-if="!reader.cardICCID && !reader.cardNumber">
+            <q-item-label lines="1" v-if="!reader.iccid && !reader.card_number">
               <span class="text-weight-medium text-grey-6">EMPTY SLOT</span>
             </q-item-label>
           </q-item-section>
-          <q-item-section side v-if="reader.cardICCID && !reader.cardNumber">
+          <q-item-section side v-if="reader.iccid && !reader.card_number">
             <div class="text-grey-8 q-gutter-xs">
               <q-btn
                 size="12px"
@@ -46,7 +46,7 @@
                 dense
                 round
                 icon="mdi-link"
-                @click="linkMode(reader.cardICCID)"
+                @click="linkMode(reader.iccid)"
               />
             </div>
           </q-item-section>
@@ -133,20 +133,20 @@ listen('global-cards-sync', (event) => {
   // structure has fields from the Rust back-end with the 'snake_case' naming convention
   const payload = event.payload as {
     iccid: string
-    readerName: string
-    cardState: string
-    cardNumber: string
+    reader_name: string
+    card_state: string
+    card_number: string
     online?: boolean
     authentication?: boolean
   }
 
-  const name = payload.readerName
-  const cardNumber = payload.cardNumber
+  const name = payload.reader_name
+  const card_number = payload.card_number
   // Split the status by the pipe character and get the second element
-  const splitted = (payload.cardState?.match(/\((.*)\)/i) ?? [])[1]?.split('|') ?? []
+  const splitted = (payload.card_state?.match(/\((.*)\)/i) ?? [])[1]?.split('|') ?? []
   const status = splitted[1]?.trim() ?? splitted[0] ?? ''
 
-  const cardICCID = payload.iccid
+  const iccid = payload.iccid
   // Find the index of the reader with the same name
   const index = state.readers.findIndex((reader) => reader.name === name)
   if (index !== -1) {
@@ -157,8 +157,8 @@ listen('global-cards-sync', (event) => {
     state.readers[index] = {
       name,
       status,
-      cardICCID,
-      cardNumber,
+      iccid,
+      card_number,
       online: payload.online !== null ? payload.online : existingReader.online,
       authentication:
         payload.authentication !== null ? payload.authentication : existingReader.authentication,
@@ -168,8 +168,8 @@ listen('global-cards-sync', (event) => {
     state.readers.push({
       name,
       status,
-      cardICCID,
-      cardNumber,
+      iccid,
+      card_number,
       online: payload.online,
       authentication: payload.authentication,
     })
@@ -181,8 +181,8 @@ listen('global-cards-sync', (event) => {
 ///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
 
 const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
-  // Find the index of the reader with the same cardICCID
-  const readerIndex = state.readers.findIndex((reader) => reader.cardICCID === content.ICCID)
+  // Find the index of the reader with the same iccid
+  const readerIndex = state.readers.findIndex((reader) => reader.iccid === content.ICCID)
   if (readerIndex === -1) {
     console.error('Reader not found')
     return
@@ -201,7 +201,7 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
   if (update_result) {
     const reader = state.readers[readerIndex]
     if (reader) {
-      reader.cardNumber = cardNumber || ''
+      reader.card_number = cardNumber || ''
 
       // Запускаем обновление только если reader точно существует
       await invoke('manual_sync_cards', {
@@ -218,7 +218,7 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
 
 // Function to change the color of the icon depending on the card status
 const cardConnectedStatus = (reader: Reader) => {
-  if (reader.cardICCID && reader.online) {
+  if (reader.iccid && reader.online) {
     // If the card is connected and online
 
     if (reader.authentication) {
@@ -237,9 +237,9 @@ const cardConnectedStatus = (reader: Reader) => {
         size: '25px',
       }
     }
-  } else if (reader.cardICCID) {
+  } else if (reader.iccid) {
     // If the card is connected to the app but not online
-    if (reader.cardNumber) {
+    if (reader.card_number) {
       // Known card
       return {
         name: 'mdi-smart-card-outline',
@@ -283,7 +283,7 @@ async function updateCard(number: string, data: SmartCard) {
 
 // remove card func from the config
 const removeCard = async (cardNumber: string) => {
-  state.readers = state.readers.filter((reader) => reader.cardNumber !== cardNumber)
+  state.readers = state.readers.filter((reader) => reader.card_number !== cardNumber)
 
   try {
     await invoke('remove_card', { cardnumber: cardNumber })
@@ -297,13 +297,13 @@ listen('global-card-config-updated', (event) => {
   console.log('event payload: ', event.payload)
   const payload = event.payload as {
     content: object
-    cardNumber: string
+    cardnumber: string
   }
-  if (payload.cardNumber) {
+  if (payload.cardnumber) {
     if (payload.content) {
-      state.cards[payload.cardNumber] = { ...payload.content }
+      state.cards[payload.cardnumber] = { ...payload.content }
     } else {
-      delete state.cards[payload.cardNumber]
+      delete state.cards[payload.cardnumber]
     }
   }
 }).catch((error) => {

@@ -345,7 +345,6 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
         }
     });
 
-    // task_pool.push((client_id, mqtt_clinet_cloned, handle));
     task_pool.push(ProcessingCard {
         client_id,
         reader_name: Some(reader_name_str),
@@ -354,11 +353,6 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
         task_handle: handle,
     });
 
-    // Логирование содержимого task_pool после добавления новой задачи
-    // log::info!("Current tasks in the pool:");
-    // for (id, _, _) in task_pool.iter() {
-    //     log::info!("Client ID: {}", id);
-    // }
     for (i, card) in task_pool.iter().enumerate() {
         log::info!(
             "TASK_POOL: [{}] Client ID: {}, Reader: {}, ATR: {}",
