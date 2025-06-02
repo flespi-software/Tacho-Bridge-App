@@ -49,16 +49,6 @@
               </q-item-label>
             </q-item-section>
 
-            <!-- <q-item-section side>
-              <q-btn
-                dense
-                flat
-                icon="edit"
-                color="primary"
-                round
-                @click.stop="openEditDialog(number)"
-              />
-            </q-item-section> -->
             <q-item-section side>
               <q-btn dense flat icon="delete" color="red" round @click.stop="removeCard(number)" />
             </q-item-section>
@@ -186,22 +176,6 @@ function validateCardNumber(): boolean {
   cardNumberError.value = ''
   return true
 }
-
-// function saveCard(): void {
-//   const number = dialogCardNumber.value.trim().toUpperCase()
-//   const name = dialogCardName.value.trim()
-
-//   if (!validateCardNumber()) {
-//     return
-//   }
-
-//   cards[number] = { ...cards[number], name }
-//   isDialogOpen.value = false
-// }
-
-// function removeCard(number: string): void {
-//   delete cards[number]
-// }
 
 // Save logic
 function saveCard(): void {

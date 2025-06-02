@@ -1,9 +1,6 @@
 <template>
   <div style="width: 600px; max-width: 100%">
     <div class="rounded-borders" style="border: 1px solid #666">
-      <!-- <div class="header-flex-container">
-        <q-item-label header>Cards are connected:</q-item-label>
-      </div> -->
       <div v-if="state.readers.length === 0" class="q-pa-md text-grey text-h6">
         No connected smart card readers
       </div>
@@ -40,14 +37,7 @@
           </q-item-section>
           <q-item-section side v-if="reader.iccid && !reader.card_number">
             <div class="text-grey-8 q-gutter-xs">
-              <q-btn
-                size="12px"
-                flat
-                dense
-                round
-                icon="mdi-link"
-                @click="linkMode(reader.iccid)"
-              />
+              <q-btn size="12px" flat dense round icon="mdi-link" @click="linkMode(reader.iccid)" />
             </div>
           </q-item-section>
         </q-item>
@@ -111,9 +101,6 @@ import type { SmartCard, Reader } from './models'
 import { ref, reactive, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit } from '@tauri-apps/api/event'
-// import { useQuasar} from 'quasar'
-
-// import { Notify } from 'quasar'
 
 // Blinking status for the card icon during authentication.
 const isBlinking = ref(true) // controls the blinking status of the icon
@@ -183,10 +170,6 @@ listen('global-cards-sync', (event) => {
 const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
   // Find the index of the reader with the same iccid
   const readerIndex = state.readers.findIndex((reader) => reader.iccid === content.iccid)
-  if (readerIndex === -1) {
-    console.error('Reader not found')
-    return
-  }
 
   // Save the card number to the currentReader object
   console.log(`Card Number: ${cardNumber}, Card iccid: ${content.iccid}`)
