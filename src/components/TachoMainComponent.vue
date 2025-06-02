@@ -27,9 +27,17 @@
                 <span>iccid: {{ reader.iccid }}</span>
               </q-item-label>
             </template>
-            <q-item-label lines="1" v-if="reader.card_number">
-              <span class="text-weight-medium">{{ reader.card_number }}</span>
-            </q-item-label>
+            <template v-if="reader.card_number">
+              <q-item-label
+                lines="1"
+                v-if="state.cards && reader.card_number && state.cards[reader.card_number]"
+              >
+                {{ state.cards[reader.card_number]?.name }}
+              </q-item-label>
+              <q-item-label lines="1">
+                <span class="text-weight-medium">{{ reader.card_number }}</span>
+              </q-item-label>
+            </template>
 
             <q-item-label lines="1" v-if="!reader.iccid && !reader.card_number">
               <span class="text-weight-medium text-grey-6">EMPTY SLOT</span>
@@ -181,7 +189,7 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
   })
 
   // Update the card number in the state if configuration update was successful
-  if (update_result) {
+  if (update_result && readerIndex > -1) {
     const reader = state.readers[readerIndex]
     if (reader) {
       reader.card_number = cardNumber || ''

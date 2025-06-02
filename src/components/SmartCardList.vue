@@ -7,7 +7,7 @@
             <q-icon name="mdi-cards" />
           </q-item-section>
 
-          <q-item-section>Smart cards ({{ Object.keys(props.cards).length }})</q-item-section>
+          <q-item-section>Smart cards ({{ Object.keys(cardsList).length }})</q-item-section>
 
           <q-item-section>
             <div>
@@ -25,7 +25,7 @@
         <q-list separator>
           <q-item
             dense
-            v-for="(card, number) in props.cards"
+            v-for="(card, number) in cardsList"
             :key="number"
             @click="cardClick(number)"
             clickable
@@ -71,6 +71,7 @@
             label="Card Number"
             outlined
             dense
+            maxlength="16"
             :disable="isEditMode"
             :error="!!cardNumberError"
             :error-message="cardNumberError"
@@ -88,7 +89,7 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, watch, defineComponent, defineProps, defineExpose } from 'vue'
+import { ref, computed, watch, defineComponent, defineProps, defineExpose } from 'vue'
 import type { SmartCard } from './models'
 
 /** Company smart card regex: 16 alphanumeric uppercase characters */
@@ -100,6 +101,19 @@ type SmartCardMap = Record<string, SmartCard>
 const props = defineProps<{
   cards: SmartCardMap
 }>()
+
+const cardsList = computed(() => {
+  return Object.keys(props.cards)
+    .filter((el) => {
+      return !isLinkMode.value || !props.cards[el]?.iccid
+    })
+    .reduce((obj: SmartCardMap, n) => {
+      if (props.cards[n]) {
+        obj[n] = props.cards[n]
+      }
+      return obj
+    }, {})
+})
 
 // Emits
 const emit = defineEmits<{
@@ -146,6 +160,7 @@ function cardClick(number: string) {
     const cardData: SmartCard = { ...props.cards[number], iccid: linkICCID.value }
     emit('update-card', number, cardData)
     isLinkMode.value = false
+    linkICCID.value = ''
   } else {
     openEditDialog(number)
   }
@@ -194,6 +209,7 @@ function saveCard(): void {
   isDialogOpen.value = false
   isLinkMode.value = false
   linkICCID.value = ''
+  isExpanded.value = true
 }
 
 function closeCard(): void {
