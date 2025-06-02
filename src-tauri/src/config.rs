@@ -150,7 +150,7 @@ fn save_config(
 ///
 /// * `config_path` - The path to the configuration file.
 /// * `iccid` - The ICCID of the card.
-/// * `cardnumber` - The card number.
+/// * `card_number` - The card number.
 ///
 /// # Returns
 ///
@@ -158,7 +158,7 @@ fn save_config(
 fn update_card_config(
     config_path: &Path,
     iccid: &str,
-    cardnumber: &str,
+    card_number: &str,
     expire: Option<u64>,
     name: Option<String>
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -168,12 +168,12 @@ fn update_card_config(
 
     let mut updated = false;
 
-    match config.cards.get_mut(cardnumber) {
+    match config.cards.get_mut(card_number) {
         Some(existing_card) => {
             if existing_card.iccid.is_empty() {
                 log::info!(
-                    "Card with cardnumber {} exists with empty ICCID. Updating ICCID to {}",
-                    cardnumber,
+                    "Card with card_number {} exists with empty ICCID. Updating ICCID to {}",
+                    card_number,
                     iccid
                 );
                 existing_card.iccid = iccid.to_string();
@@ -181,25 +181,25 @@ fn update_card_config(
                 updated = true;
             } else {
                 log::info!(
-                    "Card with cardnumber {} already exists with ICCID {}",
-                    cardnumber,
+                    "Card with card_number {} already exists with ICCID {}",
+                    card_number,
                     existing_card.iccid
                 );
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
-                    "Card with this cardnumber already exists and has ICCID",
+                    "Card with this card_number already exists and has ICCID",
                 )));
             }
         }
         None => {
             log::debug!(
-                "Adding new card: cardnumber = {}, iccid = {}, expire = {:?}",
-                cardnumber,
+                "Adding new card: card_number = {}, iccid = {}, expire = {:?}",
+                card_number,
                 iccid,
                 expire
             );
             config.cards.insert(
-                cardnumber.to_string(),
+                card_number.to_string(),
                 CardConfig {
                     iccid: iccid.to_string(),
                     expire,
@@ -217,8 +217,8 @@ fn update_card_config(
         load_config_to_cache(&config)?;
         log::debug!("Configuration loaded to cache successfully");
 
-        if let Some(card_config) = config.cards.get(cardnumber) {
-            emit_card_config_event("global-card-config-updated", cardnumber.to_string(), Some(card_config.clone()));
+        if let Some(card_config) = config.cards.get(card_number) {
+            emit_card_config_event("global-card-config-updated", card_number.to_string(), Some(card_config.clone()));
         }
     }
 
@@ -231,13 +231,13 @@ fn update_card_config(
 /// # Arguments
 ///
 /// * `iccid` - The ICCID of the card.
-/// * `cardnumber` - The card number.
+/// * `card_number` - The card number.
 ///
 /// # Returns
 ///
 /// * `bool` - Returns `true` if the configuration was successfully updated, otherwise `false`.
 #[tauri::command]
-pub fn update_card(iccid: &str, cardnumber: &str, expire: Option<u64>, name: Option<String>) -> bool {
+pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -246,7 +246,13 @@ pub fn update_card(iccid: &str, cardnumber: &str, expire: Option<u64>, name: Opt
         }
     };
 
-    match update_card_config(&config_path, iccid, cardnumber, expire, name) {
+    if content.iccid.trim().is_empty() {
+        log::error!("ICCID is empty in card config");
+        return false;
+    }
+    // let iccid = content.iccid.as_str();    
+
+    match update_card_config(&config_path, &content.iccid, cardnumber, content.expire, content.name) {
         Ok(_) => {
             log::info!("The card, {} is added to the configuration!", cardnumber);
             true
@@ -319,13 +325,13 @@ pub async fn remove_card(
 
 pub async fn remove_card_from_config(
     config_path: &Path,
-    cardnumber: &str,
+    card_number: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::debug!("Loading configuration from {:?}", config_path);
     let mut config = load_config(config_path)?;
     log::debug!("Loaded configuration: {:?}", config);
 
-    if config.cards.remove(cardnumber).is_some() {
+    if config.cards.remove(card_number).is_some() {
         save_config(config_path, &config)?;
         log::debug!("Configuration saved successfully after removal");
 
@@ -333,14 +339,14 @@ pub async fn remove_card_from_config(
         log::debug!("Configuration loaded to cache successfully");
 
         // Kill card task with the specified client_id (card number)
-        remove_connections(vec![cardnumber.to_string()]).await;
-        log::info!("Removed connection for card {}", cardnumber);
+        remove_connections(vec![card_number.to_string()]).await;
+        log::info!("Removed connection for card {}", card_number);
 
-        emit_card_config_event("global-card-config-updated", cardnumber.to_string(), None);
+        emit_card_config_event("global-card-config-updated", card_number.to_string(), None);
 
         Ok(())
     } else {
-        log::warn!("Cardnumber {} not found in configuration", cardnumber);
+        log::warn!("Cardnumber {} not found in configuration", card_number);
         Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "Card not found in configuration",
@@ -612,10 +618,10 @@ pub fn init_config() -> io::Result<()> {
     /*
         Send data of all cards in events one by one to the front.
     */
-    for (cardnumber, card_config) in &config.cards {
+    for (card_number, card_config) in &config.cards {
         emit_card_config_event(
             "global-card-config-updated",
-            cardnumber.clone(),
+            card_number.clone(),
             Some(card_config.clone()),
         );
     }
@@ -641,7 +647,7 @@ fn migrate_old_config(contents: &str) -> Option<ConfigurationFile> {
     let old_config: OldConfig = serde_yaml::from_str(contents).ok()?;
 
     let mut new_cards = HashMap::new();
-    if let Some(old_cards) = old_config.cards {
+    if let Some(old_cards ) = old_config.cards {
         for (atr, card_number) in old_cards {
             let card_config = CardConfig {
                 iccid: String::new(),

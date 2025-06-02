@@ -163,79 +163,91 @@ async fn process_reader_states(
             let mut card_number: String = String::new();
             let mut iccid: String = String::new();
 
-            // 'PRESENT' ensures that the card is in the reader and accessible
-            if should_register_new_card(reader_name_string, &atr).await {
-                // The card may not be created initially
-                match ManagedCard::new(reader_name, protocol) {
-                    Ok(managed_card) => {
-                        match managed_card.get_iccid().await {
-                            Ok(received_iccid) => {
-                                log::info!("ICCID: {}", received_iccid);
+            // Mechanism that controls the process of adding to TASK_POOL
+            let action = should_register_new_card(reader_name_string, &atr).await;
 
-                                // Save the ICCID to an external variable
-                                iccid = received_iccid.clone();
+            match action {
+                CardProcessingResult::Create => {
+                    // The card may not be created initially
+                    match ManagedCard::new(reader_name, protocol) {
+                        Ok(managed_card) => {
+                            match managed_card.get_iccid().await {
+                                Ok(received_iccid) => {
+                                    log::info!("ICCID: {}", received_iccid);
 
-                                // Checking if card number is in the cache
-                                card_number = get_from_cache(CacheSection::Cards, &iccid);
+                                    iccid = received_iccid.clone();
+                                    card_number = get_from_cache(CacheSection::Cards, &iccid);
 
-                                // Only if the map and ICCID are received successfully - run the task
-                                ensure_connection(
-                                    rs.name(),
-                                    card_number.clone(),
-                                    atr.clone(),
-                                    managed_card,
-                                ).await;
-                            }
-                            Err(e) => {
-                                log::error!("Failed to get ICCID: {}", e);
-                                log::warn!(
-                                    "Card for reader {} failed to return ICCID. Will not start connection.",
-                                    reader_name_string
-                                );
+                                    ensure_connection(
+                                        rs.name(),
+                                        card_number.clone(),
+                                        atr.clone(),
+                                        managed_card,
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to get ICCID: {}", e);
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Failed to create ManagedCard for reader {}: {}",
-                            reader_name_string,
-                            e
-                        );
+                        Err(e) => {
+                            log::error!(
+                                "Failed to create ManagedCard for reader {}: {}",
+                                reader_name_string,
+                                e
+                            );
+                        }
                     }
                 }
+                CardProcessingResult::Delete => {
+                    // Do nothing
+                }
+                CardProcessingResult::Ignore => {
+                    // Do nothing
+                }
             }
-        
-            //  Trace status of the reader & card
-            log::info!(
-                "{:?} {:?} {:?}, {:?}",
-                rs.name(),
-                rs.event_state(),
-                atr,
-                card_number
-            );
 
-            emit_event(
-                "global-cards-sync",
-                iccid.into(),
-                reader_name_string.into(),
-                card_state_string.into(),
-                card_number.clone().into(),
-                None,
-                None,
-            );
+            // Emit event for Create or Delete, but not Ignore
+            if action != CardProcessingResult::Ignore {
+                emit_event(
+                    "global-cards-sync",
+                    iccid.into(),
+                    reader_name_string.into(),
+                    card_state_string.into(),
+                    card_number.clone().into(),
+                    None,
+                    None,
+                );
+
+                //  Trace status of the reader & card
+                log::info!(
+                    "{:?} {:?} {:?}, {:?}",
+                    rs.name(),
+                    rs.event_state(),
+                    atr,
+                    card_number
+                );
+            }
         };
     }
 
     Ok(())
 }
 
-/// Determines if a card with the given reader name and ATR should be registered.
-/// Also removes any stale entries with the same reader name but empty ATR.
-pub async fn should_register_new_card(reader_name: &str, atr: &str) -> bool {
+#[derive(Debug, PartialEq, Eq)]
+pub enum CardProcessingResult {
+    Create,
+    Delete,
+    Ignore,
+}
+
+/// Determines what action should be taken for a card with the given reader name and ATR.
+/// Also removes any stale entries with the same reader name but a previously stored ATR.
+pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProcessingResult {
     log::debug!("should_register_new_card");
     let mut pool = TASK_POOL.lock().await;
-    log::debug!("TASK_POOL len: {}", pool.len());
 
+    // Log the current contents of the task pool
     for (i, card) in pool.iter().enumerate() {
         log::debug!(
             "Checking index {}: client_id = {}, reader_name = {:?}, atr = {:?}",
@@ -246,51 +258,29 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> bool {
         );
     }
 
-
-
-    // Условие 1: Если и reader_name, и atr заданы, и таких нет в пуле → return true
+    // Case 1: Both reader_name and atr are provided and not found in the pool → register new card
     if !reader_name.is_empty() && !atr.is_empty() {
         let exists = pool.iter().any(|c| {
             c.reader_name.as_deref() == Some(reader_name) &&
             c.atr.as_deref() == Some(atr)
         });
+
         if !exists {
-            return true;
+            return CardProcessingResult::Create;
         }
     }
 
-    // Condition 2: If atr is empty, but reader_name is in the pool with filled atr -> delete such card
+    // Case 2: ATR is empty, but a card with the same reader name and filled ATR exists → remove it
     if atr.is_empty() {
         log::debug!("ATR is empty. Checking for stale entries with reader_name = '{}'", reader_name);
 
-        for (i, card) in pool.iter().enumerate() {
-            log::debug!(
-                "Checking index {}: client_id = {}, reader_name = {:?}, atr = {:?}",
-                i,
-                card.client_id,
-                card.reader_name,
-                card.atr
-            );
-        }
-
         let to_remove = pool.iter().position(|c| {
-            let reader_match = c.reader_name.as_deref() == Some(reader_name);
-            let atr_filled = c.atr.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
-
-            log::debug!(
-                "Match check: reader_match = {}, atr_filled = {} for reader = {:?}, atr = {:?}",
-                reader_match,
-                atr_filled,
-                c.reader_name,
-                c.atr
-            );
-
-            reader_match && atr_filled
+            c.reader_name.as_deref() == Some(reader_name)
+                && c.atr.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
         });
 
         if let Some(index) = to_remove {
             let removed = pool.remove(index);
-
             removed.task_handle.abort();
 
             log::warn!(
@@ -298,15 +288,13 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> bool {
                 removed.reader_name.as_deref().unwrap_or("unknown"),
                 removed.atr.as_deref().unwrap_or("unknown"),
             );
-        } else {
-            log::debug!(
-                "No stale ProcessingCard found for reader '{}'. Nothing removed.",
-                reader_name
-            );
+
+            return CardProcessingResult::Delete;
         }
     }
 
-    false
+    // No action needed
+    CardProcessingResult::Ignore
 }
 
 /// Check if the reader is a virtual reader. This usually only applies to Windows.
@@ -354,13 +342,13 @@ pub async fn sc_monitor() -> ! {
                 log::debug!("Exiting inner loop to re-establish context...");
                 break; // Exit the inner loop to re-establish context
             }
-            log::debug!(
-                "Successfully set up reader states: {:?}",
-                reader_states
-                    .iter()
-                    .map(|rs| rs.name().to_string_lossy())
-                    .collect::<Vec<_>>()
-            );
+            // log::debug!(
+            //     "Successfully set up reader states: {:?}",
+            //     reader_states
+            //         .iter()
+            //         .map(|rs| rs.name().to_string_lossy())
+            //         .collect::<Vec<_>>()
+            // );
             
             if let Err(e) =
                 process_reader_states(&ctx, &mut reader_states).await

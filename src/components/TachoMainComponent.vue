@@ -193,8 +193,8 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
 
   // update the configuration with the new card number in the dynamic cache
   const update_result = await invoke('update_card', {
-    content,
     cardnumber: cardNumber,
+    content: content,
   })
 
   // Update the card number in the state if configuration update was successful
@@ -203,7 +203,7 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
     if (reader) {
       reader.card_number = cardNumber || ''
 
-      // Запускаем обновление только если reader точно существует
+      // Run update only if reader definitely exists
       await invoke('manual_sync_cards', {
         readername: reader.name,
         restart: false,
@@ -297,13 +297,13 @@ listen('global-card-config-updated', (event) => {
   console.log('event payload: ', event.payload)
   const payload = event.payload as {
     content: object
-    cardnumber: string
+    card_number: string
   }
-  if (payload.cardnumber) {
+  if (payload.card_number) {
     if (payload.content) {
-      state.cards[payload.cardnumber] = { ...payload.content }
+      state.cards[payload.card_number] = { ...payload.content }
     } else {
-      delete state.cards[payload.cardnumber]
+      delete state.cards[payload.card_number]
     }
   }
 }).catch((error) => {
