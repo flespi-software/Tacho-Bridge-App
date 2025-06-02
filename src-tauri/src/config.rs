@@ -232,15 +232,6 @@ fn update_card_config(
 
 /// Public function to update the configuration with a new card.
 /// This function is a Tauri command that updates the configuration file with a new card's ATR and card number.
-///
-/// # Arguments
-///
-/// * `iccid` - The ICCID of the card.
-/// * `card_number` - The card number.
-///
-/// # Returns
-///
-/// * `bool` - Returns `true` if the configuration was successfully updated, otherwise `false`.
 #[tauri::command]
 pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
     let config_path = match get_config_path() {
@@ -250,11 +241,6 @@ pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
             return false;
         }
     };
-
-    if content.iccid.trim().is_empty() {
-        log::error!("ICCID is empty in card config");
-        return false;
-    }
 
     match update_card_config(&config_path, cardnumber, content) {
         Ok(_) => {
@@ -270,15 +256,6 @@ pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
 
 /// Updates the server address in the configuration.
 /// This function updates the configuration file with a new server address.
-///
-/// # Arguments
-///
-/// * `config_path` - The path to the configuration file.
-/// * `server_address` - The new server address.
-///
-/// # Returns
-///
-/// * `Result<(), Box<dyn std::error::Error + Send + Sync>>` - Returns `Ok` if the configuration was successfully updated, otherwise returns an error.
 pub fn update_server_config(
     config_path: &Path,
     host: &str,

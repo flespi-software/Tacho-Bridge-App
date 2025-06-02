@@ -342,13 +342,13 @@ pub async fn sc_monitor() -> ! {
                 log::debug!("Exiting inner loop to re-establish context...");
                 break; // Exit the inner loop to re-establish context
             }
-            // log::debug!(
-            //     "Successfully set up reader states: {:?}",
-            //     reader_states
-            //         .iter()
-            //         .map(|rs| rs.name().to_string_lossy())
-            //         .collect::<Vec<_>>()
-            // );
+            log::debug!(
+                "Successfully set up reader states: {:?}",
+                reader_states
+                    .iter()
+                    .map(|rs| rs.name().to_string_lossy())
+                    .collect::<Vec<_>>()
+            );
             
             if let Err(e) =
                 process_reader_states(&ctx, &mut reader_states).await
