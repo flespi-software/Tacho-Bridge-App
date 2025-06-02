@@ -19,6 +19,7 @@ use tauri::Emitter;
 // ───── Local Modules ─────
 use crate::global_app_handle::emit_card_config_event;
 use crate::mqtt::remove_connections;
+// use crate::smart_card::manual_sync_cards;
 
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize, Debug)]
@@ -145,81 +146,85 @@ fn save_config(
 
 /// Updates the configuration with a new card.
 /// This function updates the configuration file with a new card's ATR and card number.
-///
-/// # Arguments
-///
-/// * `config_path` - The path to the configuration file.
-/// * `iccid` - The ICCID of the card.
-/// * `card_number` - The card number.
-///
-/// # Returns
-///
-/// * `Result<(), Box<dyn std::error::Error + Send + Sync>>` - Returns `Ok` if the configuration was successfully updated, otherwise returns an error.
 fn update_card_config(
     config_path: &Path,
-    iccid: &str,
     card_number: &str,
-    expire: Option<u64>,
-    name: Option<String>
+    content: CardConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log::debug!("Loading configuration from {:?}", config_path);
     let mut config = load_config(config_path)?;
     log::debug!("Loaded configuration: {:?}", config);
 
-    let mut updated = false;
+    let mut needs_restart = false;
+    let mut changed = false;
 
     match config.cards.get_mut(card_number) {
         Some(existing_card) => {
             if existing_card.iccid.is_empty() {
-                log::info!(
-                    "Card with card_number {} exists with empty ICCID. Updating ICCID to {}",
-                    card_number,
-                    iccid
+                // ICCID is being set for the first time
+                log::debug!(
+                    "Existing card with empty ICCID. Updating: iccid = {}, name = {:?}, expire = {:?}",
+                    content.iccid,
+                    content.name,
+                    content.expire
                 );
-                existing_card.iccid = iccid.to_string();
-                existing_card.expire = expire;
-                updated = true;
+                existing_card.iccid = content.iccid;
+                existing_card.expire = content.expire;
+                existing_card.name = content.name;
+                needs_restart = true;
+                changed = true;
             } else {
-                log::info!(
-                    "Card with card_number {} already exists with ICCID {}",
-                    card_number,
-                    existing_card.iccid
-                );
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "Card with this card_number already exists and has ICCID",
-                )));
+                // Update optional fields only (no restart required)
+                if existing_card.expire != content.expire || existing_card.name != content.name {
+                    log::debug!(
+                        "Updating optional fields for card {}: name = {:?}, expire = {:?}",
+                        card_number,
+                        content.name,
+                        content.expire
+                    );
+                    existing_card.expire = content.expire;
+                    existing_card.name = content.name;
+                    changed = true;
+                }
             }
         }
         None => {
+            // Add new card entirely
             log::debug!(
-                "Adding new card: card_number = {}, iccid = {}, expire = {:?}",
+                "Adding new card: card_number = {}, iccid = {}, name = {:?}, expire = {:?}",
                 card_number,
-                iccid,
-                expire
+                content.iccid,
+                content.name,
+                content.expire
             );
-            config.cards.insert(
-                card_number.to_string(),
-                CardConfig {
-                    iccid: iccid.to_string(),
-                    expire,
-                    name
-                },
-            );
-            updated = true;
+            config.cards.insert(card_number.to_string(), content);
+            needs_restart = true;
+            changed = true;
         }
     }
 
-    if updated {
+    if changed {
+        // Save config to file
         save_config(config_path, &config)?;
         log::debug!("Configuration saved successfully");
 
+        // Load into runtime cache
         load_config_to_cache(&config)?;
         log::debug!("Configuration loaded to cache successfully");
 
+        // Emit frontend update event
         if let Some(card_config) = config.cards.get(card_number) {
-            emit_card_config_event("global-card-config-updated", card_number.to_string(), Some(card_config.clone()));
+            emit_card_config_event(
+                "global-card-config-updated",
+                card_number.to_string(),
+                Some(card_config.clone())
+            );
         }
+
+        // // Restart connection if necessary
+        // if needs_restart {
+        //     log::info!("Restarting connection for card: {}", card_number);
+        //     manual_sync_cards(card_number.to_string(), true).await;
+        // }
     }
 
     Ok(())
@@ -250,9 +255,8 @@ pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
         log::error!("ICCID is empty in card config");
         return false;
     }
-    // let iccid = content.iccid.as_str();    
 
-    match update_card_config(&config_path, &content.iccid, cardnumber, content.expire, content.name) {
+    match update_card_config(&config_path, cardnumber, content) {
         Ok(_) => {
             log::info!("The card, {} is added to the configuration!", cardnumber);
             true
