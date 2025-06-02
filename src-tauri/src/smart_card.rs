@@ -201,6 +201,7 @@ async fn process_reader_states(
                 }
                 CardProcessingResult::Delete => {
                     // Do nothing
+                    log::debug!("CARD DELETED {}", card_state_string);
                 }
                 CardProcessingResult::Ignore => {
                     // Do nothing
@@ -288,9 +289,9 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProce
                 removed.reader_name.as_deref().unwrap_or("unknown"),
                 removed.atr.as_deref().unwrap_or("unknown"),
             );
-
-            return CardProcessingResult::Delete;
         }
+
+        return CardProcessingResult::Delete;
     }
 
     // No action needed
