@@ -45,7 +45,7 @@
 
             <q-item-section>
               <q-item-label caption class="overflow-hidden ellipsis">
-                <small>{{ card.ICCID }}</small>
+                <small>{{ card.iccid }}</small>
               </q-item-label>
             </q-item-section>
 
@@ -153,7 +153,7 @@ function linkMode(iccid: string) {
 
 function cardClick(number: string) {
   if (isLinkMode.value) {
-    const cardData: SmartCard = { ...props.cards[number], ICCID: linkICCID.value }
+    const cardData: SmartCard = { ...props.cards[number], iccid: linkICCID.value }
     emit('update-card', number, cardData)
     isLinkMode.value = false
   } else {
@@ -165,7 +165,7 @@ function openEditDialog(number: string): void {
   isEditMode.value = true
   dialogCardNumber.value = number
   dialogCardName.value = props.cards[number]?.name ?? ''
-  dialogCardICCID.value = props.cards[number]?.ICCID ?? ''
+  dialogCardICCID.value = props.cards[number]?.iccid ?? ''
   cardNumberError.value = ''
   isDialogOpen.value = true
 }
@@ -210,7 +210,7 @@ function saveCard(): void {
 
   if (!validateCardNumber()) return
 
-  const cardData: SmartCard = { ...props.cards[number], name, ICCID: dialogCardICCID.value || '' }
+  const cardData: SmartCard = { ...props.cards[number], name, iccid: dialogCardICCID.value || '' }
 
   if (isEditMode.value) {
     emit('update-card', number, cardData)

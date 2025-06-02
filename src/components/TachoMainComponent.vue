@@ -27,7 +27,7 @@
             <template v-if="!reader.card_number && reader.iccid">
               <q-item-label lines="1">UNKNOWN CARD</q-item-label>
               <q-item-label lines="1" caption>
-                <span>ICCID: {{ reader.iccid }}</span>
+                <span>iccid: {{ reader.iccid }}</span>
               </q-item-label>
             </template>
             <q-item-label lines="1" v-if="reader.card_number">
@@ -118,7 +118,7 @@ import { listen, emit } from '@tauri-apps/api/event'
 // Blinking status for the card icon during authentication.
 const isBlinking = ref(true) // controls the blinking status of the icon
 
-const cardlist = ref<null | { linkMode: (ICCID: string) => null; openAddDialog: () => null }>(null)
+const cardlist = ref<null | { linkMode: (iccid: string) => null; openAddDialog: () => null }>(null)
 
 // reactive state for the readers and cards
 const state = reactive({
@@ -182,14 +182,14 @@ listen('global-cards-sync', (event) => {
 
 const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
   // Find the index of the reader with the same iccid
-  const readerIndex = state.readers.findIndex((reader) => reader.iccid === content.ICCID)
+  const readerIndex = state.readers.findIndex((reader) => reader.iccid === content.iccid)
   if (readerIndex === -1) {
     console.error('Reader not found')
     return
   }
 
   // Save the card number to the currentReader object
-  console.log(`Card Number: ${cardNumber}, Card ICCID: ${content.ICCID}`)
+  console.log(`Card Number: ${cardNumber}, Card iccid: ${content.iccid}`)
 
   // update the configuration with the new card number in the dynamic cache
   const update_result = await invoke('update_card', {
@@ -203,7 +203,7 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
     if (reader) {
       reader.card_number = cardNumber || ''
 
-      // Run update only if reader definitely exists
+      // Run update only if reader definitely exists// Запускаем обновление только если reader точно существует
       await invoke('manual_sync_cards', {
         readername: reader.name,
         restart: false,
@@ -265,8 +265,8 @@ const cardConnectedStatus = (reader: Reader) => {
 }
 
 // SmartCardList handlers
-function linkMode(ICCID: string) {
-  cardlist.value?.linkMode(ICCID)
+function linkMode(iccid: string) {
+  cardlist.value?.linkMode(iccid)
   if (Object.keys(state.cards).length === 0) {
     cardlist.value?.openAddDialog()
   }

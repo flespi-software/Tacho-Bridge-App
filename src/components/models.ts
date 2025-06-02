@@ -1,7 +1,7 @@
 // Interfaces
 export interface SmartCard {
   name?: string
-  ICCID?: string
+  iccid?: string
 }
 
 export interface Reader {
