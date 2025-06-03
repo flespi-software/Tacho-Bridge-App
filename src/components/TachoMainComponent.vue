@@ -24,7 +24,9 @@
             <template v-if="!reader.card_number && reader.iccid">
               <q-item-label lines="1">UNKNOWN CARD</q-item-label>
               <q-item-label lines="1" caption>
-                <span>iccid: {{ reader.iccid }}</span>
+                <q-chip dense size="sm" color="grey" class="text-dark text-bold">
+                  ICCID: {{ reader.iccid }}
+                </q-chip>
               </q-item-label>
             </template>
             <template v-if="reader.card_number">

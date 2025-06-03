@@ -45,7 +45,9 @@
 
             <q-item-section>
               <q-item-label caption class="overflow-hidden ellipsis">
-                <small>{{ card.iccid }}</small>
+                <q-chip v-if="card.iccid" dense size="sm" color="grey" class="text-dark text-bold">
+                  ICCID: {{ card.iccid }}
+                </q-chip>
               </q-item-label>
             </q-item-section>
 
