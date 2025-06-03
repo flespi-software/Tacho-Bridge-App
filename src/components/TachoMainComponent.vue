@@ -157,7 +157,7 @@ listen('global-cards-sync', (event) => {
       iccid,
       card_number,
       online: payload.online,
-      authentication: payload.authentication
+      authentication: payload.authentication,
     }
   } else {
     // If reader with the same name is not found, add the reader to the list
@@ -257,7 +257,7 @@ const cardConnectedStatus = (reader: Reader) => {
 // SmartCardList handlers
 function linkMode(iccid: string) {
   cardlist.value?.linkMode(iccid)
-  if (Object.keys(state.cards).length === 0) {
+  if (Object.values(state.cards)?.filter((card) => !card.iccid).length === 0) {
     cardlist.value?.openAddDialog()
   }
 }

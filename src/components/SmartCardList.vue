@@ -1,5 +1,20 @@
 <template>
   <div class="q-pt-md">
+    <q-banner v-if="isLinkMode" dense inline-actions rounded class="text-white bg-blue-8 q-mb-xs">
+      Click a card in the list below to assign or click
+      <q-btn
+        label="Add card"
+        dense
+        icon="mdi-card-plus"
+        color="white"
+        flat
+        class="q-ml-sm"
+        @click.stop="openAddDialog()"
+      />
+      <template v-slot:action>
+        <q-btn flat round color="white" icon="mdi-close" @click="cancelLink" />
+      </template>
+    </q-banner>
     <q-card flat bordered>
       <q-expansion-item v-model="isExpanded">
         <template v-slot:header>
@@ -15,7 +30,7 @@
                 label="Add Card"
                 dense
                 icon="mdi-card-plus"
-                flat
+                color="green"
                 @click.stop="openAddDialog()"
               />
             </div>
@@ -209,15 +224,17 @@ function saveCard(): void {
     emit('add-card', number, cardData)
   }
   isDialogOpen.value = false
-  isLinkMode.value = false
-  linkICCID.value = ''
+  cancelLink()
   isExpanded.value = true
 }
 
-function closeCard(): void {
-  isDialogOpen.value = false
+function cancelLink(): void {
   isLinkMode.value = false
   linkICCID.value = ''
+}
+function closeCard(): void {
+  isDialogOpen.value = false
+  cancelLink()
 }
 // Delete
 function removeCard(number: string): void {
