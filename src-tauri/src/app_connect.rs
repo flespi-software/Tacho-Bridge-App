@@ -81,11 +81,8 @@ pub async fn app_connection() {
     // `10` is the capacity of the internal channel used by the event loop for buffering operations
     let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
     let mqtt_clinet_cloned = mqtt_client.clone();
-    // let client_id_cloned = client_id.clone();
-
     let log_header: String = format!("{} |", client_id);
 
-    // create async task for the mqtt client
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
         loop {
@@ -141,14 +138,12 @@ pub async fn app_connection() {
                         ConnectionError::MqttState(ServerDisconnect { .. }) => log::warn!("{} The connection was terminated on the server side. Most likely the user has turned off the channel/device.", log_header),
                         ConnectionError::MqttState(AwaitPingResp { .. }) => {
                             log::warn!("{} Awaiting PING response from the server. The connection might be unstable.", log_header);
-                            // Implement your reconnection or handling strategy here
                         },
                         ConnectionError::MqttState(StateError::Io{ .. }) => {
                             log::warn!("{} MQTT state IO error: Connection closed by peer", log_header);
                         },
                         _ => {
                             log::error!("{} Unhandled error: {:?}", log_header, e);
-                            // return; // exit the loop
                         },
                     };
                     // Reconnection timeout for handled errors

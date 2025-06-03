@@ -13,7 +13,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_yaml;
 use lazy_static::lazy_static;
-use tokio::sync::watch::Sender;
 use tauri::Emitter;
 
 // ───── Local Modules ─────

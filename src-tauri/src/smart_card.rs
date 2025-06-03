@@ -10,7 +10,6 @@ use log::{debug, error, info, warn};
 use once_cell::sync::OnceCell;
 use lazy_static::lazy_static;
 use rumqttc::v5::AsyncClient;
-use tokio::sync::watch::{self, Sender};
 use tokio::time::Duration;
 
 use tauri::async_runtime::{JoinHandle, Mutex};
@@ -22,7 +21,7 @@ use pcsc::{Card, Protocols, State as PcscState};
 // ───── Local Modules ─────
 use crate::config::{get_from_cache, CacheSection};
 use crate::global_app_handle::emit_event;
-use crate::mqtt::{ensure_connection, remove_connections, remove_connections_all};
+use crate::mqtt::{ensure_connection, remove_connections_all};
 
 // ───── Constants ─────
 const MAX_BUFFER_SIZE: usize = 260; // Example buffer size for smart card communication.

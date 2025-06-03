@@ -191,7 +191,7 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
   if (update_result && readerIndex > -1) {
     const reader = state.readers[readerIndex]
     if (reader) {
-      // Run update only if reader definitely exists// Запускаем обновление только если reader точно существует
+      // Run update only if reader definitely exists
       await invoke('manual_sync_cards', {
         readername: reader.name,
         restart: false,

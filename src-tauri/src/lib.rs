@@ -8,9 +8,6 @@ mod mqtt;               // MQTT communication.
 mod smart_card;         // PCSC module for smart card operations.
 mod global_app_handle;  // Global access to app state and emitters.
 
-// ───── Std Lib ─────
-use std::thread::sleep;
-
 // ───── External Crates ─────
 use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application framework and async runtime.
 

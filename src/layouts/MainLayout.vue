@@ -72,18 +72,16 @@ import 'animate.css'
 
 const TBA_IDENT_REGEXP = /^TBA\d{13}$/ // Regular expression for the company card number
 const isIndetValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))
-// const ident = ref('') // App ident. The unique identifier of the application. Config
 const ident = ref('') // Input field for ident without prefix
 const identInput = computed({
-  get: () => `TBA${ident.value}`, // Без пробела
+  get: () => `TBA${ident.value}`,
   set: (val) => {
-    ident.value = val.replace(/^TBA/, '') // Убираем "TBA", если пользователь вводит его вручную
+    ident.value = val.replace(/^TBA/, '')
   },
 })
 // Server configuration dialog
 const config = ref(false) // Config dialog
 const host = ref('') // Server address. Config
-// const dark_theme = ref(''); // dark_theme of the application (dark or light). Config
 const dense = ref(true) // Dense mode
 
 /*
@@ -132,7 +130,6 @@ const saveServerConfig = async (host: string, ident: string, theme: string) => {
     })
 
     // Launch a manual refresh of server connections.
-    // await invoke('manual_sync_cards', { readername: "", restart: true })  // restart CARDS connections
     await invoke('manual_sync_cards', {
       readername: "",
       restart: true,
