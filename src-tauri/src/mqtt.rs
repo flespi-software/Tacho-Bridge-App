@@ -167,8 +167,8 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                             );
 
                                             log::info!("Authentication process is finished");
-                                            // Reset the card to its original state
                                             
+                                            // Reset the card to its original state
                                             managed_card.reconnect().await;
 
                                             payload_ack = process_rapdu_mqtt_hex("".to_string());
@@ -181,9 +181,6 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                             // PROCESS AUTHORIZATION WITH APDU COMMUNICATION
                                             // The "hex" parameter contains the apdu instruction that needs to be transferred to the card
                                             if let Some(hex_value) = json_payload.get("payload").and_then(|v| v.as_str()) {
-                                                // 00A4020c020002 - select icc id file
-                                                // 00b0000019 - read selected file
-
                                                 log::info!(
                                                     "{} TRACKER: Payload hex value: {}",
                                                     log_header,
@@ -201,9 +198,6 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
                                                     // If the input value is empty, then pass the ATR to the server.
                                                     rapdu_mqtt_hex = atr_clone.clone();
-                                                    // finish_value = true;    // This is a crutch, temporary solution to not include the visual effect of authorization.
-                                                    //                         // Because the ATR request is not always the beginning of authorization.
-                                                    //                         // Sometimes it is a part of the command that can be rejected by the tracker, so this part should be ignored
 
                                                     // Send the global-cards-sync event to the frontend that card is connected
                                                     emit_event("global-cards-sync",
@@ -217,8 +211,10 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
                                                 } else {
                                                     // // Otherwise, the logic for exchanging messages with the card.
-                                                    rapdu_mqtt_hex = managed_card.send_apdu(&hex_value, &client_id_cloned).await;
-                                                    log::info!("rapdu_mqtt_hex: {}", rapdu_mqtt_hex);
+                                                    let response = managed_card.send_apdu(&hex_value, &client_id_cloned).await;
+                                                    log::info!("rapdu_mqtt_hex: {}", response);
+
+                                                    rapdu_mqtt_hex = response;
 
                                                     // Send the global-cards-sync event to the frontend that card is connected
                                                     emit_event("global-cards-sync",

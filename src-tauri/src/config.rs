@@ -60,10 +60,6 @@ pub struct AppearanceConfig {
 
 /// Retrieves the configuration file path.
 /// This function constructs the path to the configuration file, creating the necessary directories if they do not exist.
-///
-/// # Returns
-///
-/// * `Result<PathBuf>` - The path to the configuration file or an error if the path could not be created.
 pub fn get_config_path() -> io::Result<PathBuf> {
     let mut config_path = PathBuf::new();
 
@@ -106,14 +102,6 @@ pub fn get_config_path() -> io::Result<PathBuf> {
 
 /// Load the configuration from the file.
 /// This function reads the configuration file and parses it.
-///
-/// # Arguments
-///
-/// * `config_path` - The path to the configuration file.
-///
-/// # Returns
-///
-/// * `Result<ConfigurationFile, Box<dyn std::error::Error + Send + Sync>>` - The loaded configuration or an error.
 fn load_config(
     config_path: &Path,
 ) -> Result<ConfigurationFile, Box<dyn std::error::Error + Send + Sync>> {
@@ -125,15 +113,6 @@ fn load_config(
 
 /// Saves the configuration to the file.
 /// This function serializes the configuration and writes it to the file.
-///
-/// # Arguments
-///
-/// * `config_path` - The path to the configuration file.
-/// * `config` - The configuration to save.
-///
-/// # Returns
-///
-/// * `Result<(), Box<dyn std::error::Error + Send + Sync>>` - Returns `Ok` if the configuration was successfully saved, otherwise returns an error.
 fn save_config(
     config_path: &Path,
     config: &ConfigurationFile,
@@ -336,14 +315,6 @@ pub async fn remove_card_from_config(
 
 /// Public function to update the server address in the configuration.
 /// This function is a Tauri command that updates the configuration file with a new server address.
-///
-/// # Arguments
-///
-/// * `server_address` - The new server address.
-///
-/// # Returns
-///
-/// * `bool` - Returns `true` if the configuration was successfully updated, otherwise `false`.
 #[tauri::command]
 pub fn update_server(host: &str, ident: &str, theme: &str) -> bool {
     let config_path = match get_config_path() {
@@ -398,14 +369,6 @@ pub enum CacheSection {
 
 /// Retrieves a value from the cache by key.
 /// This function locks the cache, retrieves the value for the given key, and returns it.
-///
-/// # Arguments
-///
-/// * `key` - The key to search in the cache.
-///
-/// # Returns
-///
-/// * `String` - The value associated with the key, or an empty string if the key is not found.
 pub fn get_from_cache(section: CacheSection, key: &str) -> String {
     let cache = CACHE.lock().unwrap();
 
