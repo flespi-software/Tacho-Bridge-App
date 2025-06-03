@@ -57,3 +57,12 @@ All notable changes to this project will be documented in this file.
 ### [0.6.1] - 2025-05-13
 
 [feature] Protocol detection mechanism is improved. Now the protocol is selected based on the card's preferences, which improves the stability of authorization with old-generation tachographs and Stoneridge.
+
+### [0.7.0] - 2025-05-29
+
+[feature] Redesigned UI. Now it's much cooler and more convenient. Added the ability to pre-configure cards regardless of their physical connection. It is possible to create many cards at once, after which it is possible to make a link with the selected connected card. It is now possible to add a name to the configured card for ease of searching in the displayed list.  
+[feature] Major change to the way cards are managed within the app. Changes have been made to card processing and the logic for sending APDU commands.  
+[fix] Changed the main card identifier, previously it was ATR, now it's ICCID. ATR does not provide the proper level of uniqueness as ICCID, so collisions and crashes in the application could occur where different cards were defined as one, now this problem has been fixed. Now ICCID is used as a unique card identifier.  
+[fix] Due to changes in the identifier, changes have been made to the configuration structure that is stored locally on the computer. Previously, this was a combination of ATR = Card_number, now the card identifier is card_number, which is an object and contains information available to it, such as iccid, expire date, etc.  
+[fix] Fixed a critical bug with the application looping if a physically faulty reader or broken drivers are connected.  
+[fix] Refactoring and bug fixes.  

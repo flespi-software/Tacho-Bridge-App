@@ -1,8 +1,14 @@
-export interface Todo {
-  id: number
-  content: string
+// Interfaces
+export interface SmartCard {
+  name?: string
+  iccid?: string
 }
 
-export interface Meta {
-  totalCount: number
+export interface Reader {
+  name: string
+  status: string
+  iccid: string
+  card_number: string
+  online?: boolean | undefined
+  authentication?: boolean | undefined
 }

@@ -136,13 +136,13 @@ async fn check_latest_version() -> Result<(), reqwest::Error> {
     if response.status().is_success() {
         let release: Release = response.json().await?;
         // log::info!("Latest release info: {:?}", release);
-
+        
         let latest_version = release.tag_name;
         let current_version = env!("CARGO_PKG_VERSION");
 
         let latest_version_num = version_to_number(&latest_version);
         let current_version_num = version_to_number(current_version);
-
+        
         if current_version_num > latest_version_num {
             log::info!(
                 "Version (current: {}, latest: {})",

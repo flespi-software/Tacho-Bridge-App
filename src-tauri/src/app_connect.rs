@@ -2,34 +2,35 @@
 //!
 //! This module provides functionality for creating and managing MQTT connections.
 
-// Standard library imports
-use std::io::ErrorKind; // For categorizing I/O errors.
-use std::time::Duration; // For specifying time durations.
+// ───── Std Lib ─────
+use std::io::ErrorKind;                  // For categorizing I/O errors.
+use std::time::Duration;                 // For specifying time durations.
 
-// MQTT client library imports
-use rumqttc::v5::ConnectionError; // For handling MQTT connection errors.
+// ───── MQTT Client Library (rumqttc) ─────
+use rumqttc::v5::ConnectionError;        // For handling MQTT connection errors.
 use rumqttc::v5::StateError::{self, AwaitPingResp, ServerDisconnect}; // Specific error for server disconnection.
-use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions}; // Core MQTT async client and options.
+use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};         // Core MQTT async client and options.
 
-// Import TASK_POOL from the smart_card module
-use crate::smart_card::TASK_POOL;   // Task pool for managing MQTT connections.
+// ───── Smart Card ─────
+use crate::smart_card::TASK_POOL;        // Task pool for managing MQTT connections.
 
-// Tauri application framework imports
+// ───── Tauri ─────
 use tauri::async_runtime::{self, JoinHandle}; // Async runtime and task join handles for Tauri apps.
 
-// Serialization/Deserialization library imports
-use serde_json::Value; // For working with JSON data structures.
+// ───── Serialization ─────
+use serde_json::Value;                   // For working with JSON data structures.
+
+// ───── Local Modules ─────
+use crate::config::get_from_cache;       // Function to get data from cache for syncing server data.
+use crate::config::split_host_to_parts;  // Function to split the host into parts for MQTT connection.
+use crate::config::CacheSection;         // Enum for cache sections for getting data from cache.
+use crate::smart_card::ProcessingCard;
 
 /// Timeout in seconds to wait before reconnecting to the server.
 ///
 /// This value is used to set the interval between reconnection attempts
 /// to the MQTT server in case of connection loss.
 const SLEEP_DURATION_SECS: u64 = 10;
-
-// Importing specific functionality from local modules
-use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
-use crate::config::split_host_to_parts; // Function to split the host into parts for MQTT connection.
-use crate::config::CacheSection; // Enum for cache sections for getting data from cache.
 
 /// Ensures an MQTT connection for the specified client ID.
 #[tauri::command]
@@ -61,7 +62,7 @@ pub async fn app_connection() {
     // This part of function checks if a connection already exists for the given client ID
     // in the task pool. If not, it initiates a new connection. This is useful for maintaining
     // a list of active MQTT connections and ensuring that each client ID is only connected once.
-    let exists = task_pool.iter().any(|(id, _, _)| *id == client_id);
+    let exists = task_pool.iter().any(|card| card.client_id == client_id);
     // If existing connection is found, then return, no add a new connection for this client_id
     if exists {
         return;
@@ -80,11 +81,8 @@ pub async fn app_connection() {
     // `10` is the capacity of the internal channel used by the event loop for buffering operations
     let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
     let mqtt_clinet_cloned = mqtt_client.clone();
-    // let client_id_cloned = client_id.clone();
-
     let log_header: String = format!("{} |", client_id);
 
-    // create async task for the mqtt client
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
         loop {
@@ -140,14 +138,12 @@ pub async fn app_connection() {
                         ConnectionError::MqttState(ServerDisconnect { .. }) => log::warn!("{} The connection was terminated on the server side. Most likely the user has turned off the channel/device.", log_header),
                         ConnectionError::MqttState(AwaitPingResp { .. }) => {
                             log::warn!("{} Awaiting PING response from the server. The connection might be unstable.", log_header);
-                            // Implement your reconnection or handling strategy here
                         },
                         ConnectionError::MqttState(StateError::Io{ .. }) => {
                             log::warn!("{} MQTT state IO error: Connection closed by peer", log_header);
                         },
                         _ => {
                             log::error!("{} Unhandled error: {:?}", log_header, e);
-                            // return; // exit the loop
                         },
                     };
                     // Reconnection timeout for handled errors
@@ -157,12 +153,21 @@ pub async fn app_connection() {
         }
     });
 
-    task_pool.push((client_id, mqtt_clinet_cloned, handle));
+    task_pool.push(ProcessingCard {
+        client_id,
+        reader_name: None,
+        atr: None,
+        mqtt_client: mqtt_clinet_cloned,
+        task_handle: handle,
+    });
 
-    // Логирование содержимого task_pool после добавления новой задачи
-    log::info!("Current tasks in the pool:");
-    for (id, _, _) in task_pool.iter() {
-        log::info!("Client ID: {}", id);
-    }
- 
+    for (i, card) in task_pool.iter().enumerate() {
+        log::info!(
+            "TASK_POOL: [{}] Client ID: {}, Reader: {}, ATR: {}",
+            i,
+            card.client_id,
+            card.reader_name.as_deref().unwrap_or("unknown"),
+            card.atr.as_deref().unwrap_or("unknown"),
+        );
+    } 
 }
