@@ -153,7 +153,7 @@ fn update_card_config(
     let mut config = load_config(config_path)?;
     log::debug!("Loaded configuration: {:?}", config);
 
-    let mut needs_restart = false;
+    // let mut needs_restart = false;
     let mut changed = false;
 
     match config.cards.get_mut(card_number) {
@@ -169,7 +169,7 @@ fn update_card_config(
                 existing_card.iccid = content.iccid;
                 existing_card.expire = content.expire;
                 existing_card.name = content.name;
-                needs_restart = true;
+                // needs_restart = true;
                 changed = true;
             } else {
                 // Update optional fields only (no restart required)
@@ -196,7 +196,7 @@ fn update_card_config(
                 content.expire
             );
             config.cards.insert(card_number.to_string(), content);
-            needs_restart = true;
+            // needs_restart = true;
             changed = true;
         }
     }
@@ -616,6 +616,7 @@ fn migrate_old_config(contents: &str) -> Option<ConfigurationFile> {
     #[derive(Deserialize)]
     struct OldConfig {
         name: String,
+        #[allow(dead_code)] // to say the compiler does not warn about an unused field that is used in another file.
         version: String,
         description: String,
         appearance: Option<AppearanceConfig>,
@@ -628,7 +629,7 @@ fn migrate_old_config(contents: &str) -> Option<ConfigurationFile> {
 
     let mut new_cards = HashMap::new();
     if let Some(old_cards ) = old_config.cards {
-        for (atr, card_number) in old_cards {
+        for (_, card_number) in old_cards {
             let card_config = CardConfig {
                 iccid: String::new(),
                 expire: None,

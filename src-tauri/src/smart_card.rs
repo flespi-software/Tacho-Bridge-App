@@ -32,6 +32,7 @@ pub struct ProcessingCard {
     pub client_id: String,              // it is Card number. Uses as client_id for mqtt connection
     pub reader_name: Option<String>,    // Name of the smart card reader (e.g., "Alcor Micro AU9540 00 00").
     pub atr: Option<String>,            // ATR of the inserted card (hex-encoded).
+    #[allow(dead_code)] // to say the compiler does not warn about an unused field that is used in another file.
     pub mqtt_client: AsyncClient,       // MQTT client instance.
     pub task_handle: JoinHandle<()>,    // Async task handle managing communication for this card.
 }
