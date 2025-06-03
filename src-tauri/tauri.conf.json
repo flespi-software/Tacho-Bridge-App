@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "tba",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "identifier": "com.flespi.tba.dev",
   "build": {
     "frontendDist": "../dist/spa",

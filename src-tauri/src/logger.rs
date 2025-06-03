@@ -85,7 +85,7 @@ pub fn setup_logging() {
                 message
             ))
         })
-        .level(log::LevelFilter::Debug)  // For debugging it is needed to set up 'Debug' filter level
+        .level(log::LevelFilter::Info)  // For debugging it is needed to set up 'Debug' filter level
         .chain(fern::log_file(&log_path).unwrap())
         .apply()
     {
