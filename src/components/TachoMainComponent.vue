@@ -192,8 +192,6 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
   if (update_result && readerIndex > -1) {
     const reader = state.readers[readerIndex]
     if (reader) {
-      reader.card_number = cardNumber || ''
-
       // Run update only if reader definitely exists// Запускаем обновление только если reader точно существует
       await invoke('manual_sync_cards', {
         readername: reader.name,
@@ -274,8 +272,6 @@ async function updateCard(number: string, data: SmartCard) {
 
 // remove card func from the config
 const removeCard = async (cardNumber: string) => {
-  state.readers = state.readers.filter((reader) => reader.card_number !== cardNumber)
-
   try {
     await invoke('remove_card', { cardnumber: cardNumber })
     console.log('Card removed:', cardNumber)
