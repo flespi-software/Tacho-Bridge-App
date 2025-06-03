@@ -154,9 +154,8 @@ listen('global-cards-sync', (event) => {
       status,
       iccid,
       card_number,
-      online: payload.online !== null ? payload.online : existingReader.online,
-      authentication:
-        payload.authentication !== null ? payload.authentication : existingReader.authentication,
+      online: payload.online,
+      authentication: payload.authentication
     }
   } else {
     // If reader with the same name is not found, add the reader to the list
