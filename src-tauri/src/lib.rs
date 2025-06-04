@@ -7,6 +7,10 @@ mod logger;             // Logging functionality.
 mod mqtt;               // MQTT communication.
 mod smart_card;         // PCSC module for smart card operations.
 mod global_app_handle;  // Global access to app state and emitters.
+#[cfg(desktop)]
+mod menu_plugin;
+#[cfg(desktop)]
+mod tray;               // Tray
 
 // ───── External Crates ─────
 use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application framework and async runtime.
@@ -14,7 +18,14 @@ use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application
 pub fn run() {
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
     tauri::Builder::default()
-        .setup(move |app| {            
+        .setup(move |app| {  
+            #[cfg(all(desktop, not(test)))]
+            {
+                let handle = app.handle();
+                tray::create_tray(handle)?;
+                handle.plugin(menu_plugin::init())?;
+            }
+                        
             // Obtain a lightweight reference to the app for convenient interaction
             let app_handle = app.app_handle();
 

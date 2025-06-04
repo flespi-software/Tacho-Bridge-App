@@ -1,13 +1,53 @@
 <template>
   <q-layout view="lHh Lpr lFf">
-    <q-header elevated>
-      <q-toolbar>
-        <!-- Title in the up of the app -->
-        <q-toolbar-title class="q-ml-md">
-          Tacho Bridge Application
-          <q-icon name="mdi-record-circle-outline" class="q-ml-md" />
-        </q-toolbar-title>
-
+    <q-header data-tauri-drag-region style="border-radius: 5px 5px 0 0; overflow: hidden">
+      <q-bar dark class="bg-grey-8 text-white glossy" data-tauri-drag-region>
+        <template v-if="Platform.is.mac">
+          <q-btn dense flat round icon="lens" size="8.5px" color="red" @click="appWindow.hide()" />
+          <q-btn
+            dense
+            flat
+            round
+            icon="lens"
+            size="8.5px"
+            color="yellow"
+            @click="appWindow.toggleMaximize()"
+          />
+          <q-btn
+            dense
+            flat
+            round
+            icon="lens"
+            size="8.5px"
+            color="green"
+            @click="appWindow.minimize()"
+          />
+        </template>
+        <div
+          class="absolute-center text-center text-weight-bold non-selectable"
+          data-tauri-drag-region
+        >
+          <q-img
+            src="../icons/favicon-16x16.png"
+            width="16px"
+            style="vertical-align: middle"
+            class="q-mr-xs"
+          />
+          <span class="gt-xs" data-tauri-drag-region>Tacho Bridge Application</span>
+          <span class="lt-sm" data-tauri-drag-region>TBA</span>
+        </div>
+        <q-space />
+        <template v-if="!Platform.is.mac">
+          <q-btn dense flat icon="mdi-window-minimize" @click="appWindow.minimize()" />
+          <q-btn dense flat icon="mdi-window-restore" @click="appWindow.toggleMaximize()" />
+          <q-btn dense flat icon="mdi-close" @click="appWindow.hide()" />
+        </template>
+      </q-bar>
+    </q-header>
+    <q-footer>
+      <q-bar dark class="bg-grey-8 text-white">
+        <q-icon name="mdi-record-circle-outline" />
+        <q-space />
         <!-- Button of the Dialog of the server configuration -->
         <div class="q-pa-xs q-gutter-sm">
           <q-btn flat round icon="mdi-cog" @click="config = true" />
@@ -54,8 +94,8 @@
             </q-card>
           </q-dialog>
         </div>
-      </q-toolbar>
-    </q-header>
+      </q-bar>
+    </q-footer>
 
     <q-page-container>
       <router-view />
@@ -64,12 +104,14 @@
 </template>
 
 <script setup lang="ts">
-import { useQuasar, Notify } from 'quasar'
+import { useQuasar, Notify, Platform } from 'quasar'
 import { ref, computed, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import 'animate.css'
 
+const appWindow = getCurrentWindow()
 const TBA_IDENT_REGEXP = /^TBA\d{13}$/ // Regular expression for the company card number
 const isIndetValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))
 const ident = ref('') // Input field for ident without prefix
@@ -131,7 +173,7 @@ const saveServerConfig = async (host: string, ident: string, theme: string) => {
 
     // Launch a manual refresh of server connections.
     await invoke('manual_sync_cards', {
-      readername: "",
+      readername: '',
       restart: true,
     })
     console.log('Server configuration updated successfully_1')
@@ -211,5 +253,4 @@ listen('global-notification', (event) => {
 }).catch((error) => {
   console.error('Error listening to global-notification:', error)
 })
-
 </script>
