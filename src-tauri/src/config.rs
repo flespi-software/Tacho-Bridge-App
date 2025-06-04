@@ -303,6 +303,17 @@ pub async fn remove_card_from_config(
 
         emit_card_config_event("global-card-config-updated", card_number.to_string(), None);
 
+        #[cfg(target_os = "linux")] {
+            // "Super hack" to reload card states and trigger an event to update readers.
+
+            use tokio::time::sleep;
+            use tokio::time::Duration;
+            use crate::smart_card::manual_sync_cards;
+
+            sleep(Duration::from_millis(100)).await;
+            manual_sync_cards(card_number.to_string(), false).await;
+        }
+
         Ok(())
     } else {
         log::warn!("Cardnumber {} not found in configuration", card_number);
@@ -400,7 +411,7 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
             log::debug!("No ICCID match found for: {}", key);
             "".to_string()
         }
-        
+
         CacheSection::Server => {
             log::debug!("Accessing Server config");
             if let Some(server) = &cache.server {
@@ -557,7 +568,7 @@ pub fn init_config() -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     log::debug!("config: saved config");
-    
+
     /*
         Send data of all cards in events one by one to the front.
     */

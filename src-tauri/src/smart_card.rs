@@ -101,7 +101,7 @@ fn setup_reader_states(
 
     reader_states.retain(|rs| !is_dead(rs));
     // Add new readers.
-    
+
     let names = match ctx.list_readers(readers_buf) {
         Ok(names) => names,
         Err(e) => {
@@ -142,7 +142,7 @@ async fn process_reader_states(
             // convert ATR to hex string value
             let atr = hex::encode(rs.atr());
             let protocol = parse_atr_and_get_protocol(&atr);
-            // log::info!("Reader: {:?}. ATR: {}. Protocol: {:?}", reader_name, atr, protocol);        
+            // log::info!("Reader: {:?}. ATR: {}. Protocol: {:?}", reader_name, atr, protocol);
 
             /*
                 This is a CRUTCH!!! Need to find a better way to convert card_state to string
@@ -357,7 +357,7 @@ pub async fn sc_monitor() -> ! {
                 log::error!("get_status_change failed: {:?}", e);
                 break;
             }
-            
+
             if let Err(e) =
                 process_reader_states(&mut reader_states).await
             {
@@ -508,61 +508,64 @@ pub async fn manual_sync_cards(
         log::error!("Failed to setup reader states: {:?}", e);
     }
     // waiting for the status change
-    ctx.get_status_change(None, &mut reader_states)
+    ctx.get_status_change(Some(Duration::from_secs(1)), &mut reader_states)
         .expect("failed to get status change");
 
-    for rs in reader_states {
-        if rs.name() != PNP_NOTIFICATION() {
-            if is_virtual_reader(rs.name()) {
-                log::warn!("Virtual reader {:?} detected. Skipping...", rs.name());
-                continue; // Skipping virtual reader processing
-            }
+    process_reader_states(&mut reader_states)
+        .await
+        .map_err(|e| format!("Processing failed: {}", e))?;
 
-            // convert reader name to string
-            let reader_name = rs.name(); // .to_str().unwrap(); // convert reader name(&CStr) to string
-            let reader_name_string = reader_name.to_str().unwrap();
+    // for rs in reader_states {
+    //     if rs.name() != PNP_NOTIFICATION() {
+    //         if is_virtual_reader(rs.name()) {
+    //             log::warn!("Virtual reader {:?} detected. Skipping...", rs.name());
+    //             continue; // Skipping virtual reader processing
+    //         }
 
-            // convert ATR to hex string value
-            let atr = hex::encode(rs.atr());
-            let protocol = parse_atr_and_get_protocol(&atr);
-            log::info!("Reader: {:?}. ATR: {}. Protocol: {:?}", reader_name, atr, protocol);        
+    //         // convert reader name to string
+    //         let reader_name = rs.name(); // .to_str().unwrap(); // convert reader name(&CStr) to string
+    //         let reader_name_string = reader_name.to_str().unwrap();
 
-            /*
-                This is a CRUTCH!!! Need to find a better way to convert card_state to string
-                The meaning of the card_state is in the pcsc module with the their own state enum.
-                The card_state is a bit mask and it is not clear how to convert it to a human readable string properly
-            */
-            let card_state_string = format!("{:?}", rs.event_state());
-            log::debug!("card_state_string {}", card_state_string);
+    //         // convert ATR to hex string value
+    //         let atr = hex::encode(rs.atr());
+    //         let protocol = parse_atr_and_get_protocol(&atr);
+    //         log::info!("Reader: {:?}. ATR: {}. Protocol: {:?}", reader_name, atr, protocol);
 
-            // If the card state has not 'CHANGED' state, then we skip the processing of this card
-            // Due to the specifics of the library, the card can be initialized in several stages,
-            // But we only need the final result with the value changed
+    //         /*
+    //             This is a CRUTCH!!! Need to find a better way to convert card_state to string
+    //             The meaning of the card_state is in the pcsc module with the their own state enum.
+    //             The card_state is a bit mask and it is not clear how to convert it to a human readable string properly
+    //         */
+    //         let card_state_string = format!("{:?}", rs.event_state());
+    //         log::debug!("card_state_string {}", card_state_string);
 
-            if readername == reader_name_string {
-                match ManagedCard::new(reader_name, protocol) {
-                    Ok(managed_card) => {
-                        if let Err(e) = managed_card.disconnect().await {
-                            log::error!("Failed to disconnect: {}", e);
-                        } else {
-                            log::info!("Card disconnected: {}", reader_name_string);
-                        }
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Failed to disconnect the card for reader {}: {}",
-                            reader_name_string,
-                            e
-                        );
-                    }
-                }
-            }
-        };
-    }
+    //         // If the card state has not 'CHANGED' state, then we skip the processing of this card
+    //         // Due to the specifics of the library, the card can be initialized in several stages,
+    //         // But we only need the final result with the value changed
+
+    //         if readername == reader_name_string {
+    //             match ManagedCard::new(reader_name, protocol) {
+    //                 Ok(managed_card) => {
+    //                     if let Err(e) = managed_card.disconnect().await {
+    //                         log::error!("Failed to disconnect: {}", e);
+    //                     } else {
+    //                         log::info!("Card disconnected: {}", reader_name_string);
+    //                     }
+    //                 }
+    //                 Err(e) => {
+    //                     log::error!(
+    //                         "Failed to disconnect the card for reader {}: {}",
+    //                         reader_name_string,
+    //                         e
+    //                     );
+    //                 }
+    //             }
+    //         }
+    //     };
+    // }
 
     Ok(())
 }
-
 //////////////////////////////////////////////////
 /// CARD WRAPER //////////////////////////////////
 /// //////////////////////////////////////////////
@@ -658,7 +661,6 @@ impl ManagedCard {
         Ok(())
     }
 
-    
     pub async fn disconnect(&self) -> Result<(), Box<dyn StdError + Send + Sync>> {
         let mut guard = self.inner.lock().await;
 
@@ -667,10 +669,38 @@ impl ManagedCard {
             Context::establish(Scope::User)?
                 .connect(&self.reader_name, ShareMode::Shared, self.protocol)?
         );
+        debug!("disconnect_1");
 
-        dummy_card
-            .disconnect(pcsc::Disposition::ResetCard)
-            .map_err(|(_, err)| Box::new(err) as _)
+        #[cfg(target_os = "linux")]
+        {
+            log::debug!("Linux-specific disconnect logic started.");
+
+            // 3. Пробуем насильно триггернуть обновление статуса
+            let mut reader_states = vec![
+                pcsc::ReaderState::new(self.reader_name.as_ref(), pcsc::State::UNAWARE)
+            ];
+
+            match Context::establish(Scope::User)?.get_status_change(Some(Duration::from_millis(1)), &mut reader_states) {
+                Ok(_) => log::debug!("Status change triggered successfully for {}", self.reader_name.to_string_lossy()),
+                Err(e) => log::warn!("get_status_change failed on Linux: {}", e),
+            }
+
+            return Ok(());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            return dummy_card
+                .disconnect(pcsc::Disposition::ResetCard)
+                .map_err(|(_, err)| Box::new(err) as _);
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            return dummy_card
+                .disconnect(pcsc::Disposition::ResetCard)
+                .map_err(|(_, err)| Box::new(err) as _);
+        }
     }
 
     pub async fn apdu_transmit(&self, apdu_hex: &str) -> Result<String, Box<dyn StdError + Send + Sync>> {
@@ -783,7 +813,7 @@ impl ManagedCard {
             }
         }
     }
-        
+
     /// Returns the card ICCID using lazy caching.
     /// On first call, reads it from the card; subsequent calls return the cached value.
     pub async fn get_iccid(&self) -> Result<String, Box<dyn StdError + Send + Sync>> {
@@ -807,7 +837,7 @@ impl ManagedCard {
         if !select_result.ends_with("9000") {
             log::warn!("SELECT EF ICC returned unexpected status: {}", select_result);
         }
-        
+
         // READ BINARY (10 байт)
         let read_response = self.apdu_transmit("00B0000108").await?;
 
