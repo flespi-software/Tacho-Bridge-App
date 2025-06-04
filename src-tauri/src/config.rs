@@ -299,7 +299,7 @@ pub async fn remove_card_from_config(
 
         // Kill card task with the specified client_id (card number)
         remove_connections(vec![card_number.to_string()]).await;
-        log::info!("Removed connection for card {}", card_number);
+        log::debug!("Removed connection for card {}", card_number);
 
         emit_card_config_event("global-card-config-updated", card_number.to_string(), None);
 
@@ -492,39 +492,39 @@ pub fn load_config_to_cache(
         appearance: config.appearance.clone(),
     };
 
-    trace_cache(&*cache);
+    // trace_cache(&*cache);
 
     Ok(())
 }
 
-pub fn trace_cache(cache: &CacheConfigData) {
-    log::debug!("HashMap: Company Card Number => Card Configuration ----------");
-    for (card_number, card_config) in cache.cards.iter() {
-        log::debug!(
-            "CN: {:<16} | ICCID: {:<16} | Expire: {}",
-            card_number,
-            card_config.iccid,
-            card_config.expire.unwrap_or(0)
-        );
-    }
-    log::debug!("{}", "-".repeat(70));
+// pub fn trace_cache(cache: &CacheConfigData) {
+//     log::debug!("HashMap: Company Card Number => Card Configuration ----------");
+//     for (card_number, card_config) in cache.cards.iter() {
+//         log::debug!(
+//             "CN: {:<16} | ICCID: {:<16} | Expire: {}",
+//             card_number,
+//             card_config.iccid,
+//             card_config.expire.unwrap_or(0)
+//         );
+//     }
+//     log::debug!("{}", "-".repeat(70));
 
-    if let Some(ident) = &cache.ident {
-        log::debug!("ident: {}", ident);
-    }
+//     if let Some(ident) = &cache.ident {
+//         log::debug!("ident: {}", ident);
+//     }
 
-    if let Some(server) = &cache.server {
-        log::info!("Server Host: {}", server.host);
-    } else {
-        log::info!("No server configuration found.");
-    }
+//     if let Some(server) = &cache.server {
+//         log::debug!("Server Host: {}", server.host);
+//     } else {
+//         log::warn!("No server configuration found.");
+//     }
 
-    if let Some(appearance) = &cache.appearance {
-        log::info!("Appearance: {:?}", appearance);
-    } else {
-        log::info!("No appearance configuration found.");
-    }
-}
+//     if let Some(appearance) = &cache.appearance {
+//         log::debug!("Appearance: {:?}", appearance);
+//     } else {
+//         log::warn!("No appearance configuration found.");
+//     }
+// }
 
 /// Generates a unique ident value based on the current time in microseconds.
 /// The ident value is in the format "TBA" followed by 13 digits.

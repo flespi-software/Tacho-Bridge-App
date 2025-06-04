@@ -112,7 +112,7 @@ fn setup_reader_states(
 
     for name in names {
         if !reader_states.iter().any(|rs| rs.name() == name) {
-            log::info!("Reader {:?} has been connected to the computer", name);
+            log::debug!("Reader {:?} has been connected to the computer", name);
             reader_states.push(ReaderState::new(name, PcscState::UNAWARE));
         }
     }
@@ -465,7 +465,6 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
 // Manual card sync function. ////////////
 // This function is used to manually sync cards from anywhere in the program.
 // Manually sync cards. Clicking on the button in the frontend will trigger this function
-
 #[tauri::command]
 pub async fn manual_sync_cards(
     readername: String,
@@ -530,14 +529,14 @@ pub struct ManagedCard {
 
 impl ManagedCard {
     pub fn new(reader_name: &CStr, protocol: Protocols) -> Result<Self, Box<dyn StdError + Send + Sync>> {
-        info!(
+        debug!(
             "ManagedCard::new() called. Reader: '{}', Protocol: {:?}",
             reader_name.to_string_lossy(),
             protocol
         );
 
         let card = Self::create_card(reader_name, protocol)?;
-        info!(
+        debug!(
             "Card successfully created for reader: '{}'",
             reader_name.to_string_lossy()
         );
@@ -576,7 +575,7 @@ impl ManagedCard {
 
         match card.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::ResetCard) {
             Ok(_) => {
-                info!(
+                debug!(
                     "Card reconnected successfully for reader: {}",
                     self.reader_name.to_string_lossy()
                 );
@@ -612,47 +611,46 @@ impl ManagedCard {
         Ok(())
     }
 
-    pub async fn disconnect(&self) -> Result<(), Box<dyn StdError + Send + Sync>> {
-        let mut guard = self.inner.lock().await;
+    // pub async fn disconnect(&self) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    //     let mut guard = self.inner.lock().await;
 
-        let dummy_card = mem::replace(
-            &mut *guard,
-            Context::establish(Scope::User)?
-                .connect(&self.reader_name, ShareMode::Shared, self.protocol)?
-        );
-        debug!("disconnect_1");
+    //     let dummy_card = mem::replace(
+    //         &mut *guard,
+    //         Context::establish(Scope::User)?
+    //             .connect(&self.reader_name, ShareMode::Shared, self.protocol)?
+    //     );
 
-        #[cfg(target_os = "linux")]
-        {
-            log::debug!("Linux-specific disconnect logic started.");
+    //     #[cfg(target_os = "linux")]
+    //     {
+    //         log::debug!("Linux-specific disconnect logic started.");
 
-            // 3. Пробуем насильно триггернуть обновление статуса
-            let mut reader_states = vec![
-                pcsc::ReaderState::new(self.reader_name.as_ref(), pcsc::State::UNAWARE)
-            ];
+    //         // force trigger status update
+    //         let mut reader_states = vec![
+    //             pcsc::ReaderState::new(self.reader_name.as_ref(), pcsc::State::UNAWARE)
+    //         ];
 
-            match Context::establish(Scope::User)?.get_status_change(Some(Duration::from_millis(1)), &mut reader_states) {
-                Ok(_) => log::debug!("Status change triggered successfully for {}", self.reader_name.to_string_lossy()),
-                Err(e) => log::warn!("get_status_change failed on Linux: {}", e),
-            }
+    //         match Context::establish(Scope::User)?.get_status_change(Some(Duration::from_millis(1)), &mut reader_states) {
+    //             Ok(_) => log::debug!("Status change triggered successfully for {}", self.reader_name.to_string_lossy()),
+    //             Err(e) => log::warn!("get_status_change failed on Linux: {}", e),
+    //         }
 
-            return Ok(());
-        }
+    //         return Ok(());
+    //     }
 
-        #[cfg(target_os = "macos")]
-        {
-            return dummy_card
-                .disconnect(pcsc::Disposition::ResetCard)
-                .map_err(|(_, err)| Box::new(err) as _);
-        }
+    //     #[cfg(target_os = "macos")]
+    //     {
+    //         return dummy_card
+    //             .disconnect(pcsc::Disposition::ResetCard)
+    //             .map_err(|(_, err)| Box::new(err) as _);
+    //     }
 
-        #[cfg(target_os = "windows")]
-        {
-            return dummy_card
-                .disconnect(pcsc::Disposition::ResetCard)
-                .map_err(|(_, err)| Box::new(err) as _);
-        }
-    }
+    //     #[cfg(target_os = "windows")]
+    //     {
+    //         return dummy_card
+    //             .disconnect(pcsc::Disposition::ResetCard)
+    //             .map_err(|(_, err)| Box::new(err) as _);
+    //     }
+    // }
 
     pub async fn apdu_transmit(&self, apdu_hex: &str) -> Result<String, Box<dyn StdError + Send + Sync>> {
         use crate::smart_card::MAX_BUFFER_SIZE;
@@ -747,7 +745,7 @@ impl ManagedCard {
         // Seccond attempt
         match self.apdu_transmit(apdu_hex).await {
             Ok(response) => {
-                info!(
+                debug!(
                     "{} APDU response (after recreate): {:?}",
                     client_id,
                     response

@@ -181,7 +181,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                             // PROCESS AUTHORIZATION WITH APDU COMMUNICATION
                                             // The "hex" parameter contains the apdu instruction that needs to be transferred to the card
                                             if let Some(hex_value) = json_payload.get("payload").and_then(|v| v.as_str()) {
-                                                log::info!(
+                                                log::debug!(
                                                     "{} TRACKER: Payload hex value: {}",
                                                     log_header,
                                                     hex_value
@@ -198,6 +198,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
                                                     // If the input value is empty, then pass the ATR to the server.
                                                     rapdu_mqtt_hex = atr_clone.clone();
+                                                    log::info!("Authentication process is started");
 
                                                     // Send the global-cards-sync event to the frontend that card is connected
                                                     emit_event("global-cards-sync",
@@ -211,10 +212,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
                                                 } else {
                                                     // // Otherwise, the logic for exchanging messages with the card.
-                                                    let response = managed_card.send_apdu(&hex_value, &client_id_cloned).await;
-                                                    log::info!("rapdu_mqtt_hex: {}", response);
-
-                                                    rapdu_mqtt_hex = response;
+                                                    rapdu_mqtt_hex = managed_card.send_apdu(&hex_value, &client_id_cloned).await;
 
                                                     // Send the global-cards-sync event to the frontend that card is connected
                                                     emit_event("global-cards-sync",
@@ -239,7 +237,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                 );
                                             }
 
-                                            log::info!(
+                                            log::debug!(
                                                 "{} CARD: Payload hex value: {}",
                                                 log_header,
                                                 payload_ack
@@ -282,7 +280,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             )
                         }
                         Event::Incoming(Incoming::PingResp(..)) => {
-                            log::info!(
+                            log::debug!(
                                 "{} Ping response received from the server.",
                                 log_header
                             );
@@ -350,7 +348,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     });
 
     for (i, card) in task_pool.iter().enumerate() {
-        log::info!(
+        log::debug!(
             "TASK_POOL: [{}] Client ID: {}, Reader: {}, ATR: {}",
             i,
             card.client_id,
@@ -373,7 +371,7 @@ pub async fn remove_connections(client_ids: Vec<String>) {
             let card = task_pool.remove(index);
             card.task_handle.abort();
 
-            log::info!(
+            log::debug!(
                 "TASK_POOL: Connection terminated for client_id: {}, reader: {}, atr: {}",
                 card.client_id,
                 card.reader_name.as_deref().unwrap_or("unknown"),
@@ -392,7 +390,7 @@ pub async fn remove_connections_all() {
 
     // Abort each task and log which client is being disconnected
     for card in task_pool.drain(..) {
-        log::info!(
+        log::debug!(
             "TASK_POOL: Aborting task for client_id: {}, reader: {}, atr: {}",
             card.client_id,
             card.reader_name.as_deref().unwrap_or("unknown"),
@@ -401,7 +399,7 @@ pub async fn remove_connections_all() {
         card.task_handle.abort();
     }
 
-    log::info!("All card connections have been terminated and the task pool has been cleared.");
+    log::debug!("All card connections have been terminated and the task pool has been cleared.");
 }
 
 fn process_rapdu_mqtt_hex(rapdu_mqtt_hex: String) -> String {

@@ -35,7 +35,6 @@ const SLEEP_DURATION_SECS: u64 = 10;
 /// Ensures an MQTT connection for the specified client ID.
 #[tauri::command]
 pub async fn app_connection() {
-    log::debug!("Ensuring APP MQTT connection...");
     // Getting server data from the cache
     let full_host = get_from_cache(CacheSection::Server, "host");
     let (host, port) = match split_host_to_parts(&full_host) {
@@ -110,7 +109,7 @@ pub async fn app_connection() {
                             // serializable data to interpret it as json
                             match serde_json::from_slice::<Value>(&publish.payload) {
                                 Ok(json_payload) => {
-                                    println!("Parsed JSON payload: {:?}", json_payload);
+                                    log::debug!("Parsed JSON payload: {:?}", json_payload);
                                     // The "hex" parameter contains the apdu instruction that needs to be transferred to the card
                                 }
                                 Err(e) => {
@@ -162,7 +161,7 @@ pub async fn app_connection() {
     });
 
     for (i, card) in task_pool.iter().enumerate() {
-        log::info!(
+        log::debug!(
             "TASK_POOL: [{}] Client ID: {}, Reader: {}, ATR: {}",
             i,
             card.client_id,

@@ -75,7 +75,7 @@ pub fn setup_logging() {
         }
     };
 
-    match fern::Dispatch::new()
+    let init_log_result = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
                 "{}[{}][{}] {}",
@@ -85,17 +85,14 @@ pub fn setup_logging() {
                 message
             ))
         })
-        .level(log::LevelFilter::Debug)  // For debugging it is needed to set up 'Debug' filter level
+        .level(log::LevelFilter::Info)  // Change to Debug if needed
         .chain(fern::log_file(&log_path).unwrap())
-        .apply()
-    {
-        Ok(_) => log::info!("-== Application is launched ==-"),
-        Err(e) => {
-            eprintln!("Failed to initialize logging: {}", e);
-            log::warn!("No permission to write log file at: {:?}", log_path);
-        }
-    }
+        .apply();
 
+    if let Err(e) = init_log_result {
+        log::warn!("Failed to initialize logging. No permission to write log file at: {:?}. Error: {}", log_path, e);
+    }
+    
     // Log the application launch
     log::info!("-== Application is launched ==-");
 
