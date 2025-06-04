@@ -515,55 +515,6 @@ pub async fn manual_sync_cards(
         .await
         .map_err(|e| format!("Processing failed: {}", e))?;
 
-    // for rs in reader_states {
-    //     if rs.name() != PNP_NOTIFICATION() {
-    //         if is_virtual_reader(rs.name()) {
-    //             log::warn!("Virtual reader {:?} detected. Skipping...", rs.name());
-    //             continue; // Skipping virtual reader processing
-    //         }
-
-    //         // convert reader name to string
-    //         let reader_name = rs.name(); // .to_str().unwrap(); // convert reader name(&CStr) to string
-    //         let reader_name_string = reader_name.to_str().unwrap();
-
-    //         // convert ATR to hex string value
-    //         let atr = hex::encode(rs.atr());
-    //         let protocol = parse_atr_and_get_protocol(&atr);
-    //         log::info!("Reader: {:?}. ATR: {}. Protocol: {:?}", reader_name, atr, protocol);
-
-    //         /*
-    //             This is a CRUTCH!!! Need to find a better way to convert card_state to string
-    //             The meaning of the card_state is in the pcsc module with the their own state enum.
-    //             The card_state is a bit mask and it is not clear how to convert it to a human readable string properly
-    //         */
-    //         let card_state_string = format!("{:?}", rs.event_state());
-    //         log::debug!("card_state_string {}", card_state_string);
-
-    //         // If the card state has not 'CHANGED' state, then we skip the processing of this card
-    //         // Due to the specifics of the library, the card can be initialized in several stages,
-    //         // But we only need the final result with the value changed
-
-    //         if readername == reader_name_string {
-    //             match ManagedCard::new(reader_name, protocol) {
-    //                 Ok(managed_card) => {
-    //                     if let Err(e) = managed_card.disconnect().await {
-    //                         log::error!("Failed to disconnect: {}", e);
-    //                     } else {
-    //                         log::info!("Card disconnected: {}", reader_name_string);
-    //                     }
-    //                 }
-    //                 Err(e) => {
-    //                     log::error!(
-    //                         "Failed to disconnect the card for reader {}: {}",
-    //                         reader_name_string,
-    //                         e
-    //                     );
-    //                 }
-    //             }
-    //         }
-    //     };
-    // }
-
     Ok(())
 }
 //////////////////////////////////////////////////
