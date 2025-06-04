@@ -126,11 +126,8 @@ fn setup_reader_states(
 }
 
 async fn process_reader_states(
-    ctx: &Context,
     reader_states: &mut [ReaderState],
 ) -> Result<(), SmartCardError> {
-    ctx.get_status_change(None, reader_states)?;
-
     for rs in reader_states {
         if rs.name() != PNP_NOTIFICATION() {
             if is_virtual_reader(rs.name()) {
@@ -145,7 +142,7 @@ async fn process_reader_states(
             // convert ATR to hex string value
             let atr = hex::encode(rs.atr());
             let protocol = parse_atr_and_get_protocol(&atr);
-            log::info!("Reader: {:?}. ATR: {}. Protocol: {:?}", reader_name, atr, protocol);        
+            // log::info!("Reader: {:?}. ATR: {}. Protocol: {:?}", reader_name, atr, protocol);        
 
             /*
                 This is a CRUTCH!!! Need to find a better way to convert card_state to string
@@ -222,11 +219,12 @@ async fn process_reader_states(
 
                 //  Trace status of the reader & card
                 log::info!(
-                    "{:?} {:?} {:?}, {:?}",
+                    "{:?} {:?} {:?}, {:?}, Protocol: {:?}",
                     rs.name(),
                     rs.event_state(),
                     atr,
-                    card_number
+                    card_number,
+                    protocol
                 );
             }
         };
@@ -259,6 +257,7 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProce
         );
     }
 
+    log::debug!("Case 1");
     // Case 1: Both reader_name and atr are provided and not found in the pool → register new card
     if !reader_name.is_empty() && !atr.is_empty() {
         let exists = pool.iter().any(|c| {
@@ -271,19 +270,22 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProce
         }
     }
 
+    log::debug!("Case 2");
     // Case 2: ATR is empty, but a card with the same reader name and filled ATR exists → remove it
     if atr.is_empty() {
         log::debug!("ATR is empty. Checking for stale entries with reader_name = '{}'", reader_name);
+
+        log::debug!("Case 2_1");
 
         let to_remove = pool.iter().position(|c| {
             c.reader_name.as_deref() == Some(reader_name)
                 && c.atr.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
         });
-
+        log::debug!("Case 2_2");
         if let Some(index) = to_remove {
             let removed = pool.remove(index);
             removed.task_handle.abort();
-
+            log::debug!("Case 2_3");
             log::warn!(
                 "Removed stale ProcessingCard for reader {} with old ATR {}",
                 removed.reader_name.as_deref().unwrap_or("unknown"),
@@ -329,7 +331,7 @@ pub async fn sc_monitor() -> ! {
         };
 
         let mut readers_buf = [0; 2048];
-        let mut reader_states = vec![
+        let mut reader_states: Vec<ReaderState> = vec![
             // Listen for reader insertions/removals, if supported.
             ReaderState::new(PNP_NOTIFICATION(), PcscState::UNAWARE),
         ];
@@ -350,9 +352,14 @@ pub async fn sc_monitor() -> ! {
                     .map(|rs| rs.name().to_string_lossy())
                     .collect::<Vec<_>>()
             );
+
+            if let Err(e) = ctx.get_status_change(None, &mut reader_states[..]) {
+                log::error!("get_status_change failed: {:?}", e);
+                break;
+            }
             
             if let Err(e) =
-                process_reader_states(&ctx, &mut reader_states).await
+                process_reader_states(&mut reader_states).await
             {
                 match e {
                     SmartCardError::UnknownReader => {

@@ -277,7 +277,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                         }
                         Event::Incoming(Incoming::ConnAck(..)) => {
                             log::info!(
-                                "{} Сonnection to the server has been successfully established.",
+                                "{} Connection to the server has been successfully established.",
                                 log_header
                             )
                         }

@@ -120,7 +120,7 @@ pub async fn app_connection() {
                         }
                         Event::Incoming(Incoming::ConnAck(..)) => {
                             log::info!(
-                                "{} Сonnection to the server has been successfully established.",
+                                "{} Connection to the server has been successfully established.",
                                 log_header
                             )
                         }
