@@ -13,6 +13,9 @@ You can always find the latest release here: [<kbd>↴ DOWNLOAD</kbd>](https://g
 ### Windows
 - **tba_x.x.x_x64_en-US.msi** _(64-bit Windows machines)_
 
+### Linux
+- **tba_x.x.x_amd64.AppImage** _(64-bit Linux machines)_
+
 ## Specifications
 
 Project uses [Tauri framework](https://tauri.app/) = [Rust](https://www.rust-lang.org/) + [Typescript](https://www.typescriptlang.org/) + [Vue 3](https://vuejs.org/) + [Quasar](https://quasar.dev/)
@@ -29,8 +32,13 @@ Init project from the root directory
 npm install
 ```
 
-Then it is needed fetch Cargo dependeces from the rust directory
 
+Cargo can be updated only from the ./src-tauri directory
+```
+cargo update
+```
+
+Then it is needed fetch Cargo dependeces from the rust directory
 ```
 cd src-tauri
 cargo fetch
@@ -76,10 +84,21 @@ Architectures in the fat file: ./src-tauri/target/universal-apple-darwin/release
 🏁 Script execution completed
 ```
 
-Cargo can be updated only from the ./src-tauri directory
+### Linux building & using
+To install system libraries like _libssl-dev, libwebkit2gtk-4.0-dev, libgtk-3-dev etc._ you need *sudo* administrator rights. Please be careful when installing new packages and dependencies.  
+
+**[Tauri Core Dependencies](https://v1.tauri.app/v1/guides/getting-started/prerequisites#setting-up-linux)**
 ```
-cargo update
+apt install -y build-essential curl wget libssl-dev libgtk-3-dev libayatana-appindicator3-dev libwebkit2gtk-4.0-dev libappindicator3-dev libgdk-pixbuf2.0-dev squashfs-tools fuse pkg-config file zlib1g-dev
 ```
+**PCSC Smart Card Support**
+```
+apt install -y pcscd libpcsclite-dev libccid usbutils
+```
+**Optional Runtime Libraries.** Recommended if AppImage doesn’t launch or you have theming/display issues.
+```
+apt install -y libxcb1 libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxrandr2 libasound2 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 libnspr4 libnss3 libpango-1.0-0 libxss1 libxext6 libxtst6
+```  
 
 ## Icon generating & customizing
 
@@ -97,14 +116,6 @@ npm run tauri icon src-tauri/icons/app-icon.png
 ```
 
 **That's it. All the necessary icons of all sizes for all platforms will be generated.**
-
-## Card connection states
-
-![Online](src/assets/credit_card_30dp_GREEN.svg 'Online') Online connection to the server (OK)
-
-![Connected](src/assets/credit_card_30dp_GRAY.svg 'Connected') Physical connection to the computer (OK). _It is needed to check server address in the App config_
-
-![Disconnected](src/assets/credit_card_off_30dp_GRAY.svg 'Disconnected') Has no physical connection to the computer and there is no connection to the server (Not OK). _Need to check everything :(_
 
 ## License
 
