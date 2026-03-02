@@ -1,0 +1,96 @@
+name: Build TBA (Windows amd64 + Ubuntu 22.04 amd64)
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-amd64:
+    name: Windows amd64 (MSI)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Setup Rust 1.77.2
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.77.2"
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install NPM dependencies
+        run: npm ci
+
+      - name: Build (Tauri)
+        run: npm run tauri build
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tba-windows-amd64-msi
+          path: src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 14
+
+  ubuntu-2204-amd64:
+    name: Ubuntu 22.04 amd64 (AppImage)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Tauri + PCSC + AppImage)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget pkg-config file zlib1g-dev \
+            libssl-dev \
+            libgtk-3-dev libwebkit2gtk-4.0-dev \
+            libayatana-appindicator3-dev libappindicator3-dev libgdk-pixbuf2.0-dev \
+            squashfs-tools fuse \
+            pcscd libpcsclite-dev libccid usbutils
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Setup Rust 1.77.2
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.77.2"
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install NPM dependencies
+        run: npm ci
+
+      - name: Build (Tauri)
+        run: npm run tauri build
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tba-ubuntu-2204-amd64-appimage
+          path: src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 14

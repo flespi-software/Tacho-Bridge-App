@@ -1,8 +1,6 @@
 // ───── Std Lib ─────
-use std::error::Error;
 use std::error::Error as StdError;
 use std::ffi::CStr;
-use std::mem;
 use std::sync::Arc;
 
 // ───── Crates ─────
@@ -24,12 +22,18 @@ use crate::global_app_handle::emit_event;
 use crate::mqtt::{ensure_connection, remove_connections_all};
 
 // ───── Constants ─────
-const MAX_BUFFER_SIZE: usize = 260; // Example buffer size for smart card communication.
+const MAX_BUFFER_SIZE: usize = 260; // Buffer size for smart card communication.
+const READERS_BUFFER_SIZE: usize = 2048;
+const MANUAL_SYNC_TIMEOUT_SECS: u64 = 1;
+const SW_TECHNICAL_PROBLEM: &str = "6F00";
+
+type DynError = Box<dyn StdError + Send + Sync>;
+type DynResult<T> = Result<T, DynError>;
 
 /// Represents a card currently being processed (i.e., connected and active).
 #[derive(Debug)]
 pub struct ProcessingCard {
-    pub client_id: String,              // it is Card number. Uses as client_id for mqtt connection
+    pub client_id: String,              // It is Card number. Uses as client_id for mqtt connection
     pub reader_name: Option<String>,    // Name of the smart card reader (e.g., "Alcor Micro AU9540 00 00").
     pub atr: Option<String>,            // ATR of the inserted card (hex-encoded).
     #[allow(dead_code)] // to say the compiler does not warn about an unused field that is used in another file.
@@ -87,13 +91,13 @@ fn setup_reader_states(
     ctx: &Context,
     readers_buf: &mut [u8],
     reader_states: &mut Vec<ReaderState>,
-) -> Result<(), Box<dyn Error>> {
+) -> DynResult<()> {
     // Remove dead readers.
     fn is_dead(rs: &ReaderState) -> bool {
         rs.event_state().intersects(PcscState::UNKNOWN | PcscState::IGNORE)
     }
 
-    for rs in &*reader_states {
+    for rs in reader_states.iter() {
         if is_dead(rs) {
             log::debug!("Removing {:?}", rs.name());
         }
@@ -118,116 +122,96 @@ fn setup_reader_states(
     }
 
     // Update the view of the state to wait on.
-    for rs in &mut *reader_states {
+    for rs in reader_states.iter_mut() {
         rs.sync_current_state();
     }
 
     Ok(())
 }
 
-async fn process_reader_states(
-    reader_states: &mut [ReaderState],
-) -> Result<(), SmartCardError> {
+async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), SmartCardError> {
     for rs in reader_states {
-        if rs.name() != PNP_NOTIFICATION() {
-            if is_virtual_reader(rs.name()) {
-                log::warn!("Virtual reader {:?} detected. Skipping...", rs.name());
-                continue; // Skipping virtual reader processing
-            }
+        if rs.name() == PNP_NOTIFICATION() {
+            continue;
+        }
 
-            // convert reader name to string
-            let reader_name = rs.name(); // .to_str().unwrap(); // convert reader name(&CStr) to string
-            let reader_name_string = reader_name.to_str().unwrap();
+        if is_virtual_reader(rs.name()) {
+            log::warn!("Virtual reader {:?} detected. Skipping...", rs.name());
+            continue;
+        }
 
-            // convert ATR to hex string value
-            let atr = hex::encode(rs.atr());
-            let protocol = parse_atr_and_get_protocol(&atr);
-            // log::info!("Reader: {:?}. ATR: {}. Protocol: {:?}", reader_name, atr, protocol);
-
-            /*
-                This is a CRUTCH!!! Need to find a better way to convert card_state to string
-                The meaning of the card_state is in the pcsc module with the their own state enum.
-                The card_state is a bit mask and it is not clear how to convert it to a human readable string properly
-            */
-            let card_state_string = format!("{:?}", rs.event_state());
-            log::debug!("card_state_string {}", card_state_string);
-
-            // If the card state has not 'CHANGED' state, then we skip the processing of this card
-            // Due to the specifics of the library, the card can be initialized in several stages,
-            // But we only need the final result with the value changed
-
-            // Default card_number var
-            let mut card_number: String = String::new();
-            let mut iccid: String = String::new();
-
-            // Mechanism that controls the process of adding to TASK_POOL
-            let action = should_register_new_card(reader_name_string, &atr).await;
-
-            match action {
-                CardProcessingResult::Create => {
-                    // The card may not be created initially
-                    match ManagedCard::new(reader_name, protocol) {
-                        Ok(managed_card) => {
-                            match managed_card.get_iccid().await {
-                                Ok(received_iccid) => {
-                                    log::info!("ICCID: {}", received_iccid);
-
-                                    iccid = received_iccid.clone();
-                                    card_number = get_from_cache(CacheSection::Cards, &iccid);
-
-                                    ensure_connection(
-                                        rs.name(),
-                                        card_number.clone(),
-                                        atr.clone(),
-                                        managed_card,
-                                    ).await;
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to get ICCID: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "Failed to create ManagedCard for reader {}: {}",
-                                reader_name_string,
-                                e
-                            );
-                        }
-                    }
-                }
-                CardProcessingResult::Delete => {
-                    // Do nothing
-                    log::debug!("CARD DELETED {}", card_state_string);
-                }
-                CardProcessingResult::Ignore => {
-                    // Do nothing
-                }
-            }
-
-            // Emit event for Create or Delete, but not Ignore
-            if action != CardProcessingResult::Ignore {
-                emit_event(
-                    "global-cards-sync",
-                    iccid.into(),
-                    reader_name_string.into(),
-                    card_state_string.into(),
-                    card_number.clone().into(),
-                    None,
-                    None,
-                );
-
-                //  Trace status of the reader & card
-                log::info!(
-                    "{:?} {:?} {:?}, {:?}, Protocol: {:?}",
-                    rs.name(),
-                    rs.event_state(),
-                    atr,
-                    card_number,
-                    protocol
-                );
-            }
+        let reader_name = rs.name();
+        let Ok(reader_name_string) = reader_name.to_str() else {
+            log::warn!("Reader name is not valid UTF-8: {:?}. Skipping...", reader_name);
+            continue;
         };
+
+        let atr = hex::encode(rs.atr());
+        let protocol = parse_atr_and_get_protocol(&atr);
+
+        let card_state_string = format!("{:?}", rs.event_state());
+        log::debug!("card_state_string {}", card_state_string);
+
+        let mut card_number = String::new();
+        let mut iccid = String::new();
+
+        let action = should_register_new_card(reader_name_string, &atr).await;
+
+        match action {
+            CardProcessingResult::Create => match ManagedCard::new(reader_name, protocol) {
+                Ok(managed_card) => match managed_card.get_iccid().await {
+                    Ok(received_iccid) => {
+                        log::info!("ICCID: {}", received_iccid);
+
+                        iccid = received_iccid;
+                        card_number = get_from_cache(CacheSection::Cards, &iccid);
+
+                        ensure_connection(
+                            rs.name(),
+                            card_number.clone(),
+                            atr.clone(),
+                            managed_card,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        log::error!("Failed to get ICCID: {}", e);
+                    }
+                },
+                Err(e) => {
+                    log::error!(
+                        "Failed to create ManagedCard for reader {}: {}",
+                        reader_name_string,
+                        e
+                    );
+                }
+            },
+            CardProcessingResult::Delete => {
+                log::debug!("CARD DELETED {}", card_state_string);
+            }
+            CardProcessingResult::Ignore => {}
+        }
+
+        if action != CardProcessingResult::Ignore {
+            emit_event(
+                "global-cards-sync",
+                iccid.into(),
+                reader_name_string.into(),
+                card_state_string.into(),
+                card_number.clone().into(),
+                None,
+                None,
+            );
+
+            log::info!(
+                "{:?} {:?} {:?}, {:?}, Protocol: {:?}",
+                rs.name(),
+                rs.event_state(),
+                atr,
+                card_number,
+                protocol
+            );
+        }
     }
 
     Ok(())
@@ -330,7 +314,7 @@ pub async fn sc_monitor() -> ! {
             }
         };
 
-        let mut readers_buf = [0; 2048];
+        let mut readers_buf = [0; READERS_BUFFER_SIZE];
         let mut reader_states: Vec<ReaderState> = vec![
             // Listen for reader insertions/removals, if supported.
             ReaderState::new(PNP_NOTIFICATION(), PcscState::UNAWARE),
@@ -390,6 +374,14 @@ pub async fn sc_monitor() -> ! {
 /// # Returns
 /// - `String`: The communication protocol ("T0", "T1", or "Unknown").
 pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
+    fn protocol_from_td(td: u8) -> Protocols {
+        match td & 0x0F {
+            0x00 => Protocols::T0,
+            0x01 => Protocols::T1,
+            _ => Protocols::T0,
+        }
+    }
+
     let atr_bytes = match hex::decode(atr) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -440,34 +432,24 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
 
     // If TD2 exists — it is default protocol
     if let Some(td2) = td2 {
-        let proto = td2 & 0x0F;
-        return match proto {
-            0x00 => Protocols::T0,
-            0x01 => Protocols::T1,
-            _ => Protocols::T0, // fallback
-        };
+        return protocol_from_td(td2);
     }
 
     // If TD2 is not presented, but TD1 it is — use it
     if let Some(td1) = td1 {
-        let proto = td1 & 0x0F;
-        return match proto {
-            0x00 => Protocols::T0,
-            0x01 => Protocols::T1,
-            _ => Protocols::T0, // fallback
-        };
+        return protocol_from_td(td1);
     }
 
     // Default value if have no TD1 and TD2
     Protocols::T0
 }
 
-// Manual card sync function. ////////////
+// Manual card sync function. 
 // This function is used to manually sync cards from anywhere in the program.
 // Manually sync cards. Clicking on the button in the frontend will trigger this function
 #[tauri::command]
 pub async fn manual_sync_cards(
-    readername: String,
+    _readername: String,
     restart: bool,
 ) -> Result<(), String> {
     log::debug!("Manual sync cards function is called. Restart: {}", restart);
@@ -479,10 +461,11 @@ pub async fn manual_sync_cards(
         return Ok(());
     }
 
-    let ctx = Context::establish(Scope::User).expect("failed to establish context");
+    let ctx = Context::establish(Scope::User)
+        .map_err(|e| format!("failed to establish context: {e}"))?;
     log::debug!("Context established successfully.");
 
-    let mut readers_buf = [0; 2048];
+    let mut readers_buf = [0; READERS_BUFFER_SIZE];
     match ctx.list_readers(&mut readers_buf) {
         Ok(readers) => {
             if readers.count() == 0 {
@@ -507,8 +490,8 @@ pub async fn manual_sync_cards(
         log::error!("Failed to setup reader states: {:?}", e);
     }
     // waiting for the status change
-    ctx.get_status_change(Some(Duration::from_secs(1)), &mut reader_states)
-        .expect("failed to get status change");
+    ctx.get_status_change(Some(Duration::from_secs(MANUAL_SYNC_TIMEOUT_SECS)), &mut reader_states)
+        .map_err(|e| format!("failed to get status change: {e}"))?;
 
     process_reader_states(&mut reader_states)
         .await
@@ -528,7 +511,7 @@ pub struct ManagedCard {
 }
 
 impl ManagedCard {
-    pub fn new(reader_name: &CStr, protocol: Protocols) -> Result<Self, Box<dyn StdError + Send + Sync>> {
+    pub fn new(reader_name: &CStr, protocol: Protocols) -> DynResult<Self> {
         debug!(
             "ManagedCard::new() called. Reader: '{}', Protocol: {:?}",
             reader_name.to_string_lossy(),
@@ -549,7 +532,7 @@ impl ManagedCard {
         })
     }
 
-    pub fn create_card(reader_name: &CStr, protocol: Protocols) -> Result<Card, Box<dyn StdError + Send + Sync>> {
+    fn create_card(reader_name: &CStr, protocol: Protocols) -> DynResult<Card> {
         let ctx = Context::establish(Scope::User)
             .map_err(|err| {
                 log::error!("Failed to establish context: {}", err);
@@ -571,9 +554,12 @@ impl ManagedCard {
             self.reader_name.to_string_lossy()
         );
 
-        let mut card = self.inner.lock().await;
+        let reconnect_result = {
+            let mut card = self.inner.lock().await;
+            card.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::ResetCard)
+        };
 
-        match card.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::ResetCard) {
+        match reconnect_result {
             Ok(_) => {
                 debug!(
                     "Card reconnected successfully for reader: {}",
@@ -598,7 +584,7 @@ impl ManagedCard {
         }
     }
 
-    pub async fn recreate(&self) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    pub async fn recreate(&self) -> DynResult<()> {
         let new_card = Self::create_card(&self.reader_name, self.protocol)?;
         let mut lock = self.inner.lock().await;
         *lock = new_card;
@@ -652,9 +638,7 @@ impl ManagedCard {
     //     }
     // }
 
-    pub async fn apdu_transmit(&self, apdu_hex: &str) -> Result<String, Box<dyn StdError + Send + Sync>> {
-        use crate::smart_card::MAX_BUFFER_SIZE;
-
+    pub async fn apdu_transmit(&self, apdu_hex: &str) -> DynResult<String> {
         debug!(
             "apdu_transmit() called for reader: {} with APDU HEX: {}",
             self.reader_name.to_string_lossy(),
@@ -673,7 +657,6 @@ impl ManagedCard {
         };
 
         let card = Arc::clone(&self.inner);
-        let apdu_cloned = apdu.clone();
 
         debug!(
             "Cloned card for blocking transmission. Sending to spawn_blocking..."
@@ -687,7 +670,7 @@ impl ManagedCard {
             let locked = card.blocking_lock();
             debug!("Lock acquired. Transmitting...");
 
-            match locked.transmit(&apdu_cloned, &mut rapdu_buf) {
+            match locked.transmit(&apdu, &mut rapdu_buf) {
                 Ok(response) => {
                     let encoded = hex::encode(response);
                     debug!("APDU transmit success. Encoded response: {}", encoded);
@@ -739,7 +722,7 @@ impl ManagedCard {
                 client_id,
                 e
             );
-            return "6F00".to_string();
+            return SW_TECHNICAL_PROBLEM.to_string();
         }
 
         // Seccond attempt
@@ -758,14 +741,14 @@ impl ManagedCard {
                     client_id,
                     retry_err
                 );
-                "6F00".to_string()
+                SW_TECHNICAL_PROBLEM.to_string()
             }
         }
     }
 
     /// Returns the card ICCID using lazy caching.
     /// On first call, reads it from the card; subsequent calls return the cached value.
-    pub async fn get_iccid(&self) -> Result<String, Box<dyn StdError + Send + Sync>> {
+    pub async fn get_iccid(&self) -> DynResult<String> {
         if let Some(cached) = self.iccid.get() {
             log::debug!(
                 "Returning cached ICCID for reader {}: {}",
