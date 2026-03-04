@@ -93,7 +93,7 @@ To install system libraries you need *sudo* administrator rights. Please be care
 **[Tauri v2 Core Dependencies](https://v2.tauri.app/start/prerequisites/)**
 ```
 sudo apt install -y build-essential curl wget pkg-config file \
-  libssl-dev libxdo-dev \
+  libssl-dev libxdo-dev libudev-dev \
   libgtk-3-dev libwebkit2gtk-4.1-dev \
   libayatana-appindicator3-dev librsvg2-dev
 ```
