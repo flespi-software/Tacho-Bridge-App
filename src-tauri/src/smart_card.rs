@@ -18,7 +18,7 @@ use pcsc::{Card, Protocols, State as PcscState};
 
 // ───── Local Modules ─────
 use crate::config::{get_from_cache, CacheSection};
-use crate::global_app_handle::emit_event;
+use crate::global_app_handle::card_emit_event;
 use crate::mqtt::{ensure_connection, remove_connections_all};
 
 // ───── Constants ─────
@@ -193,7 +193,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
         }
 
         if action != CardProcessingResult::Ignore {
-            emit_event(
+            card_emit_event(
                 "global-cards-sync",
                 iccid.into(),
                 reader_name_string.into(),

@@ -49,7 +49,7 @@ pub struct TachoState {
     pub authentication: Option<bool>,
 }
 
-pub fn emit_event(event_name: &str, iccid: String, reader_name: String, card_state: String, card_number: String, online: Option<bool>, authentication: Option<bool>) {
+pub fn card_emit_event(event_name: &str, iccid: String, reader_name: String, card_state: String, card_number: String, online: Option<bool>, authentication: Option<bool>) {
     let payload = TachoState {
         iccid,
         reader_name,
@@ -96,6 +96,15 @@ pub fn emit_card_config_event(event_name: &str, card_number: String, config: Opt
 pub struct NotificationPayload {
     pub notification_type: String,
     pub message: String,
+}
+
+/// Emits the app connection status to the frontend.
+pub fn app_emit_event(online: bool) {
+    if let Some(app_handle) = get_app_handle() {
+        if let Err(e) = app_handle.emit("app-connection-status", online) {
+            log::error!("[CONN] failed to emit app connection status: {:?}", e);
+        }
+    }
 }
 
 pub fn emit_notification_event(event_name: &str, payload: NotificationPayload) {

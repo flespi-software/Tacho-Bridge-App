@@ -7,6 +7,7 @@ mod logger;             // Logging functionality.
 mod mqtt;               // MQTT communication.
 mod smart_card;         // PCSC module for smart card operations.
 mod global_app_handle;  // Global access to app state and emitters.
+// mod com_port;          // COM port handling.
 
 // ───── External Crates ─────
 use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application framework and async runtime.
@@ -79,6 +80,22 @@ pub fn run() {
                         // Start Main MQTT App client connection
                         app_connect::app_connection().await;
                     });
+
+                    // Spawn a background task to monitor the COM port for the Smart Card Rack device. This will run concurrently with the main application.
+                    // async_runtime::spawn(async {
+                    //     // Find the COM port for the Smart Card Rack device using its VID and PID. If found, start monitoring it.
+                    //     if let Ok(Some(port)) = com_port::find_card_reader_by_vid_pid(0x0403, 0x6015).await {
+                    //         log::info!("Smart Card Rack found at: {}", port);
+                            
+                    //         // Start continuous monitoring in the background for the COM port. This function will run indefinitely, checking for card insertions and removals.
+                    //         match com_port::monitor_card_reader(port).await {
+                    //             Ok(_) => log::info!("COM port monitor finished"),
+                    //             Err(e) => log::error!("COM port monitor error: {}", e),
+                    //         }
+                    //     } else {
+                    //         log::warn!("Smart Card Rack device not found (VID:0x0403, PID:0x6015)");
+                    //     }
+                    // });
                 });
 
                 // Handle the application close event to log this.

@@ -24,7 +24,7 @@ use crate::config::get_from_cache;                  // Function to get data from
 use crate::config::split_host_to_parts;             // Function to split the host into parts for MQTT connection.
 use crate::config::CacheSection;                    // Enum for cache sections for getting data from cache.
 use crate::smart_card::{ManagedCard, TASK_POOL};    // Managed card object and global task pool for MQTT handling.
-use crate::global_app_handle::emit_event;           // Sends events to the frontend via global app handle.
+use crate::global_app_handle::card_emit_event;           // Sends events to the frontend via global app handle.
 use crate::smart_card::ProcessingCard;
 
 /// Timeout in seconds to wait before reconnecting to the server.
@@ -42,7 +42,7 @@ fn emit_card_sync_event(
     is_online: Option<bool>,
     auth_in_progress: Option<bool>,
 ) {
-    emit_event(
+    card_emit_event(
         GLOBAL_CARDS_SYNC_EVENT,
         iccid.to_owned().into(),
         reader_name.to_string_lossy().into(),

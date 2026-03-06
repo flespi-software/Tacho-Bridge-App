@@ -24,6 +24,7 @@ use serde_json::Value;                   // For working with JSON data structure
 use crate::config::get_from_cache;       // Function to get data from cache for syncing server data.
 use crate::config::split_host_to_parts;  // Function to split the host into parts for MQTT connection.
 use crate::config::CacheSection;         // Enum for cache sections for getting data from cache.
+use crate::global_app_handle::app_emit_event; // Emits app connection status to the frontend.
 use crate::smart_card::ProcessingCard;
 
 /// Timeout in seconds to wait before reconnecting to the server.
@@ -146,6 +147,7 @@ pub async fn app_connection() {
                             "{} [CONN] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
                             log_header
                         );
+                        app_emit_event(true);
                     }
 
                     log::debug!("App {} Notification: {:?}", log_header, notification);
@@ -191,6 +193,7 @@ pub async fn app_connection() {
                     if is_online {
                         log::warn!("{} [CONN] state=ONLINE->OFFLINE err={:?}", log_header, e);
                         is_online = false;
+                        app_emit_event(false);
                     } else {
                         log::warn!("{} [CONN] state=OFFLINE err={:?}", log_header, e);
                     }
