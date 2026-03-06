@@ -24,7 +24,7 @@ Quasar will be used as an interface, buttons, menu, etc. It was decided to aband
 
 ## Getting started
 
-Firstly it is needed to install [Rust](https://tauri.app/v1/guides/getting-started/prerequisites).
+Firstly it is needed to install [Rust](https://v2.tauri.app/start/prerequisites/).
 
 Init project from the root directory
 
@@ -85,20 +85,26 @@ Architectures in the fat file: ./src-tauri/target/universal-apple-darwin/release
 ```
 
 ### Linux building & using
-To install system libraries like _libssl-dev, libwebkit2gtk-4.0-dev, libgtk-3-dev etc._ you need *sudo* administrator rights. Please be careful when installing new packages and dependencies.  
+Minimum supported versions: **Ubuntu 22.04** / **Debian 12 (bookworm)** or newer.
+Tauri v2 requires `libwebkit2gtk-4.1-dev` which is not available on older distributions.
 
-**[Tauri Core Dependencies](https://v1.tauri.app/v1/guides/getting-started/prerequisites#setting-up-linux)**
+To install system libraries you need *sudo* administrator rights. Please be careful when installing new packages and dependencies.
+
+**[Tauri v2 Core Dependencies](https://v2.tauri.app/start/prerequisites/)**
 ```
-apt install -y build-essential curl wget libssl-dev libgtk-3-dev libayatana-appindicator3-dev libwebkit2gtk-4.0-dev libappindicator3-dev libgdk-pixbuf2.0-dev squashfs-tools fuse pkg-config file zlib1g-dev
+sudo apt install -y build-essential curl wget pkg-config file \
+  libssl-dev libxdo-dev libudev-dev \
+  libgtk-3-dev libwebkit2gtk-4.1-dev \
+  libayatana-appindicator3-dev librsvg2-dev
 ```
 **PCSC Smart Card Support**
 ```
-apt install -y pcscd libpcsclite-dev libccid usbutils
+sudo apt install -y pcscd libpcsclite-dev libccid usbutils
 ```
-**Optional Runtime Libraries.** Recommended if AppImage doesn’t launch or you have theming/display issues.
+**AppImage build dependencies**
 ```
-apt install -y libxcb1 libx11-xcb1 libxcomposite1 libxcursor1 libxdamage1 libxrandr2 libasound2 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 libnspr4 libnss3 libpango-1.0-0 libxss1 libxext6 libxtst6
-```  
+sudo apt install -y squashfs-tools fuse
+```
 
 ## Icon generating & customizing
 

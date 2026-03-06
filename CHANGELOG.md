@@ -68,3 +68,10 @@ All notable changes to this project will be documented in this file.
 [fix] Fixed a critical bug with the application looping if a physically faulty reader or broken drivers are connected.  
 [fix] Refactoring and bug fixes.  
 [fix] Fixed incorrect behavior of the library on Linux when programmatically calling a change in the card state.  
+
+### [0.7.1] - 2026-03-02
+
+[fix] Refactoring of smart card and MQTT connection modules for better readability and maintainability.
+[fix] Improved error handling in smart card flow to reduce risks of runtime failures.
+[fix] Standardized connection logging format ([CONN] state/phase/failure/action) in MQTT and app connection flows.
+[feature] Added .github/workflows compilation on GitHub-hosted runners for Windows amd64 and Ubuntu 22.04 AppImage.

@@ -24,7 +24,7 @@ use crate::config::get_from_cache;                  // Function to get data from
 use crate::config::split_host_to_parts;             // Function to split the host into parts for MQTT connection.
 use crate::config::CacheSection;                    // Enum for cache sections for getting data from cache.
 use crate::smart_card::{ManagedCard, TASK_POOL};    // Managed card object and global task pool for MQTT handling.
-use crate::global_app_handle::emit_event;           // Sends events to the frontend via global app handle.
+use crate::global_app_handle::card_emit_event;           // Sends events to the frontend via global app handle.
 use crate::smart_card::ProcessingCard;
 
 /// Timeout in seconds to wait before reconnecting to the server.
@@ -32,9 +32,52 @@ use crate::smart_card::ProcessingCard;
 /// This value is used to set the interval between reconnection attempts
 /// to the MQTT server in case of connection loss.
 const SLEEP_DURATION_SECS: u64 = 10;
+const GLOBAL_CARDS_SYNC_EVENT: &str = "global-cards-sync";
+const CARD_PRESENT_STATE: &str = "PRESENT";
+
+fn emit_card_sync_event(
+    iccid: &str,
+    reader_name: &CStr,
+    client_id: &str,
+    is_online: Option<bool>,
+    auth_in_progress: Option<bool>,
+) {
+    card_emit_event(
+        GLOBAL_CARDS_SYNC_EVENT,
+        iccid.to_owned().into(),
+        reader_name.to_string_lossy().into(),
+        CARD_PRESENT_STATE.into(),
+        client_id.to_owned(),
+        is_online,
+        auth_in_progress,
+    );
+}
+
+async fn publish_ack(
+    mqtt_client: &AsyncClient,
+    topic_ack: String,
+    payload_ack: String,
+    log_header: &str,
+) {
+    if let Err(e) = mqtt_client
+        .publish(topic_ack, QoS::AtLeastOnce, false, payload_ack)
+        .await
+    {
+        log::error!("{} MQTT publish failed: {:?}", log_header, e);
+    } else {
+        log::debug!("{} MQTT response published successfully", log_header);
+    }
+}
 
 // /// Ensures an MQTT connection for the specified client ID.
 pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: String, managed_card: ManagedCard) {
+    log::info!(
+        "[CONN] phase=ensure_connection status=start reader={} client_id={} atr_len={}",
+        reader_name.to_string_lossy(),
+        client_id,
+        atr.len()
+    );
+
     // Return early if the client_id is empty, as we cannot ensure a connection without a valid ID
     if client_id.is_empty() {
         log::warn!("Reader: {:?}. ClientID is empty. Cannot ensure connection.", reader_name);
@@ -50,6 +93,11 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     let exists = task_pool.iter().any(|card| card.client_id == client_id);
     // If existing connection is found, then return, no add a new connection for this client_id
     if exists {
+        log::info!(
+            "[CONN] phase=ensure_connection status=skip_existing reader={} client_id={}",
+            reader_name.to_string_lossy(),
+            client_id
+        );
         return;
     }
 
@@ -61,7 +109,12 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
             (host, port)
         }
         Err(e) => {
-            log::error!("Error: {}", e);
+            log::error!(
+                "[CONN] phase=ensure_connection status=failed reason=invalid_host reader={} client_id={} err={}",
+                reader_name.to_string_lossy(),
+                client_id,
+                e
+            );
             return;
         }
     };
@@ -74,6 +127,13 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     mqtt_options.set_keep_alive(Duration::from_secs(120));
     // log::debug!("mqtt_options: {:?}", mqtt_options);
     log::debug!("mqtt_options: {:?}", mqtt_options);
+    log::info!(
+        "[CONN] phase=connect_attempt status=initialized reader={} client_id={} host={}:{}",
+        reader_name.to_string_lossy(),
+        client_id,
+        host,
+        port
+    );
 
     // Create a new asynchronous MQTT client and its associated event loop
     // `mqtt_options` specifies the configuration for the MQTT connection
@@ -97,7 +157,28 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
-        let iccid: String = managed_card.get_iccid().await.expect("ICCID must be initialized");
+        let iccid: String = match managed_card.get_iccid().await {
+            Ok(iccid) => {
+                log::info!("{} [CONN] phase=init status=iccid_resolved", log_header);
+                iccid
+            }
+            Err(e) => {
+                log::error!(
+                    "{} [CONN] phase=init status=aborted reason=iccid_resolve_failed err={}",
+                    log_header,
+                    e
+                );
+                emit_card_sync_event("", &reader_name, &client_id_cloned, Some(false), None);
+                return;
+            }
+        };
+
+        log::info!(
+            "{} [CONN] phase=eventloop status=started reader={} iccid={}",
+            log_header,
+            reader_name.to_string_lossy(),
+            iccid
+        );
 
         loop {
             match eventloop.poll().await {
@@ -107,13 +188,11 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                         if !was_online {
                             was_online = true;
                             // Send the global-cards-sync event to the frontend that card is connected
-                            emit_event("global-cards-sync",
-                                iccid.clone().into(),
-                                reader_name.to_string_lossy().into(),
-                                "PRESENT".into(),
-                                client_id_cloned.clone(),
-                                Some(true),
-                                None
+                            emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), None);
+
+                            log::info!(
+                                "{} [CONN] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
+                                log_header
                             );
                         }
                     }
@@ -126,11 +205,12 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             let topic_str = match std::str::from_utf8(&publish.topic) {
                                 Ok(str) => str,
                                 Err(e) => {
-                                    eprintln!(
-                                        "Error converting topic from bytes to string: {:?}",
+                                    log::error!(
+                                        "{} Failed to decode incoming topic as UTF-8: {:?}",
+                                        log_header,
                                         e
                                     );
-                                    return;
+                                    continue;
                                 }
                             };
 
@@ -157,14 +237,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                         // Processing the "finish" parameter depending on its value
                                         if finish_value {
                                             // Send the global-cards-sync event to the frontend that card is connected
-                                            emit_event("global-cards-sync",
-                                                iccid.clone().into(),
-                                                reader_name.to_string_lossy().into(),
-                                                "PRESENT".into(),
-                                                client_id_cloned.clone(),
-                                                Some(true),
-                                                Some(false)
-                                            );
+                                            emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(false));
 
                                             log::info!("Authentication process is finished");
                                             
@@ -187,45 +260,44 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     hex_value
                                                 );
 
-                                                let mut rapdu_mqtt_hex = String::new(); // empty string for the response
-
-                                                if hex_value.is_empty() {
+                                                let rapdu_mqtt_hex = if hex_value.is_empty() {
                                                     // This case is needed to reset the card when authorization is not completed, otherwise the card will not respond to commands correctly.
                                                     if auth_process { 
+                                                        log::warn!(
+                                                            "{} Empty payload received while auth in progress. Reconnecting card.",
+                                                            log_header
+                                                        );
                                                         // Reset the card to its original state
                                                         managed_card.reconnect().await;
                                                     }
 
                                                     // If the input value is empty, then pass the ATR to the server.
-                                                    rapdu_mqtt_hex = atr_clone.clone();
-                                                    log::info!("Authentication process is started");
-
-                                                    // Send the global-cards-sync event to the frontend that card is connected
-                                                    emit_event("global-cards-sync",
-                                                        iccid.clone().into(),
-                                                        reader_name.to_string_lossy().into(),
-                                                        "PRESENT".into(),
-                                                        client_id_cloned.clone(),
-                                                        Some(true),
-                                                        Some(false)
+                                                    log::info!(
+                                                        "{} Authentication process started",
+                                                        log_header
                                                     );
 
+                                                    // Send the global-cards-sync event to the frontend that card is connected
+                                                    emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(false));
+
+                                                    atr_clone.clone()
                                                 } else {
                                                     // // Otherwise, the logic for exchanging messages with the card.
-                                                    rapdu_mqtt_hex = managed_card.send_apdu(&hex_value, &client_id_cloned).await;
+                                                    if !auth_process {
+                                                        log::info!(
+                                                            "{} Authentication APDU exchange started",
+                                                            log_header
+                                                        );
+                                                    }
+
+                                                    let rapdu = managed_card.send_apdu(&hex_value, &client_id_cloned).await;
 
                                                     // Send the global-cards-sync event to the frontend that card is connected
-                                                    emit_event("global-cards-sync",
-                                                        iccid.clone().into(),
-                                                        reader_name.to_string_lossy().into(),
-                                                        "PRESENT".into(),
-                                                        client_id_cloned.clone(),
-                                                        Some(true),
-                                                        Some(true)
-                                                    );
+                                                    emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(true));
 
                                                     auth_process = true;    // Authorization process is in progress
-                                                }
+                                                    rapdu
+                                                };
 
                                                 payload_ack = process_rapdu_mqtt_hex(rapdu_mqtt_hex);
 
@@ -245,18 +317,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                         }
 
                                         // publish a message to the channel
-                                        let publish_result = mqtt_client
-                                            .publish(
-                                                topic_ack,
-                                                QoS::AtLeastOnce,
-                                                false,
-                                                payload_ack,
-                                            )
-                                            .await;
-                                        match publish_result {
-                                            Ok(_) => println!("Message published successfully"),
-                                            Err(e) => println!("Error sending message: {:?}", e),
-                                        }
+                                        publish_ack(&mqtt_client, topic_ack, payload_ack, &log_header).await;
                                     } else {
                                         log::error!(
                                             "{} Finish parameter not found or is not a boolean",
@@ -275,7 +336,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                         }
                         Event::Incoming(Incoming::ConnAck(..)) => {
                             log::info!(
-                                "{} Connection to the server has been successfully established.",
+                                "{} [CONN] event=CONNACK status=received",
                                 log_header
                             )
                         }
@@ -286,53 +347,69 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             );
                             
                             // Send the global-cards-sync event to the frontend that card is connected
-                            emit_event("global-cards-sync",
-                                iccid.clone().into(),
-                                reader_name.to_string_lossy().into(),
-                                "PRESENT".into(),
-                                client_id_cloned.clone(),
-                                Some(true),
-                                Some(false)
-                            );
+                            emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(false));
                         }
                         _ => {} // This handles any other events that you haven't explicitly matched above
                     }
                 }
                 Err(e) => {
                     // Send the global-cards-sync event to the frontend that card is connected
-                    emit_event("global-cards-sync",
-                        iccid.clone().into(),
-                        reader_name.to_string_lossy().into(),
-                        "PRESENT".into(),
-                        client_id_cloned.clone(),
-                        Some(false),
-                        None
-                    );
+                    emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(false), None);
 
                     is_online = false;
                     was_online = false; // Reset the flag when the connection is lost
 
+                    log::warn!(
+                        "{} [CONN] state=ONLINE->OFFLINE err={:?}",
+                        log_header,
+                        e
+                    );
+
                     match e {
                         ConnectionError::Io(ref io_err) => match io_err.kind() {
-                            ErrorKind::ConnectionAborted => log::warn!("{} Can't establish a connection to a remote server.", log_header),
-                            ErrorKind::ConnectionReset => log::warn!("{} The connection could not be established. Check the server address in the configuration.", log_header),
-                            ErrorKind::TimedOut => log::warn!("{} Connection timeout. The server may be down or the network is unstable.", log_header),
-                            _ => log::error!("{} An IO error occurred.", log_header),
+                            ErrorKind::ConnectionAborted => log::warn!(
+                                "{} [CONN] failure=io kind=connection_aborted detail=remote_connection_not_established",
+                                log_header
+                            ),
+                            ErrorKind::ConnectionReset => log::warn!(
+                                "{} [CONN] failure=io kind=connection_reset detail=check_server_address",
+                                log_header
+                            ),
+                            ErrorKind::TimedOut => log::warn!(
+                                "{} [CONN] failure=io kind=timed_out detail=server_or_network_unstable",
+                                log_header
+                            ),
+                            _ => log::error!("{} [CONN] failure=io kind=other", log_header),
                         },
-                        ConnectionError::MqttState(ServerDisconnect { .. }) => log::warn!("{} The connection was terminated on the server side. Most likely the user has turned off the channel/device.", log_header),
+                        ConnectionError::MqttState(ServerDisconnect { .. }) => log::warn!(
+                            "{} [CONN] failure=mqtt_state kind=server_disconnect detail=server_terminated_connection",
+                            log_header
+                        ),
                         ConnectionError::MqttState(AwaitPingResp { .. }) => {
-                            log::warn!("{} Awaiting PING response from the server. The connection might be unstable.", log_header);
+                            log::warn!(
+                                "{} [CONN] failure=mqtt_state kind=await_ping_resp detail=connection_may_be_unstable",
+                                log_header
+                            );
                             // Implement your reconnection or handling strategy here
                         },
                         ConnectionError::MqttState(StateError::Io(os_err)) => {
-                            println!("An IO error occurred in MQTT state: {:?}", os_err);
+                            log::error!(
+                                "{} [CONN] failure=mqtt_state kind=io err={:?}",
+                                log_header,
+                                os_err
+                            );
                         },
                         _ => {
-                            log::error!("{} Unhandled error: {:?}", log_header, e);
+                            log::error!("{} [CONN] failure=unhandled err={:?}", log_header, e);
                             // return; // exit the loop
                         },
                     };
                     // Reconnection timeout for handled errors
+                    log::warn!(
+                        "{} [CONN] action=reconnect_scheduled delay_secs={}",
+                        log_header,
+                        SLEEP_DURATION_SECS
+                    );
                     tokio::time::sleep(Duration::from_secs(SLEEP_DURATION_SECS)).await;
                 }
             }
@@ -346,6 +423,8 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
         mqtt_client: mqtt_clinet_cloned,
         task_handle: handle,
     });
+
+    log::info!("MQTT task registered in TASK_POOL. Current size: {}", task_pool.len());
 
     for (i, card) in task_pool.iter().enumerate() {
         log::debug!(
@@ -377,13 +456,18 @@ pub async fn remove_connections(client_ids: Vec<String>) {
                 card.reader_name.as_deref().unwrap_or("unknown"),
                 card.atr.as_deref().unwrap_or("unknown"),
             );
+        } else {
+            log::warn!(
+                "TASK_POOL: No active connection found for requested client_id: {}",
+                client_id
+            );
         }
     }
 }
 
 /// Terminates all active card-related MQTT connections and clears the task pool.
 pub async fn remove_connections_all() {
-    log::debug!("Removing all card connections...");
+    log::info!("Removing all card connections...");
 
     // Lock the task pool
     let mut task_pool = TASK_POOL.lock().await;
@@ -399,17 +483,14 @@ pub async fn remove_connections_all() {
         card.task_handle.abort();
     }
 
-    log::debug!("All card connections have been terminated and the task pool has been cleared.");
+    log::info!("All card connections have been terminated and the task pool has been cleared.");
 }
 
 fn process_rapdu_mqtt_hex(rapdu_mqtt_hex: String) -> String {
     // Create a JSON object with the hex value
-    let json_value = serde_json::json!({
+    serde_json::json!({
         "payload": rapdu_mqtt_hex,
-    });
-
+    })
     // Serialize the JSON object to a string and assign it to `payload_ack`
-    let payload_ack = json_value.to_string();
-
-    payload_ack
+    .to_string()
 }

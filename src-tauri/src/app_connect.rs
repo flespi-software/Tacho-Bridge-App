@@ -24,6 +24,7 @@ use serde_json::Value;                   // For working with JSON data structure
 use crate::config::get_from_cache;       // Function to get data from cache for syncing server data.
 use crate::config::split_host_to_parts;  // Function to split the host into parts for MQTT connection.
 use crate::config::CacheSection;         // Enum for cache sections for getting data from cache.
+use crate::global_app_handle::app_emit_event; // Emits app connection status to the frontend.
 use crate::smart_card::ProcessingCard;
 
 /// Timeout in seconds to wait before reconnecting to the server.
@@ -32,18 +33,56 @@ use crate::smart_card::ProcessingCard;
 /// to the MQTT server in case of connection loss.
 const SLEEP_DURATION_SECS: u64 = 10;
 
+fn log_connection_error(log_header: &str, error: &ConnectionError) {
+    match error {
+        ConnectionError::Io(io_err) => match io_err.kind() {
+            ErrorKind::ConnectionAborted => log::warn!(
+                "{} [CONN] failure=io kind=connection_aborted detail=remote_connection_not_established",
+                log_header
+            ),
+            ErrorKind::ConnectionReset => log::warn!(
+                "{} [CONN] failure=io kind=connection_reset detail=check_server_address",
+                log_header
+            ),
+            ErrorKind::TimedOut => log::warn!(
+                "{} [CONN] failure=io kind=timed_out detail=server_or_network_unstable",
+                log_header
+            ),
+            _ => log::error!("{} [CONN] failure=io kind=other", log_header),
+        },
+        ConnectionError::MqttState(ServerDisconnect { .. }) => log::warn!(
+            "{} [CONN] failure=mqtt_state kind=server_disconnect detail=server_terminated_connection",
+            log_header
+        ),
+        ConnectionError::MqttState(AwaitPingResp { .. }) => {
+            log::warn!(
+                "{} [CONN] failure=mqtt_state kind=await_ping_resp detail=connection_may_be_unstable",
+                log_header
+            );
+        }
+        ConnectionError::MqttState(StateError::Io { .. }) => {
+            log::warn!("{} [CONN] failure=mqtt_state kind=io detail=connection_closed_by_peer", log_header);
+        }
+        _ => {
+            log::error!("{} [CONN] failure=unhandled err={:?}", log_header, error);
+        }
+    }
+}
+
 /// Ensures an MQTT connection for the specified client ID.
 #[tauri::command]
 pub async fn app_connection() {
+    log::info!("[CONN] phase=app_connection status=start");
+
     // Getting server data from the cache
     let full_host = get_from_cache(CacheSection::Server, "host");
     let (host, port) = match split_host_to_parts(&full_host) {
         Ok((host, port)) => {
-            log::debug!("Server data from cache: {:?}:{}", host, port);
+            log::debug!("[CONN] phase=config status=host_loaded host={}:{}", host, port);
             (host, port)
         }
         Err(e) => {
-            log::error!("Error: {}", e);
+            log::error!("[CONN] phase=config status=failed reason=invalid_host err={}", e);
             return;
         }
     };
@@ -51,7 +90,7 @@ pub async fn app_connection() {
     let client_id = get_from_cache(CacheSection::Ident, "ident");
 
     if client_id.is_empty() {
-        log::warn!("client_id: {:?}. ClientID is empty. Cannot ensure connection.", client_id);
+        log::warn!("[CONN] phase=config status=failed reason=empty_client_id");
         return;
     }
 
@@ -64,6 +103,10 @@ pub async fn app_connection() {
     let exists = task_pool.iter().any(|card| card.client_id == client_id);
     // If existing connection is found, then return, no add a new connection for this client_id
     if exists {
+        log::info!(
+            "[CONN] phase=app_connection status=skip_existing client_id={}",
+            client_id
+        );
         return;
     }
 
@@ -74,6 +117,12 @@ pub async fn app_connection() {
     // mqtt_options.set_credentials(flespi_token, "");
     mqtt_options.set_keep_alive(Duration::from_secs(120));
     log::debug!("mqtt_options: {:?}", mqtt_options);
+    log::info!(
+        "[CONN] phase=connect_attempt status=initialized client_id={} host={}:{}",
+        client_id,
+        host,
+        port
+    );
 
     // Create a new asynchronous MQTT client and its associated event loop
     // `mqtt_options` specifies the configuration for the MQTT connection
@@ -81,12 +130,26 @@ pub async fn app_connection() {
     let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
     let mqtt_clinet_cloned = mqtt_client.clone();
     let log_header: String = format!("{} |", client_id);
+    let client_id_for_task = client_id.clone();
 
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
+        let mut is_online = false;
+
+        log::info!("{} [CONN] phase=eventloop status=started", log_header);
+
         loop {
             match eventloop.poll().await {
                 Ok(notification) => {
+                    if !is_online {
+                        is_online = true;
+                        log::info!(
+                            "{} [CONN] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
+                            log_header
+                        );
+                        app_emit_event(true);
+                    }
+
                     log::debug!("App {} Notification: {:?}", log_header, notification);
 
                     match notification {
@@ -119,7 +182,7 @@ pub async fn app_connection() {
                         }
                         Event::Incoming(Incoming::ConnAck(..)) => {
                             log::info!(
-                                "{} Connection to the server has been successfully established.",
+                                "{} [CONN] event=CONNACK status=received",
                                 log_header
                             )
                         }
@@ -127,25 +190,22 @@ pub async fn app_connection() {
                     }
                 }
                 Err(e) => {
-                    match e {
-                        ConnectionError::Io(ref io_err) => match io_err.kind() {
-                            ErrorKind::ConnectionAborted => log::warn!("{} Can't establish a connection to a remote server.", log_header),
-                            ErrorKind::ConnectionReset => log::warn!("{} The connection could not be established. Check the server address in the configuration.", log_header),
-                            ErrorKind::TimedOut => log::warn!("{} Connection timeout. The server may be down or the network is unstable.", log_header),
-                            _ => log::error!("{} An IO error occurred.", log_header),
-                        },
-                        ConnectionError::MqttState(ServerDisconnect { .. }) => log::warn!("{} The connection was terminated on the server side. Most likely the user has turned off the channel/device.", log_header),
-                        ConnectionError::MqttState(AwaitPingResp { .. }) => {
-                            log::warn!("{} Awaiting PING response from the server. The connection might be unstable.", log_header);
-                        },
-                        ConnectionError::MqttState(StateError::Io{ .. }) => {
-                            log::warn!("{} MQTT state IO error: Connection closed by peer", log_header);
-                        },
-                        _ => {
-                            log::error!("{} Unhandled error: {:?}", log_header, e);
-                        },
-                    };
+                    if is_online {
+                        log::warn!("{} [CONN] state=ONLINE->OFFLINE err={:?}", log_header, e);
+                        is_online = false;
+                        app_emit_event(false);
+                    } else {
+                        log::warn!("{} [CONN] state=OFFLINE err={:?}", log_header, e);
+                    }
+
+                    log_connection_error(&log_header, &e);
+
                     // Reconnection timeout for handled errors
+                    log::warn!(
+                        "{} [CONN] action=reconnect_scheduled delay_secs={}",
+                        log_header,
+                        SLEEP_DURATION_SECS
+                    );
                     tokio::time::sleep(Duration::from_secs(SLEEP_DURATION_SECS)).await;
                 }
             }
@@ -159,6 +219,12 @@ pub async fn app_connection() {
         mqtt_client: mqtt_clinet_cloned,
         task_handle: handle,
     });
+
+    log::info!(
+        "[CONN] phase=task_pool status=registered client_id={} pool_size={}",
+        client_id_for_task,
+        task_pool.len()
+    );
 
     for (i, card) in task_pool.iter().enumerate() {
         log::debug!(
