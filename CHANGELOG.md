@@ -71,11 +71,11 @@ All notable changes to this project will be documented in this file.
 
 ### [0.7.1] - 2026-03-06
 
-[fix] Refactoring of smart card and MQTT connection modules for better readability and maintainability.
-[fix] Improved error handling in smart card flow to reduce risks of runtime failures.
-[fix] Standardized connection logging format ([CONN] state/phase/failure/action) in MQTT and app connection flows.
-[fix] Refactoring of emit_event calls.
-[feature] Added .github/workflows compilation on GitHub-hosted runners for Windows amd64 and Ubuntu 22.04 AppImage.
-[feature] App connection status indicator — header icon turns green when MQTT connection is online.
-[feature] Server configuration dialog extracted into a separate ServerConfigDialog component.
-[feature] Theme selector redesigned from dropdown to icon button toggle (Light/Auto/Dark).
+[fix] Refactoring of smart card and MQTT connection modules for better readability and maintainability.  
+[fix] Improved error handling in smart card flow to reduce risks of runtime failures.  
+[fix] Standardized connection logging format ([CONN] state/phase/failure/action) in MQTT and app connection flows.  
+[fix] Refactoring of emit_event calls.  
+[feature] Added .github/workflows compilation on GitHub-hosted runners for Windows amd64 and Ubuntu 22.04 AppImage.  
+[feature] App connection status indicator — header icon turns green when MQTT connection is online.  
+[feature] Server configuration dialog extracted into a separate ServerConfigDialog component.  
+[feature] Theme selector redesigned from dropdown to icon button toggle (Light/Auto/Dark).  
