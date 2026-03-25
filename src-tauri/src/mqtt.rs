@@ -83,7 +83,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
         log::warn!("Reader: {:?}. ClientID is empty. Cannot ensure connection.", reader_name);
         return;
     }
-    
+
     // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
 
@@ -239,8 +239,11 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                             // Send the global-cards-sync event to the frontend that card is connected
                                             emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(false));
 
-                                            log::info!("Authentication process is finished");
-                                            
+                                            log::info!(
+                                                "{} Authentication process is finished",
+                                                log_header
+                                            );
+
                                             // Reset the card to its original state
                                             managed_card.reconnect().await;
 
@@ -262,7 +265,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
                                                 let rapdu_mqtt_hex = if hex_value.is_empty() {
                                                     // This case is needed to reset the card when authorization is not completed, otherwise the card will not respond to commands correctly.
-                                                    if auth_process { 
+                                                    if auth_process {
                                                         log::warn!(
                                                             "{} Empty payload received while auth in progress. Reconnecting card.",
                                                             log_header
@@ -345,7 +348,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                 "{} Ping response received from the server.",
                                 log_header
                             );
-                            
+
                             // Send the global-cards-sync event to the frontend that card is connected
                             emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(false));
                         }

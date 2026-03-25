@@ -147,6 +147,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
         };
 
         let atr = hex::encode(rs.atr());
+        let protocol = parse_atr_and_get_protocol(&atr);
 
         let card_state_string = format!("{:?}", rs.event_state());
         log::debug!("card_state_string {}", card_state_string);
@@ -157,7 +158,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
         let action = should_register_new_card(reader_name_string, &atr).await;
 
         match action {
-            CardProcessingResult::Create => match ManagedCard::new(reader_name) {
+            CardProcessingResult::Create => match ManagedCard::new(reader_name, protocol) {
                 Ok(managed_card) => match managed_card.get_iccid().await {
                     Ok(received_iccid) => {
                         log::info!("ICCID: {}", received_iccid);
@@ -203,11 +204,12 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
             );
 
             log::info!(
-                "{:?} {:?} {:?}, {:?}",
+                "{:?} {:?} {:?}, {:?}, Protocol: {:?}",
                 rs.name(),
                 rs.event_state(),
                 atr,
                 card_number,
+                protocol
             );
         }
     }
@@ -364,7 +366,85 @@ pub async fn sc_monitor() -> ! {
     }
 }
 
-// Manual card sync function. 
+/// Parses the ATR and extracts the communication protocol (T=0 or T=1).
+///
+/// # Arguments
+/// - `atr`: A string containing the ATR in hexadecimal format.
+///
+/// # Returns
+/// - `String`: The communication protocol ("T0", "T1", or "Unknown").
+pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
+    fn protocol_from_td(td: u8) -> Protocols {
+        match td & 0x0F {
+            0x00 => Protocols::T0,
+            0x01 => Protocols::T1,
+            _ => Protocols::T0,
+        }
+    }
+
+    let atr_bytes = match hex::decode(atr) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            log::error!("Invalid ATR format: {}", atr);
+            return Protocols::T0;
+        }
+    };
+
+    if atr_bytes.len() < 2 {
+        log::warn!("ATR is too short: {:?}", atr_bytes);
+        return Protocols::T0;
+    }
+
+    let mut index = 1;
+    let y1 = atr_bytes[index] >> 4;
+    index += 1;
+
+    // Skip TA1, TB1, TC1 depends on Y1
+    if y1 & 0x1 != 0 { index += 1; } // TA1
+    if y1 & 0x2 != 0 { index += 1; } // TB1
+    if y1 & 0x4 != 0 { index += 1; } // TC1
+
+    // TD1
+    let td1 = if y1 & 0x8 != 0 && index < atr_bytes.len() {
+        let td1 = atr_bytes[index];
+        index += 1;
+        Some(td1)
+    } else {
+        None
+    };
+
+    // TD2 (if was TD1)
+    let td2 = if let Some(td1) = td1 {
+        let y2 = td1 >> 4;
+        // Skip TA2, TB2, TC2
+        if y2 & 0x1 != 0 { index += 1; } // TA2
+        if y2 & 0x2 != 0 { index += 1; } // TB2
+        if y2 & 0x4 != 0 { index += 1; } // TC2
+
+        if y2 & 0x8 != 0 && index < atr_bytes.len() {
+            Some(atr_bytes[index])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // If TD2 exists — it is default protocol
+    if let Some(td2) = td2 {
+        return protocol_from_td(td2);
+    }
+
+    // If TD2 is not presented, but TD1 it is — use it
+    if let Some(td1) = td1 {
+        return protocol_from_td(td1);
+    }
+
+    // Default value if have no TD1 and TD2
+    Protocols::T0
+}
+
+// Manual card sync function.
 // This function is used to manually sync cards from anywhere in the program.
 // Manually sync cards. Clicking on the button in the frontend will trigger this function
 #[tauri::command]
@@ -426,17 +506,19 @@ pub async fn manual_sync_cards(
 pub struct ManagedCard {
     inner: Arc<Mutex<Card>>,
     reader_name: Arc<CStr>,
+    protocol: Protocols,
     pub iccid: OnceCell<String>,
 }
 
 impl ManagedCard {
-    pub fn new(reader_name: &CStr) -> DynResult<Self> {
+    pub fn new(reader_name: &CStr, protocol: Protocols) -> DynResult<Self> {
         debug!(
-            "ManagedCard::new() called. Reader: '{}'",
+            "ManagedCard::new() called. Reader: '{}', Protocol: {:?}",
             reader_name.to_string_lossy(),
+            protocol
         );
 
-        let card = Self::create_card(reader_name)?;
+        let card = Self::create_card(reader_name, protocol)?;
         debug!(
             "Card successfully created for reader: '{}'",
             reader_name.to_string_lossy()
@@ -445,35 +527,23 @@ impl ManagedCard {
         Ok(Self {
             inner: Arc::new(Mutex::new(card)),
             reader_name: Arc::from(reader_name.to_owned()),
+            protocol,
             iccid: OnceCell::new(),
         })
     }
 
-    fn create_card(reader_name: &CStr) -> DynResult<Card> {
+    fn create_card(reader_name: &CStr, protocol: Protocols) -> DynResult<Card> {
         let ctx = Context::establish(Scope::User)
             .map_err(|err| {
                 log::error!("Failed to establish context: {}", err);
                 Box::<dyn StdError + Send + Sync>::from(err)
             })?;
 
-        let card = ctx.connect(reader_name, ShareMode::Shared, Protocols::ANY)
+        let card = ctx.connect(reader_name, ShareMode::Shared, protocol)
             .map_err(|err| {
                 log::error!("Failed to connect to card: {}", err);
                 Box::<dyn StdError + Send + Sync>::from(err)
             })?;
-
-        match card.status2_owned() {
-            Ok(status) => log::info!(
-                "Connected to reader '{}', protocol: {:?}",
-                reader_name.to_string_lossy(),
-                status.protocol2()
-            ),
-            Err(e) => log::warn!(
-                "Connected to reader '{}', but failed to read status: {}",
-                reader_name.to_string_lossy(),
-                e
-            ),
-        }
 
         Ok(card)
     }
@@ -515,7 +585,7 @@ impl ManagedCard {
     }
 
     pub async fn recreate(&self) -> DynResult<()> {
-        let new_card = Self::create_card(&self.reader_name)?;
+        let new_card = Self::create_card(&self.reader_name, self.protocol)?;
         let mut lock = self.inner.lock().await;
         *lock = new_card;
 

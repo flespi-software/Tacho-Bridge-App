@@ -79,3 +79,8 @@ All notable changes to this project will be documented in this file.
 [feature] App connection status indicator — header icon turns green when MQTT connection is online.  
 [feature] Server configuration dialog extracted into a separate ServerConfigDialog component.  
 [feature] Theme selector redesigned from dropdown to icon button toggle (Light/Auto/Dark).  
+
+### [0.7.2] - 2026-03-25
+
+[fix] The T protocol detection mechanism for connecting to the card has been reworked. The PC/SC library now handles this completely automatically.  
+[feature] Updated Rust toolchain and dependencies: rumqttc 0.24→0.25.1, reqwest 0.12→0.13.2, tauri 2.5→2.10.3, pcsc 2.8→2.9.0

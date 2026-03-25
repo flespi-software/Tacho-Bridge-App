@@ -106,7 +106,7 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, computed, watch, defineComponent, defineProps, defineExpose } from 'vue'
+import { ref, computed, watch } from 'vue'
 import type { SmartCard } from './models'
 
 /** Company smart card regex: 16 alphanumeric uppercase characters */
@@ -241,17 +241,6 @@ function removeCard(number: string): void {
   emit('delete-card', number)
 }
 
-defineComponent({
-  setup() {
-    return {
-      openAddDialog,
-      openEditDialog,
-      validateCardNumber,
-      saveCard,
-      linkMode,
-    }
-  },
-})
 defineExpose({
   linkMode,
   openAddDialog,
