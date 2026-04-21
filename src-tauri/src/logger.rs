@@ -85,7 +85,7 @@ pub fn setup_logging() {
                 message
             ))
         })
-        .level(log::LevelFilter::Debug)  // Change to Debug / Info if needed
+        .level(log::LevelFilter::Info)  // Change to Debug / Info if needed
         .chain(fern::log_file(&log_path).unwrap())
         .apply();
 

@@ -149,7 +149,7 @@ fn ber_length(data: &[u8]) -> Option<(usize, usize)> {
 /// Logs all fields and persists the subset we track (expire, company_name,
 /// company_address) into the card's config if values changed.
 fn parse_ef_identification(client_id: &str, data: &[u8]) {
-    log::info!(
+    log::debug!(
         "EF_Identification (0520) plaintext ({} bytes): {}",
         data.len(),
         hex::encode(data)
@@ -224,7 +224,7 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
     }
 
     if changed {
-        log::info!("EF_Identification → config update for {}", client_id);
+        log::debug!("EF_Identification → config update for {}", client_id);
         crate::config::update_card(client_id, cfg);
     }
 }
@@ -233,7 +233,7 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
 /// Layout: typeOfTachographCardId (1) + cardStructureVersion (2) + noOfCompanyActivityRecords (2).
 /// Persists card_type and structure_version into the card's config if changed.
 fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
-    log::info!(
+    log::debug!(
         "EF_Application_Identification (0501) plaintext ({} bytes): {}",
         data.len(),
         hex::encode(data)
@@ -297,7 +297,7 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
     }
 
     if changed {
-        log::info!("EF_Application_Identification → config update for {}", client_id);
+        log::debug!("EF_Application_Identification → config update for {}", client_id);
         crate::config::update_card(client_id, cfg);
     }
 }
