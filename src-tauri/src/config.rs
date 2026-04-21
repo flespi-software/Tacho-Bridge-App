@@ -598,13 +598,9 @@ pub fn init_config() -> io::Result<()> {
                 loaded_config.version = env!("CARGO_PKG_VERSION").to_string();
                 config = loaded_config;
             }
-            Err(_) => {
-                log::warn!("Config format mismatch. Attempting migration...");
-                config = migrate_old_config(&contents)
-                    .unwrap_or_else(|| {
-                        log::error!("Migration failed. Resetting to default config.");
-                        generate_default_config()
-                    });
+            Err(e) => {
+                log::error!("Config parse failed ({}). Resetting to default config.", e);
+                config = generate_default_config();
             }
         }
     } else {
@@ -632,49 +628,6 @@ pub fn init_config() -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     Ok(())
-}
-
-fn migrate_old_config(contents: &str) -> Option<ConfigurationFile> {
-    #[derive(Deserialize)]
-    struct OldConfig {
-        name: String,
-        #[allow(dead_code)] // to say the compiler does not warn about an unused field that is used in another file.
-        version: String,
-        description: String,
-        appearance: Option<AppearanceConfig>,
-        ident: Option<String>,
-        server: Option<ServerConfig>,
-        cards: Option<HashMap<String, String>>, // old cards format
-    }
-
-    let old_config: OldConfig = serde_yaml::from_str(contents).ok()?;
-
-    let mut new_cards = HashMap::new();
-    if let Some(old_cards ) = old_config.cards {
-        for (_, card_number) in old_cards {
-            let card_config = CardConfig {
-                iccid: String::new(),
-                expire: None,
-                name: None,
-                card_type: None,
-                structure_version: None,
-                company_name: None,
-                company_address: None,
-                last_auth: None,
-            };
-            new_cards.insert(card_number, card_config);
-        }
-    }
-
-    Some(ConfigurationFile {
-        name: old_config.name,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        description: old_config.description,
-        appearance: old_config.appearance,
-        ident: old_config.ident,
-        server: old_config.server,
-        cards: new_cards,
-    })
 }
 
 // Default structure config

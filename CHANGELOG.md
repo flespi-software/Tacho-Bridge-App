@@ -90,3 +90,4 @@ All notable changes to this project will be documented in this file.
 [fix] README.md updated. Added usage information.
 [fix] Fixed bug with ICID detection when connecting a card.  
 [fix] The T protocol detection mechanism for connecting to the card has been reworked. The PC/SC library now handles this completely automatically.  
+[fix] The code for migrating the old configuration version to the current one has been removed.
