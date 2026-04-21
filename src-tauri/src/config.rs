@@ -48,9 +48,13 @@ pub enum DarkTheme {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CardConfig {
-    pub iccid: String,          // ICCID
-    pub expire: Option<u64>,    // Expire date
-    pub name: Option<String>,    // Custom card name (for ease of user identification)
+    pub iccid: String,                          // ICCID
+    pub expire: Option<u64>,                    // Expire date
+    pub name: Option<String>,                   // Custom card name (for ease of user identification)
+    pub card_type: Option<u8>,                  // typeOfTachographCardId: 1=Driver, 2=Workshop, 3=Control, 4=Company
+    pub structure_version: Option<(u8, u8)>,    // cardStructureVersion (major, minor): major 0x00=Gen1, 0x01=Gen2; minor = data-element revision
+    pub company_name: Option<String>,           // Company name (from EF_Identification, Company Card only)
+    pub company_address: Option<String>,        // Company address (from EF_Identification, Company Card only)
 }
 // UI Configuration structure, part of ConfigurationFile that contains data about how UI looks like.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -148,19 +152,37 @@ fn update_card_config(
                 existing_card.iccid = content.iccid;
                 existing_card.expire = content.expire;
                 existing_card.name = content.name;
+                existing_card.card_type = content.card_type;
+                existing_card.structure_version = content.structure_version;
+                existing_card.company_name = content.company_name;
+                existing_card.company_address = content.company_address;
                 // needs_restart = true;
                 changed = true;
             } else {
                 // Update optional fields only (no restart required)
-                if existing_card.expire != content.expire || existing_card.name != content.name {
+                if existing_card.expire != content.expire
+                    || existing_card.name != content.name
+                    || existing_card.card_type != content.card_type
+                    || existing_card.structure_version != content.structure_version
+                    || existing_card.company_name != content.company_name
+                    || existing_card.company_address != content.company_address
+                {
                     log::debug!(
-                        "Updating optional fields for card {}: name = {:?}, expire = {:?}",
+                        "Updating optional fields for card {}: name = {:?}, expire = {:?}, card_type = {:?}, structure_version = {:?}, company_name = {:?}, company_address = {:?}",
                         card_number,
                         content.name,
-                        content.expire
+                        content.expire,
+                        content.card_type,
+                        content.structure_version,
+                        content.company_name,
+                        content.company_address
                     );
                     existing_card.expire = content.expire;
                     existing_card.name = content.name;
+                    existing_card.card_type = content.card_type;
+                    existing_card.structure_version = content.structure_version;
+                    existing_card.company_name = content.company_name;
+                    existing_card.company_address = content.company_address;
                     changed = true;
                 }
             }
@@ -376,6 +398,13 @@ pub enum CacheSection {
     Server,
     Ident,
     Appearance
+}
+
+/// Returns a clone of the CardConfig for the given card number from the runtime cache,
+/// or None if the card is not known yet.
+pub fn get_card_config_from_cache(card_number: &str) -> Option<CardConfig> {
+    let cache = CACHE.lock().unwrap();
+    cache.cards.get(card_number).cloned()
 }
 
 /// Retrieves a value from the cache by key.
@@ -607,7 +636,11 @@ fn migrate_old_config(contents: &str) -> Option<ConfigurationFile> {
             let card_config = CardConfig {
                 iccid: String::new(),
                 expire: None,
-                name: None
+                name: None,
+                card_type: None,
+                structure_version: None,
+                company_name: None,
+                company_address: None,
             };
             new_cards.insert(card_number, card_config);
         }

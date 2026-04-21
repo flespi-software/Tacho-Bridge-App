@@ -31,13 +31,39 @@
             </template>
             <template v-if="reader.card_number">
               <q-item-label
-                lines="1"
                 v-if="state.cards && reader.card_number && state.cards[reader.card_number]"
+                style="word-break: break-word; white-space: normal"
               >
                 {{ state.cards[reader.card_number]?.name }}
               </q-item-label>
-              <q-item-label lines="1">
+              <q-item-label>
                 <span class="text-weight-medium">{{ reader.card_number }}</span>
+                <span
+                  v-if="state.cards[reader.card_number]?.structure_version"
+                  class="text-grey-7 q-ml-xs"
+                >
+                  ({{ formatStructureVersion(state.cards[reader.card_number]?.structure_version) }})
+                </span>
+              </q-item-label>
+              <q-item-label
+                v-if="state.cards[reader.card_number]?.company_name"
+                caption
+                class="overflow-hidden ellipsis"
+              >
+                <q-icon name="mdi-domain" size="xs" class="q-mr-xs" />
+                {{ state.cards[reader.card_number]?.company_name }}
+              </q-item-label>
+              <q-item-label v-if="state.cards[reader.card_number]?.expire" caption>
+                <q-icon name="mdi-calendar" size="xs" class="q-mr-xs" />
+                <span
+                  :class="
+                    isExpired(state.cards[reader.card_number]?.expire)
+                      ? 'text-red text-weight-medium'
+                      : ''
+                  "
+                >
+                  {{ formatExpire(state.cards[reader.card_number]?.expire) }}
+                </span>
               </q-item-label>
             </template>
 
@@ -108,6 +134,7 @@
 <script setup lang="ts">
 import SmartCardList from './SmartCardList.vue'
 import type { SmartCard, Reader } from './models'
+import { formatStructureVersion, formatExpire, isExpired } from './cardFormatters'
 import { ref, reactive, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit } from '@tauri-apps/api/event'

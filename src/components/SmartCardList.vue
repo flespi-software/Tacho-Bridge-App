@@ -1,5 +1,12 @@
 <template>
   <div class="q-pt-md">
+    <!--
+      TOP SECTION: Link-mode banner.
+      Only visible when the user is binding a newly-detected ICCID (from a physical
+      card in a reader) to one of the existing saved cards. Shown above the list so
+      it's clear the next click in the list below assigns the ICCID.
+      In link mode the list below is filtered to UNLINKED cards only (see cardsList).
+    -->
     <q-banner v-if="isLinkMode" dense inline-actions rounded class="text-white bg-blue-8 q-mb-xs">
       Click a card in the list below to assign or click
       <q-btn
@@ -15,8 +22,16 @@
         <q-btn flat round color="white" icon="mdi-close" @click="cancelLink" />
       </template>
     </q-banner>
+
+    <!--
+      BOTTOM SECTION: Smart cards list (collapsible card).
+      Always rendered. In normal mode shows every saved card with full metadata
+      (name, number, generation/type, expire, company name/address, ICCID).
+      In link mode the list below is filtered to cards that have no ICCID yet.
+    -->
     <q-card flat bordered>
       <q-expansion-item v-model="isExpanded">
+        <!-- Header of the collapsible card: icon + title with count + Add button -->
         <template v-slot:header>
           <q-item-section avatar>
             <q-icon name="mdi-cards" />
@@ -37,6 +52,12 @@
           </q-item-section>
         </template>
         <q-separator />
+
+        <!--
+          Card rows. Click behavior depends on isLinkMode:
+            - link mode → bind the pending ICCID to the clicked card
+            - normal mode → open the Edit dialog for the clicked card
+        -->
         <q-list separator>
           <q-item
             dense
@@ -45,27 +66,66 @@
             @click="cardClick(number)"
             clickable
           >
+            <!-- Avatar icon: "link" during link mode, regular smart-card icon otherwise -->
             <q-item-section avatar>
               <q-icon name="mdi-link" color="grey" v-if="isLinkMode" />
               <q-icon name="mdi-smart-card" color="grey" v-else />
             </q-item-section>
+
+            <!--
+              Main info block (left → right text column):
+                1. User-given card name
+                2. Card number + "(generation | card type)" in grey parens, if known
+                3. Expiry date (red+bold if already expired)
+                4. Company name with building icon
+                5. Company address with map-marker icon
+              All auto-populated fields below the number come from the APDU sniffer
+              parsing EF_Identification / EF_Application_Identification after auth.
+            -->
             <q-item-section>
               <q-item-label class="overflow-hidden ellipsis">
                 {{ card.name }}
               </q-item-label>
               <q-item-label caption class="overflow-hidden ellipsis">
-                {{ number }}
+                <span>{{ number }}</span>
+                <span
+                  v-if="card.structure_version || card.card_type != null"
+                  class="text-grey-7 q-ml-xs"
+                >
+                  ({{ formatCardMeta(card) }})
+                </span>
+              </q-item-label>
+              <q-item-label v-if="card.expire" caption class="overflow-hidden ellipsis">
+                <span :class="isExpired(card.expire) ? 'text-red text-weight-medium' : ''">
+                  Expire: {{ formatExpire(card.expire) }}
+                </span>
+              </q-item-label>
+              <q-item-label v-if="card.company_name" caption class="overflow-hidden ellipsis">
+                <q-icon name="mdi-domain" size="xs" class="q-mr-xs" />{{ card.company_name }}
+              </q-item-label>
+              <q-item-label
+                v-if="card.company_address"
+                caption
+                class="overflow-hidden ellipsis text-grey-7"
+              >
+                <q-icon name="mdi-map-marker" size="xs" class="q-mr-xs" />{{ card.company_address }}
               </q-item-label>
             </q-item-section>
 
-            <q-item-section>
-              <q-item-label caption class="overflow-hidden ellipsis">
-                <q-chip v-if="card.iccid" dense size="sm" color="grey" class="text-dark text-bold">
-                  ICCID: {{ card.iccid }}
-                </q-chip>
-              </q-item-label>
+            <!-- ICCID chip pinned to the right. Hidden if card has no ICCID yet. -->
+            <q-item-section side>
+              <q-chip
+                v-if="card.iccid"
+                dense
+                size="sm"
+                color="grey"
+                class="text-dark text-bold q-ma-none"
+              >
+                ICCID: {{ card.iccid }}
+              </q-chip>
             </q-item-section>
 
+            <!-- Rightmost column: remove card from config -->
             <q-item-section side>
               <q-btn dense flat icon="delete" color="red" round @click.stop="removeCard(number)" />
             </q-item-section>
@@ -74,7 +134,12 @@
       </q-expansion-item>
     </q-card>
 
-    <!-- Add/Edit Dialog -->
+    <!--
+      Add/Edit card dialog.
+      Opens in two modes:
+        - Add    → all fields empty (ICCID pre-filled if coming from link flow)
+        - Edit   → card number and ICCID locked (they identify the record)
+    -->
     <q-dialog v-model="isDialogOpen">
       <q-card style="min-width: 400px">
         <q-card-section>
@@ -93,7 +158,15 @@
             :error="!!cardNumberError"
             :error-message="cardNumberError"
           />
-          <q-input v-model="dialogCardName" label="Card Name" outlined dense class="q-mt-xs" />
+          <q-input
+            v-model="dialogCardName"
+            label="Card Name"
+            outlined
+            dense
+            type="textarea"
+            autogrow
+            class="q-mt-xs"
+          />
         </q-card-section>
 
         <q-card-actions align="right">
@@ -108,6 +181,7 @@
 <script lang="ts" setup>
 import { ref, computed, watch } from 'vue'
 import type { SmartCard } from './models'
+import { formatCardMeta, formatExpire, isExpired } from './cardFormatters'
 
 /** Company smart card regex: 16 alphanumeric uppercase characters */
 const TACHO_COMPANY_CARD_REGEXP = /^[A-Z0-9]{16}$/
@@ -119,6 +193,10 @@ const props = defineProps<{
   cards: SmartCardMap
 }>()
 
+// Filtered view of cards rendered in the list:
+//   - Normal mode:   every saved card (full metadata from config + sniffer).
+//   - Link mode:     only cards WITHOUT an ICCID yet, so the user can bind the
+//                    pending ICCID (from the top-section banner flow) to one of them.
 const cardsList = computed(() => {
   return Object.keys(props.cards)
     .filter((el) => {
@@ -240,6 +318,7 @@ function closeCard(): void {
 function removeCard(number: string): void {
   emit('delete-card', number)
 }
+
 
 defineExpose({
   linkMode,

@@ -295,6 +295,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
                                                     let rapdu = managed_card.send_apdu(&hex_value, &client_id_cloned).await;
 
+                                                    // Passive sniffer: extract plaintext EF data from SM'd responses
+                                                    crate::apdu_sniffer::sniff(&client_id_cloned, hex_value, &rapdu);
+
                                                     // Send the global-cards-sync event to the frontend that card is connected
                                                     emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(true));
 

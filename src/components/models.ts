@@ -2,6 +2,11 @@
 export interface SmartCard {
   name?: string
   iccid?: string
+  expire?: number | null
+  card_type?: number | null
+  structure_version?: [number, number] | null
+  company_name?: string | null
+  company_address?: string | null
 }
 
 export interface Reader {
