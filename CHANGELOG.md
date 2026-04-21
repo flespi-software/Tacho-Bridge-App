@@ -86,6 +86,7 @@ All notable changes to this project will be documented in this file.
 [feature] Passive APDU sniffer parses plaintext EF data from VU↔card SM traffic (tachograph SM uses DO'81 plain value, no encryption). Recognises EF_Identification (0520) and EF_Application_Identification (0501).  
 [feature] CardConfig extended with sniffer-populated fields — card_type, structure_version, company_name, company_address, expire — persisted in config.yaml and synced to the frontend.  
 [feature] Card info display — extended view (card type, generation, expire, company name/address) in the smart cards list; condensed view in the reader block.  
-[feature] Added display of the last successful authentication status + timestamp.  
+[feature] Added display of the last successful authentication status + timestamp. The config contains UTC 0. Displayed according to the local time zone.  
+[fix] README.md updated. Added usage information.
 [fix] Fixed bug with ICID detection when connecting a card.  
 [fix] The T protocol detection mechanism for connecting to the card has been reworked. The PC/SC library now handles this completely automatically.  
