@@ -28,7 +28,7 @@ struct Release {
 ///
 /// * On macOS, the log file is created in the `~/Documents/tba` directory.
 /// * On Windows, the log file is created in the `%USERPROFILE%\Documents\tba` directory.
-/// 
+///
 
 pub fn setup_logging() {
     let mut log_path = PathBuf::new();
@@ -85,14 +85,14 @@ pub fn setup_logging() {
                 message
             ))
         })
-        .level(log::LevelFilter::Info)  // Change to Debug / Info if needed
+        .level(log::LevelFilter::Debug)  // Change to Debug / Info if needed
         .chain(fern::log_file(&log_path).unwrap())
         .apply();
 
     if let Err(e) = init_log_result {
         log::warn!("Failed to initialize logging. No permission to write log file at: {:?}. Error: {}", log_path, e);
     }
-    
+
     // Log the application launch
     log::info!("-== Application is launched ==-");
 
@@ -133,13 +133,13 @@ async fn check_latest_version() -> Result<(), reqwest::Error> {
     if response.status().is_success() {
         let release: Release = response.json().await?;
         // log::info!("Latest release info: {:?}", release);
-        
+
         let latest_version = release.tag_name;
         let current_version = env!("CARGO_PKG_VERSION");
 
         let latest_version_num = version_to_number(&latest_version);
         let current_version_num = version_to_number(current_version);
-        
+
         if current_version_num > latest_version_num {
             log::info!(
                 "Version (current: {}, latest: {})",
