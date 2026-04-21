@@ -7,6 +7,7 @@ export interface SmartCard {
   structure_version?: [number, number] | null
   company_name?: string | null
   company_address?: string | null
+  last_auth?: [number, boolean] | null
 }
 
 export interface Reader {

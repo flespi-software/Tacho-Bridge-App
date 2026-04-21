@@ -13,6 +13,37 @@
             <q-item-label caption lines="3" class="text-grey text-bold">
               <small>{{ reader.name }}</small>
             </q-item-label>
+            <!--
+              Last authentication state. Three modes:
+                - processing (yellow) — active APDU exchange with the VU
+                - success (green)    — last completed auth ended with finish:true
+                - fail (red)         — last completed auth was aborted
+              Only the status word itself is coloured; the prefix stays neutral.
+            -->
+            <q-item-label
+              v-if="
+                reader.card_number &&
+                (authInProgress[reader.card_number] ||
+                  state.cards[reader.card_number]?.last_auth)
+              "
+              caption
+            >
+              <template v-if="authInProgress[reader.card_number]">
+                Last auth:
+                <span class="text-amber-8 text-weight-medium">processing...</span>
+              </template>
+              <template v-else-if="state.cards[reader.card_number]?.last_auth">
+                Last auth:
+                {{ formatAuthDate(state.cards[reader.card_number]?.last_auth?.[0]) }}
+                (<span
+                  :class="
+                    state.cards[reader.card_number]?.last_auth?.[1]
+                      ? 'text-green-8'
+                      : 'text-red text-weight-medium'
+                  "
+                >{{ state.cards[reader.card_number]?.last_auth?.[1] ? 'success' : 'fail' }}</span>)
+              </template>
+            </q-item-label>
           </q-item-section>
         </q-item>
         <q-item class="col-6" style="min-height: 50px" dense v-if="reader.status !== 'UNKNOWN'">
@@ -134,8 +165,8 @@
 <script setup lang="ts">
 import SmartCardList from './SmartCardList.vue'
 import type { SmartCard, Reader } from './models'
-import { formatStructureVersion, formatExpire, isExpired } from './cardFormatters'
-import { ref, reactive, defineComponent } from 'vue'
+import { formatStructureVersion, formatExpire, isExpired, formatAuthDate } from './cardFormatters'
+import { ref, reactive, computed, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit } from '@tauri-apps/api/event'
 
@@ -148,6 +179,20 @@ const cardlist = ref<null | { linkMode: (iccid: string) => null; openAddDialog: 
 const state = reactive({
   readers: [] as Reader[],
   cards: {} as Record<string, SmartCard>,
+})
+
+// Transient "authentication in progress" flag per card_number, derived from
+// the Reader.authentication field emitted by the backend via global-cards-sync.
+// Persists only for the duration of an active APDU exchange; SmartCardList
+// uses it to render the yellow "Last auth: processing..." line.
+const authInProgress = computed<Record<string, boolean>>(() => {
+  const map: Record<string, boolean> = {}
+  for (const r of state.readers) {
+    if (r.card_number && r.authentication) {
+      map[r.card_number] = true
+    }
+  }
+  return map
 })
 
 ////////////////////////// Listening for the event from the backend //////////////////////////

@@ -244,6 +244,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                 log_header
                                             );
 
+                                            // Persist successful auth timestamp
+                                            crate::config::record_auth_result(&client_id_cloned, true);
+
                                             // Reset the card to its original state
                                             managed_card.reconnect().await;
 
@@ -270,6 +273,8 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                             "{} Empty payload received while auth in progress. Reconnecting card.",
                                                             log_header
                                                         );
+                                                        // Persist failed auth timestamp (aborted mid-flow)
+                                                        crate::config::record_auth_result(&client_id_cloned, false);
                                                         // Reset the card to its original state
                                                         managed_card.reconnect().await;
                                                     }

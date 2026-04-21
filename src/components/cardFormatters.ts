@@ -47,3 +47,9 @@ export function isExpired(unixTs: number | null | undefined): boolean {
   if (!unixTs) return false
   return unixTs * 1000 < Date.now()
 }
+
+/// Formats last_auth timestamp as "YYYY-MM-DD HH:MM:SS".
+export function formatAuthDate(unixTs: number | null | undefined): string {
+  if (!unixTs) return ''
+  return new Date(unixTs * 1000).toISOString().slice(0, 19).replace('T', ' ')
+}

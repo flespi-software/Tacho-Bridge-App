@@ -55,6 +55,7 @@ pub struct CardConfig {
     pub structure_version: Option<(u8, u8)>,    // cardStructureVersion (major, minor): major 0x00=Gen1, 0x01=Gen2; minor = data-element revision
     pub company_name: Option<String>,           // Company name (from EF_Identification, Company Card only)
     pub company_address: Option<String>,        // Company address (from EF_Identification, Company Card only)
+    pub last_auth: Option<(u64, bool)>,         // Last completed authentication: (unix_timestamp, success_flag)
 }
 // UI Configuration structure, part of ConfigurationFile that contains data about how UI looks like.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -156,6 +157,7 @@ fn update_card_config(
                 existing_card.structure_version = content.structure_version;
                 existing_card.company_name = content.company_name;
                 existing_card.company_address = content.company_address;
+                existing_card.last_auth = content.last_auth;
                 // needs_restart = true;
                 changed = true;
             } else {
@@ -166,16 +168,18 @@ fn update_card_config(
                     || existing_card.structure_version != content.structure_version
                     || existing_card.company_name != content.company_name
                     || existing_card.company_address != content.company_address
+                    || existing_card.last_auth != content.last_auth
                 {
                     log::debug!(
-                        "Updating optional fields for card {}: name = {:?}, expire = {:?}, card_type = {:?}, structure_version = {:?}, company_name = {:?}, company_address = {:?}",
+                        "Updating optional fields for card {}: name = {:?}, expire = {:?}, card_type = {:?}, structure_version = {:?}, company_name = {:?}, company_address = {:?}, last_auth = {:?}",
                         card_number,
                         content.name,
                         content.expire,
                         content.card_type,
                         content.structure_version,
                         content.company_name,
-                        content.company_address
+                        content.company_address,
+                        content.last_auth
                     );
                     existing_card.expire = content.expire;
                     existing_card.name = content.name;
@@ -183,6 +187,7 @@ fn update_card_config(
                     existing_card.structure_version = content.structure_version;
                     existing_card.company_name = content.company_name;
                     existing_card.company_address = content.company_address;
+                    existing_card.last_auth = content.last_auth;
                     changed = true;
                 }
             }
@@ -405,6 +410,20 @@ pub enum CacheSection {
 pub fn get_card_config_from_cache(card_number: &str) -> Option<CardConfig> {
     let cache = CACHE.lock().unwrap();
     cache.cards.get(card_number).cloned()
+}
+
+/// Records the final state of an authentication attempt in the card config:
+/// `success == true` → green "success" line in UI; `false` → red "fail".
+/// The processing state while auth is running is derived from Reader.authentication
+/// in the frontend and is NOT stored here (it's transient, lost on restart).
+pub fn record_auth_result(card_number: &str, success: bool) {
+    let Some(mut cfg) = get_card_config_from_cache(card_number) else {
+        log::warn!("record_auth_result: unknown card_number {}", card_number);
+        return;
+    };
+    let ts = chrono::Utc::now().timestamp() as u64;
+    cfg.last_auth = Some((ts, success));
+    update_card(card_number, cfg);
 }
 
 /// Retrieves a value from the cache by key.
@@ -641,6 +660,7 @@ fn migrate_old_config(contents: &str) -> Option<ConfigurationFile> {
                 structure_version: None,
                 company_name: None,
                 company_address: None,
+                last_auth: None,
             };
             new_cards.insert(card_number, card_config);
         }
