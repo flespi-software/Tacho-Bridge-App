@@ -48,8 +48,14 @@ export function isExpired(unixTs: number | null | undefined): boolean {
   return unixTs * 1000 < Date.now()
 }
 
-/// Formats last_auth timestamp as "YYYY-MM-DD HH:MM:SS".
+/// Formats last_auth timestamp (stored as UTC unix seconds) in the user's local
+/// timezone as "YYYY-MM-DD HH:MM:SS". Storage stays UTC — only display is localised.
 export function formatAuthDate(unixTs: number | null | undefined): string {
   if (!unixTs) return ''
-  return new Date(unixTs * 1000).toISOString().slice(0, 19).replace('T', ' ')
+  const d = new Date(unixTs * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  )
 }
