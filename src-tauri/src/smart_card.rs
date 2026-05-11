@@ -444,7 +444,7 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
     Protocols::T0
 }
 
-// Manual card sync function. 
+// Manual card sync function.
 // This function is used to manually sync cards from anywhere in the program.
 // Manually sync cards. Clicking on the button in the frontend will trigger this function
 #[tauri::command]
@@ -763,20 +763,36 @@ impl ManagedCard {
             self.reader_name.to_string_lossy()
         );
 
-        // SELECT EF ICC (2FE2)
+        // SELECT EF_ICC (FID 0002) under MF
         let select_result = self.apdu_transmit("00A4020C020002").await?;
 
         if !select_result.ends_with("9000") {
-            log::warn!("SELECT EF ICC returned unexpected status: {}", select_result);
+            // Do NOT proceed to READ BINARY: on SW != 9000 the current EF is
+            // unchanged, so READ would return bytes from whatever was previously
+            // selected (e.g. EF_Identification from a prior auth session),
+            // producing a garbage ICCID that happens to be part of cardNumber.
+            return Err(
+                format!("SELECT EF_ICC failed with status: {}", select_result).into()
+            );
         }
 
-        // READ BINARY (10 байт)
+        // READ BINARY: 8 bytes of cardExtendedSerialNumber at offset 1 (skipping clockStop)
         let read_response = self.apdu_transmit("00B0000108").await?;
 
-        let hex_data = read_response.strip_suffix("9000").unwrap_or(&read_response);
+        let Some(hex_data) = read_response.strip_suffix("9000") else {
+            return Err(
+                format!("READ BINARY EF_ICC returned unexpected status: {}", read_response).into()
+            );
+        };
 
         let bytes = hex::decode(hex_data)
             .map_err(|e| format!("Failed to decode ICCID hex: {}", e))?;
+
+        if bytes.len() != 8 {
+            return Err(
+                format!("EF_ICC READ BINARY returned {} bytes, expected 8", bytes.len()).into()
+            );
+        }
 
         let iccid = bytes.iter().map(|b| format!("{:02X}", b)).collect::<String>();
 

@@ -13,6 +13,37 @@
             <q-item-label caption lines="3" class="text-grey text-bold">
               <small>{{ reader.name }}</small>
             </q-item-label>
+            <!--
+              Last authentication state. Three modes:
+                - processing (yellow) — active APDU exchange with the VU
+                - success (green)    — last completed auth ended with finish:true
+                - fail (red)         — last completed auth was aborted
+              Only the status word itself is coloured; the prefix stays neutral.
+            -->
+            <q-item-label
+              v-if="
+                reader.card_number &&
+                (authInProgress[reader.card_number] ||
+                  state.cards[reader.card_number]?.last_auth)
+              "
+              caption
+            >
+              <template v-if="authInProgress[reader.card_number]">
+                Last auth:
+                <span class="text-amber-8 text-weight-medium">processing...</span>
+              </template>
+              <template v-else-if="state.cards[reader.card_number]?.last_auth">
+                Last auth:
+                {{ formatAuthDate(state.cards[reader.card_number]?.last_auth?.[0]) }}
+                (<span
+                  :class="
+                    state.cards[reader.card_number]?.last_auth?.[1]
+                      ? 'text-green-8'
+                      : 'text-red text-weight-medium'
+                  "
+                >{{ state.cards[reader.card_number]?.last_auth?.[1] ? 'success' : 'fail' }}</span>)
+              </template>
+            </q-item-label>
           </q-item-section>
         </q-item>
         <q-item class="col-6" style="min-height: 50px" dense v-if="reader.status !== 'UNKNOWN'">
@@ -31,13 +62,39 @@
             </template>
             <template v-if="reader.card_number">
               <q-item-label
-                lines="1"
                 v-if="state.cards && reader.card_number && state.cards[reader.card_number]"
+                style="word-break: break-word; white-space: normal"
               >
                 {{ state.cards[reader.card_number]?.name }}
               </q-item-label>
-              <q-item-label lines="1">
+              <q-item-label>
                 <span class="text-weight-medium">{{ reader.card_number }}</span>
+                <span
+                  v-if="state.cards[reader.card_number]?.structure_version"
+                  class="text-grey-7 q-ml-xs"
+                >
+                  ({{ formatStructureVersion(state.cards[reader.card_number]?.structure_version) }})
+                </span>
+              </q-item-label>
+              <q-item-label
+                v-if="state.cards[reader.card_number]?.company_name"
+                caption
+                class="overflow-hidden ellipsis"
+              >
+                <q-icon name="mdi-domain" size="xs" class="q-mr-xs" />
+                {{ state.cards[reader.card_number]?.company_name }}
+              </q-item-label>
+              <q-item-label v-if="state.cards[reader.card_number]?.expire" caption>
+                <q-icon name="mdi-calendar" size="xs" class="q-mr-xs" />
+                <span
+                  :class="
+                    isExpired(state.cards[reader.card_number]?.expire)
+                      ? 'text-red text-weight-medium'
+                      : ''
+                  "
+                >
+                  {{ formatExpire(state.cards[reader.card_number]?.expire) }}
+                </span>
               </q-item-label>
             </template>
 
@@ -108,7 +165,8 @@
 <script setup lang="ts">
 import SmartCardList from './SmartCardList.vue'
 import type { SmartCard, Reader } from './models'
-import { ref, reactive, defineComponent } from 'vue'
+import { formatStructureVersion, formatExpire, isExpired, formatAuthDate } from './cardFormatters'
+import { ref, reactive, computed, defineComponent } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit } from '@tauri-apps/api/event'
 
@@ -121,6 +179,20 @@ const cardlist = ref<null | { linkMode: (iccid: string) => null; openAddDialog: 
 const state = reactive({
   readers: [] as Reader[],
   cards: {} as Record<string, SmartCard>,
+})
+
+// Transient "authentication in progress" flag per card_number, derived from
+// the Reader.authentication field emitted by the backend via global-cards-sync.
+// Persists only for the duration of an active APDU exchange; SmartCardList
+// uses it to render the yellow "Last auth: processing..." line.
+const authInProgress = computed<Record<string, boolean>>(() => {
+  const map: Record<string, boolean> = {}
+  for (const r of state.readers) {
+    if (r.card_number && r.authentication) {
+      map[r.card_number] = true
+    }
+  }
+  return map
 })
 
 ////////////////////////// Listening for the event from the backend //////////////////////////

@@ -1,0 +1,366 @@
+// Passive APDU sniffer.
+//
+// TBA is a transparent proxy between flespi (VU role) and the smart card.
+// After Gen1 mutual authentication flespi wraps every APDU in Secure Messaging
+// (CLA=0C), but for tachograph cards the SM wrapper uses DO'81 (plain value) +
+// DO'8E (MAC) — no DO'87 (encrypted value). That means the file content flows
+// through TBA in cleartext; only integrity is protected.
+//
+// This module observes (CAPDU, RAPDU) pairs and, when a READ BINARY response
+// arrives for a previously-SELECTed EF we recognise (0520 EF_Identification,
+// 0501 EF_Application_Identification), decodes and logs the parsed fields.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use lazy_static::lazy_static;
+
+struct SniffState {
+    /// FID of the most recently SELECTed EF (plain or SM-wrapped).
+    last_selected_ef: Option<u16>,
+}
+
+lazy_static! {
+    /// Per-client_id sniffer state. client_id == card number.
+    static ref STATE: Mutex<HashMap<String, SniffState>> = Mutex::new(HashMap::new());
+}
+
+/// Observe a CAPDU/RAPDU exchange. client_id is the card number.
+pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
+    let cmd = match hex::decode(command_hex) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let resp = match hex::decode(response_hex) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // Track SELECTed EF (ignore SELECT AID / SELECT MF)
+    if let Some(fid) = select_ef_fid(&cmd) {
+        let mut state = STATE.lock().unwrap();
+        state
+            .entry(client_id.to_string())
+            .or_insert(SniffState { last_selected_ef: None })
+            .last_selected_ef = Some(fid);
+        return;
+    }
+
+    // READ BINARY — check if we have a known EF context and plaintext data to parse
+    if !is_read_binary(&cmd) {
+        return;
+    }
+
+    let fid = {
+        let state = STATE.lock().unwrap();
+        state
+            .get(client_id)
+            .and_then(|s| s.last_selected_ef)
+    };
+    let Some(fid) = fid else { return; };
+
+    let Some(data) = extract_plain_body(&resp) else { return; };
+
+    match fid {
+        0x0520 => parse_ef_identification(client_id, &data),
+        0x0501 => parse_ef_application_identification(client_id, &data),
+        _ => {}
+    }
+}
+
+/// Returns the FID if `cmd` is a SELECT EF under current DF.
+/// Handles both plain (`00 A4 02 0C 02 HI LO`) and SM-wrapped
+/// (`0C A4 02 0C Lc 81 02 HI LO ... 8E 08 <MAC> 00`) forms.
+fn select_ef_fid(cmd: &[u8]) -> Option<u16> {
+    if cmd.len() < 7 || cmd[1] != 0xA4 || cmd[2] != 0x02 {
+        return None;
+    }
+    // Plain: 00 A4 02 0C 02 HI LO
+    if cmd[0] == 0x00 && cmd[4] == 0x02 && cmd.len() >= 7 {
+        return Some(u16::from_be_bytes([cmd[5], cmd[6]]));
+    }
+    // SM: 0C A4 02 0C Lc 81 02 HI LO ...
+    if cmd[0] == 0x0C && cmd.len() >= 9 && cmd[5] == 0x81 && cmd[6] == 0x02 {
+        return Some(u16::from_be_bytes([cmd[7], cmd[8]]));
+    }
+    None
+}
+
+fn is_read_binary(cmd: &[u8]) -> bool {
+    cmd.len() >= 2 && (cmd[0] == 0x00 || cmd[0] == 0x0C) && cmd[1] == 0xB0
+}
+
+/// Extracts plaintext body from a RAPDU.
+/// - SM response: body is the value of DO'81 (plain value), expected as the
+///   first data object before DO'99/DO'8E and the trailing SW.
+/// - Plain response: body is everything except the trailing 2-byte SW.
+/// Returns None if the response has no payload (e.g. only SW).
+fn extract_plain_body(resp: &[u8]) -> Option<Vec<u8>> {
+    if resp.len() < 2 {
+        return None;
+    }
+    let body = &resp[..resp.len() - 2];
+    if body.is_empty() {
+        return None;
+    }
+
+    // SM-wrapped: starts with DO'81
+    if body[0] == 0x81 {
+        let (len, len_bytes) = ber_length(&body[1..])?;
+        let start = 1 + len_bytes;
+        if start + len <= body.len() {
+            return Some(body[start..start + len].to_vec());
+        }
+        return None;
+    }
+
+    // SM with encrypted body (DO'87) — cannot decode without session keys
+    if body[0] == 0x87 {
+        return None;
+    }
+
+    // Plain response: body is the data
+    Some(body.to_vec())
+}
+
+/// Parses BER-TLV length: returns (length, bytes_consumed).
+fn ber_length(data: &[u8]) -> Option<(usize, usize)> {
+    if data.is_empty() {
+        return None;
+    }
+    let first = data[0];
+    if first < 0x80 {
+        return Some((first as usize, 1));
+    }
+    let num = (first & 0x7F) as usize;
+    if num == 0 || num > 4 || data.len() < 1 + num {
+        return None;
+    }
+    let mut len = 0usize;
+    for i in 0..num {
+        len = (len << 8) | (data[1 + i] as usize);
+    }
+    Some((len, 1 + num))
+}
+
+// ─────────── Field parsers ───────────
+
+/// Parses EF_Identification (Annex 1C §2.24 CardIdentification + holder block).
+/// Logs all fields and persists the subset we track (expire, company_name,
+/// company_address) into the card's config if values changed.
+fn parse_ef_identification(client_id: &str, data: &[u8]) {
+    log::debug!(
+        "EF_Identification (0520) plaintext ({} bytes): {}",
+        data.len(),
+        hex::encode(data)
+    );
+
+    if let Some(b) = slice(data, 0, 1) {
+        log::info!("  cardIssuingMemberState: 0x{:02X} ({})", b[0], b[0]);
+    }
+    if let Some(b) = slice(data, 1, 16) {
+        log::info!(
+            "  cardNumber: \"{}\" (raw={})",
+            ia5(b),
+            hex::encode(b)
+        );
+    }
+    if let Some(b) = slice(data, 17, 36) {
+        log::info!("  cardIssuingAuthorityName: {}", name_str(b));
+    }
+    if let Some(b) = slice(data, 53, 4) {
+        log::info!("  cardIssueDate: {}", time_real(b));
+    }
+    if let Some(b) = slice(data, 57, 4) {
+        log::info!("  cardValidityBegin: {}", time_real(b));
+    }
+    if let Some(b) = slice(data, 61, 4) {
+        log::info!("  cardExpiryDate: {}", time_real(b));
+    }
+
+    // Company Card holder block
+    if data.len() >= 65 + 74 {
+        if let Some(b) = slice(data, 65, 36) {
+            log::info!("  companyName: {}", name_str(b));
+        }
+        if let Some(b) = slice(data, 101, 36) {
+            log::info!("  companyAddress: {}", name_str(b));
+        }
+        if let Some(b) = slice(data, 137, 2) {
+            log::info!(
+                "  cardHolderPreferredLanguage: \"{}\"",
+                String::from_utf8_lossy(b)
+            );
+        }
+    }
+
+    // Persist changes to card config
+    let Some(mut cfg) = crate::config::get_card_config_from_cache(client_id) else {
+        return;
+    };
+    let mut changed = false;
+
+    if let Some(b) = slice(data, 61, 4) {
+        let ts = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        let new_value = if ts == 0 { None } else { Some(ts as u64) };
+        if cfg.expire != new_value {
+            cfg.expire = new_value;
+            changed = true;
+        }
+    }
+    if let Some(b) = slice(data, 65, 36) {
+        let new_value = extract_name(b);
+        if cfg.company_name != new_value {
+            cfg.company_name = new_value;
+            changed = true;
+        }
+    }
+    if let Some(b) = slice(data, 101, 36) {
+        let new_value = extract_name(b);
+        if cfg.company_address != new_value {
+            cfg.company_address = new_value;
+            changed = true;
+        }
+    }
+
+    if changed {
+        log::debug!("EF_Identification → config update for {}", client_id);
+        crate::config::update_card(client_id, cfg);
+    }
+}
+
+/// Parses EF_Application_Identification for Company Card.
+/// Layout: typeOfTachographCardId (1) + cardStructureVersion (2) + noOfCompanyActivityRecords (2).
+/// Persists card_type and structure_version into the card's config if changed.
+fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
+    log::debug!(
+        "EF_Application_Identification (0501) plaintext ({} bytes): {}",
+        data.len(),
+        hex::encode(data)
+    );
+
+    if !data.is_empty() {
+        let t = data[0];
+        let ts = match t {
+            1 => "Driver Card",
+            2 => "Workshop Card",
+            3 => "Control Card",
+            4 => "Company Card",
+            _ => "Unknown",
+        };
+        log::info!("  typeOfTachographCardId: 0x{:02X} ({})", t, ts);
+    }
+    if data.len() >= 3 {
+        log::info!(
+            "  cardStructureVersion: {:02X}.{:02X}",
+            data[1],
+            data[2]
+        );
+    }
+    if data.len() >= 5 {
+        let n = u16::from_be_bytes([data[3], data[4]]);
+        log::info!("  noOfCompanyActivityRecords: {}", n);
+    }
+
+    // Persist changes to card config
+    let Some(mut cfg) = crate::config::get_card_config_from_cache(client_id) else {
+        return;
+    };
+    let mut changed = false;
+
+    if !data.is_empty() {
+        let new_value = Some(data[0]);
+        if cfg.card_type != new_value {
+            cfg.card_type = new_value;
+            changed = true;
+        }
+    }
+    if data.len() >= 3 {
+        // Gen2 cards expose EF_Application_Identification under BOTH DF_Tachograph (Gen1, ver 00.00)
+        // and DF_Tachograph_G2 (Gen2, ver 01.xx). Keep only the highest version seen —
+        // tuple comparison is lexicographic: (0,0) < (1,0) < (1,1) < (1,2) ...
+        let new_value = (data[1], data[2]);
+        let should_update = match cfg.structure_version {
+            Some(current) => new_value > current,
+            None => true,
+        };
+        if should_update {
+            cfg.structure_version = Some(new_value);
+            changed = true;
+        } else {
+            log::debug!(
+                "EF_AI structure_version {:?} not higher than stored {:?} — skipped",
+                new_value,
+                cfg.structure_version
+            );
+        }
+    }
+
+    if changed {
+        log::debug!("EF_Application_Identification → config update for {}", client_id);
+        crate::config::update_card(client_id, cfg);
+    }
+}
+
+// ─────────── Helpers ───────────
+
+fn slice(d: &[u8], start: usize, len: usize) -> Option<&[u8]> {
+    if start + len <= d.len() {
+        Some(&d[start..start + len])
+    } else {
+        None
+    }
+}
+
+/// Trims trailing padding (0x00 / 0xFF) from tachograph fixed-length strings.
+fn trim(b: &[u8]) -> &[u8] {
+    let end = b
+        .iter()
+        .rposition(|c| *c != 0xFF && *c != 0x00 && *c != b' ')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &b[..end]
+}
+
+/// `Name` = codePage (1 byte) + 35 bytes string.
+fn name_str(b: &[u8]) -> String {
+    if b.is_empty() {
+        return String::new();
+    }
+    let cp = b[0];
+    let payload = trim(&b[1..]);
+    format!("[cp={}] \"{}\"", cp, String::from_utf8_lossy(payload))
+}
+
+/// Extracts just the string value from a `Name` field (codePage byte + 35-byte string).
+/// Codepage itself is dropped. Returns None if content is empty after trimming padding.
+fn extract_name(b: &[u8]) -> Option<String> {
+    if b.is_empty() {
+        return None;
+    }
+    let payload = trim(&b[1..]);
+    if payload.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(payload).to_string())
+}
+
+/// IA5 fixed-length string, trims padding.
+fn ia5(b: &[u8]) -> String {
+    String::from_utf8_lossy(trim(b)).into_owned()
+}
+
+/// 4-byte TimeReal (unix seconds, big-endian).
+fn time_real(b: &[u8]) -> String {
+    if b.len() < 4 {
+        return "<invalid>".into();
+    }
+    let ts = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    if ts == 0 {
+        return "<unset>".into();
+    }
+    match chrono::DateTime::<chrono::Utc>::from_timestamp(ts as i64, 0) {
+        Some(dt) => format!("{} (ts={})", dt.format("%Y-%m-%d %H:%M:%S UTC"), ts),
+        None => format!("ts={}", ts),
+    }
+}

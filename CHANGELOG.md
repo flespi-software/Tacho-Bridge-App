@@ -79,3 +79,15 @@ All notable changes to this project will be documented in this file.
 [feature] App connection status indicator — header icon turns green when MQTT connection is online.  
 [feature] Server configuration dialog extracted into a separate ServerConfigDialog component.  
 [feature] Theme selector redesigned from dropdown to icon button toggle (Light/Auto/Dark).  
+
+### [0.7.2] - 2026-05-12
+
+[feature] Updated Rust toolchain and dependencies: rumqttc 0.24→0.25.1, reqwest 0.12→0.13.2, tauri 2.5→2.10.3, pcsc 2.8→2.9.0  
+[feature] Passive APDU sniffer parses plaintext EF data from VU↔card SM traffic (tachograph SM uses DO'81 plain value, no encryption). Recognises EF_Identification (0520) and EF_Application_Identification (0501).  
+[feature] CardConfig extended with sniffer-populated fields — card_type, structure_version, company_name, company_address, expire — persisted in config.yaml and synced to the frontend.  
+[feature] Card info display — extended view (card type, generation, expire, company name/address) in the smart cards list; condensed view in the reader block.  
+[feature] Added display of the last successful authentication status + timestamp. The config contains UTC 0. Displayed according to the local time zone.  
+[fix] README.md updated. Added usage information.
+[fix] Fixed bug with ICID detection when connecting a card.  
+[fix] The T protocol detection mechanism for connecting to the card has been reworked. The PC/SC library now handles this completely automatically.  
+[fix] The code for migrating the old configuration version to the current one has been removed.

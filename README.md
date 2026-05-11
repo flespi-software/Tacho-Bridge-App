@@ -123,6 +123,62 @@ npm run tauri icon src-tauri/icons/app-icon.png
 
 **That's it. All the necessary icons of all sizes for all platforms will be generated.**
 
+## Usage
+
+TBA is a transparent APDU proxy between a remote Vehicle Unit (tachograph) and a physical tachograph card in a local smart card reader. The authentication ceremony is driven by the VU; TBA only relays bytes and extracts data that passes through.
+
+### Linking a card
+
+Before a card can be used, it must be linked in TBA:
+
+1. Insert the card into a reader. TBA detects it and shows its **ICCID**.
+2. Click the **Add Card** button (or use link mode on the detected card) to bind the physical card to a **card number** in the config.
+3. Card numbers are 16 alphanumeric uppercase characters per Annex 1C regulation (EU 2016/799).
+
+Without linking, an inserted card appears as "UNKNOWN CARD" and cannot authenticate.
+
+### Card information display
+
+Once linked and authenticated at least once, the reader block shows, under the reader name:
+
+- **Name** — user-defined label (e.g. fleet identifier)
+- **Card number** followed by `(generation | card type)` in grey, e.g. `4200000000525000 (Gen2 v2)`
+- **Company name** and **company address** (icons 🏢 and 📍)
+- **Expire** date, red if already past
+- **Last auth** — last completed authentication time and its status (`success` green, `fail` red, `processing...` yellow during an active APDU exchange)
+
+### Card data is only available during / after authentication
+
+Tachograph cards protect their content with access conditions. Files like `EF_Identification` (card number, company name/address, expiry date) and `EF_Application_Identification` (card type, structure version) are readable **only** over Secure Messaging established by the Vehicle Unit during mutual authentication.
+
+TBA does **not** hold any cryptographic keys (those are issued by EUR CA to certified VU/workshop manufacturers only), so it cannot originate SM commands on its own. Instead it passively observes the APDU stream passing through:
+
+- VU issues `SELECT EF` + `READ BINARY` wrapped in SM after auth
+- The card's response contains `DO'81` (plain value) + `DO'8E` (MAC) — tachograph SM protects integrity but **does not encrypt** the file content
+- TBA parses the plaintext from `DO'81` and persists recognised fields
+
+Currently recognised files:
+
+| FID | File | Extracted fields |
+|-----|------|------------------|
+| `0520` | `EF_Identification` | cardExpiryDate → `expire`, companyName → `company_name`, companyAddress → `company_address` |
+| `0501` | `EF_Application_Identification` | typeOfTachographCardId → `card_type`, cardStructureVersion → `structure_version` (keep highest on Gen2 cards that expose both Gen1 and Gen2) |
+
+If the card has never been authenticated through TBA, these fields stay `null` in the config and the UI shows only the fields that are available pre-auth (ICCID, card number, name).
+
+### Time storage and display
+
+`last_auth` and `expire` are stored as UTC unix seconds. The UI renders them in the **local timezone of the machine**, so the same config file shown on computers in different regions displays the corresponding local time. Format: `YYYY-MM-DD HH:MM:SS`.
+
+### Config and log location
+
+Both files live in the user's Documents directory:
+
+- **Config:** `~/Documents/tba/config.yaml` — server host, app identifier, per-card data (iccid, card number, expire, company info, last_auth, …)
+- **Log:** `~/Documents/tba/log.txt` — rolling file log written by `fern`; contains APDU traces (at DEBUG), connection events (`[CONN] phase=… status=…`), and sniffer field extractions
+
+On first run both are created automatically; if the OS denies write access, the UI surfaces a notification.
+
 ## License
 
 [MIT](LICENSE) license.

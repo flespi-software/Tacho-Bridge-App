@@ -6,6 +6,7 @@ mod config;             // Configuration handling.
 mod logger;             // Logging functionality.
 mod mqtt;               // MQTT communication.
 mod smart_card;         // PCSC module for smart card operations.
+mod apdu_sniffer;       // Passive sniffer for plaintext EF data in proxied APDUs.
 mod global_app_handle;  // Global access to app state and emitters.
 // mod com_port;          // COM port handling.
 
