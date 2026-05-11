@@ -80,7 +80,7 @@ All notable changes to this project will be documented in this file.
 [feature] Server configuration dialog extracted into a separate ServerConfigDialog component.  
 [feature] Theme selector redesigned from dropdown to icon button toggle (Light/Auto/Dark).  
 
-### [0.7.2] - 2026-03-25
+### [0.7.2] - 2026-05-12
 
 [feature] Updated Rust toolchain and dependencies: rumqttc 0.24→0.25.1, reqwest 0.12→0.13.2, tauri 2.5→2.10.3, pcsc 2.8→2.9.0  
 [feature] Passive APDU sniffer parses plaintext EF data from VU↔card SM traffic (tachograph SM uses DO'81 plain value, no encryption). Recognises EF_Identification (0520) and EF_Application_Identification (0501).  
