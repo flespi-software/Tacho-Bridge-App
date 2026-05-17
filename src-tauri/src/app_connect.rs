@@ -27,11 +27,18 @@ use crate::config::CacheSection;         // Enum for cache sections for getting 
 use crate::global_app_handle::app_emit_event; // Emits app connection status to the frontend.
 use crate::smart_card::ProcessingCard;
 
-/// Timeout in seconds to wait before reconnecting to the server.
-///
-/// This value is used to set the interval between reconnection attempts
-/// to the MQTT server in case of connection loss.
-const SLEEP_DURATION_SECS: u64 = 10;
+/// Initial delay (in seconds) before the first reconnect attempt after a
+/// connection failure. Subsequent failures back off exponentially up to
+/// `RECONNECT_DELAY_MAX_SECS`.
+const RECONNECT_DELAY_INITIAL_SECS: u64 = 10;
+/// Upper bound for the reconnect backoff. Past this point we keep retrying
+/// at this interval until either the server comes back or the task is killed.
+const RECONNECT_DELAY_MAX_SECS: u64 = 300;
+
+/// Returns the next reconnect delay given the current one (exponential, capped).
+fn next_reconnect_delay(current: u64) -> u64 {
+    current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
+}
 
 fn log_connection_error(log_header: &str, error: &ConnectionError) {
     match error {
@@ -135,6 +142,7 @@ pub async fn app_connection() {
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
         let mut is_online = false;
+        let mut reconnect_delay_secs: u64 = RECONNECT_DELAY_INITIAL_SECS;
 
         log::info!("{} [CONN] phase=eventloop status=started", log_header);
 
@@ -143,6 +151,8 @@ pub async fn app_connection() {
                 Ok(notification) => {
                     if !is_online {
                         is_online = true;
+                        // Successful poll → reset backoff for the next failure.
+                        reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
                         log::info!(
                             "{} [CONN] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
                             log_header
@@ -200,13 +210,14 @@ pub async fn app_connection() {
 
                     log_connection_error(&log_header, &e);
 
-                    // Reconnection timeout for handled errors
+                    // Reconnection timeout for handled errors — exponential backoff, capped.
                     log::warn!(
                         "{} [CONN] action=reconnect_scheduled delay_secs={}",
                         log_header,
-                        SLEEP_DURATION_SECS
+                        reconnect_delay_secs
                     );
-                    tokio::time::sleep(Duration::from_secs(SLEEP_DURATION_SECS)).await;
+                    tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
+                    reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
                 }
             }
         }
@@ -234,5 +245,23 @@ pub async fn app_connection() {
             card.reader_name.as_deref().unwrap_or("unknown"),
             card.atr.as_deref().unwrap_or("unknown"),
         );
-    } 
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_reconnect_delay_doubles_then_saturates() {
+        assert_eq!(next_reconnect_delay(10), 20);
+        assert_eq!(next_reconnect_delay(40), 80);
+        assert_eq!(next_reconnect_delay(160), RECONNECT_DELAY_MAX_SECS);
+        assert_eq!(next_reconnect_delay(RECONNECT_DELAY_MAX_SECS), RECONNECT_DELAY_MAX_SECS);
+    }
+
+    #[test]
+    fn next_reconnect_delay_overflow_safe() {
+        assert_eq!(next_reconnect_delay(u64::MAX), RECONNECT_DELAY_MAX_SECS);
+    }
 }

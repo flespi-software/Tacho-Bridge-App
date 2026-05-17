@@ -27,13 +27,31 @@ use crate::smart_card::{ManagedCard, TASK_POOL};    // Managed card object and g
 use crate::global_app_handle::card_emit_event;           // Sends events to the frontend via global app handle.
 use crate::smart_card::ProcessingCard;
 
-/// Timeout in seconds to wait before reconnecting to the server.
-///
-/// This value is used to set the interval between reconnection attempts
-/// to the MQTT server in case of connection loss.
-const SLEEP_DURATION_SECS: u64 = 10;
+/// Initial delay (in seconds) before the first reconnect attempt after a
+/// connection failure. Subsequent failures back off exponentially up to
+/// `RECONNECT_DELAY_MAX_SECS`.
+const RECONNECT_DELAY_INITIAL_SECS: u64 = 10;
+/// Upper bound for the reconnect backoff. Past this point we keep retrying
+/// at this interval until either the server comes back or the task is killed.
+const RECONNECT_DELAY_MAX_SECS: u64 = 300;
 const GLOBAL_CARDS_SYNC_EVENT: &str = "global-cards-sync";
 const CARD_PRESENT_STATE: &str = "PRESENT";
+
+/// Returns the next reconnect delay given the current one (exponential, capped).
+fn next_reconnect_delay(current: u64) -> u64 {
+    current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
+}
+
+/// Rewrites a `request/...` topic to its matching `response/...` topic.
+/// Replaces only the leading segment so substrings deeper in the topic
+/// (in client_id, parcel id, etc.) cannot be accidentally mangled.
+fn request_to_response_topic(topic: &str) -> String {
+    if let Some(rest) = topic.strip_prefix("request/") {
+        format!("response/{}", rest)
+    } else {
+        topic.to_string()
+    }
+}
 
 fn emit_card_sync_event(
     iccid: &str,
@@ -154,6 +172,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     let mut is_online: bool = false;    // flag to control the card connection (to the server) status
     let mut was_online = false;   // Flag to track the previous connection status
     let mut auth_process: bool = false;  // Flag to control the authentication process
+    let mut reconnect_delay_secs: u64 = RECONNECT_DELAY_INITIAL_SECS; // exponential backoff state
 
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
@@ -185,6 +204,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                 Ok(notification) => {
                     if !is_online {
                         is_online = true;
+                        // Successful poll → reset the backoff so the next failure
+                        // starts from the initial delay again.
+                        reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
                         if !was_online {
                             was_online = true;
                             // Send the global-cards-sync event to the frontend that card is connected
@@ -217,8 +239,10 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             // Convert &str to String for further use
                             let topic = topic_str.to_string();
                             // The contents of response and request are the same.
-                            // Card number and parcel ID. So we just change the initial topic
-                            let topic_ack = topic.replace("request", "response");
+                            // Card number and parcel ID. So we just change the leading
+                            // "request/" segment to "response/" — prefix-only swap to
+                            // avoid mangling substrings inside the rest of the topic.
+                            let topic_ack = request_to_response_topic(&topic);
                             // serializable data to interpret it as json
                             match serde_json::from_slice::<Value>(&publish.payload) {
                                 Ok(json_payload) => {
@@ -244,8 +268,8 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                 log_header
                                             );
 
-                                            // Persist successful auth timestamp
-                                            crate::config::record_auth_result(&client_id_cloned, true);
+                                            // Persist successful auth timestamp (offloaded to blocking thread).
+                                            crate::config::record_auth_result_async(&client_id_cloned, true).await;
 
                                             // Reset the card to its original state
                                             managed_card.reconnect().await;
@@ -273,8 +297,8 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                             "{} Empty payload received while auth in progress. Reconnecting card.",
                                                             log_header
                                                         );
-                                                        // Persist failed auth timestamp (aborted mid-flow)
-                                                        crate::config::record_auth_result(&client_id_cloned, false);
+                                                        // Persist failed auth timestamp (aborted mid-flow, offloaded to blocking thread).
+                                                        crate::config::record_auth_result_async(&client_id_cloned, false).await;
                                                         // Reset the card to its original state
                                                         managed_card.reconnect().await;
                                                     }
@@ -415,13 +439,14 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             // return; // exit the loop
                         },
                     };
-                    // Reconnection timeout for handled errors
+                    // Reconnection timeout for handled errors — exponential backoff, capped.
                     log::warn!(
                         "{} [CONN] action=reconnect_scheduled delay_secs={}",
                         log_header,
-                        SLEEP_DURATION_SECS
+                        reconnect_delay_secs
                     );
-                    tokio::time::sleep(Duration::from_secs(SLEEP_DURATION_SECS)).await;
+                    tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
+                    reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
                 }
             }
         }
@@ -461,6 +486,10 @@ pub async fn remove_connections(client_ids: Vec<String>) {
             let card = task_pool.remove(index);
             card.task_handle.abort();
 
+            // Drop any APDU sniffer state we accumulated for this client so the
+            // global HashMap does not grow without bound across reconnects.
+            crate::apdu_sniffer::forget(&card.client_id);
+
             log::debug!(
                 "TASK_POOL: Connection terminated for client_id: {}, reader: {}, atr: {}",
                 card.client_id,
@@ -472,6 +501,8 @@ pub async fn remove_connections(client_ids: Vec<String>) {
                 "TASK_POOL: No active connection found for requested client_id: {}",
                 client_id
             );
+            // Also clear any stale sniffer state, just in case (no-op if absent).
+            crate::apdu_sniffer::forget(&client_id);
         }
     }
 }
@@ -494,6 +525,9 @@ pub async fn remove_connections_all() {
         card.task_handle.abort();
     }
 
+    // Clear all APDU sniffer state in one shot.
+    crate::apdu_sniffer::forget_all();
+
     log::info!("All card connections have been terminated and the task pool has been cleared.");
 }
 
@@ -504,4 +538,56 @@ fn process_rapdu_mqtt_hex(rapdu_mqtt_hex: String) -> String {
     })
     // Serialize the JSON object to a string and assign it to `payload_ack`
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_to_response_topic_swaps_prefix_only() {
+        assert_eq!(
+            request_to_response_topic("request/1/ABCDEF0123456789"),
+            "response/1/ABCDEF0123456789"
+        );
+    }
+
+    #[test]
+    fn request_to_response_topic_does_not_touch_inner_substrings() {
+        // The literal substring "request" appears inside the payload-id segment;
+        // the prefix-only swap must leave it intact.
+        assert_eq!(
+            request_to_response_topic("request/1/clientrequest-99"),
+            "response/1/clientrequest-99"
+        );
+    }
+
+    #[test]
+    fn request_to_response_topic_returns_unchanged_when_no_prefix() {
+        assert_eq!(
+            request_to_response_topic("status/1/ABCDEF"),
+            "status/1/ABCDEF"
+        );
+    }
+
+    #[test]
+    fn next_reconnect_delay_doubles_then_saturates() {
+        assert_eq!(next_reconnect_delay(10), 20);
+        assert_eq!(next_reconnect_delay(20), 40);
+        assert_eq!(next_reconnect_delay(150), RECONNECT_DELAY_MAX_SECS);
+        assert_eq!(next_reconnect_delay(RECONNECT_DELAY_MAX_SECS), RECONNECT_DELAY_MAX_SECS);
+    }
+
+    #[test]
+    fn next_reconnect_delay_overflow_safe() {
+        // saturating_mul prevents overflow; should still cap at max.
+        assert_eq!(next_reconnect_delay(u64::MAX), RECONNECT_DELAY_MAX_SECS);
+    }
+
+    #[test]
+    fn process_rapdu_mqtt_hex_emits_payload_field() {
+        let json = process_rapdu_mqtt_hex("DEADBEEF".to_string());
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed.get("payload").and_then(|v| v.as_str()), Some("DEADBEEF"));
+    }
 }

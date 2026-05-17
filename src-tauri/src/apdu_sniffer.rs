@@ -25,6 +25,21 @@ lazy_static! {
     static ref STATE: Mutex<HashMap<String, SniffState>> = Mutex::new(HashMap::new());
 }
 
+/// Drop the per-client sniffer state. Call when a card/connection is being
+/// removed so the global HashMap does not grow without bound over long runs.
+pub fn forget(client_id: &str) {
+    if let Ok(mut state) = STATE.lock() {
+        state.remove(client_id);
+    }
+}
+
+/// Drop sniffer state for every client. Used when wiping the whole task pool.
+pub fn forget_all() {
+    if let Ok(mut state) = STATE.lock() {
+        state.clear();
+    }
+}
+
 /// Observe a CAPDU/RAPDU exchange. client_id is the card number.
 pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
     let cmd = match hex::decode(command_hex) {
@@ -38,11 +53,12 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
 
     // Track SELECTed EF (ignore SELECT AID / SELECT MF)
     if let Some(fid) = select_ef_fid(&cmd) {
-        let mut state = STATE.lock().unwrap();
-        state
-            .entry(client_id.to_string())
-            .or_insert(SniffState { last_selected_ef: None })
-            .last_selected_ef = Some(fid);
+        if let Ok(mut state) = STATE.lock() {
+            state
+                .entry(client_id.to_string())
+                .or_insert(SniffState { last_selected_ef: None })
+                .last_selected_ef = Some(fid);
+        }
         return;
     }
 
@@ -52,7 +68,7 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
     }
 
     let fid = {
-        let state = STATE.lock().unwrap();
+        let Ok(state) = STATE.lock() else { return; };
         state
             .get(client_id)
             .and_then(|s| s.last_selected_ef)
@@ -362,5 +378,132 @@ fn time_real(b: &[u8]) -> String {
     match chrono::DateTime::<chrono::Utc>::from_timestamp(ts as i64, 0) {
         Some(dt) => format!("{} (ts={})", dt.format("%Y-%m-%d %H:%M:%S UTC"), ts),
         None => format!("ts={}", ts),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_ef_fid_plain_form() {
+        // Plain SELECT EF for FID 0x0520: 00 A4 02 0C 02 05 20
+        let cmd = [0x00, 0xA4, 0x02, 0x0C, 0x02, 0x05, 0x20];
+        assert_eq!(select_ef_fid(&cmd), Some(0x0520));
+    }
+
+    #[test]
+    fn select_ef_fid_sm_form() {
+        // SM-wrapped SELECT EF for FID 0x0501:
+        // 0C A4 02 0C Lc 81 02 05 01 ... MAC ... 00
+        let cmd = [0x0C, 0xA4, 0x02, 0x0C, 0x09, 0x81, 0x02, 0x05, 0x01, 0x8E, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0x00];
+        assert_eq!(select_ef_fid(&cmd), Some(0x0501));
+    }
+
+    #[test]
+    fn select_ef_fid_rejects_non_select() {
+        let cmd = [0x00, 0xB0, 0x00, 0x00, 0x05];
+        assert_eq!(select_ef_fid(&cmd), None);
+    }
+
+    #[test]
+    fn is_read_binary_recognizes_plain_and_sm() {
+        assert!(is_read_binary(&[0x00, 0xB0, 0x00, 0x00, 0x05]));
+        assert!(is_read_binary(&[0x0C, 0xB0, 0x00, 0x00, 0x05]));
+        assert!(!is_read_binary(&[0x00, 0xA4, 0x02, 0x0C]));
+    }
+
+    #[test]
+    fn extract_plain_body_strips_sw() {
+        // Plain response: 12 34 56  + SW 90 00
+        let resp = [0x12, 0x34, 0x56, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp), Some(vec![0x12, 0x34, 0x56]));
+    }
+
+    #[test]
+    fn extract_plain_body_handles_do81() {
+        // DO'81 body of length 3, then DO'8E and SW.
+        let resp = [0x81, 0x03, 0xAA, 0xBB, 0xCC, 0x8E, 0x02, 0xFF, 0xFF, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp), Some(vec![0xAA, 0xBB, 0xCC]));
+    }
+
+    #[test]
+    fn extract_plain_body_refuses_encrypted_do87() {
+        let resp = [0x87, 0x02, 0xAA, 0xBB, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp), None);
+    }
+
+    #[test]
+    fn extract_plain_body_handles_too_short() {
+        assert_eq!(extract_plain_body(&[]), None);
+        assert_eq!(extract_plain_body(&[0x90]), None);
+        // Only SW, no payload
+        assert_eq!(extract_plain_body(&[0x90, 0x00]), None);
+    }
+
+    #[test]
+    fn ber_length_short_form() {
+        assert_eq!(ber_length(&[0x05]), Some((5, 1)));
+        assert_eq!(ber_length(&[0x7F]), Some((127, 1)));
+    }
+
+    #[test]
+    fn ber_length_long_form() {
+        // 0x82 = 2 length bytes follow
+        assert_eq!(ber_length(&[0x82, 0x01, 0x23]), Some((0x0123, 3)));
+    }
+
+    #[test]
+    fn ber_length_rejects_truncated_long_form() {
+        assert_eq!(ber_length(&[0x82, 0x01]), None);
+        assert_eq!(ber_length(&[0x85]), None); // > 4 bytes claimed
+    }
+
+    #[test]
+    fn forget_removes_only_target_client() {
+        forget_all();
+        // Push state for two clients via SELECT
+        sniff("clientA", "00A4020C02 0520".replace(' ', "").as_str(), "9000");
+        sniff("clientB", "00A4020C02 0501".replace(' ', "").as_str(), "9000");
+        {
+            let state = STATE.lock().unwrap();
+            assert!(state.contains_key("clientA"));
+            assert!(state.contains_key("clientB"));
+        }
+
+        forget("clientA");
+        {
+            let state = STATE.lock().unwrap();
+            assert!(!state.contains_key("clientA"));
+            assert!(state.contains_key("clientB"));
+        }
+
+        forget_all();
+        {
+            let state = STATE.lock().unwrap();
+            assert!(state.is_empty());
+        }
+    }
+
+    #[test]
+    fn trim_strips_padding() {
+        assert_eq!(trim(b"ABC\x00\x00\x00"), b"ABC");
+        assert_eq!(trim(b"ABC\xFF\xFF"), b"ABC");
+        assert_eq!(trim(b"   ABC   "), b"   ABC");
+        assert_eq!(trim(b"\xFF\xFF\xFF"), b"");
+    }
+
+    #[test]
+    fn extract_name_drops_codepage_and_empty() {
+        // codepage=1, content="HELLO" then padding
+        let mut buf = vec![0x01];
+        buf.extend_from_slice(b"HELLO");
+        buf.extend_from_slice(&[0xFF; 30]);
+        assert_eq!(extract_name(&buf), Some("HELLO".to_string()));
+
+        // codepage only, no content
+        let mut buf2 = vec![0x01];
+        buf2.extend_from_slice(&[0xFF; 35]);
+        assert_eq!(extract_name(&buf2), None);
     }
 }
