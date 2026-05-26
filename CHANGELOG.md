@@ -91,3 +91,18 @@ All notable changes to this project will be documented in this file.
 [fix] Fixed bug with ICID detection when connecting a card.  
 [fix] The T protocol detection mechanism for connecting to the card has been reworked. The PC/SC library now handles this completely automatically.  
 [fix] The code for migrating the old configuration version to the current one has been removed.
+
+### [0.7.3] - 2026-05-27
+
+[fix] Card removal now asks for confirmation before deleting. Previously a single misclick silently wiped a saved card from the config (autosaved, no undo).  
+[fix] Configuration is now written atomically (temp file + rename). A crash or kill during a write can no longer leave an empty or partially-written config.yaml.  
+[fix] Logging no longer panics when the HOME / USERPROFILE environment variable is unset — it falls back to a local log directory so the app still starts. The log file is also opened only once, removing a race that could panic if the file was removed between two open calls.  
+[fix] Reader rows in the UI are now keyed by reader name instead of list index, fixing stale and duplicated reader entries.  
+[fix] Persisting the authentication result no longer blocks the MQTT event loop — the config write is offloaded to a dedicated blocking thread.  
+[fix] Card-number duplicate check hardened so reserved names like constructor or __proto__ can no longer falsely report "already exists".  
+[fix] request/… → response/… topic rewrite now swaps only the leading segment instead of a blind text replace, so the literal substring "request" deeper in a topic can no longer be mangled.  
+[feature] MQTT reconnection now uses exponential backoff (10s up to a 300s cap, reset on a successful poll) instead of a fixed 10s interval. The same backoff was added to the PCSC reader monitor to prevent a tight reconnect loop when the PC/SC service is down.  
+[feature] Frontend event handling reworked for stability — Tauri listeners are registered on mount and detached on unmount (no leaked or double-firing handlers across hot reload/navigation), wired before frontend-loaded is emitted to close an initial-sync race, and all incoming event payloads are validated at runtime and ignored if malformed.  
+[feature] APDU sniffer memory hygiene — per-client state is dropped on card disconnect and on full task-pool wipe, so the global state map no longer grows unbounded during long-running sessions.  
+[feature] Resilience to poisoned mutexes — the global app handle recovers its inner value instead of cascading a panic, so frontend event emission keeps working after an earlier panic. Event emitters were also migrated from println! to structured log calls.  
+[feature] Added unit test coverage across the config, APDU sniffer, MQTT, app-connection, and logger modules (atomic save round-trip, BER/DO'81 parsing, reconnect-delay math, topic rewrite, version ordering, and more).
