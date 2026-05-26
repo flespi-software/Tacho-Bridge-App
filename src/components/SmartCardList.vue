@@ -180,6 +180,7 @@
 
 <script lang="ts" setup>
 import { ref, computed, watch } from 'vue'
+import { Dialog } from 'quasar'
 import type { SmartCard } from './models'
 import { formatCardMeta, formatExpire, isExpired } from './cardFormatters'
 
@@ -278,7 +279,9 @@ function validateCardNumber(): boolean {
     return false
   }
 
-  if (!isEditMode.value && number in props.cards) {
+  // Use hasOwnProperty instead of `in` so prototype-chain names like
+  // "constructor" or "__proto__" can't falsely report "already exists".
+  if (!isEditMode.value && Object.prototype.hasOwnProperty.call(props.cards, number)) {
     cardNumberError.value = 'Card number already exists'
     return false
   }
@@ -316,7 +319,17 @@ function closeCard(): void {
 }
 // Delete
 function removeCard(number: string): void {
-  emit('delete-card', number)
+  // Confirm before emitting — a misclick used to silently wipe a saved card
+  // from the config (autosaved, no undo).
+  Dialog.create({
+    title: 'Remove card',
+    message: `Remove card "${number}" from the configuration? This cannot be undone.`,
+    ok: { label: 'Remove', color: 'red', flat: false },
+    cancel: { label: 'Cancel', flat: true },
+    persistent: true,
+  }).onOk(() => {
+    emit('delete-card', number)
+  })
 }
 
 

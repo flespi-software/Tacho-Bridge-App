@@ -116,14 +116,38 @@ fn load_config(
     Ok(config)
 }
 
-/// Saves the configuration to the file.
-/// This function serializes the configuration and writes it to the file.
+/// Saves the configuration to the file atomically.
+/// Writes to a sibling temp file in the same directory, then renames it over the target.
+/// This prevents config corruption (empty/partial file) if the process is killed mid-write.
 fn save_config(
     config_path: &Path,
     config: &ConfigurationFile,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let yaml = serde_yaml::to_string(config)?;
-    File::create(config_path)?.write_all(yaml.as_bytes())?;
+
+    let parent = config_path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, "config path has no parent directory")
+    })?;
+    let file_name = config_path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, "config path has no file name")
+    })?;
+
+    let mut tmp_path = parent.to_path_buf();
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(".tmp");
+    tmp_path.push(tmp_name);
+
+    {
+        let mut tmp_file = File::create(&tmp_path)?;
+        tmp_file.write_all(yaml.as_bytes())?;
+        tmp_file.sync_all()?;
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, config_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(Box::new(e));
+    }
+
     Ok(())
 }
 
@@ -423,7 +447,27 @@ pub fn record_auth_result(card_number: &str, success: bool) {
     };
     let ts = chrono::Utc::now().timestamp() as u64;
     cfg.last_auth = Some((ts, success));
-    update_card(card_number, cfg);
+    if !update_card(card_number, cfg) {
+        log::error!(
+            "record_auth_result: failed to persist last_auth for card_number {}",
+            card_number
+        );
+    }
+}
+
+/// Async-safe variant of `record_auth_result`.
+/// Offloads the blocking config write (disk I/O + sync mutexes) to a dedicated
+/// blocking thread so the caller's tokio worker is not stalled. Use this from
+/// async contexts such as the MQTT eventloop tasks.
+pub async fn record_auth_result_async(card_number: &str, success: bool) {
+    let card_number = card_number.to_string();
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        record_auth_result(&card_number, success);
+    })
+    .await
+    {
+        log::error!("record_auth_result_async: spawn_blocking failed: {:?}", e);
+    }
 }
 
 /// Retrieves a value from the cache by key.
@@ -642,6 +686,179 @@ fn generate_default_config() -> ConfigurationFile {
         ident: Some(generate_ident()),
         server: None,
         cards: HashMap::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("tba-test-{}-{}-{}-{}", tag, pid, nanos, seq));
+        fs::create_dir_all(&dir).expect("create tmp dir");
+        dir
+    }
+
+    fn sample_config() -> ConfigurationFile {
+        let mut cards = HashMap::new();
+        cards.insert(
+            "ABCDEF0123456789".to_string(),
+            CardConfig {
+                iccid: "1122334455667788".to_string(),
+                expire: Some(1_700_000_000),
+                name: Some("My Company Card".to_string()),
+                card_type: Some(4),
+                structure_version: Some((1, 0)),
+                company_name: Some("Acme Logistics".to_string()),
+                company_address: Some("Street 1".to_string()),
+                last_auth: Some((1_700_000_500, true)),
+            },
+        );
+        ConfigurationFile {
+            name: "TBA".to_string(),
+            version: "0.0.0-test".to_string(),
+            description: "test".to_string(),
+            appearance: Some(AppearanceConfig {
+                dark_theme: DarkTheme::Auto,
+            }),
+            ident: Some("TBA0000000000001".to_string()),
+            server: Some(ServerConfig {
+                host: "mqtt.example.com:8883".to_string(),
+            }),
+            cards,
+        }
+    }
+
+    #[test]
+    fn save_then_load_roundtrip() {
+        let dir = unique_tmp_dir("roundtrip");
+        let path = dir.join("config.yaml");
+
+        let cfg = sample_config();
+        save_config(&path, &cfg).expect("save");
+
+        let loaded = load_config(&path).expect("load");
+        assert_eq!(loaded.cards.len(), 1);
+        let card = loaded.cards.get("ABCDEF0123456789").expect("card present");
+        assert_eq!(card.iccid, "1122334455667788");
+        assert_eq!(card.card_type, Some(4));
+        assert_eq!(card.last_auth, Some((1_700_000_500, true)));
+        assert_eq!(
+            loaded.server.as_ref().map(|s| s.host.as_str()),
+            Some("mqtt.example.com:8883")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_is_atomic_no_tmp_leftover() {
+        let dir = unique_tmp_dir("atomic");
+        let path = dir.join("config.yaml");
+        let tmp_path = dir.join("config.yaml.tmp");
+
+        save_config(&path, &sample_config()).expect("save");
+        assert!(path.exists(), "final config must exist");
+        assert!(!tmp_path.exists(), "tmp file must be renamed away");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_overwrites_existing_file_safely() {
+        let dir = unique_tmp_dir("overwrite");
+        let path = dir.join("config.yaml");
+
+        save_config(&path, &sample_config()).expect("first save");
+        let first_meta = fs::metadata(&path).expect("meta1");
+
+        let mut second = sample_config();
+        second.cards.clear();
+        save_config(&path, &second).expect("second save");
+
+        let loaded = load_config(&path).expect("load second");
+        assert!(loaded.cards.is_empty(), "second save must replace contents");
+        assert!(first_meta.is_file());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rejects_malformed_yaml() {
+        let dir = unique_tmp_dir("malformed");
+        let path = dir.join("config.yaml");
+        fs::write(&path, b"this: is: not: yaml: [[[").expect("write garbage");
+
+        let res = load_config(&path);
+        assert!(res.is_err(), "load must fail on malformed yaml");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_host_to_parts_valid() {
+        let (host, port) = split_host_to_parts("mqtt.flespi.io:8883").expect("split");
+        assert_eq!(host, "mqtt.flespi.io");
+        assert_eq!(port, 8883);
+    }
+
+    #[test]
+    fn split_host_to_parts_missing_port() {
+        assert!(split_host_to_parts("mqtt.flespi.io").is_err());
+    }
+
+    #[test]
+    fn split_host_to_parts_bad_port() {
+        assert!(split_host_to_parts("mqtt.flespi.io:notaport").is_err());
+    }
+
+    #[test]
+    fn generate_default_config_is_well_formed() {
+        let cfg = generate_default_config();
+        assert!(!cfg.name.is_empty());
+        assert!(!cfg.version.is_empty());
+        assert!(cfg.cards.is_empty());
+        let ident = cfg.ident.expect("default ident");
+        assert!(ident.starts_with("TBA"));
+        assert_eq!(ident.len(), 3 + 13);
+    }
+
+    #[test]
+    fn generate_ident_format() {
+        let id = generate_ident();
+        assert!(id.starts_with("TBA"));
+        assert_eq!(id.len(), 3 + 13);
+        assert!(id[3..].chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn card_config_yaml_roundtrip_preserves_optional_fields() {
+        let card = CardConfig {
+            iccid: "1234567890123456".to_string(),
+            expire: None,
+            name: None,
+            card_type: None,
+            structure_version: None,
+            company_name: None,
+            company_address: None,
+            last_auth: None,
+        };
+        let yaml = serde_yaml::to_string(&card).expect("ser");
+        let back: CardConfig = serde_yaml::from_str(&yaml).expect("de");
+        assert_eq!(back.iccid, "1234567890123456");
+        assert!(back.expire.is_none());
+        assert!(back.last_auth.is_none());
     }
 }
 

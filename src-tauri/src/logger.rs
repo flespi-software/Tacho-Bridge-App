@@ -33,33 +33,41 @@ struct Release {
 pub fn setup_logging() {
     let mut log_path = PathBuf::new();
 
-    #[cfg(target_os = "macos")]
-    {
-        log_path.push(env::var("HOME").unwrap());
-        log_path.push("Documents");
-        log_path.push("tba");
-    }
-    #[cfg(target_os = "linux")]
-    {
-        log_path.push(env::var("HOME").unwrap());
-        log_path.push("Documents");
-        log_path.push("tba");
-    }
+    // Resolve the home directory without panicking if the env var is missing —
+    // fall back to the current working directory so the app still starts and
+    // we just lose persistent logging.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let home_var = "HOME";
     #[cfg(target_os = "windows")]
-    {
-        log_path.push(env::var("USERPROFILE").unwrap());
-        log_path.push("Documents");
-        log_path.push("tba");
+    let home_var = "USERPROFILE";
+
+    match env::var(home_var) {
+        Ok(home) => {
+            log_path.push(home);
+            log_path.push("Documents");
+            log_path.push("tba");
+        }
+        Err(e) => {
+            eprintln!(
+                "Failed to read {} env var ({}). Logging to current directory.",
+                home_var, e
+            );
+            log_path.push(".");
+            log_path.push("tba-logs");
+        }
     }
 
     if let Err(e) = std::fs::create_dir_all(&log_path) {
-        eprintln!("Failed to create log directory: {}", e);
+        eprintln!("Failed to create log directory {:?}: {}", log_path, e);
         return;
     }
 
     log_path.push("log.txt");
 
-    match fern::log_file(&log_path) {   // Check if the log file can be created. Permission check.
+    // Open the log file exactly once. Reusing the same handle eliminates the
+    // race where the file could be removed between two open() calls and the
+    // second one would panic via .unwrap().
+    let log_file = match fern::log_file(&log_path) {
         Ok(file) => file,
         Err(e) => {
             eprintln!("Failed to create log file: {}", e);
@@ -86,11 +94,14 @@ pub fn setup_logging() {
             ))
         })
         .level(log::LevelFilter::Info)  // Change to Debug / Info if needed
-        .chain(fern::log_file(&log_path).unwrap())
+        .chain(log_file)
         .apply();
 
     if let Err(e) = init_log_result {
-        log::warn!("Failed to initialize logging. No permission to write log file at: {:?}. Error: {}", log_path, e);
+        eprintln!(
+            "Failed to initialize logging at {:?}: {}",
+            log_path, e
+        );
     }
 
     // Log the application launch
@@ -179,4 +190,30 @@ fn version_to_number(version: &str) -> u32 {
         .split('.')
         .filter_map(|s| s.parse::<u32>().ok())
         .fold(0, |acc, num| acc * 100 + num)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_to_number_strips_v_prefix_and_packs_components() {
+        // 0.7.2 → 0*10000 + 7*100 + 2 = 702
+        assert_eq!(version_to_number("0.7.2"), 702);
+        assert_eq!(version_to_number("v0.7.2"), 702);
+        assert_eq!(version_to_number("1.0.0"), 10000);
+    }
+
+    #[test]
+    fn version_to_number_orders_versions_correctly() {
+        assert!(version_to_number("v0.7.3") > version_to_number("v0.7.2"));
+        assert!(version_to_number("v0.8.0") > version_to_number("v0.7.99"));
+        assert!(version_to_number("v1.0.0") > version_to_number("v0.99.99"));
+    }
+
+    #[test]
+    fn version_to_number_handles_garbage_components() {
+        // Non-numeric chunks are skipped silently.
+        assert_eq!(version_to_number("v1.x.3"), 103);
+    }
 }

@@ -339,6 +339,9 @@ pub async fn sc_monitor() -> ! {
 
             if let Err(e) = ctx.get_status_change(None, &mut reader_states[..]) {
                 log::error!("get_status_change failed: {:?}", e);
+                // Small backoff prevents a tight reconnect loop if the PCSC
+                // service is repeatedly returning errors (e.g. daemon down).
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 break;
             }
 
@@ -352,6 +355,10 @@ pub async fn sc_monitor() -> ! {
                     }
                     SmartCardError::Other(msg) => {
                         log::error!("SmartCard error: {}", msg);
+                        // Without a small backoff this branch could spin the
+                        // outer reconnect loop very quickly under persistent
+                        // PCSC failures.
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
 

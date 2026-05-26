@@ -4,7 +4,7 @@
       <div v-if="state.readers.length === 0" class="q-pa-md text-grey text-h6">
         No connected smart card readers
       </div>
-      <div v-for="(reader, index) in state.readers" :key="index" class="row reader">
+      <div v-for="reader in state.readers" :key="reader.name" class="row reader">
         <q-item class="col-6" style="min-height: 50px" dense>
           <q-item-section avatar>
             <q-icon name="mdi-usb-port" :color="reader.status !== 'UNKNOWN' ? 'green' : 'red'" />
@@ -166,20 +166,26 @@
 import SmartCardList from './SmartCardList.vue'
 import type { SmartCard, Reader } from './models'
 import { formatStructureVersion, formatExpire, isExpired, formatAuthDate } from './cardFormatters'
-import { ref, reactive, computed, defineComponent } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { listen, emit } from '@tauri-apps/api/event'
+import { listen, emit, type UnlistenFn } from '@tauri-apps/api/event'
+import { Notify } from 'quasar'
 
-// Blinking status for the card icon during authentication.
-const isBlinking = ref(true) // controls the blinking status of the icon
-
-const cardlist = ref<null | { linkMode: (iccid: string) => null; openAddDialog: () => null }>(null)
+const cardlist = ref<null | {
+  linkMode: (iccid: string) => void
+  openAddDialog: () => void
+}>(null)
 
 // reactive state for the readers and cards
 const state = reactive({
   readers: [] as Reader[],
   cards: {} as Record<string, SmartCard>,
 })
+
+// Registered Tauri listeners. Kept in an array so we can detach them all
+// in onUnmounted — leaking listeners across HMR/navigation would let stale
+// handlers keep mutating dead state and double-fire on remount.
+const unlistenFns: UnlistenFn[] = []
 
 // Transient "authentication in progress" flag per card_number, derived from
 // the Reader.authentication field emitted by the backend via global-cards-sync.
@@ -196,55 +202,58 @@ const authInProgress = computed<Record<string, boolean>>(() => {
 })
 
 ////////////////////////// Listening for the event from the backend //////////////////////////
-// This is an event listener that will listen for the backend to send an event
-listen('global-cards-sync', (event) => {
-  console.log('event payload: ', event.payload) // log event payload from backend to the console
-  // structure has fields from the Rust back-end with the 'snake_case' naming convention
-  const payload = event.payload as {
-    iccid: string
-    reader_name: string
-    card_state: string
-    card_number: string
-    online?: boolean
-    authentication?: boolean
-  }
+// Narrow runtime guard for the global-cards-sync payload. We do not trust the
+// shape blindly — if the backend ever changes the contract, this guard fails
+// closed (the event is ignored) instead of letting the UI throw at runtime.
+type CardsSyncPayload = {
+  iccid: string
+  reader_name: string
+  card_state: string
+  card_number: string
+  online?: boolean
+  authentication?: boolean
+}
+function isCardsSyncPayload(raw: unknown): raw is CardsSyncPayload {
+  if (!raw || typeof raw !== 'object') return false
+  const p = raw as Record<string, unknown>
+  return (
+    typeof p.iccid === 'string' &&
+    typeof p.reader_name === 'string' &&
+    typeof p.card_state === 'string' &&
+    typeof p.card_number === 'string'
+  )
+}
 
-  const name = payload.reader_name
-  const card_number = payload.card_number
+function handleCardsSync(raw: unknown): void {
+  if (!isCardsSyncPayload(raw)) {
+    console.warn('global-cards-sync: ignoring malformed payload', raw)
+    return
+  }
+  console.log('event payload: ', raw)
+
+  const name = raw.reader_name
+  const card_number = raw.card_number
   // Split the status by the pipe character and get the second element
-  const splitted = (payload.card_state?.match(/\((.*)\)/i) ?? [])[1]?.split('|') ?? []
+  const splitted = (raw.card_state?.match(/\((.*)\)/i) ?? [])[1]?.split('|') ?? []
   const status = splitted[1]?.trim() ?? splitted[0] ?? ''
 
-  const iccid = payload.iccid
+  const iccid = raw.iccid
   // Find the index of the reader with the same name
   const index = state.readers.findIndex((reader) => reader.name === name)
-  if (index !== -1) {
-    // If reader with the same name is found, update the status and card data
-    const existingReader = state.readers[index]
-    if (!existingReader) return // на всякий случай
-
-    state.readers[index] = {
-      name,
-      status,
-      iccid,
-      card_number,
-      online: payload.online,
-      authentication: payload.authentication,
-    }
-  } else {
-    // If reader with the same name is not found, add the reader to the list
-    state.readers.push({
-      name,
-      status,
-      iccid,
-      card_number,
-      online: payload.online,
-      authentication: payload.authentication,
-    })
+  const next: Reader = {
+    name,
+    status,
+    iccid,
+    card_number,
+    online: raw.online,
+    authentication: raw.authentication,
   }
-}).catch((error) => {
-  console.error('Error listening to global-cards-sync:', error)
-})
+  if (index !== -1) {
+    state.readers[index] = next
+  } else {
+    state.readers.push(next)
+  }
+}
 
 ///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
 
@@ -289,7 +298,7 @@ const cardConnectedStatus = (reader: Reader) => {
         name: 'mdi-smart-card',
         color: 'green',
         size: '25px',
-        class: isBlinking.value ? 'blinking-icon' : '', // blinking status
+        class: 'blinking-icon',
       }
     } else {
       // If the card is not in the authentication process
@@ -350,37 +359,71 @@ const removeCard = async (cardNumber: string) => {
     console.log('Card removed:', cardNumber)
   } catch (error) {
     console.error('Failed to remove card:', error)
+    Notify.create({
+      message: `Failed to remove card ${cardNumber}: ${String(error)}`,
+      color: 'red',
+      position: 'bottom',
+      timeout: 8000,
+    })
   }
 }
 
-listen('global-card-config-updated', (event) => {
-  console.log('event payload: ', event.payload)
-  const payload = event.payload as {
-    content: object
-    card_number: string
+function handleCardConfigUpdated(raw: unknown): void {
+  if (!raw || typeof raw !== 'object') {
+    console.warn('global-card-config-updated: ignoring malformed payload', raw)
+    return
   }
-  if (payload.card_number) {
-    if (payload.content) {
-      state.cards[payload.card_number] = { ...payload.content }
-    } else {
-      delete state.cards[payload.card_number]
-    }
+  const payload = raw as { card_number?: unknown; content?: unknown }
+  if (typeof payload.card_number !== 'string' || payload.card_number.length === 0) {
+    console.warn('global-card-config-updated: missing card_number', raw)
+    return
   }
-}).catch((error) => {
-  console.error('Error listening to global-card-config-updated:', error)
+  console.log('event payload: ', raw)
+
+  if (payload.content && typeof payload.content === 'object') {
+    state.cards[payload.card_number] = { ...(payload.content as SmartCard) }
+  } else {
+    delete state.cards[payload.card_number]
+  }
+}
+
+onMounted(async () => {
+  // Register listeners BEFORE notifying the backend that we're loaded.
+  // Otherwise the initial sync burst can race the channel registration and
+  // arrive into the void, leaving the UI stuck on stale empty state.
+  try {
+    const unlisten = await listen('global-cards-sync', (event) => handleCardsSync(event.payload))
+    unlistenFns.push(unlisten)
+  } catch (error) {
+    console.error('Error listening to global-cards-sync:', error)
+  }
+
+  try {
+    const unlisten = await listen('global-card-config-updated', (event) =>
+      handleCardConfigUpdated(event.payload),
+    )
+    unlistenFns.push(unlisten)
+  } catch (error) {
+    console.error('Error listening to global-card-config-updated:', error)
+  }
+
+  // Now that both listeners are wired, tell the backend it can start
+  // emitting initial state.
+  try {
+    await emit('frontend-loaded', { message: 'Hello from frontend!' })
+  } catch (error) {
+    console.error('Error emitting frontend-loaded event:', error)
+  }
 })
 
-// Generate an event to inform the back-end that the front-end is loaded.
-// To correctly display states in the application.
-emit('frontend-loaded', { message: 'Hello from frontend!' }).catch((error) => {
-  console.error('Error emitting frontend-loaded event:', error)
-})
-
-defineComponent({
-  setup() {
-    return {
-      saveCardNumber,
+onUnmounted(() => {
+  while (unlistenFns.length > 0) {
+    const fn = unlistenFns.pop()
+    try {
+      fn?.()
+    } catch (e) {
+      console.error('Error detaching Tauri listener:', e)
     }
-  },
+  }
 })
 </script>

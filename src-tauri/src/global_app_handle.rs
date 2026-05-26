@@ -17,14 +17,29 @@ lazy_static! {
 
 // initialize the global app handle
 pub fn set_app_handle(handle: AppHandle) {
-    let mut app_handle = APP_HANDLE.lock().unwrap();
-    *app_handle = Some(handle);
+    // Lock failure here means the mutex was poisoned by an earlier panic.
+    // Recover the inner value instead of cascading the panic so subsequent
+    // emit_* calls keep working.
+    let mut guard = match APP_HANDLE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            log::warn!("APP_HANDLE mutex was poisoned — recovering");
+            poisoned.into_inner()
+        }
+    };
+    *guard = Some(handle);
 }
 
 // getting the global app handle
 pub fn get_app_handle() -> Option<AppHandle> {
-    let app_handle = APP_HANDLE.lock().unwrap();
-    app_handle.clone()
+    let guard = match APP_HANDLE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            log::warn!("APP_HANDLE mutex was poisoned — recovering");
+            poisoned.into_inner()
+        }
+    };
+    guard.clone()
 }
 
 /// Represents the state of a tachograph card.
@@ -61,11 +76,12 @@ pub fn card_emit_event(event_name: &str, iccid: String, reader_name: String, car
 
     if let Some(app_handle) = get_app_handle() {
         if let Err(e) = app_handle.emit(event_name, payload) {
-            println!("Error: {:?}", e);
+            log::error!("emit '{}' failed: {:?}", event_name, e);
+        } else {
+            log::debug!("'{}' has been sent", event_name);
         }
-        println!("{} has been sent", event_name);
     } else {
-        println!("App card handle is not set");
+        log::warn!("emit '{}' skipped: app handle not set", event_name);
     }
 }
 
@@ -83,12 +99,12 @@ pub fn emit_card_config_event(event_name: &str, card_number: String, config: Opt
 
     if let Some(app_handle) = get_app_handle() {
         if let Err(e) = app_handle.emit(event_name, payload) {
-            println!("Error emitting {}: {:?}", event_name, e);
+            log::error!("emit '{}' failed: {:?}", event_name, e);
         } else {
-            println!("{} has been sent", event_name);
+            log::debug!("'{}' has been sent", event_name);
         }
     } else {
-        println!("App card handle is not set");
+        log::warn!("emit '{}' skipped: app handle not set", event_name);
     }
 }
 
@@ -110,10 +126,11 @@ pub fn app_emit_event(online: bool) {
 pub fn emit_notification_event(event_name: &str, payload: NotificationPayload) {
     if let Some(app_handle) = get_app_handle() {
         if let Err(e) = app_handle.emit(event_name, payload) {
-            println!("Error: {:?}", e);
+            log::error!("emit '{}' failed: {:?}", event_name, e);
+        } else {
+            log::debug!("'{}' has been sent", event_name);
         }
-        println!("{} has been sent", event_name);
     } else {
-        println!("App notification handle is not set");
+        log::warn!("emit '{}' skipped: app handle not set", event_name);
     }
 }
