@@ -29,7 +29,7 @@
       (name, number, generation/type, expire, company name/address, ICCID).
       In link mode the list below is filtered to cards that have no ICCID yet.
     -->
-    <q-card flat bordered>
+    <q-card flat class="smart-card-list">
       <q-expansion-item v-model="isExpanded">
         <!-- Header of the collapsible card: icon + title with count + Add button -->
         <template v-slot:header>
@@ -39,16 +39,17 @@
 
           <q-item-section>Smart cards ({{ Object.keys(cardsList).length }})</q-item-section>
 
-          <q-item-section>
-            <div>
-              <q-btn
-                label="Add Card"
-                dense
-                icon="mdi-card-plus"
-                color="green"
-                @click.stop="openAddDialog()"
-              />
-            </div>
+          <q-item-section side>
+            <q-btn
+              label="Add Card"
+              icon="mdi-card-plus"
+              color="positive"
+              rounded
+              unelevated
+              size="sm"
+              padding="xs md"
+              @click.stop="openAddDialog()"
+            />
           </q-item-section>
         </template>
         <q-separator />
@@ -118,8 +119,9 @@
                 v-if="card.iccid"
                 dense
                 size="sm"
-                color="grey"
-                class="text-dark text-bold q-ma-none"
+                color="blue-grey-2"
+                text-color="blue-grey-9"
+                class="text-bold q-ma-none"
               >
                 ICCID: {{ card.iccid }}
               </q-chip>
@@ -141,13 +143,34 @@
         - Edit   → card number and ICCID locked (they identify the record)
     -->
     <q-dialog v-model="isDialogOpen">
-      <q-card style="min-width: 400px">
-        <q-card-section>
+      <q-card style="min-width: 420px">
+        <q-card-section class="row items-center q-pb-sm">
+          <q-icon
+            :name="isEditMode ? 'mdi-smart-card' : 'mdi-card-plus'"
+            size="28px"
+            color="primary"
+            class="q-mr-sm"
+          />
           <div class="text-h6">{{ isEditMode ? 'Edit Card' : 'Add Card' }}</div>
+          <q-space />
+          <q-btn flat round dense icon="mdi-close" v-close-popup @click="closeCard" />
         </q-card-section>
 
-        <q-card-section class="q-py-none">
-          <q-input v-model="dialogCardICCID" label="ICCID" outlined dense disable />
+        <q-separator />
+
+        <q-card-section class="q-pt-md q-pb-sm">
+          <q-input
+            v-model="dialogCardICCID"
+            label="ICCID"
+            outlined
+            dense
+            disable
+            class="q-mb-sm"
+          >
+            <template v-slot:prepend>
+              <q-icon name="mdi-chip" size="xs" />
+            </template>
+          </q-input>
           <q-input
             v-model="dialogCardNumber"
             label="Card Number"
@@ -157,7 +180,13 @@
             :disable="isEditMode"
             :error="!!cardNumberError"
             :error-message="cardNumberError"
-          />
+            hide-bottom-space
+            class="q-mb-sm"
+          >
+            <template v-slot:prepend>
+              <q-icon name="mdi-numeric" size="xs" />
+            </template>
+          </q-input>
           <q-input
             v-model="dialogCardName"
             label="Card Name"
@@ -165,13 +194,16 @@
             dense
             type="textarea"
             autogrow
-            class="q-mt-xs"
-          />
+          >
+            <template v-slot:prepend>
+              <q-icon name="mdi-tag-outline" size="xs" />
+            </template>
+          </q-input>
         </q-card-section>
 
-        <q-card-actions align="right">
-          <q-btn flat label="Cancel" color="primary" v-close-popup @click="closeCard" />
-          <q-btn flat label="Save" color="primary" @click="saveCard" />
+        <q-card-actions align="right" class="q-px-md q-pb-md">
+          <q-btn flat label="Cancel" color="grey-7" v-close-popup @click="closeCard" />
+          <q-btn unelevated label="Save" color="primary" rounded @click="saveCard" />
         </q-card-actions>
       </q-card>
     </q-dialog>

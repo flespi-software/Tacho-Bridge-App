@@ -1,10 +1,12 @@
 <template>
   <div style="width: 600px; max-width: 100%">
-    <div class="rounded-borders" style="border: 1px solid #666">
-      <div v-if="state.readers.length === 0" class="q-pa-md text-grey text-h6">
-        No connected smart card readers
+    <div class="readers-container">
+      <div v-if="state.readers.length === 0" class="empty-state">
+        <q-icon name="mdi-card-search-outline" class="empty-state-icon" />
+        <div class="empty-state-title">No connected smart card readers</div>
+        <div class="empty-state-subtitle">Connect a smart card reader to get started</div>
       </div>
-      <div v-for="reader in state.readers" :key="reader.name" class="row reader">
+      <div v-for="reader in state.readers" :key="reader.name" class="row reader-row">
         <q-item class="col-6" style="min-height: 50px" dense>
           <q-item-section avatar>
             <q-icon name="mdi-usb-port" :color="reader.status !== 'UNKNOWN' ? 'green' : 'red'" />
@@ -55,7 +57,7 @@
             <template v-if="!reader.card_number && reader.iccid">
               <q-item-label lines="1">UNKNOWN CARD</q-item-label>
               <q-item-label lines="1" caption>
-                <q-chip dense size="sm" color="grey" class="text-dark text-bold">
+                <q-chip dense size="sm" color="blue-grey-2" text-color="blue-grey-9" class="text-bold">
                   ICCID: {{ reader.iccid }}
                 </q-chip>
               </q-item-label>
@@ -121,12 +123,6 @@
 </template>
 
 <style scoped>
-.reader {
-  border-bottom: 1px solid #666;
-}
-.reader:last-child {
-  border-bottom: 0;
-}
 .blinking-icon {
   animation: blink 1300ms infinite;
 }

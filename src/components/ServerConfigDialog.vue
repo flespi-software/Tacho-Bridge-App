@@ -1,48 +1,53 @@
 <template>
   <q-dialog :model-value="modelValue" persistent @update:model-value="$emit('update:modelValue', $event)">
-    <q-card style="min-width: 350px">
-      <q-card-section>
+    <q-card style="width: 420px; max-width: 90vw">
+      <q-card-section class="row items-center q-pb-sm">
+        <q-icon name="mdi-server-network" size="28px" color="primary" class="q-mr-sm" />
         <div class="text-h6">Server configuration</div>
+        <q-space />
+        <q-btn flat round dense icon="mdi-close" v-close-popup />
       </q-card-section>
 
-      <q-card-section class="q-pt-none">
+      <q-separator />
+
+      <q-card-section class="q-pt-md q-pb-sm">
         <q-input
           label="App ident"
+          outlined
           dense
           v-model="identInput"
           autofocus
+          maxlength="16"
           @keyup.enter="$emit('update:modelValue', false)"
           :error="!isIdentValid"
-          error-message="The identifier must have the prefix TBA + 13 digits. For example: TBA0000000000001."
-        />
+          error-message="Must be TBA + 13 digits, e.g. TBA0000000000001"
+          hide-bottom-space
+          class="q-mb-sm"
+        >
+          <template v-slot:prepend>
+            <q-icon name="mdi-identifier" size="xs" />
+          </template>
+        </q-input>
         <q-input
           label="Server address"
+          outlined
           dense
           v-model="hostValue"
           @keyup.enter="$emit('update:modelValue', false)"
-        />
-        <div class="q-mt-md row items-center">
-          <div class="text-caption text-grey q-mr-md">Theme</div>
-          <q-btn-toggle
-            v-model="selectedTheme"
-            no-caps
-            rounded
-            unelevated
-            toggle-color="primary"
-            :options="[
-              { icon: 'mdi-white-balance-sunny', value: 'Light' },
-              { icon: 'mdi-brightness-auto', value: 'Auto' },
-              { icon: 'mdi-weather-night', value: 'Dark' },
-            ]"
-            @update:model-value="changeTheme"
-          />
-        </div>
+        >
+          <template v-slot:prepend>
+            <q-icon name="mdi-server-network" size="xs" />
+          </template>
+        </q-input>
       </q-card-section>
-      <q-card-actions align="right" class="text-primary">
-        <q-btn flat label="Cancel" v-close-popup />
+
+      <q-card-actions align="right" class="q-px-md q-pb-md">
+        <q-btn flat label="Cancel" color="grey-7" v-close-popup />
         <q-btn
-          flat
+          unelevated
+          rounded
           label="Save"
+          color="primary"
           v-close-popup
           @click="saveServerConfig"
         />
@@ -70,7 +75,7 @@ const ident = ref('')
 const identInput = computed({
   get: () => `TBA${ident.value}`,
   set: (val) => {
-    ident.value = val.replace(/^TBA/, '')
+    ident.value = val.startsWith('TBA') ? val.slice(3) : ''
   },
 })
 const isIdentValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))
@@ -78,32 +83,21 @@ const isIdentValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))
 const hostValue = ref('')
 
 const $q = useQuasar()
-const selectedTheme = ref('')
 
-const changeTheme = (value: string) => {
-  switch (value) {
-    case 'Auto':
-      $q.dark.set('auto')
-      break
-    case 'Dark':
-      $q.dark.set(true)
-      break
-    case 'Light':
-      $q.dark.set(false)
-      break
-    default:
-      console.log('Unknown theme value:', value)
-  }
+function currentThemeLabel(): string {
+  if ($q.dark.mode === 'auto') return 'Auto'
+  return $q.dark.isActive ? 'Dark' : 'Light'
 }
 
 const saveServerConfig = async () => {
-  console.log(`server_address: ${hostValue.value}, ident: ${identInput.value}, theme: ${selectedTheme.value}`)
+  const theme = currentThemeLabel()
+  console.log(`server_address: ${hostValue.value}, ident: ${identInput.value}, theme: ${theme}`)
 
   try {
     const response = await invoke('update_server', {
       host: hostValue.value,
       ident: identInput.value,
-      theme: selectedTheme.value,
+      theme,
     })
 
     console.log('Response from update_server:', response)
@@ -133,20 +127,13 @@ const saveServerConfig = async () => {
   }
 }
 
-// Listen for config updates from backend
 listen('global-config-server', (event) => {
   const payload = event.payload as {
     host: string
     ident: string
-    dark_theme: string
   }
-  console.log('host:', payload.host, 'ident:', payload.ident, 'dark_theme:', payload.dark_theme)
-
   hostValue.value = payload.host
   identInput.value = payload.ident
-
-  changeTheme(payload.dark_theme)
-  selectedTheme.value = payload.dark_theme
 }).catch((error) => {
   console.error('Error listening to global-config-server:', error)
 })
