@@ -22,6 +22,9 @@ use std::time::Duration;
 // ───── Serial ─────
 use serialport::SerialPortType;
 
+// ───── Local Modules ─────
+use crate::global_app_handle::{rack_emit_event, RackState};
+
 /// Guards against starting more than one rack monitor. The `frontend-loaded`
 /// event in `lib.rs` can fire several times at startup, which would otherwise
 /// spawn duplicate monitors.
@@ -52,6 +55,26 @@ struct RackInfo {
     product: Option<String>,
     vid: u16,
     pid: u16,
+}
+
+impl RackInfo {
+    /// Build the frontend payload for this rack. The card list is empty for now;
+    /// it will be filled once the server reports the cards in the rack's slots.
+    fn to_state(&self, connected: bool) -> RackState {
+        RackState {
+            connected,
+            name: self
+                .product
+                .clone()
+                .unwrap_or_else(|| "Card Rack".to_string()),
+            serial: self.serial.clone(),
+            manufacturer: self.manufacturer.clone(),
+            product: self.product.clone(),
+            vid: Some(self.vid),
+            pid: Some(self.pid),
+            cards: Vec::new(),
+        }
+    }
 }
 
 /// Find the rack's serial port by its USB manufacturer + product strings. Both
@@ -124,9 +147,14 @@ fn on_rack_connected(rack: &RackInfo, _port: Box<dyn serialport::SerialPort>) {
         "[RACK] phase=ready status=rack_connected_ready_for_work serial={}",
         rack.serial.as_deref().unwrap_or("?")
     );
+
+    // Tell the frontend the rack is present. The card list is empty for now —
+    // the server doesn't yet report the cards held in the rack's slots.
+    rack_emit_event(rack.to_state(true));
+
     // TODO: open this rack's own MQTT connection, announce readiness to the
-    // server, then forward server bytes <-> the serial `_port`. Emit a frontend
-    // event here too once the UI shows rack status.
+    // server, then forward server bytes <-> the serial `_port`. When the server
+    // starts reporting cards, fill `RackState.cards` and re-emit.
 }
 
 /// Called when the rack transitions to disconnected.
@@ -136,8 +164,11 @@ fn on_rack_disconnected(rack: &RackInfo) {
         rack.port_name,
         rack.serial.as_deref().unwrap_or("?")
     );
-    // TODO: tear down the rack's MQTT connection / mark it not-ready to the
-    // server, and emit a frontend event.
+
+    // Tell the frontend the rack is gone.
+    rack_emit_event(rack.to_state(false));
+
+    // TODO: tear down the rack's MQTT connection / mark it not-ready to the server.
 }
 
 /// Background monitor: continuously watches the bus for the rack appearing and

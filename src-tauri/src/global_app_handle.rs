@@ -134,3 +134,67 @@ pub fn emit_notification_event(event_name: &str, payload: NotificationPayload) {
         log::warn!("emit '{}' skipped: app handle not set", event_name);
     }
 }
+
+/// One card currently held in a rack slot, as shown in the UI. Populated once
+/// the server starts reporting cards; empty for now.
+#[derive(Clone, Serialize)]
+pub struct RackCard {
+    pub slot: u16,
+    pub card_number: Option<String>,
+    pub name: Option<String>,
+}
+
+/// State of the connected card rack, pushed to the frontend. Carries only
+/// device identity + presence + the (eventual) card list — no wire protocol.
+#[derive(Clone, Serialize)]
+pub struct RackState {
+    pub connected: bool,
+    pub name: String,
+    pub serial: Option<String>,
+    pub manufacturer: Option<String>,
+    pub product: Option<String>,
+    pub vid: Option<u16>,
+    pub pid: Option<u16>,
+    pub cards: Vec<RackCard>,
+}
+
+// Last known rack state. The rack monitor runs independently of the frontend,
+// so its emit can fire before the UI has subscribed (the event would be lost).
+// We cache the latest state and re-emit it when the frontend (re)loads.
+lazy_static! {
+    static ref LAST_RACK_STATE: Mutex<Option<RackState>> = Mutex::new(None);
+}
+
+/// Emits the card rack state to the frontend (event `rack-state`) and caches it
+/// so a freshly-loaded frontend can be brought up to date via
+/// [`emit_current_rack_state`].
+pub fn rack_emit_event(state: RackState) {
+    if let Ok(mut guard) = LAST_RACK_STATE.lock() {
+        *guard = Some(state.clone());
+    }
+    if let Some(app_handle) = get_app_handle() {
+        if let Err(e) = app_handle.emit("rack-state", state) {
+            log::error!("emit 'rack-state' failed: {:?}", e);
+        } else {
+            log::debug!("'rack-state' has been sent");
+        }
+    } else {
+        log::warn!("emit 'rack-state' skipped: app handle not set");
+    }
+}
+
+/// Re-emits the cached rack state to the frontend, if any. Called on
+/// `frontend-loaded` so the UI shows the rack immediately on (re)load, without
+/// waiting for the next connect/disconnect transition.
+pub fn emit_current_rack_state() {
+    let state = LAST_RACK_STATE.lock().ok().and_then(|g| g.clone());
+    if let Some(state) = state {
+        if let Some(app_handle) = get_app_handle() {
+            if let Err(e) = app_handle.emit("rack-state", state) {
+                log::error!("re-emit 'rack-state' failed: {:?}", e);
+            } else {
+                log::debug!("'rack-state' re-emitted to frontend");
+            }
+        }
+    }
+}

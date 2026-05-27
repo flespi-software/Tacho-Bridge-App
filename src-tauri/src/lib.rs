@@ -65,6 +65,11 @@ pub fn run() {
                         Err(e) => println!("Failed to emit global config server: {:?}", e),
                     }
 
+                    // Re-emit the last known rack state: the rack monitor runs
+                    // independently and may have already reported the rack before
+                    // the frontend subscribed, so a fresh load needs it replayed.
+                    global_app_handle::emit_current_rack_state();
+
                     // Run async function in the background with the Tauri runtime
                     // let app_handle_for_sc_monitor = app_handle.clone();
                     async_runtime::spawn(async {

@@ -112,6 +112,8 @@
         </q-item>
       </div>
     </div>
+    <!-- Card rack block, below the plain readers. One rack holds many cards. -->
+    <RackList :rack="rack" />
     <SmartCardList
       ref="cardlist"
       :cards="state.cards"
@@ -160,7 +162,8 @@
 
 <script setup lang="ts">
 import SmartCardList from './SmartCardList.vue'
-import type { SmartCard, Reader } from './models'
+import RackList from './RackList.vue'
+import type { SmartCard, Reader, RackState } from './models'
 import { formatStructureVersion, formatExpire, isExpired, formatAuthDate } from './cardFormatters'
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
@@ -177,6 +180,10 @@ const state = reactive({
   readers: [] as Reader[],
   cards: {} as Record<string, SmartCard>,
 })
+
+// Card rack state, pushed from the backend via `rack-state`. null until the
+// backend reports a rack at least once; then it reflects connect/disconnect.
+const rack = ref<RackState | null>(null)
 
 // Registered Tauri listeners. Kept in an array so we can detach them all
 // in onUnmounted — leaking listeners across HMR/navigation would let stale
@@ -249,6 +256,21 @@ function handleCardsSync(raw: unknown): void {
   } else {
     state.readers.push(next)
   }
+}
+
+// Runtime guard for the rack-state payload — fail closed on a malformed shape.
+function isRackStatePayload(raw: unknown): raw is RackState {
+  if (!raw || typeof raw !== 'object') return false
+  const p = raw as Record<string, unknown>
+  return typeof p.connected === 'boolean' && typeof p.name === 'string' && Array.isArray(p.cards)
+}
+
+function handleRackState(raw: unknown): void {
+  if (!isRackStatePayload(raw)) {
+    console.warn('rack-state: ignoring malformed payload', raw)
+    return
+  }
+  rack.value = raw
 }
 
 ///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
@@ -403,7 +425,14 @@ onMounted(async () => {
     console.error('Error listening to global-card-config-updated:', error)
   }
 
-  // Now that both listeners are wired, tell the backend it can start
+  try {
+    const unlisten = await listen('rack-state', (event) => handleRackState(event.payload))
+    unlistenFns.push(unlisten)
+  } catch (error) {
+    console.error('Error listening to rack-state:', error)
+  }
+
+  // Now that the listeners are wired, tell the backend it can start
   // emitting initial state.
   try {
     await emit('frontend-loaded', { message: 'Hello from frontend!' })
