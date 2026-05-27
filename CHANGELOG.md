@@ -106,3 +106,6 @@ All notable changes to this project will be documented in this file.
 [feature] APDU sniffer memory hygiene — per-client state is dropped on card disconnect and on full task-pool wipe, so the global state map no longer grows unbounded during long-running sessions.  
 [feature] Resilience to poisoned mutexes — the global app handle recovers its inner value instead of cascading a panic, so frontend event emission keeps working after an earlier panic. Event emitters were also migrated from println! to structured log calls.  
 [feature] Added unit test coverage across the config, APDU sniffer, MQTT, app-connection, and logger modules (atomic save round-trip, BER/DO'81 parsing, reconnect-delay math, topic rewrite, version ordering, and more).
+
+### [0.8.0] - 2026-05-27
+[feature] new
