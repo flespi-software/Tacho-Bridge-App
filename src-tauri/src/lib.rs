@@ -8,7 +8,7 @@ mod mqtt;               // MQTT communication.
 mod smart_card;         // PCSC module for smart card operations.
 mod apdu_sniffer;       // Passive sniffer for plaintext EF data in proxied APDUs.
 mod global_app_handle;  // Global access to app state and emitters.
-// mod com_port;          // COM port handling.
+mod com_port;           // Card rack over the COM (serial) port.
 
 // ───── External Crates ─────
 use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application framework and async runtime.
@@ -16,7 +16,7 @@ use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application
 pub fn run() {
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
     tauri::Builder::default()
-        .setup(move |app| {            
+        .setup(move |app| {
             // Obtain a lightweight reference to the app for convenient interaction
             let app_handle = app.app_handle();
 
@@ -82,21 +82,12 @@ pub fn run() {
                         app_connect::app_connection().await;
                     });
 
-                    // Spawn a background task to monitor the COM port for the Smart Card Rack device. This will run concurrently with the main application.
-                    // async_runtime::spawn(async {
-                    //     // Find the COM port for the Smart Card Rack device using its VID and PID. If found, start monitoring it.
-                    //     if let Ok(Some(port)) = com_port::find_card_reader_by_vid_pid(0x0403, 0x6015).await {
-                    //         log::info!("Smart Card Rack found at: {}", port);
-                            
-                    //         // Start continuous monitoring in the background for the COM port. This function will run indefinitely, checking for card insertions and removals.
-                    //         match com_port::monitor_card_reader(port).await {
-                    //             Ok(_) => log::info!("COM port monitor finished"),
-                    //             Err(e) => log::error!("COM port monitor error: {}", e),
-                    //         }
-                    //     } else {
-                    //         log::warn!("Smart Card Rack device not found (VID:0x0403, PID:0x6015)");
-                    //     }
-                    // });
+                    // Spawn a background task for the card rack on the COM port.
+                    // Runs concurrently with the PCSC reader monitor above — a
+                    // plugged-in reader and a connected rack work in parallel.
+                    async_runtime::spawn(async {
+                        com_port::rack_connection().await;
+                    });
                 });
 
                 // Handle the application close event to log this.

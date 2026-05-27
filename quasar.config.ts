@@ -59,7 +59,16 @@ export default defineConfig((/* ctx */) => {
       // polyfillModulePreload: true,
       // distDir
 
-      // extendViteConf (viteConf) {},
+      // Exclude the Rust build tree from Vite's file watcher. `src-tauri/target`
+      // holds ~40k build artifacts; watching them pins the dev server at several
+      // hundred % CPU. Tauri rebuilds the backend itself, so Vite must ignore it.
+      extendViteConf(viteConf) {
+        viteConf.server = viteConf.server || {}
+        viteConf.server.watch = {
+          ...(viteConf.server.watch || {}),
+          ignored: ['**/src-tauri/target/**', '**/src-tauri/gen/**'],
+        }
+      },
       // viteVuePluginOptions: {},
 
       vitePlugins: [

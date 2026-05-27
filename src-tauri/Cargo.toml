@@ -7,6 +7,9 @@ license = ""
 repository = "https://git.gurtam.net/shev/flespi_tca"
 edition = "2021"
 rust-version = "1.84.0"
+# Pin the app binary so `cargo run` / `tauri dev` always select it even when
+# extra local-only binaries exist under src/bin/ (which is git-ignored).
+default-run = "tacho-bridge-application"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

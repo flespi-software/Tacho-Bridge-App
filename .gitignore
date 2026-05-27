@@ -40,3 +40,8 @@ CLAUDE.md
 
 # test data
 1746_\[20.04.2026 15-52-51 - 20.04.2026 15-53-06\]_GMT+3.json
+
+/docs/
+
+# Private diagnostic tools containing proprietary protocol details (public repo)
+/src-tauri/src/bin/
