@@ -111,3 +111,4 @@ All notable changes to this project will be documented in this file.
 [fix] Fixed a bug with loading the backend and frontend sequence when starting the application.  
 [feature] The UI has been improved. Everything is now smoother, more rounded, and more beautiful.  
 [feature] Support for working with serial devices via the COM port has been added.  
+[feature] Added visual display of connected lisle design rack to the current UI.
