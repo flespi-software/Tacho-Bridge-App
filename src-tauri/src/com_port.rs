@@ -22,21 +22,45 @@ use std::time::Duration;
 // ───── Serial ─────
 use serialport::SerialPortType;
 
+// ───── MQTT Client Library (rumqttc) ─────
+use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
+
+// ───── Tauri ─────
+use tauri::async_runtime::{self, JoinHandle};
+
 // ───── Local Modules ─────
+use crate::config::{get_from_cache, split_host_to_parts, CacheSection};
 use crate::global_app_handle::{rack_emit_event, RackState};
+
+/// Initial / capped reconnect backoff for the rack's MQTT connection — same
+/// policy as the app and per-card connections.
+const RECONNECT_DELAY_INITIAL_SECS: u64 = 10;
+const RECONNECT_DELAY_MAX_SECS: u64 = 300;
+
+/// Returns the next reconnect delay given the current one (exponential, capped).
+fn next_reconnect_delay(current: u64) -> u64 {
+    current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
+}
 
 /// Guards against starting more than one rack monitor. The `frontend-loaded`
 /// event in `lib.rs` can fire several times at startup, which would otherwise
 /// spawn duplicate monitors.
 static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// USB string descriptors the rack advertises. We match on BOTH: the vendor
-/// manufacturer string and the product string — both are set by the device
-/// vendor and together identify the rack specifically. We deliberately do NOT
-/// match on USB vid/pid — those belong to the underlying USB-serial chip
-/// (shared across many unrelated adapters and liable to change between hardware
-/// revisions). vid/pid are only read and logged, to collect data for now.
-const RACK_MANUFACTURER: &str = "Lisle Design Ltd";
+lazy_static::lazy_static! {
+    /// Handle to the rack's MQTT task, if one is running. Started when the rack
+    /// connects and aborted when it disconnects, so there is at most one rack
+    /// MQTT connection at a time.
+    static ref RACK_MQTT_TASK: std::sync::Mutex<Option<JoinHandle<()>>> =
+        std::sync::Mutex::new(None);
+}
+
+/// USB product string the rack advertises. Combined with the brand marker in
+/// the manufacturer string (see `RACK_BRAND_MARKER`), this identifies a
+/// supported rack. We deliberately do NOT match on USB vid/pid — those belong to
+/// the underlying USB-serial chip (shared across many unrelated adapters and
+/// liable to change between hardware revisions). vid/pid are only read and
+/// logged, to collect data for now.
 const RACK_PRODUCT: &str = "Smart Card Rack";
 
 /// Serial line settings for the rack link.
@@ -44,6 +68,71 @@ const BAUD: u32 = 115_200;
 
 /// How often the monitor scans the bus for the rack appearing/disappearing.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// MQTT client_id construction for the rack connection.
+///
+/// The id must match the server's `^[0-9A-Z]{16}$` (exactly 16 uppercase
+/// alphanumerics). Layout is `BRAND` + filler zeros + `SERIAL`: the brand comes
+/// from the device's own manufacturer string (no hard-coded value), the serial
+/// is kept flush at the end, and the gap between them is padded with zeros.
+const RACK_ID_LEN: usize = 16; // server contract: exactly 16 chars
+const RACK_ID_BRAND_LEN: usize = 5; // chars of the brand kept in the id
+const RACK_ID_PAD: char = '0'; // filler placed between brand and serial
+
+/// Substring (case-insensitive) the manufacturer must contain for the device to
+/// be treated as a supported rack.
+const RACK_BRAND_MARKER: &str = "lisle";
+
+/// Extracts the brand prefix for the client_id from the manufacturer string:
+/// the first whitespace-separated word, kept to `[0-9A-Z]`, uppercased, and
+/// limited to `RACK_ID_BRAND_LEN` chars. e.g. "Lisle Design Ltd" -> "LISLE".
+fn brand_prefix(manufacturer: &str) -> String {
+    manufacturer
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .take(RACK_ID_BRAND_LEN)
+        .collect()
+}
+
+/// Builds the rack's MQTT client_id as `<brand>` + zero filler + sanitised
+/// serial, uppercased, kept to `[0-9A-Z]`, exactly 16 chars. The serial sits
+/// flush at the end; if brand + serial would exceed 16, the serial is truncated
+/// to its trailing chars (no filler).
+///
+/// Examples (manufacturer, serial → id):
+///   "Lisle Design Ltd", "SC1799" → "LISLE00000SC1799"
+///   "Lisle Design Ltd", none/""  → "LISLE00000000000"
+fn build_client_id(manufacturer: &str, serial: Option<&str>) -> String {
+    let brand = brand_prefix(manufacturer);
+
+    // Keep only [0-9A-Z] from the serial, uppercased.
+    let mut serial_clean: String = serial
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+
+    // Space available for the serial after the brand.
+    let serial_room = RACK_ID_LEN - brand.len();
+    if serial_clean.len() > serial_room {
+        // Too long: keep the trailing chars so the serial stays flush at the end.
+        serial_clean = serial_clean[serial_clean.len() - serial_room..].to_string();
+    }
+
+    let mut id = String::with_capacity(RACK_ID_LEN);
+    id.push_str(&brand);
+    // Filler zeros between brand and serial, so the serial ends at position 16.
+    for _ in 0..(serial_room - serial_clean.len()) {
+        id.push(RACK_ID_PAD);
+    }
+    id.push_str(&serial_clean);
+    id
+}
 
 /// Details of a discovered rack device, for logging and later use. `vid`/`pid`
 /// are kept only for logging/data collection — they are not used for matching.
@@ -58,6 +147,21 @@ struct RackInfo {
 }
 
 impl RackInfo {
+    /// True if the device manufacturer string marks it as a supported rack
+    /// (contains the brand marker, case-insensitive).
+    fn is_supported(&self) -> bool {
+        self.manufacturer
+            .as_deref()
+            .map(|m| m.to_ascii_lowercase().contains(RACK_BRAND_MARKER))
+            .unwrap_or(false)
+    }
+
+    /// The MQTT client_id the server uses to address this rack. The brand prefix
+    /// is derived from the device's own manufacturer string.
+    fn client_id(&self) -> String {
+        build_client_id(self.manufacturer.as_deref().unwrap_or(""), self.serial.as_deref())
+    }
+
     /// Build the frontend payload for this rack. The card list is empty for now;
     /// it will be filled once the server reports the cards in the rack's slots.
     fn to_state(&self, connected: bool) -> RackState {
@@ -77,16 +181,20 @@ impl RackInfo {
     }
 }
 
-/// Find the rack's serial port by its USB manufacturer + product strings. Both
-/// must match. vid/pid are recorded for logging but never used as match criteria.
+/// Find a candidate rack: a USB device whose product matches and whose
+/// manufacturer contains the brand marker (case-insensitive). vid/pid are
+/// recorded for logging but never used as match criteria.
 fn find_rack() -> Option<RackInfo> {
     let ports = serialport::available_ports().ok()?;
 
     for p in &ports {
         if let SerialPortType::UsbPort(info) = &p.port_type {
-            if info.manufacturer.as_deref() == Some(RACK_MANUFACTURER)
-                && info.product.as_deref() == Some(RACK_PRODUCT)
-            {
+            let manufacturer_ok = info
+                .manufacturer
+                .as_deref()
+                .map(|m| m.to_ascii_lowercase().contains(RACK_BRAND_MARKER))
+                .unwrap_or(false);
+            if manufacturer_ok && info.product.as_deref() == Some(RACK_PRODUCT) {
                 return Some(RackInfo {
                     port_name: p.port_name.clone(),
                     serial: info.serial_number.clone(),
@@ -129,9 +237,125 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
     }
 }
 
-/// Called when the rack transitions to connected. Logs readiness; this is the
-/// single place to later announce readiness to the server over MQTT and emit a
-/// frontend event.
+/// MQTT event loop for the rack's own connection. Mirrors the app/per-card
+/// connections in `mqtt.rs`: connect, poll the event loop, log commands pushed
+/// by the server, and reconnect with exponential backoff. Runs until aborted.
+///
+/// Command *execution* (forwarding bytes to the serial port) is intentionally
+/// not here yet — the wire protocol lives server-side and in the git-ignored
+/// diagnostic tool. For now an incoming command is logged so we can confirm the
+/// server↔rack channel works.
+async fn rack_mqtt_loop(client_id: String) {
+    let log_header = format!("RACK {} |", client_id);
+
+    let full_host = get_from_cache(CacheSection::Server, "host");
+    let (host, port) = match split_host_to_parts(&full_host) {
+        Ok(hp) => hp,
+        Err(e) => {
+            log::error!(
+                "{} [MQTT] phase=config status=failed reason=invalid_host err={}",
+                log_header,
+                e
+            );
+            return;
+        }
+    };
+
+    let mut mqtt_options = MqttOptions::new(&client_id, &host, port);
+    mqtt_options.set_keep_alive(Duration::from_secs(120));
+    log::info!(
+        "{} [MQTT] phase=connect_attempt status=initialized host={}:{}",
+        log_header,
+        host,
+        port
+    );
+
+    let (_mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
+
+    let mut is_online = false;
+    let mut reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
+
+    loop {
+        match eventloop.poll().await {
+            Ok(notification) => {
+                if !is_online {
+                    is_online = true;
+                    reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
+                    log::info!(
+                        "{} [MQTT] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
+                        log_header
+                    );
+                }
+
+                match notification {
+                    Event::Incoming(Incoming::ConnAck(..)) => {
+                        log::info!("{} [MQTT] event=CONNACK status=received", log_header);
+                    }
+                    Event::Incoming(Incoming::Publish(publish)) => {
+                        // A command from the server. We only log it for now; the
+                        // protocol handling that turns it into serial bytes is
+                        // not part of this public client.
+                        let topic = String::from_utf8_lossy(&publish.topic).into_owned();
+                        log::info!(
+                            "{} [MQTT] event=command topic={} bytes={}",
+                            log_header,
+                            topic,
+                            publish.payload.len()
+                        );
+                        // TODO: forward `publish.payload` to the serial port and
+                        // publish the rack's reply back to the response topic.
+                    }
+                    _ => {}
+                }
+            }
+            Err(e) => {
+                if is_online {
+                    log::warn!("{} [MQTT] state=ONLINE->OFFLINE err={:?}", log_header, e);
+                    is_online = false;
+                } else {
+                    log::warn!("{} [MQTT] state=OFFLINE err={:?}", log_header, e);
+                }
+                log::warn!(
+                    "{} [MQTT] action=reconnect_scheduled delay_secs={}",
+                    log_header,
+                    reconnect_delay_secs
+                );
+                tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
+                reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
+            }
+        }
+    }
+}
+
+/// Starts the rack's MQTT task if one is not already running.
+fn start_rack_mqtt(client_id: String) {
+    let mut guard = match RACK_MQTT_TASK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.is_some() {
+        log::debug!("[RACK] [MQTT] start skipped: task already running");
+        return;
+    }
+    log::info!("[RACK] [MQTT] phase=start client_id={}", client_id);
+    let handle = async_runtime::spawn(rack_mqtt_loop(client_id));
+    *guard = Some(handle);
+}
+
+/// Stops the rack's MQTT task if one is running.
+fn stop_rack_mqtt() {
+    let mut guard = match RACK_MQTT_TASK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(handle) = guard.take() {
+        handle.abort();
+        log::info!("[RACK] [MQTT] phase=stop status=aborted");
+    }
+}
+
+/// Called when the rack transitions to connected. Logs readiness, emits the
+/// frontend event, and starts the rack's own MQTT connection.
 fn on_rack_connected(rack: &RackInfo, _port: Box<dyn serialport::SerialPort>) {
     // vid/pid logged for data collection only — matching is by product string.
     log::info!(
@@ -143,18 +367,31 @@ fn on_rack_connected(rack: &RackInfo, _port: Box<dyn serialport::SerialPort>) {
         rack.vid,
         rack.pid,
     );
+    // Only Lisle Design racks are supported. The manufacturer string must carry
+    // the brand marker; otherwise we don't talk to the device at all.
+    if !rack.is_supported() {
+        log::warn!(
+            "[RACK] phase=ready status=unsupported reason=manufacturer_not_lisle manufacturer={} \
+             detail=not_a_lisle_design_tachograph_rack",
+            rack.manufacturer.as_deref().unwrap_or("?")
+        );
+        return;
+    }
+
+    let client_id = rack.client_id();
     log::info!(
-        "[RACK] phase=ready status=rack_connected_ready_for_work serial={}",
-        rack.serial.as_deref().unwrap_or("?")
+        "[RACK] phase=ready status=rack_connected_ready_for_work serial={} client_id={}",
+        rack.serial.as_deref().unwrap_or("?"),
+        client_id
     );
 
     // Tell the frontend the rack is present. The card list is empty for now —
     // the server doesn't yet report the cards held in the rack's slots.
     rack_emit_event(rack.to_state(true));
 
-    // TODO: open this rack's own MQTT connection, announce readiness to the
-    // server, then forward server bytes <-> the serial `_port`. When the server
-    // starts reporting cards, fill `RackState.cards` and re-emit.
+    // Open the rack's own MQTT connection and wait for server commands. Command
+    // execution (serial forwarding) is a later step; see `rack_mqtt_loop`.
+    start_rack_mqtt(client_id);
 }
 
 /// Called when the rack transitions to disconnected.
@@ -168,7 +405,8 @@ fn on_rack_disconnected(rack: &RackInfo) {
     // Tell the frontend the rack is gone.
     rack_emit_event(rack.to_state(false));
 
-    // TODO: tear down the rack's MQTT connection / mark it not-ready to the server.
+    // Tear down the rack's MQTT connection.
+    stop_rack_mqtt();
 }
 
 /// Background monitor: continuously watches the bus for the rack appearing and
@@ -226,11 +464,94 @@ pub async fn rack_connection() {
 mod tests {
     use super::*;
 
+    const MFR: &str = "Lisle Design Ltd"; // sample manufacturer string
+
     #[test]
-    fn rack_identity_strings_are_set() {
-        // Sanity: discovery relies on both non-empty identity strings.
-        assert!(!RACK_MANUFACTURER.is_empty());
+    fn rack_product_string_is_set() {
         assert!(!RACK_PRODUCT.is_empty());
+        assert!(!RACK_BRAND_MARKER.is_empty());
+    }
+
+    // The server contract: client_id must match ^[0-9A-Z]{16}$.
+    fn matches_server_contract(id: &str) -> bool {
+        id.len() == 16 && id.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    }
+
+    #[test]
+    fn brand_prefix_from_manufacturer() {
+        assert_eq!(brand_prefix("Lisle Design Ltd"), "LISLE");
+        assert_eq!(brand_prefix("lisle design ltd"), "LISLE"); // case-insensitive
+        assert_eq!(brand_prefix("Acme Co"), "ACME"); // shorter first word
+        assert_eq!(brand_prefix(""), ""); // empty
+    }
+
+    #[test]
+    fn client_id_for_sc1799() {
+        // Brand (from manufacturer) + zero filler + serial; serial flush at end.
+        assert_eq!(build_client_id(MFR, Some("SC1799")), "LISLE00000SC1799");
+    }
+
+    #[test]
+    fn client_id_serial_is_flush_at_end() {
+        // Whatever the serial length, it must end the id (filler in the middle).
+        assert!(build_client_id(MFR, Some("SC1799")).ends_with("SC1799"));
+        assert!(build_client_id(MFR, Some("AB")).ends_with("AB"));
+    }
+
+    #[test]
+    fn client_id_always_matches_server_contract() {
+        for serial in [
+            Some("SC1799"),
+            Some("sc1799"),                 // lowercase gets uppercased
+            Some("SC-17/99"),               // punctuation stripped
+            Some(""),                       // empty serial
+            None,                           // no serial at all
+            Some("VERYLONGSERIALNUMBER123"),// longer than 16 → truncated
+        ] {
+            let id = build_client_id(MFR, serial);
+            assert!(
+                matches_server_contract(&id),
+                "id {:?} from serial {:?} violates ^[0-9A-Z]{{16}}$",
+                id,
+                serial
+            );
+        }
+    }
+
+    #[test]
+    fn client_id_starts_with_brand_from_manufacturer() {
+        assert!(build_client_id(MFR, Some("ANYTHING")).starts_with("LISLE"));
+    }
+
+    #[test]
+    fn client_id_empty_serial_is_padded() {
+        assert_eq!(build_client_id(MFR, None), "LISLE00000000000");
+    }
+
+    #[test]
+    fn client_id_long_serial_keeps_trailing_chars() {
+        // Serial longer than the room → keep its tail, still 16 and contract-valid.
+        let id = build_client_id(MFR, Some("VERYLONGSERIAL123"));
+        assert!(matches_server_contract(&id));
+        assert!(id.starts_with("LISLE"));
+        // 11 chars of room after "LISLE" → trailing 11 of the serial.
+        assert_eq!(id, "LISLENGSERIAL123");
+    }
+
+    #[test]
+    fn is_supported_checks_manufacturer_marker() {
+        let base = RackInfo {
+            port_name: "/dev/x".into(),
+            serial: Some("SC1".into()),
+            manufacturer: Some("Lisle Design Ltd".into()),
+            product: None,
+            vid: 0,
+            pid: 0,
+        };
+        assert!(base.is_supported());
+        assert!(RackInfo { manufacturer: Some("LISLE DESIGN".into()), ..base.clone() }.is_supported());
+        assert!(!RackInfo { manufacturer: Some("Acme Co".into()), ..base.clone() }.is_supported());
+        assert!(!RackInfo { manufacturer: None, ..base.clone() }.is_supported());
     }
 
     #[test]
