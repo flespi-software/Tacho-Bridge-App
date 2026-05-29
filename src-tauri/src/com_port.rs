@@ -16,21 +16,32 @@
 //! parallel and neither blocks the other.
 
 // ───── Std Lib ─────
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 // ───── Serial ─────
-use serialport::SerialPortType;
+use serialport::{SerialPort, SerialPortType};
 
 // ───── MQTT Client Library (rumqttc) ─────
+use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
 
-// ───── Tauri ─────
+// ───── Async ─────
 use tauri::async_runtime::{self, JoinHandle};
+use tokio::sync::Mutex as AsyncMutex;
 
 // ───── Local Modules ─────
 use crate::config::{get_from_cache, split_host_to_parts, CacheSection};
 use crate::global_app_handle::{rack_emit_event, RackState};
+
+/// The open serial port to the rack, shared between the monitor (which opens it)
+/// and the MQTT task (which writes server commands to it and reads replies).
+type SharedPort = Arc<AsyncMutex<Box<dyn SerialPort>>>;
+
+/// How long to wait for the rack's serial reply after writing a command.
+const SERIAL_REPLY_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Initial / capped reconnect backoff for the rack's MQTT connection — same
 /// policy as the app and per-card connections.
@@ -215,7 +226,7 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
         .data_bits(serialport::DataBits::Eight)
         .stop_bits(serialport::StopBits::One)
         .parity(serialport::Parity::None)
-        .timeout(Duration::from_millis(500))
+        .timeout(SERIAL_REPLY_TIMEOUT)
         .open()
     {
         Ok(port) => {
@@ -238,14 +249,14 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
 }
 
 /// MQTT event loop for the rack's own connection. Mirrors the app/per-card
-/// connections in `mqtt.rs`: connect, poll the event loop, log commands pushed
-/// by the server, and reconnect with exponential backoff. Runs until aborted.
+/// connections in `mqtt.rs`: connect, poll the event loop, reconnect with
+/// exponential backoff. Runs until aborted.
 ///
-/// Command *execution* (forwarding bytes to the serial port) is intentionally
-/// not here yet — the wire protocol lives server-side and in the git-ignored
-/// diagnostic tool. For now an incoming command is logged so we can confirm the
-/// server↔rack channel works.
-async fn rack_mqtt_loop(client_id: String) {
+/// Server commands arrive as JSON `{"serial_cmd":"<hex>"}`. The hex is decoded
+/// and the raw bytes are written straight to the serial port; the rack's reply
+/// is read back and published to the response topic. The meaning of the bytes is
+/// owned by the server — the client is just a transparent pipe.
+async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
     let log_header = format!("RACK {} |", client_id);
 
     let full_host = get_from_cache(CacheSection::Server, "host");
@@ -270,7 +281,7 @@ async fn rack_mqtt_loop(client_id: String) {
         port
     );
 
-    let (_mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
+    let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
 
     let mut is_online = false;
     let mut reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
@@ -292,20 +303,60 @@ async fn rack_mqtt_loop(client_id: String) {
                         log::info!("{} [MQTT] event=CONNACK status=received", log_header);
                     }
                     Event::Incoming(Incoming::Publish(publish)) => {
-                        // A command from the server. We only log it for now; the
-                        // protocol handling that turns it into serial bytes is
-                        // not part of this public client.
                         let topic = String::from_utf8_lossy(&publish.topic).into_owned();
+                        let payload_text = String::from_utf8_lossy(&publish.payload);
+
                         log::info!(
-                            "{} [MQTT] event=command topic={} bytes={}",
+                            "{} [MQTT] event=command topic={} bytes={} qos={:?}",
                             log_header,
                             topic,
-                            publish.payload.len()
+                            publish.payload.len(),
+                            publish.qos,
                         );
-                        // TODO: forward `publish.payload` to the serial port and
-                        // publish the rack's reply back to the response topic.
+                        log::info!("{} [MQTT] command_text={}", log_header, payload_text);
+
+                        // Extract the `serial_cmd` hex string from the JSON command.
+                        let serial_hex = match serde_json::from_slice::<serde_json::Value>(
+                            &publish.payload,
+                        ) {
+                            Ok(json) => json
+                                .get("serial_cmd")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            Err(e) => {
+                                log::warn!("{} [MQTT] command ignored: bad JSON: {}", log_header, e);
+                                None
+                            }
+                        };
+
+                        if let Some(serial_hex) = serial_hex {
+                            // Forward the bytes to the rack and publish its reply
+                            // back on the matching response topic.
+                            let reply =
+                                forward_to_serial(&serial_port, &serial_hex, &log_header).await;
+                            if let Some(reply_hex) = reply {
+                                let resp_topic = request_to_response_topic(&topic);
+                                let resp_payload =
+                                    serde_json::json!({ "serial_resp": reply_hex }).to_string();
+                                if let Err(e) = mqtt_client
+                                    .publish(resp_topic, QoS::AtLeastOnce, false, resp_payload)
+                                    .await
+                                {
+                                    log::error!("{} [MQTT] reply publish failed: {:?}", log_header, e);
+                                }
+                            }
+                        } else {
+                            log::warn!(
+                                "{} [MQTT] command has no 'serial_cmd' field, nothing to forward",
+                                log_header
+                            );
+                        }
                     }
-                    _ => {}
+                    other => {
+                        // Trace every other incoming/outgoing event so the full
+                        // exchange with the broker is visible while we wire things up.
+                        log::info!("{} [MQTT] event=other detail={:?}", log_header, other);
+                    }
                 }
             }
             Err(e) => {
@@ -327,8 +378,79 @@ async fn rack_mqtt_loop(client_id: String) {
     }
 }
 
+/// Rewrites a leading `request/` topic segment to `response/` for replies.
+/// Returns the topic unchanged if it has no `request/` prefix.
+fn request_to_response_topic(topic: &str) -> String {
+    match topic.strip_prefix("request/") {
+        Some(rest) => format!("response/{}", rest),
+        None => topic.to_string(),
+    }
+}
+
+/// Decodes a hex command, writes the raw bytes to the rack's serial port, and
+/// reads whatever the rack sends back within `SERIAL_REPLY_TIMEOUT`. Returns the
+/// reply as an uppercase hex string, or `None` on a write error / no reply.
+///
+/// This is a transparent pipe: the bytes' meaning is decided by the server. The
+/// blocking serial I/O runs on a blocking thread so the async runtime isn't stalled.
+async fn forward_to_serial(port: &SharedPort, serial_hex: &str, log_header: &str) -> Option<String> {
+    let bytes = match hex::decode(serial_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("{} [SERIAL] bad hex in serial_cmd: {}", log_header, e);
+            return None;
+        }
+    };
+
+    log::info!("{} [SERIAL] tx bytes={} hex={}", log_header, bytes.len(), serial_hex);
+
+    let port = port.clone();
+    let log_header_blocking = log_header.to_string();
+
+    // serialport is blocking; do the write+read on a blocking thread.
+    let result = tokio::task::spawn_blocking(move || {
+        let mut guard = port.blocking_lock();
+        if let Err(e) = guard.write_all(&bytes) {
+            log::error!("{} [SERIAL] write failed: {}", log_header_blocking, e);
+            return None;
+        }
+        let _ = guard.flush();
+
+        // Read whatever arrives until the inter-byte timeout fires. The port's
+        // own read timeout bounds each read; we stop on the first timeout once
+        // we have some data, or return nothing if the rack stays silent.
+        let mut reply = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            match guard.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => reply.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+                Err(e) => {
+                    log::warn!("{} [SERIAL] read error: {}", log_header_blocking, e);
+                    break;
+                }
+            }
+        }
+        if reply.is_empty() {
+            None
+        } else {
+            Some(hex::encode_upper(&reply))
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+
+    match &result {
+        Some(reply_hex) => log::info!("{} [SERIAL] rx hex={}", log_header, reply_hex),
+        None => log::warn!("{} [SERIAL] no reply from rack", log_header),
+    }
+    result
+}
+
 /// Starts the rack's MQTT task if one is not already running.
-fn start_rack_mqtt(client_id: String) {
+fn start_rack_mqtt(client_id: String, port: SharedPort) {
     let mut guard = match RACK_MQTT_TASK.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -338,7 +460,7 @@ fn start_rack_mqtt(client_id: String) {
         return;
     }
     log::info!("[RACK] [MQTT] phase=start client_id={}", client_id);
-    let handle = async_runtime::spawn(rack_mqtt_loop(client_id));
+    let handle = async_runtime::spawn(rack_mqtt_loop(client_id, port));
     *guard = Some(handle);
 }
 
@@ -355,8 +477,9 @@ fn stop_rack_mqtt() {
 }
 
 /// Called when the rack transitions to connected. Logs readiness, emits the
-/// frontend event, and starts the rack's own MQTT connection.
-fn on_rack_connected(rack: &RackInfo, _port: Box<dyn serialport::SerialPort>) {
+/// frontend event, and starts the rack's own MQTT connection wired to the open
+/// serial port.
+fn on_rack_connected(rack: &RackInfo, port: Box<dyn SerialPort>) {
     // vid/pid logged for data collection only — matching is by product string.
     log::info!(
         "[RACK] phase=discovery status=found port={} serial={} manufacturer={} product={} vid={:#06x} pid={:#06x}",
@@ -389,9 +512,10 @@ fn on_rack_connected(rack: &RackInfo, _port: Box<dyn serialport::SerialPort>) {
     // the server doesn't yet report the cards held in the rack's slots.
     rack_emit_event(rack.to_state(true));
 
-    // Open the rack's own MQTT connection and wait for server commands. Command
-    // execution (serial forwarding) is a later step; see `rack_mqtt_loop`.
-    start_rack_mqtt(client_id);
+    // Open the rack's own MQTT connection wired to the serial port, and wait for
+    // server commands. Each `serial_cmd` is written straight to this port.
+    let shared_port: SharedPort = Arc::new(AsyncMutex::new(port));
+    start_rack_mqtt(client_id, shared_port);
 }
 
 /// Called when the rack transitions to disconnected.
@@ -470,6 +594,14 @@ mod tests {
     fn rack_product_string_is_set() {
         assert!(!RACK_PRODUCT.is_empty());
         assert!(!RACK_BRAND_MARKER.is_empty());
+    }
+
+    #[test]
+    fn response_topic_swaps_request_prefix_only() {
+        assert_eq!(request_to_response_topic("request/0"), "response/0");
+        assert_eq!(request_to_response_topic("request/1/ABC"), "response/1/ABC");
+        // No request/ prefix → unchanged.
+        assert_eq!(request_to_response_topic("status/x"), "status/x");
     }
 
     // The server contract: client_id must match ^[0-9A-Z]{16}$.
