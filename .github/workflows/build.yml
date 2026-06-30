@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   windows-amd64:
-    name: Windows amd64 (MSI)
+    name: Windows amd64 (NSIS)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,11 +38,11 @@ jobs:
       - name: Build (Tauri)
         run: npm run tauri build
 
-      - name: Upload MSI artifact
+      - name: Upload NSIS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tba-windows-amd64-msi
-          path: src-tauri/target/release/bundle/msi/*.msi
+          name: tba-windows-amd64-nsis
+          path: src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
           retention-days: 14
 
