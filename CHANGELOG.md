@@ -107,10 +107,11 @@ All notable changes to this project will be documented in this file.
 [feature] Resilience to poisoned mutexes — the global app handle recovers its inner value instead of cascading a panic, so frontend event emission keeps working after an earlier panic. Event emitters were also migrated from println! to structured log calls.  
 [feature] Added unit test coverage across the config, APDU sniffer, MQTT, app-connection, and logger modules (atomic save round-trip, BER/DO'81 parsing, reconnect-delay math, topic rewrite, version ordering, and more).
 
-### [0.8.0] - 2026-05-28
+### [0.8.0] - 2026-06-30
 [fix] Fixed a bug with loading the backend and frontend sequence when starting the application.  
+[fix] Improved control over the current session with the server.  
+[fix] Updating the action config for Windows to avoid conflicts when building alpha test versions, etc.  
 [feature] The UI has been improved. Everything is now smoother, more rounded, and more beautiful.  
 [feature] Support for working with serial devices via the COM port has been added.  
 [feature] Added visual display of connected lisle design rack to the current UI.
 [feature] Added mqtt connection with the "Lisle" manufacturer name ident.  
-[fix] Repeated requests are now handled idempotently — when the server re-sends a command with the same request_id (after a reply timeout), the cached response is returned without re-running the card or serial exchange. This stops the duplicate responses that the server rejected (dropping the card connection) and avoids replaying stateful authentication APDUs. The idempotency cache resets on each MQTT reconnect.  
