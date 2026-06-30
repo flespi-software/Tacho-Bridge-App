@@ -113,3 +113,4 @@ All notable changes to this project will be documented in this file.
 [feature] Support for working with serial devices via the COM port has been added.  
 [feature] Added visual display of connected lisle design rack to the current UI.
 [feature] Added mqtt connection with the "Lisle" manufacturer name ident.  
+[fix] Repeated requests are now handled idempotently — when the server re-sends a command with the same request_id (after a reply timeout), the cached response is returned without re-running the card or serial exchange. This stops the duplicate responses that the server rejected (dropping the card connection) and avoids replaying stateful authentication APDUs. The idempotency cache resets on each MQTT reconnect.  

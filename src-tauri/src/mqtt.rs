@@ -53,6 +53,16 @@ fn request_to_response_topic(topic: &str) -> String {
     }
 }
 
+/// Extracts the request id (the first segment after `request/`) from a topic of
+/// the form `request/<id>/<sender>`. Used for idempotent handling of repeated
+/// requests: the server re-sends the same id when it does not get a timely reply.
+fn request_id_from_topic(topic: &str) -> Option<u64> {
+    topic
+        .strip_prefix("request/")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|id| id.parse::<u64>().ok())
+}
+
 fn emit_card_sync_event(
     iccid: &str,
     reader_name: &CStr,
@@ -174,6 +184,15 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     let mut auth_process: bool = false;  // Flag to control the authentication process
     let mut reconnect_delay_secs: u64 = RECONNECT_DELAY_INITIAL_SECS; // exponential backoff state
 
+    // Idempotency state for the current MQTT connection. The server re-sends a command with the
+    // same request_id when it does not get a timely reply. We remember the last id we answered and
+    // its response so a repeated request re-sends the cached reply instead of re-running the card:
+    // replaying a stateful authentication APDU can corrupt the card state, and the duplicate reply
+    // would be rejected by the server anyway. Reset on every CONNACK, because a new MQTT session
+    // restarts the server-side request_id counter at 1.
+    let mut last_request_id: Option<u64> = None;
+    let mut last_response_payload: Option<String> = None;
+
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
         let iccid: String = match managed_card.get_iccid().await {
@@ -243,6 +262,30 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             // "request/" segment to "response/" — prefix-only swap to
                             // avoid mangling substrings inside the rest of the topic.
                             let topic_ack = request_to_response_topic(&topic);
+
+                            // Idempotency: the server re-sends a request with the same id after a
+                            // command timeout. If we already answered this id, re-send the cached
+                            // response without touching the card; if it is still being processed, drop it.
+                            let req_id = request_id_from_topic(&topic);
+                            if req_id.is_some() && req_id == last_request_id {
+                                match &last_response_payload {
+                                    Some(cached) => {
+                                        log::warn!(
+                                            "{} duplicate request_id={:?}: re-sending cached response, skipping card exchange",
+                                            log_header,
+                                            req_id
+                                        );
+                                        publish_ack(&mqtt_client, topic_ack.clone(), cached.clone(), &log_header).await;
+                                    }
+                                    None => log::warn!(
+                                        "{} duplicate request_id={:?} still in flight: ignoring",
+                                        log_header,
+                                        req_id
+                                    ),
+                                }
+                                continue;
+                            }
+
                             // serializable data to interpret it as json
                             match serde_json::from_slice::<Value>(&publish.payload) {
                                 Ok(json_payload) => {
@@ -351,6 +394,13 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                             );
                                         }
 
+                                        // Cache this reply so a re-sent request with the same id is
+                                        // answered from cache without re-running the card exchange.
+                                        if req_id.is_some() {
+                                            last_request_id = req_id;
+                                            last_response_payload = Some(payload_ack.clone());
+                                        }
+
                                         // publish a message to the channel
                                         publish_ack(&mqtt_client, topic_ack, payload_ack, &log_header).await;
                                     } else {
@@ -370,6 +420,10 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             }
                         }
                         Event::Incoming(Incoming::ConnAck(..)) => {
+                            // New MQTT session: the server restarts its request_id counter at 1, so
+                            // drop the idempotency slot to avoid mistaking a fresh request for a duplicate.
+                            last_request_id = None;
+                            last_response_payload = None;
                             log::info!(
                                 "{} [CONN] event=CONNACK status=received",
                                 log_header
@@ -568,6 +622,19 @@ mod tests {
             request_to_response_topic("status/1/ABCDEF"),
             "status/1/ABCDEF"
         );
+    }
+
+    #[test]
+    fn request_id_from_topic_parses_first_segment_only() {
+        assert_eq!(request_id_from_topic("request/354/0000000067664100"), Some(354));
+        assert_eq!(request_id_from_topic("request/1/ABCDEF"), Some(1));
+    }
+
+    #[test]
+    fn request_id_from_topic_rejects_non_numeric_or_wrong_prefix() {
+        assert_eq!(request_id_from_topic("request/abc/ABCDEF"), None);
+        assert_eq!(request_id_from_topic("response/1/ABCDEF"), None);
+        assert_eq!(request_id_from_topic("request/"), None);
     }
 
     #[test]

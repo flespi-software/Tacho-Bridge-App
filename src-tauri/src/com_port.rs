@@ -286,6 +286,13 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
     let mut is_online = false;
     let mut reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
 
+    // Idempotency state for the current MQTT connection: the server re-sends a request with the
+    // same id when it does not get a timely reply. Remember the last id we answered and its reply
+    // so a repeat re-sends the cached response instead of re-forwarding to the rack. Reset on every
+    // CONNACK, because a new MQTT session restarts the server-side request_id counter at 1.
+    let mut last_request_id: Option<u64> = None;
+    let mut last_response_payload: Option<String> = None;
+
     loop {
         match eventloop.poll().await {
             Ok(notification) => {
@@ -300,6 +307,9 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
 
                 match notification {
                     Event::Incoming(Incoming::ConnAck(..)) => {
+                        // New MQTT session: server restarts request_id at 1, drop the idempotency slot.
+                        last_request_id = None;
+                        last_response_payload = None;
                         log::info!("{} [MQTT] event=CONNACK status=received", log_header);
                     }
                     Event::Incoming(Incoming::Publish(publish)) => {
@@ -314,6 +324,35 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                             publish.qos,
                         );
                         log::info!("{} [MQTT] command_text={}", log_header, payload_text);
+
+                        // Idempotency: the server re-sends a request with the same id after a
+                        // timeout. If we already answered this id, re-send the cached response
+                        // without forwarding to the rack again; if it is still in flight, drop it.
+                        let req_id = request_id_from_topic(&topic);
+                        if req_id.is_some() && req_id == last_request_id {
+                            match &last_response_payload {
+                                Some(cached) => {
+                                    log::warn!(
+                                        "{} [MQTT] duplicate request_id={:?}: re-sending cached response, skipping serial exchange",
+                                        log_header,
+                                        req_id
+                                    );
+                                    let resp_topic = request_to_response_topic(&topic);
+                                    if let Err(e) = mqtt_client
+                                        .publish(resp_topic, QoS::AtLeastOnce, false, cached.clone())
+                                        .await
+                                    {
+                                        log::error!("{} [MQTT] cached reply publish failed: {:?}", log_header, e);
+                                    }
+                                }
+                                None => log::warn!(
+                                    "{} [MQTT] duplicate request_id={:?} still in flight: ignoring",
+                                    log_header,
+                                    req_id
+                                ),
+                            }
+                            continue;
+                        }
 
                         // Extract the `serial_cmd` hex string from the JSON command.
                         let serial_hex = match serde_json::from_slice::<serde_json::Value>(
@@ -338,6 +377,12 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                                 let resp_topic = request_to_response_topic(&topic);
                                 let resp_payload =
                                     serde_json::json!({ "serial_resp": reply_hex }).to_string();
+                                // Cache this reply so a re-sent request with the same id is answered
+                                // from cache without forwarding to the rack again.
+                                if req_id.is_some() {
+                                    last_request_id = req_id;
+                                    last_response_payload = Some(resp_payload.clone());
+                                }
                                 if let Err(e) = mqtt_client
                                     .publish(resp_topic, QoS::AtLeastOnce, false, resp_payload)
                                     .await
@@ -385,6 +430,16 @@ fn request_to_response_topic(topic: &str) -> String {
         Some(rest) => format!("response/{}", rest),
         None => topic.to_string(),
     }
+}
+
+/// Extracts the request id (first segment after `request/`) from a topic of the
+/// form `request/<id>/<sender>`. Used for idempotent handling of repeated requests:
+/// the server re-sends the same id when it does not get a timely reply.
+fn request_id_from_topic(topic: &str) -> Option<u64> {
+    topic
+        .strip_prefix("request/")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|id| id.parse::<u64>().ok())
 }
 
 /// Decodes a hex command, writes the raw bytes to the rack's serial port, and
@@ -602,6 +657,15 @@ mod tests {
         assert_eq!(request_to_response_topic("request/1/ABC"), "response/1/ABC");
         // No request/ prefix → unchanged.
         assert_eq!(request_to_response_topic("status/x"), "status/x");
+    }
+
+    #[test]
+    fn request_id_from_topic_parses_first_segment_only() {
+        assert_eq!(request_id_from_topic("request/42/RACK0000000000AB"), Some(42));
+        assert_eq!(request_id_from_topic("request/0"), Some(0));
+        // Non-numeric id or wrong prefix → None.
+        assert_eq!(request_id_from_topic("request/abc/X"), None);
+        assert_eq!(request_id_from_topic("status/1/X"), None);
     }
 
     // The server contract: client_id must match ^[0-9A-Z]{16}$.
