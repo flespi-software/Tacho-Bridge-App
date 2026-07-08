@@ -210,39 +210,66 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
         }
     }
 
-    // Persist changes to card config
-    let Some(mut cfg) = crate::config::get_card_config_from_cache(client_id) else {
+    // Persist changes to card config.
+    // Cheap pre-check against the runtime cache first: the VU re-reads these
+    // EFs on every authentication, and in the common no-change case we must
+    // not touch the disk at all.
+    let Some(cfg) = crate::config::get_card_config_from_cache(client_id) else {
         return;
     };
-    let mut changed = false;
 
-    if let Some(b) = slice(data, 61, 4) {
+    // Outer Option = field present in this response; inner value = new content.
+    let new_expire = slice(data, 61, 4).map(|b| {
         let ts = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-        let new_value = if ts == 0 { None } else { Some(ts as u64) };
-        if cfg.expire != new_value {
-            cfg.expire = new_value;
-            changed = true;
-        }
-    }
-    if let Some(b) = slice(data, 65, 36) {
-        let new_value = extract_name(b);
-        if cfg.company_name != new_value {
-            cfg.company_name = new_value;
-            changed = true;
-        }
-    }
-    if let Some(b) = slice(data, 101, 36) {
-        let new_value = extract_name(b);
-        if cfg.company_address != new_value {
-            cfg.company_address = new_value;
-            changed = true;
-        }
+        if ts == 0 { None } else { Some(ts as u64) }
+    });
+    let new_company_name = slice(data, 65, 36).map(extract_name);
+    let new_company_address = slice(data, 101, 36).map(extract_name);
+
+    let would_change = new_expire.as_ref().is_some_and(|v| &cfg.expire != v)
+        || new_company_name.as_ref().is_some_and(|v| &cfg.company_name != v)
+        || new_company_address.as_ref().is_some_and(|v| &cfg.company_address != v);
+    if !would_change {
+        return;
     }
 
-    if changed {
-        log::debug!("EF_Identification → config update for {}", client_id);
-        crate::config::update_card(client_id, cfg);
-    }
+    log::debug!("EF_Identification → config update for {}", client_id);
+
+    // sniff() runs on the card's async MQTT task, so the write (file I/O with
+    // fsync) is offloaded to the blocking pool. mutate_card_config re-applies
+    // the change against fresh file state under the global config lock, so a
+    // concurrent writer cannot be reverted by a stale snapshot.
+    let client_id = client_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let ok = crate::config::mutate_card_config(&client_id, move |card| {
+            let mut changed = false;
+            if let Some(v) = new_expire {
+                if card.expire != v {
+                    card.expire = v;
+                    changed = true;
+                }
+            }
+            if let Some(v) = new_company_name {
+                if card.company_name != v {
+                    card.company_name = v;
+                    changed = true;
+                }
+            }
+            if let Some(v) = new_company_address {
+                if card.company_address != v {
+                    card.company_address = v;
+                    changed = true;
+                }
+            }
+            changed
+        });
+        if !ok {
+            log::error!(
+                "sniffer: failed to persist EF_Identification fields for {}",
+                client_id
+            );
+        }
+    });
 }
 
 /// Parses EF_Application_Identification for Company Card.
@@ -278,44 +305,63 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
         log::info!("  noOfCompanyActivityRecords: {}", n);
     }
 
-    // Persist changes to card config
-    let Some(mut cfg) = crate::config::get_card_config_from_cache(client_id) else {
+    // Persist changes to card config.
+    // Cheap pre-check against the runtime cache first — no disk I/O in the
+    // common no-change case (the VU reads this EF on every authentication).
+    let Some(cfg) = crate::config::get_card_config_from_cache(client_id) else {
         return;
     };
-    let mut changed = false;
 
-    if !data.is_empty() {
-        let new_value = Some(data[0]);
-        if cfg.card_type != new_value {
-            cfg.card_type = new_value;
-            changed = true;
-        }
+    let new_card_type = if !data.is_empty() { Some(data[0]) } else { None };
+    // Gen2 cards expose EF_Application_Identification under BOTH DF_Tachograph (Gen1, ver 00.00)
+    // and DF_Tachograph_G2 (Gen2, ver 01.xx). Keep only the highest version seen —
+    // tuple comparison is lexicographic: (0,0) < (1,0) < (1,1) < (1,2) ...
+    let new_structure_version = if data.len() >= 3 {
+        Some((data[1], data[2]))
+    } else {
+        None
+    };
+
+    let version_is_higher = |current: Option<(u8, u8)>, candidate: (u8, u8)| match current {
+        Some(current) => candidate > current,
+        None => true,
+    };
+
+    let would_change = new_card_type.is_some_and(|t| cfg.card_type != Some(t))
+        || new_structure_version.is_some_and(|v| version_is_higher(cfg.structure_version, v));
+    if !would_change {
+        return;
     }
-    if data.len() >= 3 {
-        // Gen2 cards expose EF_Application_Identification under BOTH DF_Tachograph (Gen1, ver 00.00)
-        // and DF_Tachograph_G2 (Gen2, ver 01.xx). Keep only the highest version seen —
-        // tuple comparison is lexicographic: (0,0) < (1,0) < (1,1) < (1,2) ...
-        let new_value = (data[1], data[2]);
-        let should_update = match cfg.structure_version {
-            Some(current) => new_value > current,
-            None => true,
-        };
-        if should_update {
-            cfg.structure_version = Some(new_value);
-            changed = true;
-        } else {
-            log::debug!(
-                "EF_AI structure_version {:?} not higher than stored {:?} — skipped",
-                new_value,
-                cfg.structure_version
+
+    log::debug!("EF_Application_Identification → config update for {}", client_id);
+
+    // Same offload pattern as EF_Identification: blocking write on the blocking
+    // pool, change re-applied to fresh file state under the global config lock.
+    let client_id = client_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let ok = crate::config::mutate_card_config(&client_id, move |card| {
+            let mut changed = false;
+            if let Some(t) = new_card_type {
+                if card.card_type != Some(t) {
+                    card.card_type = Some(t);
+                    changed = true;
+                }
+            }
+            if let Some(v) = new_structure_version {
+                if version_is_higher(card.structure_version, v) {
+                    card.structure_version = Some(v);
+                    changed = true;
+                }
+            }
+            changed
+        });
+        if !ok {
+            log::error!(
+                "sniffer: failed to persist EF_Application_Identification fields for {}",
+                client_id
             );
         }
-    }
-
-    if changed {
-        log::debug!("EF_Application_Identification → config update for {}", client_id);
-        crate::config::update_card(client_id, cfg);
-    }
+    });
 }
 
 // ─────────── Helpers ───────────

@@ -112,6 +112,7 @@ All notable changes to this project will be documented in this file.
 [fix] Improved control over the current session with the server.  
 [fix] Updating the action config for Windows to avoid conflicts when building alpha test versions, etc.  
 [fix] Moved the blocking smart card monitor to a dedicated thread and guarded it against duplicate spawns, preventing potential UI and MQTT freezes.  
+[fix] Fixed a race condition in config.yaml writes that could silently drop card data, and moved config disk I/O off the UI and networking threads.  
 [feature] The UI has been improved. Everything is now smoother, more rounded, and more beautiful.  
 [feature] Support for working with serial devices via the COM port has been added.  
 [feature] Added visual display of connected lisle design rack to the current UI.

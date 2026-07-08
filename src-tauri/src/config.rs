@@ -158,6 +158,9 @@ fn update_card_config(
     card_number: &str,
     content: CardConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Serialize the whole read-modify-write against all other config writers.
+    let _guard = config_write_guard();
+
     let mut config = load_config(config_path)?;
     log::debug!("Loaded configuration: {:?}", config);
 
@@ -259,10 +262,10 @@ fn update_card_config(
     Ok(())
 }
 
-/// Public function to update the configuration with a new card.
-/// This function is a Tauri command that updates the configuration file with a new card's ATR and card number.
-#[tauri::command]
-pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
+/// Synchronous core of the full-content card update (file I/O + fsync under
+/// the global config lock). Blocking by design — call it from a blocking
+/// thread, never from an async task or the main thread.
+pub fn persist_card(card_number: &str, content: CardConfig) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,
         Err(e) => {
@@ -271,9 +274,9 @@ pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
         }
     };
 
-    match update_card_config(&config_path, cardnumber, content) {
+    match update_card_config(&config_path, card_number, content) {
         Ok(_) => {
-            log::info!("The card, {} is added to the configuration!", cardnumber);
+            log::info!("The card, {} is added to the configuration!", card_number);
             true
         }
         Err(e) => {
@@ -281,6 +284,79 @@ pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
             false
         }
     }
+}
+
+/// Applies `mutate` to one card entry under the global config write lock:
+/// fresh load from disk → mutate → save → refresh cache → emit the frontend
+/// event. The closure returns whether it actually changed anything; when it
+/// returns false the save is skipped entirely.
+///
+/// This is the safe primitive for "change one field" writers (sniffer, auth
+/// results): mutating fresh file state under the lock means concurrent writers
+/// cannot revert each other's fields, which a cache-read + full-write would do.
+/// Blocking (file I/O + fsync) — call from a blocking thread.
+pub fn mutate_card_config<F>(card_number: &str, mutate: F) -> bool
+where
+    F: FnOnce(&mut CardConfig) -> bool,
+{
+    let config_path = match get_config_path() {
+        Ok(path) => path,
+        Err(e) => {
+            log::error!("Failed to get config path: {}", e);
+            return false;
+        }
+    };
+
+    let _guard = config_write_guard();
+
+    let mut config = match load_config(&config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            log::error!("mutate_card_config: failed to load config: {}", e);
+            return false;
+        }
+    };
+
+    let Some(card) = config.cards.get_mut(card_number) else {
+        log::warn!("mutate_card_config: unknown card_number {}", card_number);
+        return false;
+    };
+
+    if !mutate(card) {
+        // Nothing changed against the authoritative file state — no write.
+        return true;
+    }
+    let updated = card.clone();
+
+    if let Err(e) = save_config(&config_path, &config) {
+        log::error!("mutate_card_config: failed to save config: {}", e);
+        return false;
+    }
+    if let Err(e) = load_config_to_cache(&config) {
+        log::error!("mutate_card_config: failed to refresh cache: {}", e);
+        return false;
+    }
+
+    emit_card_config_event(
+        "global-card-config-updated",
+        card_number.to_string(),
+        Some(updated),
+    );
+
+    true
+}
+
+/// Public function to update the configuration with a new card.
+/// This is a Tauri command: a thin async wrapper so the webview invoke never
+/// runs file I/O on the main thread — the blocking core goes to the blocking pool.
+#[tauri::command]
+pub async fn update_card(cardnumber: String, content: CardConfig) -> bool {
+    tauri::async_runtime::spawn_blocking(move || persist_card(&cardnumber, content))
+        .await
+        .unwrap_or_else(|e| {
+            log::error!("update_card: blocking task failed: {:?}", e);
+            false
+        })
 }
 
 /// Updates the server address in the configuration.
@@ -291,6 +367,9 @@ pub fn update_server_config(
     ident: &str,
     theme: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Serialize the whole read-modify-write against all other config writers.
+    let _guard = config_write_guard();
+
     let mut config = load_config(config_path)?;
 
     config.server = Some(ServerConfig {
@@ -337,17 +416,37 @@ pub async fn remove_card_from_config(
     config_path: &Path,
     card_number: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log::debug!("Loading configuration from {:?}", config_path);
-    let mut config = load_config(config_path)?;
-    log::debug!("Loaded configuration: {:?}", config);
+    let path = config_path.to_path_buf();
+    let number = card_number.to_string();
 
-    if config.cards.remove(card_number).is_some() {
-        save_config(config_path, &config)?;
-        log::debug!("Configuration saved successfully after removal");
+    // The file part (load-modify-save + cache refresh) is blocking — run it on
+    // the blocking pool, serialized with all other config writers by the lock.
+    let removed = tauri::async_runtime::spawn_blocking(
+        move || -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            let _guard = config_write_guard();
 
-        load_config_to_cache(&config)?;
-        log::debug!("Configuration loaded to cache successfully");
+            log::debug!("Loading configuration from {:?}", path);
+            let mut config = load_config(&path)?;
 
+            if config.cards.remove(&number).is_none() {
+                return Ok(false);
+            }
+
+            save_config(&path, &config)?;
+            log::debug!("Configuration saved successfully after removal");
+
+            load_config_to_cache(&config)?;
+            log::debug!("Configuration loaded to cache successfully");
+
+            Ok(true)
+        },
+    )
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("remove_card_from_config: blocking task failed: {}", e).into()
+    })??;
+
+    if removed {
         // Kill card task with the specified client_id (card number)
         remove_connections(vec![card_number.to_string()]).await;
         log::debug!("Removed connection for card {}", card_number);
@@ -376,27 +475,35 @@ pub async fn remove_card_from_config(
 }
 
 /// Public function to update the server address in the configuration.
-/// This function is a Tauri command that updates the configuration file with a new server address.
+/// This is a Tauri command: a thin async wrapper so the webview invoke never
+/// runs file I/O on the main thread — the blocking core goes to the blocking pool.
 #[tauri::command]
-pub fn update_server(host: &str, ident: &str, theme: &str) -> bool {
-    let config_path = match get_config_path() {
-        Ok(path) => path,
-        Err(e) => {
-            log::error!("Failed to get config path: {}", e);
-            return false;
-        }
-    };
+pub async fn update_server(host: String, ident: String, theme: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config_path = match get_config_path() {
+            Ok(path) => path,
+            Err(e) => {
+                log::error!("Failed to get config path: {}", e);
+                return false;
+            }
+        };
 
-    match update_server_config(&config_path, host, ident, theme) {
-        Ok(_) => {
-            log::info!("The server address is updated to '{}'.", host);
-            true
+        match update_server_config(&config_path, &host, &ident, &theme) {
+            Ok(_) => {
+                log::info!("The server address is updated to '{}'.", host);
+                true
+            }
+            Err(e) => {
+                log::error!("Failed to update server address: {}", e);
+                false
+            }
         }
-        Err(e) => {
-            log::error!("Failed to update server address: {}", e);
-            false
-        }
-    }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::error!("update_server: blocking task failed: {:?}", e);
+        false
+    })
 }
 
 /*
@@ -421,6 +528,26 @@ lazy_static! {
     /// which can only be entered manually.
     static ref CACHE: Mutex<CacheConfigData> = Mutex::new(CacheConfigData::default());
 }
+
+/// Serializes every load-modify-save cycle on config.yaml. Without it,
+/// concurrent writers (frontend commands, the APDU sniffer, auth-result
+/// persistence) interleave: both load the same version and the last save
+/// silently drops the other's changes; they also share one tmp file, which
+/// breaks the atomic-rename guarantee. Held across the whole read-modify-write
+/// including the cache refresh, so cache order matches file order.
+static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquires the config write lock, recovering from poisoning (a panic in an
+/// earlier holder must not cascade into every future config write).
+fn config_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    match CONFIG_WRITE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("CONFIG_WRITE_LOCK was poisoned — recovering");
+            poisoned.into_inner()
+        }
+    }
+}
 #[derive(Debug)]
 pub enum CacheSection {
     Cards,
@@ -441,13 +568,14 @@ pub fn get_card_config_from_cache(card_number: &str) -> Option<CardConfig> {
 /// The processing state while auth is running is derived from Reader.authentication
 /// in the frontend and is NOT stored here (it's transient, lost on restart).
 pub fn record_auth_result(card_number: &str, success: bool) {
-    let Some(mut cfg) = get_card_config_from_cache(card_number) else {
-        log::warn!("record_auth_result: unknown card_number {}", card_number);
-        return;
-    };
     let ts = chrono::Utc::now().timestamp() as u64;
-    cfg.last_auth = Some((ts, success));
-    if !update_card(card_number, cfg) {
+    // Mutate fresh file state under the config lock instead of writing a full
+    // cache snapshot back — a stale snapshot would revert fields a concurrent
+    // writer (e.g. the sniffer) just persisted.
+    if !mutate_card_config(card_number, |card| {
+        card.last_auth = Some((ts, success));
+        true
+    }) {
         log::error!(
             "record_auth_result: failed to persist last_auth for card_number {}",
             card_number
@@ -630,6 +758,10 @@ fn generate_ident() -> String {
 /// Initializes the configuration file.
 /// This function creates a default configuration file if it does not exist, and loads it into the cache.
 pub fn init_config() -> io::Result<()> {
+    // Startup also participates in the write serialization: a card task could
+    // already be persisting by the time a repeated `frontend-loaded` re-inits.
+    let _guard = config_write_guard();
+
     let config_path = get_config_path()?;
     let config: ConfigurationFile;
 
@@ -840,6 +972,53 @@ mod tests {
         assert!(id.starts_with("TBA"));
         assert_eq!(id.len(), 3 + 13);
         assert!(id[3..].chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn concurrent_card_updates_do_not_lose_writes() {
+        // Regression for the read-modify-write race: without CONFIG_WRITE_LOCK
+        // two writers load the same version and the last save drops the other's
+        // card. Every thread adds unique cards; all must survive.
+        let dir = unique_tmp_dir("concurrent");
+        let path = dir.join("config.yaml");
+        save_config(&path, &sample_config()).expect("seed config");
+
+        const THREADS: usize = 8;
+        const UPDATES_PER_THREAD: usize = 10;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..UPDATES_PER_THREAD {
+                        let number = format!("THREAD{:02}CARD{:04}", t, i);
+                        let card = CardConfig {
+                            iccid: format!("{:016}", t * 1000 + i),
+                            expire: None,
+                            name: None,
+                            card_type: None,
+                            structure_version: None,
+                            company_name: None,
+                            company_address: None,
+                            last_auth: None,
+                        };
+                        update_card_config(&path, &number, card).expect("update");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+
+        let loaded = load_config(&path).expect("load");
+        assert_eq!(
+            loaded.cards.len(),
+            1 + THREADS * UPDATES_PER_THREAD,
+            "every concurrent update must be preserved"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
