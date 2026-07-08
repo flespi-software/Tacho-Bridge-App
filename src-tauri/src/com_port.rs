@@ -328,11 +328,10 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                         // New MQTT session: server restarts request_id at 1, drop the idempotency slot.
                         last_request_id = None;
                         last_response_payload = None;
-                        log::info!("{} [MQTT] event=CONNACK status=received", log_header);
+                        log::debug!("{} [MQTT] event=CONNACK status=received", log_header);
                     }
                     Event::Incoming(Incoming::Publish(publish)) => {
                         let topic = String::from_utf8_lossy(&publish.topic).into_owned();
-                        let payload_text = String::from_utf8_lossy(&publish.payload);
 
                         log::info!(
                             "{} [MQTT] event=command topic={} bytes={} qos={:?}",
@@ -341,7 +340,13 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                             publish.payload.len(),
                             publish.qos,
                         );
-                        log::info!("{} [MQTT] command_text={}", log_header, payload_text);
+                        // Full command text only at debug: the rack protocol
+                        // must not end up in users' log files at INFO level.
+                        log::debug!(
+                            "{} [MQTT] command_text={}",
+                            log_header,
+                            String::from_utf8_lossy(&publish.payload)
+                        );
 
                         // Idempotency: the server re-sends a request with the same id after a
                         // timeout. If we already answered this id, re-send the cached response
@@ -416,24 +421,21 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                         }
                     }
                     other => {
-                        // Trace every other incoming/outgoing event so the full
-                        // exchange with the broker is visible while we wire things up.
-                        log::info!("{} [MQTT] event=other detail={:?}", log_header, other);
+                        // Full broker exchange is visible at debug (TBA_LOG=com_port=debug).
+                        log::debug!("{} [MQTT] event=other detail={:?}", log_header, other);
                     }
                 }
             }
             Err(e) => {
-                if is_online {
-                    log::warn!("{} [MQTT] state=ONLINE->OFFLINE err={:?}", log_header, e);
-                    is_online = false;
-                } else {
-                    log::warn!("{} [MQTT] state=OFFLINE err={:?}", log_header, e);
-                }
-                log::warn!(
-                    "{} [MQTT] action=reconnect_scheduled delay_secs={}",
-                    log_header,
-                    reconnect_delay_secs
+                let transition = if is_online { "ONLINE->OFFLINE" } else { "OFFLINE" };
+                is_online = false;
+
+                // One line per failed poll: kind + retry delay; full error
+                // details only for genuinely unexpected failures.
+                crate::mqtt::log_connection_failure(
+                    &log_header, "MQTT", transition, &e, reconnect_delay_secs,
                 );
+
                 tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
                 reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
             }
@@ -475,7 +477,10 @@ async fn forward_to_serial(port: &SharedPort, serial_hex: &str, log_header: &str
         }
     };
 
-    log::info!("{} [SERIAL] tx bytes={} hex={}", log_header, bytes.len(), serial_hex);
+    // Payload hex only at debug — the rack protocol must not end up in users'
+    // log files at INFO level.
+    log::info!("{} [SERIAL] tx bytes={}", log_header, bytes.len());
+    log::debug!("{} [SERIAL] tx hex={}", log_header, serial_hex);
 
     let port = port.clone();
     let log_header_blocking = log_header.to_string();
@@ -539,7 +544,10 @@ async fn forward_to_serial(port: &SharedPort, serial_hex: &str, log_header: &str
     .flatten();
 
     match &result {
-        Some(reply_hex) => log::info!("{} [SERIAL] rx hex={}", log_header, reply_hex),
+        Some(reply_hex) => {
+            log::info!("{} [SERIAL] rx bytes={}", log_header, reply_hex.len() / 2);
+            log::debug!("{} [SERIAL] rx hex={}", log_header, reply_hex);
+        }
         None => log::warn!("{} [SERIAL] no reply from rack", log_header),
     }
     result

@@ -267,21 +267,15 @@ pub enum CardProcessingResult {
 /// Determines what action should be taken for a card with the given reader name and ATR.
 /// Also removes any stale entries with the same reader name but a previously stored ATR.
 pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProcessingResult {
-    log::debug!("should_register_new_card");
     let mut pool = TASK_POOL.lock().await;
 
-    // Log the current contents of the task pool
-    for (i, card) in pool.iter().enumerate() {
-        log::debug!(
-            "Checking index {}: client_id = {}, reader_name = {:?}, atr = {:?}",
-            i,
-            card.client_id,
-            card.reader_name,
-            card.atr
-        );
-    }
+    log::debug!(
+        "should_register_new_card: reader='{}' atr_len={} pool_size={}",
+        reader_name,
+        atr.len(),
+        pool.len()
+    );
 
-    log::debug!("Case 1");
     // Case 1: Both reader_name and atr are provided and not found in the pool → register new card
     if !reader_name.is_empty() && !atr.is_empty() {
         let exists = pool.iter().any(|c| {
@@ -294,22 +288,15 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProce
         }
     }
 
-    log::debug!("Case 2");
     // Case 2: ATR is empty, but a card with the same reader name and filled ATR exists → remove it
     if atr.is_empty() {
-        log::debug!("ATR is empty. Checking for stale entries with reader_name = '{}'", reader_name);
-
-        log::debug!("Case 2_1");
-
         let to_remove = pool.iter().position(|c| {
             c.reader_name.as_deref() == Some(reader_name)
                 && c.atr.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
         });
-        log::debug!("Case 2_2");
         if let Some(index) = to_remove {
             let removed = pool.remove(index);
             removed.task_handle.abort();
-            log::debug!("Case 2_3");
             log::warn!(
                 "Removed stale ProcessingCard for reader {} with old ATR {}",
                 removed.reader_name.as_deref().unwrap_or("unknown"),
@@ -391,14 +378,15 @@ pub fn sc_monitor() {
         log::debug!("Initialized readers buffer and reader states.");
 
         loop {
-            log::debug!("Starting the inner loop to monitor reader states...");
+            // These repeat every poll timeout (30s), so they live at trace to
+            // keep debug output focused on actual card events.
+            log::trace!("Starting the inner loop to monitor reader states...");
             if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
                 log::error!("Failed to setup_reader_states: {:?}", e);
-                log::debug!("Exiting inner loop to re-establish context...");
                 break; // Exit the inner loop to re-establish context
             }
-            log::debug!(
-                "Successfully set up reader states: {:?}",
+            log::trace!(
+                "Reader states: {:?}",
                 reader_states
                     .iter()
                     .map(|rs| rs.name().to_string_lossy())
@@ -488,6 +476,12 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
             return Protocols::T0;
         }
     };
+
+    // An empty ATR is the normal "no card in the reader" case (e.g. a card
+    // removal event) — nothing to parse, and not worth a warning.
+    if atr_bytes.is_empty() {
+        return Protocols::T0;
+    }
 
     if atr_bytes.len() < 2 {
         log::warn!("ATR is too short: {:?}", atr_bytes);
@@ -744,17 +738,8 @@ impl ManagedCard {
     // }
 
     pub async fn apdu_transmit(&self, apdu_hex: &str) -> DynResult<String> {
-        debug!(
-            "apdu_transmit() called for reader: {} with APDU HEX: {}",
-            self.reader_name.to_string_lossy(),
-            apdu_hex
-        );
-
         let apdu = match hex::decode(apdu_hex) {
-            Ok(data) => {
-                debug!("APDU decoded successfully: {:?}", data);
-                data
-            }
+            Ok(data) => data,
             Err(err) => {
                 error!("Failed to decode APDU '{}': {}", apdu_hex, err);
                 return Err(format!("Decode error: {}", err).into());
@@ -763,24 +748,15 @@ impl ManagedCard {
 
         let card = Arc::clone(&self.inner);
 
-        debug!(
-            "Cloned card for blocking transmission. Sending to spawn_blocking..."
-        );
-
+        // The send/response pair is logged by send_apdu() with the client_id
+        // header; this layer only logs failures.
         let response = tauri::async_runtime::spawn_blocking(move || {
-            debug!("Entered spawn_blocking thread. Preparing buffer and locking card...");
-
             let mut rapdu_buf = [0u8; MAX_BUFFER_SIZE];
 
             let locked = card.blocking_lock();
-            debug!("Lock acquired. Transmitting...");
 
             match locked.transmit(&apdu, &mut rapdu_buf) {
-                Ok(response) => {
-                    let encoded = hex::encode(response);
-                    debug!("APDU transmit success. Encoded response: {}", encoded);
-                    Ok(encoded)
-                }
+                Ok(response) => Ok(hex::encode(response)),
                 Err(err) => {
                     error!("APDU transmit failed: {}", err);
                     Err(format!("Transmit error: {}", err))
@@ -788,12 +764,6 @@ impl ManagedCard {
             }
         })
         .await??;
-
-        debug!(
-            "apdu_transmit() complete for reader: {}. Final response: {}",
-            self.reader_name.to_string_lossy(),
-            response
-        );
 
         Ok(response)
     }

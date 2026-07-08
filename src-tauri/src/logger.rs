@@ -30,6 +30,24 @@ struct Release {
 /// * On Windows, the log file is created in the `%USERPROFILE%\Documents\tba` directory.
 ///
 
+/// Rotate when the log grows past this size; one archived generation is kept
+/// as `log.1.txt`. 50 MB is months of INFO-level logs — without the cap the
+/// file grows forever.
+const LOG_ROTATE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Parses a level name from the `TBA_LOG` spec ("debug", "warn", ...).
+fn parse_level(s: &str) -> Option<log::LevelFilter> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(log::LevelFilter::Off),
+        "error" => Some(log::LevelFilter::Error),
+        "warn" => Some(log::LevelFilter::Warn),
+        "info" => Some(log::LevelFilter::Info),
+        "debug" => Some(log::LevelFilter::Debug),
+        "trace" => Some(log::LevelFilter::Trace),
+        _ => None,
+    }
+}
+
 pub fn setup_logging() {
     let mut log_path = PathBuf::new();
 
@@ -64,6 +82,19 @@ pub fn setup_logging() {
 
     log_path.push("log.txt");
 
+    // Size-based rotation with one archived generation (log.1.txt).
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > LOG_ROTATE_BYTES {
+            let archived = log_path.with_file_name("log.1.txt");
+            // Windows rename does not overwrite an existing destination.
+            let _ = std::fs::remove_file(&archived);
+            match std::fs::rename(&log_path, &archived) {
+                Ok(()) => eprintln!("Log rotated: log.txt -> log.1.txt"),
+                Err(e) => eprintln!("Failed to rotate log file: {}", e),
+            }
+        }
+    }
+
     // Open the log file exactly once. Reusing the same handle eliminates the
     // race where the file could be removed between two open() calls and the
     // second one would panic via .unwrap().
@@ -83,21 +114,59 @@ pub fn setup_logging() {
         }
     };
 
-    let init_log_result = fern::Dispatch::new()
+    let mut dispatch = fern::Dispatch::new()
         .format(|out, message, record| {
+            // Compact single-line prefix: `2026-07-08 17:22:49.151 WARN  [mqtt] ...`
+            // (our crate prefix is stripped from the target for readability).
+            let target = record.target();
+            let target = target.strip_prefix("app_lib::").unwrap_or(target);
             out.finish(format_args!(
-                "{}[{}][{}] {}",
-                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S%.3f]"),
-                record.target(),
+                "{} {:<5} [{}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
                 record.level(),
+                target,
                 message
             ))
         })
-        .level(log::LevelFilter::Info)  // Change to Debug / Info if needed
-        .chain(log_file)
-        .apply();
+        // Default: our code and dependencies at INFO.
+        .level(log::LevelFilter::Info);
 
-    if let Err(e) = init_log_result {
+    // TBA_LOG controls verbosity without a rebuild. Applies to our modules
+    // only — dependencies stay at INFO. Examples:
+    //   TBA_LOG=debug                       whole app at debug
+    //   TBA_LOG=smart_card=debug,mqtt=warn  per-module overrides
+    let mut level_spec = String::from("info");
+    if let Ok(spec) = env::var("TBA_LOG") {
+        for part in spec.split(',').filter(|p| !p.trim().is_empty()) {
+            match part.split_once('=') {
+                Some((module, level)) => match parse_level(level) {
+                    Some(level) => {
+                        dispatch =
+                            dispatch.level_for(format!("app_lib::{}", module.trim()), level);
+                    }
+                    None => eprintln!("TBA_LOG: unknown level in '{}'", part),
+                },
+                None => match parse_level(part) {
+                    // Bare level: the whole app_lib tree (fern falls back from
+                    // app_lib::mqtt to app_lib when matching module levels).
+                    Some(level) => dispatch = dispatch.level_for("app_lib", level),
+                    None => eprintln!("TBA_LOG: unknown level '{}'", part),
+                },
+            }
+        }
+        level_spec = spec;
+    }
+
+    dispatch = dispatch.chain(log_file);
+
+    // In dev builds mirror the log to stdout so `npm run tauri dev` shows it
+    // live in the terminal.
+    #[cfg(debug_assertions)]
+    {
+        dispatch = dispatch.chain(std::io::stdout());
+    }
+
+    if let Err(e) = dispatch.apply() {
         eprintln!(
             "Failed to initialize logging at {:?}: {}",
             log_path, e
@@ -105,7 +174,7 @@ pub fn setup_logging() {
     }
 
     // Log the application launch
-    log::info!("-== Application is launched ==-");
+    log::info!("-== Application is launched ==- (log level: {})", level_spec);
 
     // Check for the latest version asynchronously
     async_runtime::spawn(async {
@@ -178,7 +247,7 @@ async fn check_latest_version() -> Result<(), reqwest::Error> {
             );
         }
     } else {
-        log::warn!("Versioin. Failed to fetch the latest release info: {}", response.status());
+        log::warn!("Version. Failed to fetch the latest release info: {}", response.status());
     }
 
     Ok(())

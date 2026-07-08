@@ -3,13 +3,10 @@
 //! This module provides functionality for creating and managing MQTT connections.
 
 // ───── Std Lib ─────
-use std::io::ErrorKind;                  // For categorizing I/O errors.
 use std::time::Duration;                 // For specifying time durations.
 
 // ───── MQTT Client Library (rumqttc) ─────
-use rumqttc::v5::ConnectionError;        // For handling MQTT connection errors.
-use rumqttc::v5::StateError::{self, AwaitPingResp, ServerDisconnect}; // Specific error for server disconnection.
-use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};         // Core MQTT async client and options.
+use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions}; // Core MQTT async client and options.
 
 // ───── Smart Card ─────
 use crate::smart_card::TASK_POOL;        // Task pool for managing MQTT connections.
@@ -38,42 +35,6 @@ const RECONNECT_DELAY_MAX_SECS: u64 = 300;
 /// Returns the next reconnect delay given the current one (exponential, capped).
 fn next_reconnect_delay(current: u64) -> u64 {
     current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
-}
-
-fn log_connection_error(log_header: &str, error: &ConnectionError) {
-    match error {
-        ConnectionError::Io(io_err) => match io_err.kind() {
-            ErrorKind::ConnectionAborted => log::warn!(
-                "{} [CONN] failure=io kind=connection_aborted detail=remote_connection_not_established",
-                log_header
-            ),
-            ErrorKind::ConnectionReset => log::warn!(
-                "{} [CONN] failure=io kind=connection_reset detail=check_server_address",
-                log_header
-            ),
-            ErrorKind::TimedOut => log::warn!(
-                "{} [CONN] failure=io kind=timed_out detail=server_or_network_unstable",
-                log_header
-            ),
-            _ => log::error!("{} [CONN] failure=io kind=other", log_header),
-        },
-        ConnectionError::MqttState(ServerDisconnect { .. }) => log::warn!(
-            "{} [CONN] failure=mqtt_state kind=server_disconnect detail=server_terminated_connection",
-            log_header
-        ),
-        ConnectionError::MqttState(AwaitPingResp { .. }) => {
-            log::warn!(
-                "{} [CONN] failure=mqtt_state kind=await_ping_resp detail=connection_may_be_unstable",
-                log_header
-            );
-        }
-        ConnectionError::MqttState(StateError::Io { .. }) => {
-            log::warn!("{} [CONN] failure=mqtt_state kind=io detail=connection_closed_by_peer", log_header);
-        }
-        _ => {
-            log::error!("{} [CONN] failure=unhandled err={:?}", log_header, error);
-        }
-    }
 }
 
 /// Ensures an MQTT connection for the specified client ID.
@@ -191,31 +152,26 @@ pub async fn app_connection() {
                             }
                         }
                         Event::Incoming(Incoming::ConnAck(..)) => {
-                            log::info!(
-                                "{} [CONN] event=CONNACK status=received",
-                                log_header
-                            )
+                            // The OFFLINE->ONLINE transition is already logged
+                            // at info; CONNACK itself is a detail.
+                            log::debug!("{} [CONN] event=CONNACK status=received", log_header)
                         }
                         _ => {} // This handles any other events that you haven't explicitly matched above
                     }
                 }
                 Err(e) => {
+                    let transition = if is_online { "ONLINE->OFFLINE" } else { "OFFLINE" };
                     if is_online {
-                        log::warn!("{} [CONN] state=ONLINE->OFFLINE err={:?}", log_header, e);
                         is_online = false;
                         app_emit_event(false);
-                    } else {
-                        log::warn!("{} [CONN] state=OFFLINE err={:?}", log_header, e);
                     }
 
-                    log_connection_error(&log_header, &e);
-
-                    // Reconnection timeout for handled errors — exponential backoff, capped.
-                    log::warn!(
-                        "{} [CONN] action=reconnect_scheduled delay_secs={}",
-                        log_header,
-                        reconnect_delay_secs
+                    // One line per failed poll: kind + retry delay; full error
+                    // details only for genuinely unexpected failures.
+                    crate::mqtt::log_connection_failure(
+                        &log_header, "CONN", transition, &e, reconnect_delay_secs,
                     );
+
                     tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
                     reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
                 }

@@ -11,7 +11,13 @@ mod global_app_handle;  // Global access to app state and emitters.
 mod com_port;           // Card rack over the COM (serial) port.
 
 // ───── External Crates ─────
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application framework and async runtime.
+
+/// `frontend-loaded` fires on every webview (re)load — dev hot-reload, manual
+/// refresh, sometimes twice at startup. The one-time backend initialization
+/// (logging, config, background tasks) must only run for the first one.
+static BACKEND_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 pub fn run() {
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
@@ -48,50 +54,51 @@ pub fn run() {
                         std::thread::sleep(std::time::Duration::from_millis(300));
                     }
 
-                    // Initialize logging. This function configures the logging system using the `fern` crate.
-                    // need to debug later. Add checking for the init result
-                    //
-                    logger::setup_logging();
+                    // ── One-time backend initialization ──
+                    if !BACKEND_INITIALIZED.swap(true, Ordering::SeqCst) {
+                        // Initialize logging (fern). Must be first so everything below logs.
+                        logger::setup_logging();
 
-                    // Initialize configuration. This function reads the configuration file and initializes the configuration structure.
-                    // The configuration file is located in the `assets` directory and is named `config.yaml`.
-                    match config::init_config() {
-                        Ok(_) => log::info!("Config initialized successfully."),
-                        Err(e) => log::error!("Failed to initialize config: {}", e),
+                        // Read config.yaml (or create the default) and fill the runtime cache.
+                        match config::init_config() {
+                            Ok(_) => log::info!("Config initialized successfully."),
+                            Err(e) => log::error!("Failed to initialize config: {}", e),
+                        }
+
+                        // The smart-card monitor is a blocking PC/SC loop
+                        // (get_status_change parks its thread until a card event),
+                        // so it runs on the blocking pool, not on an async worker.
+                        async_runtime::spawn_blocking(|| {
+                            smart_card::sc_monitor();
+                        });
+
+                        async_runtime::spawn(async {
+                            // Start Main MQTT App client connection
+                            app_connect::app_connection().await;
+                        });
+
+                        // Background task for the card rack on the COM port. Runs
+                        // concurrently with the PCSC reader monitor — a plugged-in
+                        // reader and a connected rack work in parallel.
+                        async_runtime::spawn(async {
+                            com_port::rack_connection().await;
+                        });
                     }
 
-                    println!("Received event with payload: {:?}", event.payload());
-                    // Load server configuration from cache to frontend using event
+                    // ── Per-(re)load: replay current state to the fresh frontend ──
+                    log::debug!("frontend-loaded: payload={:?}", event.payload());
+
                     match config::emit_global_config_server(&front_app_handle) {
-                        Ok(_) => println!("Global config server emitted successfully."),
-                        Err(e) => println!("Failed to emit global config server: {:?}", e),
+                        Ok(_) => log::debug!("Global config server emitted successfully."),
+                        Err(e) => log::error!("Failed to emit global config server: {:?}", e),
                     }
 
-                    // Re-emit the last known rack state: the rack monitor runs
-                    // independently and may have already reported the rack before
-                    // the frontend subscribed, so a fresh load needs it replayed.
+                    // Card list for the SmartCardList component.
+                    config::emit_all_card_configs();
+
+                    // Last known rack state: the rack monitor runs independently
+                    // and may have reported the rack before the frontend subscribed.
                     global_app_handle::emit_current_rack_state();
-
-                    // The smart-card monitor is a blocking PC/SC loop
-                    // (get_status_change parks its thread until a card event),
-                    // so it runs on the blocking pool, not on an async worker.
-                    // Duplicate spawns from repeated `frontend-loaded` events
-                    // are ignored inside sc_monitor itself.
-                    async_runtime::spawn_blocking(|| {
-                        smart_card::sc_monitor();
-                    });
-
-                    async_runtime::spawn(async {
-                        // Start Main MQTT App client connection
-                        app_connect::app_connection().await;
-                    });
-
-                    // Spawn a background task for the card rack on the COM port.
-                    // Runs concurrently with the PCSC reader monitor above — a
-                    // plugged-in reader and a connected rack work in parallel.
-                    async_runtime::spawn(async {
-                        com_port::rack_connection().await;
-                    });
                 });
 
                 // Handle the application close event to log this.

@@ -4,13 +4,12 @@
 
 // ───── Std Lib ─────
 use std::ffi::CStr;                  // For handling C-style strings in Rust.
-use std::io::ErrorKind;             // For categorizing I/O errors.
 use std::time::Duration;            // For specifying time durations.
 
 // ───── MQTT Client Library (rumqttc) ─────
 use rumqttc::v5::mqttbytes::QoS;                    // Quality of Service levels for MQTT.
 use rumqttc::v5::ConnectionError;                   // For handling MQTT connection errors.
-use rumqttc::v5::StateError::{self, AwaitPingResp, ServerDisconnect}; // Specific error for server disconnection.
+use rumqttc::v5::StateError;                        // MQTT protocol state errors.
 use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};        // Core MQTT async client and options.
 
 // ───── Tauri ─────
@@ -40,6 +39,79 @@ const CARD_PRESENT_STATE: &str = "PRESENT";
 /// Returns the next reconnect delay given the current one (exponential, capped).
 fn next_reconnect_delay(current: u64) -> u64 {
     current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
+}
+
+/// Maps a connection error to a short stable `kind` for one-line logs, plus a
+/// flag saying whether it is routine network churn. Expected errors are logged
+/// as a single WARN line without the full Debug dump (which used to repeat the
+/// same "Connection reset by peer" six times per blip across three lines);
+/// unexpected ones keep the details at ERROR. Shared by all three MQTT loops
+/// (app, per-card, rack).
+pub(crate) fn classify_connection_error(e: &ConnectionError) -> (String, bool) {
+    use std::io::ErrorKind as K;
+
+    fn io_kind(io: &std::io::Error) -> (String, bool) {
+        // DNS failures surface as Uncategorized with a lookup message —
+        // routine when the machine is offline.
+        let msg = io.to_string();
+        if msg.contains("lookup address") || msg.contains("dns error") {
+            return ("dns_lookup_failed".to_string(), true);
+        }
+        let expected = matches!(
+            io.kind(),
+            K::ConnectionAborted
+                | K::ConnectionReset
+                | K::ConnectionRefused
+                | K::TimedOut
+                | K::BrokenPipe
+                | K::NotConnected
+                | K::UnexpectedEof
+        );
+        (format!("io_{:?}", io.kind()), expected)
+    }
+
+    match e {
+        ConnectionError::Io(io) => io_kind(io),
+        ConnectionError::MqttState(StateError::Io(io)) => io_kind(io),
+        ConnectionError::MqttState(StateError::Deserialization(
+            rumqttc::v5::mqttbytes::Error::Io(io),
+        )) => io_kind(io),
+        ConnectionError::MqttState(StateError::AwaitPingResp) => {
+            ("await_ping_resp".to_string(), true)
+        }
+        ConnectionError::MqttState(StateError::ConnectionAborted) => {
+            ("connection_aborted".to_string(), true)
+        }
+        ConnectionError::MqttState(StateError::ServerDisconnect { reason_code, .. }) => {
+            (format!("server_disconnect_{:?}", reason_code), true)
+        }
+        ConnectionError::Timeout(_) => ("timeout".to_string(), true),
+        ConnectionError::ConnectionRefused(code) => (format!("conn_refused_{:?}", code), true),
+        _ => ("unhandled".to_string(), false),
+    }
+}
+
+/// Logs a connection failure as exactly one line: WARN with a short kind for
+/// routine churn, ERROR with full details for anything unexpected.
+pub(crate) fn log_connection_failure(
+    log_header: &str,
+    scope: &str,
+    transition: &str,
+    e: &ConnectionError,
+    retry_in_secs: u64,
+) {
+    let (kind, expected) = classify_connection_error(e);
+    if expected {
+        log::warn!(
+            "{} [{}] state={} kind={} retry_in={}s",
+            log_header, scope, transition, kind, retry_in_secs
+        );
+    } else {
+        log::error!(
+            "{} [{}] state={} kind={} err={:?} retry_in={}s",
+            log_header, scope, transition, kind, e, retry_in_secs
+        );
+    }
 }
 
 /// Rewrites a `request/...` topic to its matching `response/...` topic.
@@ -153,8 +225,6 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     let mut mqtt_options = MqttOptions::new(&client_id, &host, port);
     // mqtt_options.set_credentials(flespi_token, "");
     mqtt_options.set_keep_alive(Duration::from_secs(120));
-    // log::debug!("mqtt_options: {:?}", mqtt_options);
-    log::debug!("mqtt_options: {:?}", mqtt_options);
     log::info!(
         "[CONN] phase=connect_attempt status=initialized reader={} client_id={} host={}:{}",
         reader_name.to_string_lossy(),
@@ -424,10 +494,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             // drop the idempotency slot to avoid mistaking a fresh request for a duplicate.
                             last_request_id = None;
                             last_response_payload = None;
-                            log::info!(
-                                "{} [CONN] event=CONNACK status=received",
-                                log_header
-                            )
+                            // The OFFLINE->ONLINE transition is already logged
+                            // at info; CONNACK itself is a detail.
+                            log::debug!("{} [CONN] event=CONNACK status=received", log_header)
                         }
                         Event::Incoming(Incoming::PingResp(..)) => {
                             log::debug!(
@@ -445,60 +514,14 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                     // Send the global-cards-sync event to the frontend that card is connected
                     emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(false), None);
 
+                    let transition = if is_online { "ONLINE->OFFLINE" } else { "OFFLINE" };
                     is_online = false;
                     was_online = false; // Reset the flag when the connection is lost
 
-                    log::warn!(
-                        "{} [CONN] state=ONLINE->OFFLINE err={:?}",
-                        log_header,
-                        e
-                    );
+                    // One line per failed poll: kind + retry delay; full error
+                    // details only for genuinely unexpected failures.
+                    log_connection_failure(&log_header, "CONN", transition, &e, reconnect_delay_secs);
 
-                    match e {
-                        ConnectionError::Io(ref io_err) => match io_err.kind() {
-                            ErrorKind::ConnectionAborted => log::warn!(
-                                "{} [CONN] failure=io kind=connection_aborted detail=remote_connection_not_established",
-                                log_header
-                            ),
-                            ErrorKind::ConnectionReset => log::warn!(
-                                "{} [CONN] failure=io kind=connection_reset detail=check_server_address",
-                                log_header
-                            ),
-                            ErrorKind::TimedOut => log::warn!(
-                                "{} [CONN] failure=io kind=timed_out detail=server_or_network_unstable",
-                                log_header
-                            ),
-                            _ => log::error!("{} [CONN] failure=io kind=other", log_header),
-                        },
-                        ConnectionError::MqttState(ServerDisconnect { .. }) => log::warn!(
-                            "{} [CONN] failure=mqtt_state kind=server_disconnect detail=server_terminated_connection",
-                            log_header
-                        ),
-                        ConnectionError::MqttState(AwaitPingResp { .. }) => {
-                            log::warn!(
-                                "{} [CONN] failure=mqtt_state kind=await_ping_resp detail=connection_may_be_unstable",
-                                log_header
-                            );
-                            // Implement your reconnection or handling strategy here
-                        },
-                        ConnectionError::MqttState(StateError::Io(os_err)) => {
-                            log::error!(
-                                "{} [CONN] failure=mqtt_state kind=io err={:?}",
-                                log_header,
-                                os_err
-                            );
-                        },
-                        _ => {
-                            log::error!("{} [CONN] failure=unhandled err={:?}", log_header, e);
-                            // return; // exit the loop
-                        },
-                    };
-                    // Reconnection timeout for handled errors — exponential backoff, capped.
-                    log::warn!(
-                        "{} [CONN] action=reconnect_scheduled delay_secs={}",
-                        log_header,
-                        reconnect_delay_secs
-                    );
                     tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
                     reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
                 }

@@ -619,79 +619,37 @@ pub async fn record_auth_result_async(card_number: &str, success: bool) {
 pub fn get_from_cache(section: CacheSection, key: &str) -> String {
     let cache = cache_guard();
 
-    log::debug!("Accessing cache section: {:?}, key: {}", section, key);
-    log::debug!("Current cache state: {:?}", *cache); // Покажет всё, если у `CacheConfigData` реализован Debug
-
     match section {
         CacheSection::Cards => {
-            log::debug!("Looking up by ICCID: {}", key);
-
+            // Reverse lookup: ICCID → card number.
             for (card_number, config) in &cache.cards {
-                log::debug!(
-                    "Cache entry -> card_number: {}, iccid: {}, expire: {:?}",
-                    card_number,
-                    config.iccid,
-                    config.expire
-                );
-
                 if config.iccid == key {
-                    log::debug!(
-                        "Match found: ICCID {} corresponds to card_number {}",
-                        key,
-                        card_number
-                    );
                     return card_number.clone();
                 }
             }
-
-            log::debug!("No ICCID match found for: {}", key);
+            log::debug!("cache: no card number for ICCID {}", key);
             "".to_string()
         }
 
-        CacheSection::Server => {
-            log::debug!("Accessing Server config");
-            if let Some(server) = &cache.server {
-                log::debug!("Server config: host = {}", server.host);
-                match key {
-                    "host" => server.host.clone(),
-                    _ => {
-                        log::debug!("Unknown key for server section: {}", key);
-                        "".to_string()
-                    }
-                }
-            } else {
-                log::debug!("No server config found");
+        CacheSection::Server => match (&cache.server, key) {
+            (Some(server), "host") => server.host.clone(),
+            (Some(_), _) => {
+                log::debug!("cache: unknown key for server section: {}", key);
                 "".to_string()
             }
-        }
+            (None, _) => "".to_string(),
+        },
 
-        CacheSection::Ident => {
-            log::debug!("Accessing Ident config");
-            if let Some(ident) = &cache.ident {
-                log::debug!("Ident: {}", ident);
-                ident.clone()
-            } else {
-                log::debug!("No ident found");
-                "".to_string()
-            }
-        }
+        CacheSection::Ident => cache.ident.clone().unwrap_or_default(),
 
-        CacheSection::Appearance => {
-            log::debug!("Accessing Appearance config");
-            if let Some(appearance) = &cache.appearance {
-                log::debug!("Appearance config: {:?}", appearance);
-                match key {
-                    "dark_theme" => format!("{:?}", appearance.dark_theme),
-                    _ => {
-                        log::debug!("Unknown key for appearance section: {}", key);
-                        "".to_string()
-                    }
-                }
-            } else {
-                log::debug!("No appearance config found");
+        CacheSection::Appearance => match (&cache.appearance, key) {
+            (Some(appearance), "dark_theme") => format!("{:?}", appearance.dark_theme),
+            (Some(_), _) => {
+                log::debug!("cache: unknown key for appearance section: {}", key);
                 "".to_string()
             }
-        }
+            (None, _) => "".to_string(),
+        },
     }
 }
 
@@ -812,21 +770,33 @@ pub fn init_config() -> io::Result<()> {
 
     log::debug!("config: saved config");
 
-    /*
-        Send data of all cards in events one by one to the front.
-    */
-    for (card_number, card_config) in &config.cards {
-        emit_card_config_event(
-            "global-card-config-updated",
-            card_number.clone(),
-            Some(card_config.clone()),
-        );
-    }
-
     load_config_to_cache(&config)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     Ok(())
+}
+
+/// Emits every known card config to the frontend. Called on each
+/// `frontend-loaded` so a (re)loaded webview gets the current card list —
+/// the backend initializes only once, but the frontend can reload many times.
+pub fn emit_all_card_configs() {
+    // Clone out under the lock, emit after releasing it.
+    let cards: Vec<(String, CardConfig)> = {
+        let cache = cache_guard();
+        cache
+            .cards
+            .iter()
+            .map(|(number, cfg)| (number.clone(), cfg.clone()))
+            .collect()
+    };
+
+    for (card_number, card_config) in cards {
+        emit_card_config_event(
+            "global-card-config-updated",
+            card_number,
+            Some(card_config),
+        );
+    }
 }
 
 // Default structure config
