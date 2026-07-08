@@ -43,6 +43,17 @@ type SharedPort = Arc<AsyncMutex<Box<dyn SerialPort>>>;
 /// How long to wait for the rack's serial reply after writing a command.
 const SERIAL_REPLY_TIMEOUT: Duration = Duration::from_millis(800);
 
+/// Upper bound on a single serial reply. A healthy rack answers with small
+/// frames; hitting this means the device is streaming garbage. Without the cap
+/// a device that never stops sending would grow the buffer without bound and
+/// keep the read loop (and the port lock) stuck forever.
+const SERIAL_REPLY_MAX_BYTES: usize = 64 * 1024;
+
+/// Hard deadline for the whole read phase of one command. The per-read timeout
+/// (`SERIAL_REPLY_TIMEOUT`) only fires on a *silent* line — a device that keeps
+/// the line busy resets it on every byte, so the loop also needs a total bound.
+const SERIAL_READ_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Initial / capped reconnect backoff for the rack's MQTT connection — same
 /// policy as the app and per-card connections.
 const RECONNECT_DELAY_INITIAL_SECS: u64 = 10;
@@ -259,16 +270,23 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
 async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
     let log_header = format!("RACK {} |", client_id);
 
-    let full_host = get_from_cache(CacheSection::Server, "host");
-    let (host, port) = match split_host_to_parts(&full_host) {
-        Ok(hp) => hp,
-        Err(e) => {
-            log::error!(
-                "{} [MQTT] phase=config status=failed reason=invalid_host err={}",
-                log_header,
-                e
-            );
-            return;
+    // Do not exit when the server host is missing or invalid — typical on
+    // first launch, when the rack is plugged in before the server is
+    // configured. Exiting would leave a finished task in RACK_MQTT_TASK and
+    // no rack MQTT until the device is re-plugged; poll the config instead.
+    let (host, port) = loop {
+        let full_host = get_from_cache(CacheSection::Server, "host");
+        match split_host_to_parts(&full_host) {
+            Ok(hp) => break hp,
+            Err(e) => {
+                log::warn!(
+                    "{} [MQTT] phase=config status=waiting reason=invalid_host err={} retry_secs={}",
+                    log_header,
+                    e,
+                    RECONNECT_DELAY_INITIAL_SECS
+                );
+                tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_INITIAL_SECS)).await;
+            }
         }
     };
 
@@ -474,9 +492,32 @@ async fn forward_to_serial(port: &SharedPort, serial_hex: &str, log_header: &str
         // Read whatever arrives until the inter-byte timeout fires. The port's
         // own read timeout bounds each read; we stop on the first timeout once
         // we have some data, or return nothing if the rack stays silent.
+        //
+        // Two hard bounds protect against a misbehaving device that streams
+        // bytes continuously (each read would then succeed before the timeout
+        // and the loop would never exit): a cap on the reply size and an
+        // overall deadline for the whole read phase.
         let mut reply = Vec::new();
         let mut buf = [0u8; 512];
+        let deadline = std::time::Instant::now() + SERIAL_READ_DEADLINE;
         loop {
+            if reply.len() >= SERIAL_REPLY_MAX_BYTES {
+                log::warn!(
+                    "{} [SERIAL] reply exceeded {} bytes — truncating, device is misbehaving",
+                    log_header_blocking,
+                    SERIAL_REPLY_MAX_BYTES
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                log::warn!(
+                    "{} [SERIAL] read deadline {:?} reached — returning {} bytes read so far",
+                    log_header_blocking,
+                    SERIAL_READ_DEADLINE,
+                    reply.len()
+                );
+                break;
+            }
             match guard.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => reply.extend_from_slice(&buf[..n]),
@@ -504,16 +545,37 @@ async fn forward_to_serial(port: &SharedPort, serial_hex: &str, log_header: &str
     result
 }
 
-/// Starts the rack's MQTT task if one is not already running.
-fn start_rack_mqtt(client_id: String, port: SharedPort) {
+/// True if the rack MQTT task slot holds a task that is still running.
+/// A task that finished on its own (panicked or returned) does not count —
+/// its stale handle is dropped so a new task can be started. Without this
+/// check the slot would look "occupied" forever and the rack MQTT connection
+/// could never come back without re-plugging the device.
+fn rack_mqtt_running() -> bool {
     let mut guard = match RACK_MQTT_TASK.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if guard.is_some() {
+    match guard.as_ref() {
+        Some(handle) if handle.inner().is_finished() => {
+            log::warn!("[RACK] [MQTT] task exited on its own — clearing stale handle");
+            *guard = None;
+            false
+        }
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Starts the rack's MQTT task if one is not already running.
+fn start_rack_mqtt(client_id: String, port: SharedPort) {
+    if rack_mqtt_running() {
         log::debug!("[RACK] [MQTT] start skipped: task already running");
         return;
     }
+    let mut guard = match RACK_MQTT_TASK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     log::info!("[RACK] [MQTT] phase=start client_id={}", client_id);
     let handle = async_runtime::spawn(rack_mqtt_loop(client_id, port));
     *guard = Some(handle);
@@ -630,6 +692,20 @@ pub async fn rack_connection() {
                 } else {
                     current = None;
                 }
+            }
+            // Same device still present, but its MQTT task died (e.g. a
+            // panic). Self-heal: the dead task dropped the shared port
+            // handle, so reopen the port and restart the task.
+            (Some(_), Some(rack)) if rack.is_supported() && !rack_mqtt_running() => {
+                log::warn!(
+                    "[RACK] phase=presence status=mqtt_task_dead port={} action=restart",
+                    rack.port_name
+                );
+                if let Some(port) = open_rack(&rack) {
+                    on_rack_connected(&rack, port);
+                    current = Some(rack);
+                }
+                // If open failed, keep `current` as is and retry next tick.
             }
             // No change (present-present same, or absent-absent).
             _ => {}

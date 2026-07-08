@@ -27,6 +27,10 @@ const MAX_BUFFER_SIZE: usize = 260; // Buffer size for smart card communication.
 const READERS_BUFFER_SIZE: usize = 2048;
 const MANUAL_SYNC_TIMEOUT_SECS: u64 = 1;
 const SW_TECHNICAL_PROBLEM: &str = "6F00";
+/// Upper bound for one `get_status_change` wait in the monitor loop. A bounded
+/// wait (instead of an infinite one) lets the loop notice a rescan request
+/// even if the `cancel()` in `request_rescan` raced past a non-blocked monitor.
+const MONITOR_POLL_TIMEOUT_SECS: u64 = 30;
 
 type DynError = Box<dyn StdError + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
@@ -47,6 +51,41 @@ lazy_static! {
     /// Global list of cards currently being processed (i.e., connected and active).
     pub static ref TASK_POOL: Arc<Mutex<Vec<ProcessingCard>>> =
         Arc::new(Mutex::new(Vec::new()));
+
+    /// The PCSC context currently used by the reader monitor. Stored so that
+    /// `request_rescan` can wake a blocked `get_status_change` from another
+    /// thread via `Context::cancel()` (pcsc Context is Clone + Send + Sync).
+    static ref MONITOR_CTX: std::sync::Mutex<Option<Context>> =
+        std::sync::Mutex::new(None);
+}
+
+/// Set when someone asked the monitor for a full rescan (see `request_rescan`).
+static RESCAN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Asks the reader monitor to drop its current PCSC view and rescan from
+/// scratch: the context and reader states are rebuilt from UNAWARE, so every
+/// still-inserted card is re-reported and re-registered through the normal
+/// pipeline (`process_reader_states` → `ensure_connection`). Used after
+/// `remove_connections_all()` — e.g. when the server host changes — so cards
+/// reconnect with fresh config without being physically re-inserted.
+pub fn request_rescan() {
+    RESCAN_REQUESTED.store(true, Ordering::SeqCst);
+
+    let guard = match MONITOR_CTX.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match guard.as_ref() {
+        Some(ctx) => match ctx.cancel() {
+            Ok(()) => log::info!("Rescan requested: monitor get_status_change cancelled"),
+            Err(e) => log::warn!(
+                "Rescan requested, but cancel failed: {:?} (will be picked up within {}s on the poll timeout)",
+                e,
+                MONITOR_POLL_TIMEOUT_SECS
+            ),
+        },
+        None => log::warn!("Rescan requested, but the monitor context is not available yet"),
+    }
 }
 
 /// Represents errors that can occur while interacting with smart card readers.
@@ -333,6 +372,16 @@ pub fn sc_monitor() {
             }
         };
 
+        // Publish the context so request_rescan() can cancel a blocked
+        // get_status_change from another thread.
+        {
+            let mut slot = match MONITOR_CTX.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *slot = Some(ctx.clone());
+        }
+
         let mut readers_buf = [0; READERS_BUFFER_SIZE];
         let mut reader_states: Vec<ReaderState> = vec![
             // Listen for reader insertions/removals, if supported.
@@ -356,12 +405,36 @@ pub fn sc_monitor() {
                     .collect::<Vec<_>>()
             );
 
-            if let Err(e) = ctx.get_status_change(None, &mut reader_states[..]) {
-                log::error!("get_status_change failed: {:?}", e);
-                // Small backoff prevents a tight reconnect loop if the PCSC
-                // service is repeatedly returning errors (e.g. daemon down).
-                std::thread::sleep(Duration::from_secs(1));
-                break;
+            match ctx.get_status_change(
+                Some(Duration::from_secs(MONITOR_POLL_TIMEOUT_SECS)),
+                &mut reader_states[..],
+            ) {
+                Ok(()) => {}
+                Err(pcsc::Error::Timeout) => {
+                    // Nothing changed within the poll window — check for a
+                    // rescan request that missed the cancel(), keep waiting.
+                    if RESCAN_REQUESTED.swap(false, Ordering::SeqCst) {
+                        log::info!("Rescan requested (picked up on poll timeout). Re-establishing context...");
+                        break;
+                    }
+                    continue;
+                }
+                Err(pcsc::Error::Cancelled) => {
+                    // request_rescan() cancelled the wait. Break to the outer
+                    // loop: fresh context + UNAWARE reader states make PCSC
+                    // re-report every inserted card, and process_reader_states
+                    // re-registers them against the (now empty) task pool.
+                    RESCAN_REQUESTED.store(false, Ordering::SeqCst);
+                    log::info!("Rescan requested (get_status_change cancelled). Re-establishing context...");
+                    break;
+                }
+                Err(e) => {
+                    log::error!("get_status_change failed: {:?}", e);
+                    // Small backoff prevents a tight reconnect loop if the PCSC
+                    // service is repeatedly returning errors (e.g. daemon down).
+                    std::thread::sleep(Duration::from_secs(1));
+                    break;
+                }
             }
 
             // Bridge back into the async runtime: registration locks the tokio
@@ -483,6 +556,12 @@ pub async fn manual_sync_cards(
     if restart {
         // remove all connections
         remove_connections_all().await;
+
+        // Wake the monitor for a full rescan: the still-inserted cards get
+        // re-registered with fresh config (e.g. the new server host) without
+        // a physical re-plug. The app-level connection is restarted separately
+        // by the frontend via the app_connection command.
+        request_rescan();
 
         return Ok(());
     }

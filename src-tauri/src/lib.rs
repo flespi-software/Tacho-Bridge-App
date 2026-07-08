@@ -28,10 +28,12 @@ pub fn run() {
                 let version = env!("CARGO_PKG_VERSION");
                 // Form new Title with the version
                 let title = format!("v{}", version);
-                // Set new title to the window
-                window
-                    .set_title(&title)
-                    .expect("Failed to set window title");
+                // Set new title to the window. A failure here is cosmetic —
+                // not worth panicking the whole app over (logging is not yet
+                // initialized at this point, so eprintln is the best we have).
+                if let Err(e) = window.set_title(&title) {
+                    eprintln!("Failed to set window title: {e}");
+                }
 
                 let front_app_handle = app_handle.clone();
 

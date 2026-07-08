@@ -58,9 +58,9 @@
 
 <script setup lang="ts">
 import { useQuasar, Notify } from 'quasar'
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 defineProps<{
   modelValue: boolean
@@ -127,14 +127,35 @@ const saveServerConfig = async () => {
   }
 }
 
-listen('global-config-server', (event) => {
-  const payload = event.payload as {
-    host: string
-    ident: string
+// Registered Tauri listeners. Stored so we can detach them on unmount —
+// a listener registered at setup top-level would outlive the component and
+// keep mutating dead state, piling up across remounts and hot reloads.
+const unlistenFns: UnlistenFn[] = []
+
+onMounted(async () => {
+  try {
+    const unlisten = await listen('global-config-server', (event) => {
+      const payload = event.payload as {
+        host: string
+        ident: string
+      }
+      hostValue.value = payload.host
+      identInput.value = payload.ident
+    })
+    unlistenFns.push(unlisten)
+  } catch (error) {
+    console.error('Error listening to global-config-server:', error)
   }
-  hostValue.value = payload.host
-  identInput.value = payload.ident
-}).catch((error) => {
-  console.error('Error listening to global-config-server:', error)
+})
+
+onUnmounted(() => {
+  while (unlistenFns.length > 0) {
+    const fn = unlistenFns.pop()
+    try {
+      fn?.()
+    } catch (e) {
+      console.error('Error detaching Tauri listener:', e)
+    }
+  }
 })
 </script>

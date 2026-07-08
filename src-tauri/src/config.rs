@@ -548,6 +548,22 @@ fn config_write_guard() -> std::sync::MutexGuard<'static, ()> {
         }
     }
 }
+
+/// Acquires the runtime cache lock, recovering from poisoning. The cache can
+/// never be left half-modified: reads don't mutate it and the only write
+/// replaces the whole struct in one assignment, so recovery is always safe.
+/// Panicking here instead (`.unwrap()`) would turn one panic — possibly
+/// swallowed silently by a tokio task — into a cascade that kills every card
+/// connection and the reader monitor until the app is restarted.
+fn cache_guard() -> std::sync::MutexGuard<'static, CacheConfigData> {
+    match CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("CACHE mutex was poisoned — recovering");
+            poisoned.into_inner()
+        }
+    }
+}
 #[derive(Debug)]
 pub enum CacheSection {
     Cards,
@@ -559,7 +575,7 @@ pub enum CacheSection {
 /// Returns a clone of the CardConfig for the given card number from the runtime cache,
 /// or None if the card is not known yet.
 pub fn get_card_config_from_cache(card_number: &str) -> Option<CardConfig> {
-    let cache = CACHE.lock().unwrap();
+    let cache = cache_guard();
     cache.cards.get(card_number).cloned()
 }
 
@@ -601,7 +617,7 @@ pub async fn record_auth_result_async(card_number: &str, success: bool) {
 /// Retrieves a value from the cache by key.
 /// This function locks the cache, retrieves the value for the given key, and returns it.
 pub fn get_from_cache(section: CacheSection, key: &str) -> String {
-    let cache = CACHE.lock().unwrap();
+    let cache = cache_guard();
 
     log::debug!("Accessing cache section: {:?}, key: {}", section, key);
     log::debug!("Current cache state: {:?}", *cache); // Покажет всё, если у `CacheConfigData` реализован Debug
@@ -704,7 +720,7 @@ pub fn load_config_to_cache(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::debug!("load_config_to_cache");
 
-    let mut cache = CACHE.lock().unwrap();
+    let mut cache = cache_guard();
     *cache = CacheConfigData {
         cards: config.cards.clone(),
         server: config.server.clone(),
@@ -749,9 +765,16 @@ pub fn load_config_to_cache(
 /// Generates a unique ident value based on the current time in microseconds.
 /// The ident value is in the format "TBA" followed by 13 digits.
 fn generate_ident() -> String {
-    let start = SystemTime::now();
-    let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
-    let micros = since_the_epoch.as_micros();
+    // A system clock set before 1970 makes duration_since fail; fall back to
+    // zero (ident "TBA0000000000000") instead of panicking at first launch —
+    // the user can always set their own ident in the settings dialog.
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or_else(|e| {
+            log::warn!("System clock is before UNIX epoch ({e}); using zero ident");
+            0
+        });
     format!("TBA{:013}", micros % 1_000_000_000_000u128)
 }
 

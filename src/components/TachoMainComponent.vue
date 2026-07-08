@@ -236,6 +236,19 @@ function handleCardsSync(raw: unknown): void {
 
   const name = raw.reader_name
   const card_number = raw.card_number
+
+  // PC/SC reports UNKNOWN/IGNORE for a reader that is gone from the system —
+  // unplugged, or renamed by the OS after sleep/wake (the same physical reader
+  // often comes back under a new name). Remove the row instead of keeping a
+  // ghost entry forever; the reader's new name arrives as a separate event.
+  if (/\b(UNKNOWN|IGNORE)\b/.test(raw.card_state)) {
+    const goneIndex = state.readers.findIndex((reader) => reader.name === name)
+    if (goneIndex !== -1) {
+      state.readers.splice(goneIndex, 1)
+    }
+    return
+  }
+
   // Split the status by the pipe character and get the second element
   const splitted = (raw.card_state?.match(/\((.*)\)/i) ?? [])[1]?.split('|') ?? []
   const status = splitted[1]?.trim() ?? splitted[0] ?? ''
