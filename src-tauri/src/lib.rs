@@ -70,16 +70,13 @@ pub fn run() {
                     // the frontend subscribed, so a fresh load needs it replayed.
                     global_app_handle::emit_current_rack_state();
 
-                    // Run async function in the background with the Tauri runtime
-                    // let app_handle_for_sc_monitor = app_handle.clone();
-                    async_runtime::spawn(async {
-                        /*
-                            This slip is needed as a temporary solution. Fix it later!
-                            The fact is that the back-end starts faster than the front, and the sent event with card data arrives at the front-end before it has time to load.
-                            *** In the near future, I will add a flag for the state of readiness to receive events from the backend. ***
-                        */
-                        // Start monitoring smart cards. This function will run fсorever with the loop
-                        smart_card::sc_monitor().await;
+                    // The smart-card monitor is a blocking PC/SC loop
+                    // (get_status_change parks its thread until a card event),
+                    // so it runs on the blocking pool, not on an async worker.
+                    // Duplicate spawns from repeated `frontend-loaded` events
+                    // are ignored inside sc_monitor itself.
+                    async_runtime::spawn_blocking(|| {
+                        smart_card::sc_monitor();
                     });
 
                     async_runtime::spawn(async {

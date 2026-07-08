@@ -1,16 +1,17 @@
 // ───── Std Lib ─────
 use std::error::Error as StdError;
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 // ───── Crates ─────
 use log::{debug, error, info, warn};
 use once_cell::sync::OnceCell;
 use lazy_static::lazy_static;
 use rumqttc::v5::AsyncClient;
-use tokio::time::Duration;
 
-use tauri::async_runtime::{JoinHandle, Mutex};
+use tauri::async_runtime::{block_on, JoinHandle, Mutex};
 
 // ───── PCSC ─────
 use pcsc::*;
@@ -295,8 +296,26 @@ fn is_virtual_reader(reader_name: &CStr) -> bool {
         || reader_name_lower.contains("remote")
 }
 
-// Automatically sync cards
-pub async fn sc_monitor() -> ! {
+/// Guards against starting more than one smart-card monitor. The
+/// `frontend-loaded` event in `lib.rs` can fire several times at startup,
+/// which would otherwise spawn duplicate monitors (duplicate PCSC contexts
+/// and doubled APDU traffic to the same card).
+static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
+
+// Automatically sync cards.
+//
+// Blocking by design: PC/SC is a synchronous API and `get_status_change` with
+// no timeout parks the calling thread until a reader/card event. This function
+// must therefore run on a thread that is allowed to block (it is spawned via
+// `async_runtime::spawn_blocking` in lib.rs), never on a tokio async worker.
+// The async parts (task pool, card registration) are bridged via `block_on`.
+pub fn sc_monitor() {
+    // Ignore duplicate spawns from repeated `frontend-loaded` events.
+    if MONITOR_RUNNING.swap(true, Ordering::SeqCst) {
+        log::debug!("sc_monitor is already running. Skipping duplicate spawn.");
+        return;
+    }
+
     loop {
         log::debug!("Starting the outer loop to establish context...");
         let ctx = match Context::establish(Scope::User) {
@@ -309,7 +328,7 @@ pub async fn sc_monitor() -> ! {
                     "Failed to establish context: {:?}. Retrying in 5 seconds...",
                     e
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                std::thread::sleep(Duration::from_secs(5));
                 continue;
             }
         };
@@ -341,24 +360,25 @@ pub async fn sc_monitor() -> ! {
                 log::error!("get_status_change failed: {:?}", e);
                 // Small backoff prevents a tight reconnect loop if the PCSC
                 // service is repeatedly returning errors (e.g. daemon down).
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                std::thread::sleep(Duration::from_secs(1));
                 break;
             }
 
-            if let Err(e) =
-                process_reader_states(&mut reader_states).await
-            {
+            // Bridge back into the async runtime: registration locks the tokio
+            // TASK_POOL mutex and spawns per-card MQTT tasks. Those futures run
+            // on the async workers; this thread just waits for the result.
+            if let Err(e) = block_on(process_reader_states(&mut reader_states)) {
                 match e {
                     SmartCardError::UnknownReader => {
                         log::warn!("Detected UnknownReader. Sleeping 3s to avoid busy loop!");
-                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        std::thread::sleep(Duration::from_secs(3));
                     }
                     SmartCardError::Other(msg) => {
                         log::error!("SmartCard error: {}", msg);
                         // Without a small backoff this branch could spin the
                         // outer reconnect loop very quickly under persistent
                         // PCSC failures.
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        std::thread::sleep(Duration::from_secs(1));
                     }
                 }
 
@@ -366,7 +386,6 @@ pub async fn sc_monitor() -> ! {
             }
 
             log::debug!("Waiting for the next status change...");
-            tokio::task::yield_now().await;
         }
 
         log::debug!("Re-establishing context...");
