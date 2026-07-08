@@ -112,7 +112,14 @@ All notable changes to this project will be documented in this file.
 [fix] Improved control over the current session with the server.  
 [fix] Updating the action config for Windows to avoid conflicts when building alpha test versions, etc.  
 [fix] Moved the blocking smart card monitor to a dedicated thread and guarded it against duplicate spawns, preventing potential UI and MQTT freezes.  
-[fix] Fixed a race condition in config.yaml writes that could silently drop card data, and moved config disk I/O off the UI and networking threads.  
+[fix] Fixed a race condition in config.yaml writes that could silently drop card data, and moved config disk I/O off the UI and networking threads. 
+[fix] Fixed an event listener leak in the server configuration dialog.  
+[fix] Added reply size and timeout limits to card rack serial communication to prevent stalls and unbounded memory growth on a misbehaving device.  
+[fix] A single internal error can no longer cascade into a state where card connections and reader monitoring stop working until the app is restarted.  
+[fix] The card rack MQTT connection now recovers on its own: it waits for the server to be configured instead of giving up, and restarts automatically if its task dies — no more re-plugging the rack.  
+[fix] The app no longer crashes on startup in rare environment edge cases (window title failure, system clock set before 1970).  
+[fix] Disconnected card readers are now removed from the UI — a reader renamed by the OS after sleep/wake no longer leaves a stale duplicate row behind.  
+[feature] Changing the server address now reconnects all inserted cards automatically — no need to re-insert them or restart the app.  
 [feature] The UI has been improved. Everything is now smoother, more rounded, and more beautiful.  
 [feature] Support for working with serial devices via the COM port has been added.  
 [feature] Added visual display of connected lisle design rack to the current UI.
