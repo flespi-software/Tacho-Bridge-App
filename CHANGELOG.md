@@ -119,6 +119,7 @@ All notable changes to this project will be documented in this file.
 [fix] The card rack MQTT connection now recovers on its own: it waits for the server to be configured instead of giving up, and restarts automatically if its task dies — no more re-plugging the rack.  
 [fix] The app no longer crashes on startup in rare environment edge cases (window title failure, system clock set before 1970).  
 [fix] Disconnected card readers are now removed from the UI — a reader renamed by the OS after sleep/wake no longer leaves a stale duplicate row behind.  
+[fix] Logs are now compact and readable: one line per connection event instead of three, correct severity levels, 50 MB rotation, and a TBA_LOG environment variable for per-module debug verbosity.  
 [feature] Changing the server address now reconnects all inserted cards automatically — no need to re-insert them or restart the app.  
 [feature] The UI has been improved. Everything is now smoother, more rounded, and more beautiful.  
 [feature] Support for working with serial devices via the COM port has been added.  
