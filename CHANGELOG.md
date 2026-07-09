@@ -125,3 +125,4 @@ All notable changes to this project will be documented in this file.
 [feature] Support for working with serial devices via the COM port has been added.  
 [feature] Added visual display of connected lisle design rack to the current UI.
 [feature] Added mqtt connection with the "Lisle" manufacturer name ident.  
+[feature] Added workflow action runner config for MacOS universal-apple-darwin.
