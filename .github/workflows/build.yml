@@ -17,12 +17,12 @@ jobs:
     name: macOS universal (x86_64 + arm64 DMG)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
 
       - name: Setup Rust (stable)
@@ -49,7 +49,7 @@ jobs:
         run: npm run tauri build -- --target universal-apple-darwin
 
       - name: Upload universal DMG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: tba-macos-universal-dmg
           path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
@@ -60,12 +60,12 @@ jobs:
     name: Windows amd64 (NSIS)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
 
       - name: Setup Rust (stable)
@@ -83,7 +83,7 @@ jobs:
         run: npm run tauri build
 
       - name: Upload NSIS artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: tba-windows-amd64-nsis
           path: src-tauri/target/release/bundle/nsis/*.exe
@@ -94,7 +94,7 @@ jobs:
     name: Ubuntu 22.04 amd64 (AppImage)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies (Tauri + PCSC + AppImage)
         run: |
@@ -108,9 +108,9 @@ jobs:
             pcscd libpcsclite-dev libccid usbutils
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
 
       - name: Setup Rust (stable)
@@ -128,7 +128,7 @@ jobs:
         run: npm run tauri build
 
       - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: tba-ubuntu-2204-amd64-appimage
           path: src-tauri/target/release/bundle/appimage/*.AppImage
@@ -143,7 +143,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Verify tag matches package.json version
         run: |
@@ -155,7 +155,7 @@ jobs:
           fi
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true

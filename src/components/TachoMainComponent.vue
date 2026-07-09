@@ -176,9 +176,9 @@ const cardlist = ref<null | {
 }>(null)
 
 // reactive state for the readers and cards
-const state = reactive({
-  readers: [] as Reader[],
-  cards: {} as Record<string, SmartCard>,
+const state = reactive<{ readers: Reader[]; cards: Record<string, SmartCard> }>({
+  readers: [],
+  cards: {},
 })
 
 // Card rack state, pushed from the backend via `rack-state`. null until the
