@@ -47,3 +47,4 @@ todo.md
 
 # Private diagnostic tools containing proprietary protocol details (public repo)
 /src-tauri/src/bin/
+/src-tauri/examples/

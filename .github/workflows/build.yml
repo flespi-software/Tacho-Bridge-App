@@ -3,6 +3,7 @@ name: Build TBA (Windows amd64 + Ubuntu 22.04 amd64 + macOS universal)
 on:
   push:
     branches: ["**"]
+    tags: ["v*"]
   pull_request:
     branches: ["master"]
   workflow_dispatch:
@@ -43,7 +44,7 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run tauri build -- --target universal-apple-darwin
 
@@ -133,3 +134,41 @@ jobs:
           path: src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish GitHub release (on v* tag)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos-universal, windows-amd64, ubuntu-2204-amd64]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches package.json version
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release and attach binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/*.dmg
+            dist/*.exe
+            dist/*.AppImage
+          fail_on_unmatched_files: true

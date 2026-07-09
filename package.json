@@ -25,8 +25,8 @@
   "devDependencies": {
     "@eslint/js": "^9.14.0",
     "@quasar/app-vite": "^2.0.0",
-    "@tauri-apps/api": "^2.2.0",
-    "@tauri-apps/cli": "^2.2.7",
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^20.5.9",
     "@vue/eslint-config-prettier": "^10.1.0",
     "@vue/eslint-config-typescript": "^14.1.3",
