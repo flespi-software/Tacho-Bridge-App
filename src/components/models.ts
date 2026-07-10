@@ -3,6 +3,7 @@ export interface SmartCard {
   name?: string
   iccid?: string
   expire?: number | null
+  t_protocol?: string | null
   card_type?: number | null
   structure_version?: [number, number] | null
   company_name?: string | null

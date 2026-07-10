@@ -18,7 +18,7 @@ use pcsc::*;
 use pcsc::{Card, Protocols, State as PcscState};
 
 // ───── Local Modules ─────
-use crate::config::{get_from_cache, CacheSection};
+use crate::config::{get_card_config_from_cache, get_from_cache, mutate_card_config, CacheSection};
 use crate::global_app_handle::card_emit_event;
 use crate::mqtt::{ensure_connection, remove_connections_all};
 
@@ -188,6 +188,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
 
         let atr = hex::encode(rs.atr());
         let protocol = parse_atr_and_get_protocol(&atr);
+        let mut effective_protocol = protocol;
 
         let card_state_string = format!("{:?}", rs.event_state());
         log::debug!("card_state_string {}", card_state_string);
@@ -199,12 +200,20 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
 
         match action {
             CardProcessingResult::Create => match ManagedCard::new(reader_name, protocol) {
-                Ok(managed_card) => match managed_card.get_iccid().await {
+                Ok(mut managed_card) => match managed_card.get_iccid().await {
                     Ok(received_iccid) => {
                         log::info!("ICCID: {}", received_iccid);
 
                         iccid = received_iccid;
                         card_number = get_from_cache(CacheSection::Cards, &iccid);
+
+                        // The card number (and thus the config entry) is known only after
+                        // reading the ICCID, so the card is opened with the ATR-derived
+                        // protocol first and switched if the config says otherwise.
+                        effective_protocol = resolve_t_protocol(&card_number, protocol);
+                        if effective_protocol != protocol {
+                            managed_card.switch_protocol(effective_protocol).await;
+                        }
 
                         ensure_connection(
                             rs.name(),
@@ -249,7 +258,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
                 rs.event_state(),
                 atr,
                 card_number,
-                protocol
+                effective_protocol
             );
         }
     }
@@ -453,13 +462,74 @@ pub fn sc_monitor() {
     }
 }
 
+/// Renders a PCSC protocol as the config string form ("T0"/"T1").
+pub fn protocol_to_str(protocol: Protocols) -> &'static str {
+    if protocol == Protocols::T1 { "T1" } else { "T0" }
+}
+
+/// Parses the config string form of a protocol; accepts "T0"/"T1" case-insensitively.
+pub fn protocol_from_str(value: &str) -> Option<Protocols> {
+    match value.trim() {
+        v if v.eq_ignore_ascii_case("T0") => Some(Protocols::T0),
+        v if v.eq_ignore_ascii_case("T1") => Some(Protocols::T1),
+        _ => None,
+    }
+}
+
+/// Returns the protocol to use for the card: the `t_protocol` value stored in the
+/// card config wins; on the first connection of a configured card the ATR-derived
+/// protocol is persisted so later connects and reconnects reuse it.
+/// Blocking (config file I/O on first connection) — the reader monitor thread is
+/// allowed to block, so this must not be called from an async worker.
+fn resolve_t_protocol(card_number: &str, atr_protocol: Protocols) -> Protocols {
+    if card_number.is_empty() {
+        // Card is not configured yet - nowhere to store the protocol.
+        return atr_protocol;
+    }
+
+    match get_card_config_from_cache(card_number).and_then(|card| card.t_protocol) {
+        Some(stored) => match protocol_from_str(&stored) {
+            Some(protocol) => {
+                if protocol != atr_protocol {
+                    info!(
+                        "Card {}: using stored T protocol {} (ATR suggests {})",
+                        card_number,
+                        protocol_to_str(protocol),
+                        protocol_to_str(atr_protocol)
+                    );
+                }
+                protocol
+            }
+            None => {
+                warn!(
+                    "Card {}: invalid t_protocol value {:?} in config (expected \"T0\" or \"T1\"), using ATR-derived {}",
+                    card_number,
+                    stored,
+                    protocol_to_str(atr_protocol)
+                );
+                atr_protocol
+            }
+        },
+        None => {
+            let value = protocol_to_str(atr_protocol);
+            if mutate_card_config(card_number, |card| {
+                card.t_protocol = Some(value.to_string());
+                true
+            }) {
+                info!("Card {}: stored ATR-derived T protocol {} in config", card_number, value);
+            }
+            atr_protocol
+        }
+    }
+}
+
 /// Parses the ATR and extracts the communication protocol (T=0 or T=1).
 ///
 /// # Arguments
 /// - `atr`: A string containing the ATR in hexadecimal format.
 ///
 /// # Returns
-/// - `String`: The communication protocol ("T0", "T1", or "Unknown").
+/// - `Protocols`: The communication protocol (T0 or T1; T0 when the ATR is absent or malformed).
 pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
     fn protocol_from_td(td: u8) -> Protocols {
         match td & 0x0F {
@@ -647,6 +717,52 @@ impl ManagedCard {
         Ok(card)
     }
 
+    /// Switches the card to another T protocol: reconnects the underlying PCSC
+    /// card with it and remembers it for future reconnects/recreates. Must be
+    /// called before the ManagedCard is cloned into the task pool - `protocol`
+    /// is a plain field, so clones would keep the old value.
+    pub async fn switch_protocol(&mut self, protocol: Protocols) {
+        if protocol == self.protocol {
+            return;
+        }
+
+        info!(
+            "Switching card protocol to {} for reader: {}",
+            protocol_to_str(protocol),
+            self.reader_name.to_string_lossy()
+        );
+
+        let reconnect_result = {
+            let mut card = self.inner.lock().await;
+            card.reconnect(ShareMode::Shared, protocol, Disposition::ResetCard)
+        };
+
+        match reconnect_result {
+            Ok(_) => self.protocol = protocol,
+            Err(e) => {
+                warn!(
+                    "Failed to switch card protocol to {} for reader {}: {:?}. Will try to recreate.",
+                    protocol_to_str(protocol),
+                    self.reader_name.to_string_lossy(),
+                    e
+                );
+                match Self::create_card(&self.reader_name, protocol) {
+                    Ok(new_card) => {
+                        *self.inner.lock().await = new_card;
+                        self.protocol = protocol;
+                    }
+                    Err(e) => error!(
+                        "Failed to recreate card with protocol {} for reader {}: {}. Keeping {}.",
+                        protocol_to_str(protocol),
+                        self.reader_name.to_string_lossy(),
+                        e,
+                        protocol_to_str(self.protocol)
+                    ),
+                }
+            }
+        }
+    }
+
     pub async fn reconnect(&self) {
         debug!(
             "Attempting to reconnect card for reader: {}",
@@ -655,7 +771,9 @@ impl ManagedCard {
 
         let reconnect_result = {
             let mut card = self.inner.lock().await;
-            card.reconnect(ShareMode::Shared, Protocols::ANY, Disposition::ResetCard)
+            // Reconnect with the same protocol the card was opened with (stored or
+            // ATR-derived) - ANY would let PCSC renegotiate and silently change it.
+            card.reconnect(ShareMode::Shared, self.protocol, Disposition::ResetCard)
         };
 
         match reconnect_result {
@@ -879,4 +997,31 @@ impl ManagedCard {
         Ok(iccid)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_str_roundtrip() {
+        assert_eq!(protocol_to_str(Protocols::T0), "T0");
+        assert_eq!(protocol_to_str(Protocols::T1), "T1");
+        assert_eq!(protocol_from_str("T0"), Some(Protocols::T0));
+        assert_eq!(protocol_from_str("T1"), Some(Protocols::T1));
+    }
+
+    #[test]
+    fn protocol_from_str_is_lenient_about_case_and_spaces() {
+        assert_eq!(protocol_from_str("t0"), Some(Protocols::T0));
+        assert_eq!(protocol_from_str(" t1 "), Some(Protocols::T1));
+    }
+
+    #[test]
+    fn protocol_from_str_rejects_unknown_values() {
+        assert_eq!(protocol_from_str(""), None);
+        assert_eq!(protocol_from_str("T2"), None);
+        assert_eq!(protocol_from_str("T=0"), None);
+        assert_eq!(protocol_from_str("ANY"), None);
+    }
 }

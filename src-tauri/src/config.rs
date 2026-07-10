@@ -51,6 +51,7 @@ pub struct CardConfig {
     pub iccid: String,                          // ICCID
     pub expire: Option<u64>,                    // Expire date
     pub name: Option<String>,                   // Custom card name (for ease of user identification)
+    pub t_protocol: Option<String>,             // Card communication protocol "T0"/"T1"; auto-filled from ATR on first connection, may be overridden manually
     pub card_type: Option<u8>,                  // typeOfTachographCardId: 1=Driver, 2=Workshop, 3=Control, 4=Company
     pub structure_version: Option<(u8, u8)>,    // cardStructureVersion (major, minor): major 0x00=Gen1, 0x01=Gen2; minor = data-element revision
     pub company_name: Option<String>,           // Company name (from EF_Identification, Company Card only)
@@ -185,6 +186,10 @@ fn update_card_config(
                 existing_card.company_name = content.company_name;
                 existing_card.company_address = content.company_address;
                 existing_card.last_auth = content.last_auth;
+                // t_protocol is not part of the frontend card form; None means "not provided", not "clear it"
+                if content.t_protocol.is_some() {
+                    existing_card.t_protocol = content.t_protocol;
+                }
                 // needs_restart = true;
                 changed = true;
             } else {
@@ -215,6 +220,11 @@ fn update_card_config(
                     existing_card.company_name = content.company_name;
                     existing_card.company_address = content.company_address;
                     existing_card.last_auth = content.last_auth;
+                    changed = true;
+                }
+                // t_protocol is not part of the frontend card form; None means "not provided", not "clear it"
+                if content.t_protocol.is_some() && existing_card.t_protocol != content.t_protocol {
+                    existing_card.t_protocol = content.t_protocol;
                     changed = true;
                 }
             }
@@ -843,6 +853,7 @@ mod tests {
                 iccid: "1122334455667788".to_string(),
                 expire: Some(1_700_000_000),
                 name: Some("My Company Card".to_string()),
+                t_protocol: Some("T0".to_string()),
                 card_type: Some(4),
                 structure_version: Some((1, 0)),
                 company_name: Some("Acme Logistics".to_string()),
@@ -989,6 +1000,7 @@ mod tests {
                             iccid: format!("{:016}", t * 1000 + i),
                             expire: None,
                             name: None,
+                            t_protocol: None,
                             card_type: None,
                             structure_version: None,
                             company_name: None,
@@ -1015,11 +1027,44 @@ mod tests {
     }
 
     #[test]
+    fn update_card_config_preserves_t_protocol_when_not_provided() {
+        let dir = unique_tmp_dir("tproto");
+        let path = dir.join("config.yaml");
+        let card_number = "ABCDEF0123456789";
+
+        let cfg = sample_config();
+        save_config(&path, &cfg).expect("save");
+
+        // A frontend-style update carries no t_protocol - the stored value must survive.
+        let mut content = cfg.cards.get(card_number).cloned().expect("card");
+        content.t_protocol = None;
+        content.name = Some("Renamed".to_string());
+        update_card_config(&path, card_number, content).expect("update");
+
+        let loaded = load_config(&path).expect("load");
+        let card = loaded.cards.get(card_number).expect("card");
+        assert_eq!(card.name.as_deref(), Some("Renamed"));
+        assert_eq!(card.t_protocol.as_deref(), Some("T0"));
+
+        // An explicit value must overwrite the stored one.
+        let mut content = card.clone();
+        content.t_protocol = Some("T1".to_string());
+        update_card_config(&path, card_number, content).expect("update");
+
+        let loaded = load_config(&path).expect("load");
+        let card = loaded.cards.get(card_number).expect("card");
+        assert_eq!(card.t_protocol.as_deref(), Some("T1"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn card_config_yaml_roundtrip_preserves_optional_fields() {
         let card = CardConfig {
             iccid: "1234567890123456".to_string(),
             expire: None,
             name: None,
+            t_protocol: None,
             card_type: None,
             structure_version: None,
             company_name: None,

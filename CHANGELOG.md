@@ -120,9 +120,12 @@ All notable changes to this project will be documented in this file.
 [fix] The app no longer crashes on startup in rare environment edge cases (window title failure, system clock set before 1970).  
 [fix] Disconnected card readers are now removed from the UI — a reader renamed by the OS after sleep/wake no longer leaves a stale duplicate row behind.  
 [fix] Logs are now compact and readable: one line per connection event instead of three, correct severity levels, 50 MB rotation, and a TBA_LOG environment variable for per-module debug verbosity.  
+[fix] Card reset after an authentication session no longer lets PC/SC silently renegotiate the communication protocol — the card is reconnected with the same T protocol it was opened with.  
 [feature] Changing the server address now reconnects all inserted cards automatically — no need to re-insert them or restart the app.  
 [feature] The UI has been improved. Everything is now smoother, more rounded, and more beautiful.  
 [feature] Support for working with serial devices via the COM port has been added.  
 [feature] Added visual display of connected lisle design rack to the current UI.
 [feature] Added mqtt connection with the "Lisle" manufacturer name ident.  
-[feature] Added workflow action runner config for MacOS universal-apple-darwin.
+[feature] Added workflow action runner config for MacOS universal-apple-darwin.  
+[feature] The card communication protocol (T0/T1) is now a persisted per-card property: detected from the ATR on the first connection, stored in the configuration, reused on every connect and reset, and manually overridable in config.yaml.  
+[feature] Added communication_protocol.md describing the TBA <-> server communication protocol.
