@@ -128,4 +128,5 @@ All notable changes to this project will be documented in this file.
 [feature] Added mqtt connection with the "Lisle" manufacturer name ident.  
 [feature] Added workflow action runner config for MacOS universal-apple-darwin.  
 [feature] The card communication protocol (T0/T1) is now a persisted per-card property: detected from the ATR on the first connection, stored in the configuration, reused on every connect and reset, and manually overridable in config.yaml.  
-[feature] Added communication_protocol.md describing the TBA <-> server communication protocol.
+[feature] Added communication_protocol.md describing the TBA <-> server communication protocol.  
+[feature] The app connection now publishes a one-shot settings report (application version, OS, architecture) to the server right after connecting — visible on the server as a read-only device setting.

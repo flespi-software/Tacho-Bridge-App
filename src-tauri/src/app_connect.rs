@@ -82,7 +82,7 @@ pub async fn app_connection() {
     //  Create a new client ID for the MQTT connection
     //////////////////////////////////////////////////
     let mut mqtt_options = MqttOptions::new(client_id.clone(), &host, port);
-    // mqtt_options.set_credentials(flespi_token, "");
+    // NOTE: username/password are reserved for future authorization - do not put anything else there.
     mqtt_options.set_keep_alive(Duration::from_secs(120));
     log::debug!("mqtt_options: {:?}", mqtt_options);
     log::info!(
@@ -97,6 +97,7 @@ pub async fn app_connection() {
     // `10` is the capacity of the internal channel used by the event loop for buffering operations
     let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
     let mqtt_clinet_cloned = mqtt_client.clone();
+    let mqtt_client_for_task = mqtt_client.clone();
     let log_header: String = format!("{} |", client_id);
     let client_id_for_task = client_id.clone();
 
@@ -154,7 +155,13 @@ pub async fn app_connection() {
                         Event::Incoming(Incoming::ConnAck(..)) => {
                             // The OFFLINE->ONLINE transition is already logged
                             // at info; CONNACK itself is a detail.
-                            log::debug!("{} [CONN] event=CONNACK status=received", log_header)
+                            log::debug!("{} [CONN] event=CONNACK status=received", log_header);
+                            // One-shot settings report per established connection.
+                            crate::commands_settings::publish_settings_report(
+                                &mqtt_client_for_task,
+                                &log_header,
+                            )
+                            .await;
                         }
                         _ => {} // This handles any other events that you haven't explicitly matched above
                     }

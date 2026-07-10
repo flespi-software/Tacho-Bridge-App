@@ -2,6 +2,7 @@
 
 // ───── Modules ─────
 mod app_connect;        // Application connection to the MQTT broker.
+mod commands_settings;  // Settings reporting to the server.
 mod config;             // Configuration handling.
 mod logger;             // Logging functionality.
 mod mqtt;               // MQTT communication.

@@ -136,6 +136,38 @@ The application-level connection identifies a running TBA instance (presence,
 diagnostics). It follows the same topic scheme; currently it carries no
 command traffic.
 
+The username/password fields of the MQTT CONNECT packet are reserved for
+future authorization and must not be used to carry anything else.
+
+### Settings report
+
+Since 0.8.0, right after the app connection is established, TBA publishes a
+one-shot **settings report** — the only message the client sends on its own
+initiative. Topic: `settings`. The payload is a JSON object keyed by setting
+name, so more settings can be reported later without changing the topic or
+the format:
+
+```json
+{
+  "app_info": {
+    "version": "0.8.0",
+    "os": "Linux",
+    "os_release": "6.1.0",
+    "arch": "x86_64"
+  }
+}
+```
+
+- `version` — application version (Cargo package version);
+- `os` / `os_release` — operating system type and release;
+- `arch` — CPU architecture the binary runs on.
+
+The report is re-sent on every reconnect (the server tracks it per
+connection). On the server the values are exposed as a read-only "Application
+Information" device setting; unknown top-level keys are ignored. Servers
+without settings-report support reject the unknown topic, so the server side
+must be deployed before a TBA release that sends it.
+
 ## 8. Configuration inputs
 
 What TBA needs to know locally to serve the protocol:
