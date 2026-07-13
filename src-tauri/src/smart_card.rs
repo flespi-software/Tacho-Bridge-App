@@ -718,9 +718,10 @@ impl ManagedCard {
     }
 
     /// Switches the card to another T protocol: reconnects the underlying PCSC
-    /// card with it and remembers it for future reconnects/recreates. Must be
-    /// called before the ManagedCard is cloned into the task pool - `protocol`
-    /// is a plain field, so clones would keep the old value.
+    /// card with it and remembers it for future reconnects/recreates. `protocol`
+    /// is a plain copied field, so clones keep the old value - valid call sites
+    /// are before the ManagedCard is cloned into the task pool, and inside the
+    /// card's own MQTT task, which is the sole clone touching the card afterwards.
     pub async fn switch_protocol(&mut self, protocol: Protocols) {
         if protocol == self.protocol {
             return;
@@ -761,6 +762,11 @@ impl ManagedCard {
                 }
             }
         }
+    }
+
+    /// Current T protocol in the config string form ("T0"/"T1").
+    pub fn protocol_str(&self) -> &'static str {
+        protocol_to_str(self.protocol)
     }
 
     pub async fn reconnect(&self) {

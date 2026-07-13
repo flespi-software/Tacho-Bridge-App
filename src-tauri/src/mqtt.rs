@@ -170,7 +170,7 @@ async fn publish_ack(
 }
 
 // /// Ensures an MQTT connection for the specified client ID.
-pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: String, managed_card: ManagedCard) {
+pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: String, mut managed_card: ManagedCard) {
     log::info!(
         "[CONN] phase=ensure_connection status=start reader={} client_id={} atr_len={}",
         reader_name.to_string_lossy(),
@@ -363,6 +363,24 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
                                     let mut payload_ack = String::new();
 
+                                    // Server-requested T protocol for this session. Applied only on session
+                                    // start (empty payload) below: switching is a physical card reset, so
+                                    // honoring it mid-session would destroy the authentication state.
+                                    let requested_protocol = json_payload
+                                        .get("protocol")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|requested| {
+                                            let parsed = crate::smart_card::protocol_from_str(requested);
+                                            if parsed.is_none() {
+                                                log::warn!(
+                                                    "{} server requested unknown T protocol '{}': ignoring",
+                                                    log_header,
+                                                    requested
+                                                );
+                                            }
+                                            parsed
+                                        });
+
                                     // Check for the presence of the "finish" parameter
                                     if let Some(finish_value) = json_payload.get("finish").and_then(|v| v.as_bool()) {
                                         log::debug!(
@@ -403,7 +421,8 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     hex_value
                                                 );
 
-                                                let rapdu_mqtt_hex = if hex_value.is_empty() {
+                                                let is_session_start = hex_value.is_empty();
+                                                let rapdu_mqtt_hex = if is_session_start {
                                                     // This case is needed to reset the card when authorization is not completed, otherwise the card will not respond to commands correctly.
                                                     if auth_process {
                                                         log::warn!(
@@ -414,6 +433,14 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                         crate::config::record_auth_result_async(&client_id_cloned, false).await;
                                                         // Reset the card to its original state
                                                         managed_card.reconnect().await;
+                                                    }
+
+                                                    // Session start is the only safe point to honor the requested
+                                                    // T protocol: the card has no session state to lose yet.
+                                                    // Session-scoped by design - not persisted to the config,
+                                                    // the server owns the value per tracker.
+                                                    if let Some(protocol) = requested_protocol {
+                                                        managed_card.switch_protocol(protocol).await;
                                                     }
 
                                                     // If the input value is empty, then pass the ATR to the server.
@@ -427,6 +454,19 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
                                                     atr_clone.clone()
                                                 } else {
+                                                    // a differing T protocol mid-session is ignored: switching resets
+                                                    // the card and would destroy the authentication state
+                                                    if let Some(protocol) = requested_protocol {
+                                                        if crate::smart_card::protocol_to_str(protocol) != managed_card.protocol_str() {
+                                                            log::warn!(
+                                                                "{} server requested T protocol {} mid-session while card is on {}: ignoring",
+                                                                log_header,
+                                                                crate::smart_card::protocol_to_str(protocol),
+                                                                managed_card.protocol_str()
+                                                            );
+                                                        }
+                                                    }
+
                                                     // // Otherwise, the logic for exchanging messages with the card.
                                                     if !auth_process {
                                                         log::info!(
@@ -447,7 +487,14 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     rapdu
                                                 };
 
-                                                payload_ack = process_rapdu_mqtt_hex(rapdu_mqtt_hex);
+                                                payload_ack = if is_session_start {
+                                                    // the session-start (ATR) reply also reports the actual T protocol -
+                                                    // the server seeds its per-tracker value from it and it signals that
+                                                    // this application understands the 'protocol' request field
+                                                    process_session_start_mqtt_hex(rapdu_mqtt_hex, managed_card.protocol_str())
+                                                } else {
+                                                    process_rapdu_mqtt_hex(rapdu_mqtt_hex)
+                                                };
 
                                                 // log::info!("finish_value: {}", finish_value);
                                             } else {
@@ -617,9 +664,35 @@ fn process_rapdu_mqtt_hex(rapdu_mqtt_hex: String) -> String {
     .to_string()
 }
 
+// Session-start (ATR) reply: the payload plus the actual T protocol the card is opened with.
+// Old servers ignore the extra field, new ones seed their per-tracker protocol value from it.
+fn process_session_start_mqtt_hex(atr_hex: String, protocol: &str) -> String {
+    serde_json::json!({
+        "payload": atr_hex,
+        "protocol": protocol,
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_session_start_mqtt_hex_reports_payload_and_protocol() {
+        let json = process_session_start_mqtt_hex("3BDB96FF".to_string(), "T1");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed.get("payload").and_then(|v| v.as_str()), Some("3BDB96FF"));
+        assert_eq!(parsed.get("protocol").and_then(|v| v.as_str()), Some("T1"));
+    }
+
+    #[test]
+    fn process_rapdu_mqtt_hex_has_no_protocol_field() {
+        // mid-session replies must stay in the old shape - only session start reports the protocol
+        let parsed: serde_json::Value =
+            serde_json::from_str(&process_rapdu_mqtt_hex("9000".to_string())).expect("valid json");
+        assert!(parsed.get("protocol").is_none());
+    }
 
     #[test]
     fn request_to_response_topic_swaps_prefix_only() {

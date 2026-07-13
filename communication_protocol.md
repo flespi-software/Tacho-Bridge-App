@@ -72,12 +72,14 @@ command again. The cache is reset on every reconnect (CONNACK).
 All payloads are JSON. Incoming command shape:
 
 ```json
-{ "finish": false, "payload": "<hex>" }
+{ "finish": false, "payload": "<hex>", "protocol": "T1" }
 ```
+
+`protocol` is optional (see below); old servers do not send it.
 
 | `finish` | `payload` | Meaning | TBA reply |
 |----------|-----------|---------|-----------|
-| `false` | empty | Session start: the server asks for the card's ATR. Also aborts a previous unfinished session (the card is reset). | `{ "payload": "<ATR hex>" }` |
+| `false` | empty | Session start: the server asks for the card's ATR. Also aborts a previous unfinished session (the card is reset). | `{ "payload": "<ATR hex>", "protocol": "T0" }` |
 | `false` | APDU hex | Transmit the APDU to the card. | `{ "payload": "<card response hex>" }` |
 | `true` | — | Authentication session finished. TBA records the result and resets the card. | `{ "payload": "" }` |
 
@@ -86,16 +88,25 @@ On an unrecoverable card error TBA replies with the standard status word
 
 ### Card communication protocol (T0/T1)
 
-The T protocol used to talk to a card is a per-card persisted property:
+The T protocol is a property of the (card, vehicle unit) pair, so the server
+owns it per tracker and drives it per session; TBA-local state is only a
+fallback. Sources in priority order:
 
-- on the first connection of a configured card it is derived from the ATR and
-  stored in the local config (`t_protocol: "T0"` / `"T1"`);
-- every later connect and every reset/reconnect uses the stored value;
-- the value can be overridden manually in the config file.
+1. **Server-requested (per session).** An incoming command may carry an
+   optional `"protocol": "T0" | "T1"` field. TBA honors it **only on session
+   start** (empty payload): switching means a physical card reset, so a
+   differing value in a mid-session command is ignored with a warning. The
+   value is session-scoped and never persisted to the local config. The
+   session-start reply reports the actual protocol next to the ATR — the
+   server seeds its per-tracker value from it, and the field's presence tells
+   the server this TBA version understands `protocol` requests.
+2. **Local config.** `t_protocol: "T0"` / `"T1"` per card: written from the
+   ATR on the first connection of a configured card, used for every connect
+   and reset/reconnect when the server does not request a protocol (old
+   servers), can be overridden manually in the config file.
 
-**TBD:** reporting the active protocol to the server alongside the ATR, and a
-server-driven protocol change (reconnect the card with the requested T and
-persist it).
+An unknown `protocol` value is ignored with a warning. Old TBA versions
+ignore the request field entirely and reply without the `protocol` field.
 
 ## 6. Rack connection payloads
 
