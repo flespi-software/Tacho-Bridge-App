@@ -75,7 +75,12 @@ const ident = ref('')
 const identInput = computed({
   get: () => `TBA${ident.value}`,
   set: (val) => {
-    ident.value = val.startsWith('TBA') ? val.slice(3) : ''
+    // Strip the fixed prefix even when partially deleted, then keep digits only —
+    // an edit that clips "TBA" must not wipe the digits the user already typed.
+    ident.value = val
+      .replace(/^T?B?A?/i, '')
+      .replace(/\D/g, '')
+      .slice(0, 13)
   },
 })
 const isIdentValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))

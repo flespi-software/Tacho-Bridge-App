@@ -513,7 +513,11 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
                                         // Cache this reply so a re-sent request with the same id is
                                         // answered from cache without re-running the card exchange.
-                                        if req_id.is_some() {
+                                        // Only real card replies are cached: a malformed request
+                                        // leaves payload_ack empty, and pinning that against the id
+                                        // would answer the server's corrected retry from cache
+                                        // without ever touching the card.
+                                        if req_id.is_some() && !payload_ack.is_empty() {
                                             last_request_id = req_id;
                                             last_response_payload = Some(payload_ack.clone());
                                         }

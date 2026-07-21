@@ -93,6 +93,11 @@ function cycleTheme() {
   } else {
     $q.dark.set(false)
   }
+  // Persist right away: this button is the only theme control, so the choice
+  // must survive a restart without a trip through the server dialog's Save.
+  invoke('update_theme', { theme: themeLabel.value }).catch((error) => {
+    console.error('Failed to persist theme:', error)
+  })
 }
 
 // Registered Tauri listeners. Stored so we can detach them on unmount —
@@ -109,7 +114,8 @@ onMounted(async () => {
       const payload = event.payload as { dark_theme?: string; host?: string; ident?: string }
       if (payload.dark_theme === 'Dark') $q.dark.set(true)
       else if (payload.dark_theme === 'Auto') $q.dark.set('auto')
-      else $q.dark.set(false)
+      else if (payload.dark_theme === 'Light') $q.dark.set(false)
+      // empty/unknown (old config without an appearance section): keep the current mode
       serverHost.value = payload.host ?? ''
       serverIdent.value = payload.ident ?? ''
     })

@@ -630,43 +630,47 @@ pub async fn manual_sync_cards(
         return Ok(());
     }
 
-    let ctx = Context::establish(Scope::User)
-        .map_err(|e| format!("failed to establish context: {e}"))?;
-    log::debug!("Context established successfully.");
+    // The whole sweep is blocking (PCSC calls, and process_reader_states writes
+    // the config on a card's first connection) — keep it off the async workers,
+    // same as the sc_monitor thread does.
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let ctx = Context::establish(Scope::User)
+            .map_err(|e| format!("failed to establish context: {e}"))?;
+        log::debug!("Context established successfully.");
 
-    let mut readers_buf = [0; READERS_BUFFER_SIZE];
-    match ctx.list_readers(&mut readers_buf) {
-        Ok(readers) => {
-            if readers.count() == 0 {
-                log::warn!("No readers found. Exiting...");
+        let mut readers_buf = [0; READERS_BUFFER_SIZE];
+        match ctx.list_readers(&mut readers_buf) {
+            Ok(readers) => {
+                if readers.count() == 0 {
+                    log::warn!("No readers found. Exiting...");
+                    return Ok(());
+                }
+                log::debug!("Available readers found");
+            }
+            Err(e) => {
+                log::error!("Failed to list readers: {:?}", e);
                 return Ok(());
             }
-            log::debug!("Available readers found");
         }
-        Err(e) => {
-            log::error!("Failed to list readers: {:?}", e);
-            return Ok(());
+
+        let mut reader_states = vec![
+            // Listen for reader insertions/removals, if supported.
+            ReaderState::new(PNP_NOTIFICATION(), State::UNAWARE),
+        ];
+
+        // setup readers states. Getting changes and other inits
+        if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
+            log::error!("Failed to setup reader states: {:?}", e);
         }
-    }
+        // waiting for the status change
+        ctx.get_status_change(Some(Duration::from_secs(MANUAL_SYNC_TIMEOUT_SECS)), &mut reader_states)
+            .map_err(|e| format!("failed to get status change: {e}"))?;
 
-    let mut reader_states = vec![
-        // Listen for reader insertions/removals, if supported.
-        ReaderState::new(PNP_NOTIFICATION(), State::UNAWARE),
-    ];
-
-    // setup readers states. Getting changes and other inits
-    if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
-        log::error!("Failed to setup reader states: {:?}", e);
-    }
-    // waiting for the status change
-    ctx.get_status_change(Some(Duration::from_secs(MANUAL_SYNC_TIMEOUT_SECS)), &mut reader_states)
-        .map_err(|e| format!("failed to get status change: {e}"))?;
-
-    process_reader_states(&mut reader_states)
-        .await
-        .map_err(|e| format!("Processing failed: {}", e))?;
-
-    Ok(())
+        block_on(process_reader_states(&mut reader_states))
+            .map_err(|e| format!("Processing failed: {}", e))
+    })
+    .await
+    .map_err(|e| format!("manual_sync_cards: blocking task failed: {e}"))?
 }
 //////////////////////////////////////////////////
 /// CARD WRAPER //////////////////////////////////

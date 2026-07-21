@@ -65,17 +65,18 @@ pub async fn app_connection() {
     // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
 
-    // This part of function checks if a connection already exists for the given client ID
-    // in the task pool. If not, it initiates a new connection. This is useful for maintaining
-    // a list of active MQTT connections and ensuring that each client ID is only connected once.
-    let exists = task_pool.iter().any(|card| card.client_id == client_id);
-    // If existing connection is found, then return, no add a new connection for this client_id
-    if exists {
+    // The app-level connection is the only pool entry without a reader. If one
+    // already exists (possibly stuck deep in reconnect backoff, or registered
+    // under a previous ident), replace it: abort the old task and start fresh,
+    // so a manual reconnect acts immediately instead of being silently skipped.
+    if let Some(index) = task_pool.iter().position(|card| card.reader_name.is_none()) {
+        let old = task_pool.remove(index);
+        old.task_handle.abort();
         log::info!(
-            "[CONN] phase=app_connection status=skip_existing client_id={}",
+            "[CONN] phase=app_connection status=replacing_existing old_client_id={} client_id={}",
+            old.client_id,
             client_id
         );
-        return;
     }
 
     //////////////////////////////////////////////////

@@ -103,6 +103,13 @@ impl SerialExchange {
 const POLL_INTERVAL_DEFAULT: Duration = Duration::from_millis(20);
 const POLL_DEADLINE_DEFAULT: Duration = Duration::from_secs(5);
 
+/// Upper bound for every server-supplied timing field (`idle_ms`, `deadline_ms`,
+/// `interval_ms`). An unclamped u64 would panic on `Instant + Duration` overflow
+/// after the command bytes were already written to the device, and a huge poll
+/// interval would pin a blocking-pool thread (and the port lock) beyond any
+/// abort — `spawn_blocking` closures cannot be cancelled.
+const SERIAL_MS_MAX: u64 = 300_000;
+
 /// Server-scripted poll loop of one envelope: after the command is accepted, keep sending
 /// `cmd` every `interval` while the device answers exactly `while_hex`; the first differing
 /// reply is the operation result. Pure byte comparison - no protocol knowledge on this side.
@@ -148,7 +155,9 @@ fn parse_envelope_fields(
     json: &serde_json::Value,
     cmd: &str,
 ) -> Result<SerialEnvelope, &'static str> {
-    let ms = |v: &serde_json::Value, key: &str| v.get(key).and_then(|x| x.as_u64());
+    let ms = |v: &serde_json::Value, key: &str| {
+        v.get(key).and_then(|x| x.as_u64()).map(|x| x.min(SERIAL_MS_MAX))
+    };
 
     let expect_hex = match json.get("expect").and_then(|v| v.as_str()) {
         Some(s) => Some(normalize_hex(s)?),
@@ -693,26 +702,42 @@ fn update_rack_card_ui(slot: u16, iccid: &str, card_number: Option<String>) {
 }
 
 lazy_static::lazy_static! {
-    /// Rack-backed per-card MQTT tasks, keyed by card number. All aborted when the rack
-    /// disconnects — without the rack there is no transport to those cards.
-    static ref RACK_CARD_TASKS: std::sync::Mutex<std::collections::HashMap<String, JoinHandle<()>>> =
+    /// Rack-backed per-card MQTT tasks, keyed by ICCID (the rack's stable card
+    /// identifier) with the spawn-time card number kept alongside. Keying by the
+    /// config-resolved card number would leak the session if the config entry is
+    /// deleted or edited while the card sits in the rack — the disconnect lookup
+    /// would then miss the running task. All aborted when the rack disconnects —
+    /// without the rack there is no transport to those cards.
+    static ref RACK_CARD_TASKS: std::sync::Mutex<std::collections::HashMap<String, (String, JoinHandle<()>)>> =
         std::sync::Mutex::new(std::collections::HashMap::new());
 
     /// Cards currently exposed by the rack, as shown in the UI (RackState.cards).
     static ref RACK_CARDS_UI: std::sync::Mutex<Vec<RackCard>> = std::sync::Mutex::new(Vec::new());
 }
 
-/// Starts the rack-backed MQTT session of one card, deduplicating by card number.
+/// Starts the rack-backed MQTT session of one card, deduplicating by ICCID and
+/// by card number (two slots mapped to the same number in the config must not
+/// open two MQTT connections with the same client_id).
 fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: SharedPort) {
     let mut tasks = match RACK_CARD_TASKS.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(handle) = tasks.get(&card_number) {
+    if let Some((_, handle)) = tasks.get(&iccid) {
         if !handle.inner().is_finished() {
             log::debug!("[RACK] [SPAWN] card {} session already running — skip", card_number);
             return;
         }
+    }
+    if tasks.iter().any(|(other_iccid, (number, handle))| {
+        *other_iccid != iccid && *number == card_number && !handle.inner().is_finished()
+    }) {
+        log::warn!(
+            "[RACK] [SPAWN] card {} is already served by another slot — slot {} skipped",
+            card_number,
+            slot
+        );
+        return;
     }
     log::info!(
         "[RACK] [SPAWN] card {} slot={} — starting rack-backed session",
@@ -721,11 +746,11 @@ fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: S
     );
     let handle = async_runtime::spawn(rack_card_mqtt_loop(
         card_number.clone(),
-        iccid,
+        iccid.clone(),
         slot,
         serial_port,
     ));
-    tasks.insert(card_number, handle);
+    tasks.insert(iccid, (card_number, handle));
 }
 
 /// MQTT loop of one rack-backed card connection. Mirrors the rack's own loop — the same opaque
@@ -880,7 +905,9 @@ fn start_rack_watch(
             return;
         }
     };
-    let ms = |key: &str| json.get(key).and_then(|v| v.as_u64());
+    let ms = |key: &str| {
+        json.get(key).and_then(|v| v.as_u64()).map(|v| v.min(SERIAL_MS_MAX))
+    };
     let interval = Duration::from_millis(ms("interval_ms").unwrap_or(1000));
     let idle = ms("idle_ms").map(Duration::from_millis).unwrap_or(SERIAL_REPLY_TIMEOUT);
     let deadline = ms("deadline_ms").map(Duration::from_millis).unwrap_or(SERIAL_READ_DEADLINE);
@@ -983,16 +1010,16 @@ fn handle_card_disconnect(payload: &[u8], log_header: &str) {
     };
     rack_update_cards(cards);
 
-    // close the card session, if the card was configured and served
-    if let Some(card_number) = crate::config::find_card_number_by_iccid(iccid) {
-        let mut tasks = match RACK_CARD_TASKS.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(handle) = tasks.remove(&card_number) {
-            handle.abort();
-            log::info!("{} [SPAWN] card {} session aborted (card removed)", log_header, card_number);
-        }
+    // Close the card session, if one was spawned. Lookup is by ICCID captured at
+    // spawn time — re-resolving the card number through the config here would
+    // leak the task when the entry was deleted or edited mid-session.
+    let mut tasks = match RACK_CARD_TASKS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some((card_number, handle)) = tasks.remove(iccid) {
+        handle.abort();
+        log::info!("{} [SPAWN] card {} session aborted (card removed)", log_header, card_number);
     }
 }
 
@@ -1003,7 +1030,7 @@ fn stop_rack_cards() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    for (card_number, handle) in tasks.drain() {
+    for (_iccid, (card_number, handle)) in tasks.drain() {
         handle.abort();
         log::info!("[RACK] [SPAWN] card {} session aborted (rack gone)", card_number);
     }
@@ -1260,6 +1287,18 @@ fn start_rack_mqtt(client_id: String, port: SharedPort) {
     *guard = Some(handle);
 }
 
+/// Tears down the rack's MQTT stack so the presence monitor rebuilds it on the
+/// next tick with fresh config. The MQTT loops resolve the broker host once at
+/// start, so a server-host change must go through a full restart; the server
+/// re-issues `connect`/`watch` after the rack reconnects.
+pub fn restart_rack_mqtt(reason: &str) {
+    if !rack_mqtt_running() {
+        return;
+    }
+    log::info!("[RACK] [MQTT] phase=restart reason={}", reason);
+    stop_rack_mqtt();
+}
+
 /// Stops the rack's MQTT task if one is running, along with every rack-backed
 /// card session — without the rack there is no transport to those cards.
 fn stop_rack_mqtt() {
@@ -1389,6 +1428,12 @@ pub async fn rack_connection() {
                     "[RACK] phase=presence status=mqtt_task_dead port={} action=restart",
                     rack.port_name
                 );
+                // The dead loop's siblings (watch task, card sessions) may still
+                // hold the old exclusive serial handle — kill them BEFORE reopening,
+                // otherwise open_rack fails on every tick forever. Running this on
+                // each retry tick also reaps a watch task that raced past a
+                // previous stop_rack_mqtt.
+                stop_rack_mqtt();
                 if let Some(port) = open_rack(&rack) {
                     on_rack_connected(&rack, port);
                     current = Some(rack);

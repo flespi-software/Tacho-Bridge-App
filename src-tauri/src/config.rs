@@ -371,6 +371,35 @@ pub async fn update_card(cardnumber: String, content: CardConfig) -> bool {
 
 /// Updates the server address in the configuration.
 /// This function updates the configuration file with a new server address.
+/// Maps the frontend's theme label to the config enum; unknown values fall back
+/// to Auto, mirroring the deserialization default.
+fn dark_theme_from_label(theme: &str) -> DarkTheme {
+    match theme {
+        "Auto" => DarkTheme::Auto,
+        "Dark" => DarkTheme::Dark,
+        "Light" => DarkTheme::Light,
+        _ => DarkTheme::Auto,
+    }
+}
+
+/// Persists only the appearance section; host/ident are untouched.
+pub fn update_appearance_config(
+    config_path: &Path,
+    theme: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Serialize the whole read-modify-write against all other config writers.
+    let _guard = config_write_guard();
+
+    let mut config = load_config(config_path)?;
+    config.appearance = Some(AppearanceConfig {
+        dark_theme: dark_theme_from_label(theme),
+    });
+    save_config(config_path, &config)?;
+    load_config_to_cache(&config)?;
+
+    Ok(())
+}
+
 pub fn update_server_config(
     config_path: &Path,
     host: &str,
@@ -387,12 +416,7 @@ pub fn update_server_config(
     });
     config.ident = Some(ident.to_string());
     config.appearance = Some(AppearanceConfig {
-        dark_theme: match theme {
-            "Auto" => DarkTheme::Auto,
-            "Dark" => DarkTheme::Dark,
-            "Light" => DarkTheme::Light,
-            _ => DarkTheme::Auto,
-        },
+        dark_theme: dark_theme_from_label(theme),
     });
 
     save_config(config_path, &config)?;
@@ -488,8 +512,11 @@ pub async fn remove_card_from_config(
 /// This is a Tauri command: a thin async wrapper so the webview invoke never
 /// runs file I/O on the main thread — the blocking core goes to the blocking pool.
 #[tauri::command]
-pub async fn update_server(host: String, ident: String, theme: String) -> bool {
-    tauri::async_runtime::spawn_blocking(move || {
+pub async fn update_server(app: tauri::AppHandle, host: String, ident: String, theme: String) -> bool {
+    let old_host = get_from_cache(CacheSection::Server, "host");
+
+    let host_for_task = host.clone();
+    let updated = tauri::async_runtime::spawn_blocking(move || {
         let config_path = match get_config_path() {
             Ok(path) => path,
             Err(e) => {
@@ -498,9 +525,9 @@ pub async fn update_server(host: String, ident: String, theme: String) -> bool {
             }
         };
 
-        match update_server_config(&config_path, &host, &ident, &theme) {
+        match update_server_config(&config_path, &host_for_task, &ident, &theme) {
             Ok(_) => {
-                log::info!("The server address is updated to '{}'.", host);
+                log::info!("The server address is updated to '{}'.", host_for_task);
                 true
             }
             Err(e) => {
@@ -512,6 +539,51 @@ pub async fn update_server(host: String, ident: String, theme: String) -> bool {
     .await
     .unwrap_or_else(|e| {
         log::error!("update_server: blocking task failed: {:?}", e);
+        false
+    });
+
+    if updated {
+        // Re-emit the server config: the frontend's cached host/ident (and the
+        // header's "server configured" state) are fed by this event only —
+        // without it they stay stale until an app restart.
+        if let Err(e) = emit_global_config_server(&app) {
+            log::error!("Failed to emit global-config-server after update: {}", e);
+        }
+
+        // The rack MQTT loops resolve the broker host once at start; reader-backed
+        // cards migrate via manual_sync_cards, the rack needs an explicit restart.
+        if old_host != host {
+            crate::com_port::restart_rack_mqtt("server_host_changed");
+        }
+    }
+
+    updated
+}
+
+/// Persists the theme chosen with the header button — the only theme control,
+/// so it must not depend on the server dialog being saved.
+#[tauri::command]
+pub async fn update_theme(theme: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config_path = match get_config_path() {
+            Ok(path) => path,
+            Err(e) => {
+                log::error!("Failed to get config path: {}", e);
+                return false;
+            }
+        };
+
+        match update_appearance_config(&config_path, &theme) {
+            Ok(_) => true,
+            Err(e) => {
+                log::error!("Failed to update theme: {}", e);
+                false
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::error!("update_theme: blocking task failed: {:?}", e);
         false
     })
 }

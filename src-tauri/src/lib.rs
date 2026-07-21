@@ -115,6 +115,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             config::update_card,           // update list of cards from the frontend
             config::update_server,         // update server config from the frontend
+            config::update_theme,          // persist theme from the header button
             config::remove_card,            // remove card from config
             smart_card::manual_sync_cards, // manual sync cards from the frontend
             app_connect::app_connection,     // App connection to the MQTT broker
