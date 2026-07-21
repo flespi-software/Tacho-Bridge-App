@@ -20,10 +20,12 @@ export interface Reader {
   authentication?: boolean | undefined
 }
 
-// One card held in a rack slot. Populated once the server reports the cards;
-// empty for now while server-side rack control is not implemented yet.
+// One card held in a rack slot, as reported by the server's rack discovery.
+// card_number/name are null when the card's ICCID is not in the local config —
+// the card is visible in the rack section but not served yet.
 export interface RackCard {
   slot: number
+  iccid?: string | null
   card_number?: string | null
   name?: string | null
 }

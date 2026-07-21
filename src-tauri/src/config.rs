@@ -589,6 +589,22 @@ pub fn get_card_config_from_cache(card_number: &str) -> Option<CardConfig> {
     cache.cards.get(card_number).cloned()
 }
 
+/// Returns the card number whose config holds the given ICCID, from the runtime cache.
+/// Used by the rack path: the server discovers cards by ICCID, but card sessions connect
+/// by the company card number only the local config knows.
+pub fn find_card_number_by_iccid(iccid: &str) -> Option<String> {
+    if iccid.is_empty() {
+        // never match a configured card whose ICCID has not been filled in yet
+        return None;
+    }
+    let cache = cache_guard();
+    cache
+        .cards
+        .iter()
+        .find(|(_, card)| card.iccid == iccid)
+        .map(|(number, _)| number.clone())
+}
+
 /// Records the final state of an authentication attempt in the card config:
 /// `success == true` → green "success" line in UI; `false` → red "fail".
 /// The processing state while auth is running is derived from Reader.authentication

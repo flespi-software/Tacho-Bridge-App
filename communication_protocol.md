@@ -36,7 +36,7 @@ own `client_id`, which is how the server tells them apart.
 |------------|-----------|---------|
 | App | `TBA` + 13 digits (e.g. `TBA1740000000000`) | Application presence: one per running TBA instance. |
 | Card | 16-character company card number | One per inserted card; carries the card's authentication traffic. |
-| Rack | 16 characters: brand prefix + zero padding + device serial (e.g. `LISLE00000SC1799`) | One per connected serial card-rack device; carries opaque serial exchanges. |
+| Rack | 16 characters: brand prefix + zero padding + device serial (e.g. `LISLE00000SC1234`) | One per connected serial card-rack device; carries opaque serial exchanges. |
 
 Lifecycle: a card connection is opened when a configured card is inserted and
 closed when it is removed. A rack connection is opened when a supported serial
@@ -114,32 +114,102 @@ The rack connection is a transparent byte pipe between the server and the
 serial device. TBA does not build, parse, or interpret these bytes — the wire
 protocol of the device is owned entirely by the server.
 
-Incoming command shape:
+Incoming command shape (only `serial_cmd` is required; every other field is
+optional):
 
 ```json
-{ "serial_cmd": "<hex>" }
+{
+  "serial_cmd": "<hex>",
+  "expect": "<hex>",
+  "idle_ms": 50,
+  "deadline_ms": 2000,
+  "poll": { "cmd": "<hex>", "while": "<hex>", "interval_ms": 20, "deadline_ms": 5000 }
+}
 ```
 
-TBA decodes the hex, writes the raw bytes to the serial port, reads the reply
-and publishes it back:
+Semantics (all byte patterns are supplied by the server; TBA only compares
+them blindly):
+
+1. Write `serial_cmd` bytes, read one reply (`idle_ms` of line silence ends a
+   reply; `deadline_ms` bounds the whole read; defaults 800 ms / 5 s).
+2. Without `poll`, that reply is the result. With `poll`: if the reply
+   differs from `expect`, it is returned immediately; otherwise TBA re-sends
+   `poll.cmd` every `poll.interval_ms` while the device answers exactly
+   `poll.while`, and returns the first differing reply. Still-matching at
+   `poll.deadline_ms` returns the last reply — the server decodes the device
+   state from it.
+
+The whole envelope is executed atomically on the port: exchanges of parallel
+card sessions of one rack queue up FIFO and interleave at envelope
+granularity.
+
+The response is published for **every** request, always in one shape:
 
 ```json
-{ "serial_resp": "<hex>" }
+{ "serial_resp": "<hex>", "serial_err": "" }
 ```
 
-Safety bounds on the read: reply size cap (64 KB) and an overall read
-deadline, protecting against a misbehaving device.
+`serial_err` is `""` on success or one of: `no_reply` (device stayed silent),
+`write_failed`, `bad_hex` (malformed envelope), `truncated` (reply hit the
+64 KB cap; the partial hex is still supplied). Only successful exchanges are
+cached for `request_id` idempotency — a repeat after an error retries the
+device.
 
-**TBD (planned envelope extensions):**
+### Card spawn (`connect`) and the rack link report
 
-- server-supplied timing parameters per exchange (reply idle timeout, overall
-  deadline);
-- a generic repeat/poll form of the exchange (all byte patterns supplied by
-  the server, TBA only compares them blindly);
-- server-driven lifecycle of per-card connections for cards sitting in rack
-  slots (open/close a card connection on the server's instruction), so that a
-  rack card is served by the same card-connection contract as a PC/SC card;
-- rack card presence monitoring.
+When the server has identified a card in a rack slot, it publishes a spawn
+instruction on the rack connection — topic `connect`:
+
+```json
+{ "iccid": "<16 hex>", "slot": 3 }
+```
+
+TBA resolves the ICCID to the company card number through its local config
+(unknown ICCID — logged and skipped) and opens a regular card connection for
+it (same contract as §5), backed by the rack serial link instead of PC/SC. If
+a PC/SC connection for that card number is already active, the spawn is
+skipped — one `client_id` never gets two connections.
+
+Right after CONNACK such a rack-backed card connection publishes a one-shot
+**rack link report** — topic `rack`:
+
+```json
+{ "iccid": "<16 hex>", "slot": 3 }
+```
+
+It binds the card session to its slot on the server; without it the server
+treats the card as reader-backed. On this connection the server then sends
+serial envelopes (this section) instead of the §5 card payloads. All
+rack-backed card connections are closed when the rack disconnects.
+
+### Card presence watch (`watch`) and card removal (`disconnect`)
+
+After discovery the server arms a client-side presence watch — topic `watch`
+on the rack connection:
+
+```json
+{ "cmd": "<hex>", "interval_ms": 1000, "idle_ms": 50, "deadline_ms": 2000 }
+```
+
+TBA re-executes the opaque `cmd` every `interval_ms` through the same FIFO
+port queue and publishes the reply back (topic `watch`, the standard
+`serial_resp`/`serial_err` envelope) **only when its bytes change**. Arming
+again replaces the loop and resets the change baseline, so the first reply
+after (re)arming is always published — this is how the server catches states
+that changed while it was busy. TBA compares bytes blindly; what the command
+means and what changed is decided entirely by the server.
+
+When the server concludes a card left its slot, it publishes a removal notice
+on the rack connection — topic `disconnect`:
+
+```json
+{ "iccid": "<16 hex>", "slot": 3 }
+```
+
+TBA closes the rack-backed card connection of that card (if one was spawned)
+and removes the card from the rack UI. Newly inserted cards need no special
+message: the server discovers them from a watch update and sends a regular
+`connect` spawn.
 
 ## 7. App connection
 

@@ -113,7 +113,7 @@
       </div>
     </div>
     <!-- Card rack block, below the plain readers. One rack holds many cards. -->
-    <RackList :rack="rack" />
+    <RackList :rack="rack" @link="linkMode" />
     <SmartCardList
       ref="cardlist"
       :cards="state.cards"

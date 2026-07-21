@@ -47,9 +47,36 @@
           slot {{ card.slot }}
         </q-chip>
         <div class="col q-ml-sm">
-          <div v-if="card.name" class="text-weight-medium">{{ card.name }}</div>
-          <div v-if="card.card_number" class="text-grey-8">{{ card.card_number }}</div>
-          <div v-else class="text-grey-6">card present</div>
+          <!-- configured card: name + number, like a card in a plain reader -->
+          <template v-if="card.card_number">
+            <div v-if="card.name" class="text-weight-medium">{{ card.name }}</div>
+            <div class="text-grey-8">{{ card.card_number }}</div>
+          </template>
+          <!-- unconfigured card: same presentation as an unknown card in a reader -->
+          <template v-else>
+            <div class="text-weight-medium">UNKNOWN CARD</div>
+            <q-chip
+              v-if="card.iccid"
+              dense
+              size="sm"
+              color="blue-grey-2"
+              text-color="blue-grey-9"
+              class="text-bold"
+            >
+              ICCID: {{ card.iccid }}
+            </q-chip>
+          </template>
+        </div>
+        <!-- link the unknown card to a configured number, same flow as for readers -->
+        <div v-if="!card.card_number && card.iccid" class="text-grey-8 q-gutter-xs">
+          <q-btn
+            size="12px"
+            flat
+            dense
+            round
+            icon="mdi-link"
+            @click="emit('link', card.iccid)"
+          />
         </div>
       </div>
     </div>
@@ -61,6 +88,10 @@ import type { RackState } from './models'
 
 defineProps<{
   rack: RackState | null
+}>()
+
+const emit = defineEmits<{
+  (e: 'link', iccid: string): void
 }>()
 </script>
 

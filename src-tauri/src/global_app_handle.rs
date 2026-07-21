@@ -135,11 +135,13 @@ pub fn emit_notification_event(event_name: &str, payload: NotificationPayload) {
     }
 }
 
-/// One card currently held in a rack slot, as shown in the UI. Populated once
-/// the server starts reporting cards; empty for now.
+/// One card currently held in a rack slot, as reported by the server's rack
+/// discovery. `card_number`/`name` are `None` when the card's ICCID is not in
+/// the local config — the card is visible in the rack but not served.
 #[derive(Clone, Serialize)]
 pub struct RackCard {
     pub slot: u16,
+    pub iccid: Option<String>,
     pub card_number: Option<String>,
     pub name: Option<String>,
 }
@@ -180,6 +182,32 @@ pub fn rack_emit_event(state: RackState) {
         }
     } else {
         log::warn!("emit 'rack-state' skipped: app handle not set");
+    }
+}
+
+/// Updates the card list of the cached rack state and re-emits it to the frontend.
+/// Called by the rack module as rack-backed card sessions are spawned and closed;
+/// a no-op when no rack state is cached yet (no rack has been reported).
+pub fn rack_update_cards(cards: Vec<RackCard>) {
+    let state = {
+        let mut guard = match LAST_RACK_STATE.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.as_mut() {
+            Some(state) => {
+                state.cards = cards;
+                Some(state.clone())
+            }
+            None => None,
+        }
+    };
+    if let Some(state) = state {
+        if let Some(app_handle) = get_app_handle() {
+            if let Err(e) = app_handle.emit("rack-state", state) {
+                log::error!("emit 'rack-state' (cards update) failed: {:?}", e);
+            }
+        }
     }
 }
 
