@@ -173,12 +173,10 @@ pub fn setup_logging() {
         );
     }
 
-    // Log the application launch. For pre-release builds the version carries
-    // the git commit (`+<hash>`), pinning the exact build; stable versions
-    // are logged clean.
+    // Log the application launch
     log::info!(
         "-== Application is launched ==- (version: {}, log level: {})",
-        env!("TBA_BUILD_VERSION"),
+        env!("CARGO_PKG_VERSION"),
         level_spec
     );
 

@@ -89,6 +89,11 @@ export default defineConfig((/* ctx */) => {
     // Full list of options: https://v2.quasar.dev/quasar-cli-vite/quasar-config-file#devserver
     devServer: {
       // https: true,
+      // Off the beaten path on purpose: 9000 is a popular default (VS Code
+      // port forwarding grabs 127.0.0.1:9000 and silently swallows webview
+      // requests -> white screen in `tauri dev`). Must match `build.devUrl`
+      // in src-tauri/tauri.conf.json.
+      port: 9314,
       open: false, // opens browser window automatically
     },
 

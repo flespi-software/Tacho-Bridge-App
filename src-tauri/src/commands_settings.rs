@@ -16,9 +16,7 @@ const SETTINGS_TOPIC: &str = "settings";
 fn settings_report_payload() -> String {
     serde_json::json!({
         "app_info": {
-            // Pre-release builds carry `+<commit>` build metadata — they are
-            // republished across commits; stable versions stay clean.
-            "version": env!("TBA_BUILD_VERSION"),
+            "version": env!("CARGO_PKG_VERSION"),
             "os": sys_info::os_type().unwrap_or_else(|_| "Unknown".to_string()),
             "os_release": sys_info::os_release().unwrap_or_else(|_| "Unknown".to_string()),
             "arch": std::env::consts::ARCH,
@@ -50,15 +48,7 @@ mod tests {
         let report: serde_json::Value =
             serde_json::from_str(&settings_report_payload()).expect("report must be valid JSON");
         let app_info = &report["app_info"];
-        let version = app_info["version"].as_str().expect("version is a string");
-        // Always rooted in the cargo version; pre-releases must carry the
-        // `+<hash>` build metadata, stable versions must not.
-        assert!(version.starts_with(env!("CARGO_PKG_VERSION")));
-        if env!("CARGO_PKG_VERSION").contains('-') {
-            assert!(version.contains('+'), "pre-release must embed the build hash");
-        } else {
-            assert!(!version.contains('+'), "stable version must stay clean");
-        }
+        assert_eq!(app_info["version"], env!("CARGO_PKG_VERSION"));
         assert!(!app_info["os"].as_str().expect("os is a string").is_empty());
         assert!(!app_info["os_release"].as_str().expect("os_release is a string").is_empty());
         assert!(!app_info["arch"].as_str().expect("arch is a string").is_empty());

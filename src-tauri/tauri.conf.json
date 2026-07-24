@@ -5,7 +5,7 @@
   "identifier": "com.flespi.tba.dev",
   "build": {
     "frontendDist": "../dist/spa",
-    "devUrl": "http://localhost:9000",
+    "devUrl": "http://localhost:9314",
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build"
   },
