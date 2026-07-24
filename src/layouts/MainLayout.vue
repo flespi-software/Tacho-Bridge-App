@@ -7,9 +7,6 @@
           Tacho Bridge
         </q-toolbar-title>
 
-        <q-btn flat round :icon="themeIcon" :color="themeColor" size="sm" @click="cycleTheme">
-          <q-tooltip>{{ themeLabel }}</q-tooltip>
-        </q-btn>
         <q-btn
           v-if="!appConnected && serverConfigured"
           flat
@@ -21,15 +18,16 @@
         >
           <q-tooltip>Reconnect</q-tooltip>
         </q-btn>
-        <q-btn
-          flat
-          round
-          :icon="appConnected ? 'mdi-server-network' : 'mdi-server-network-off'"
+        <q-icon
+          :name="appConnected ? 'mdi-server-network' : 'mdi-server-network-off'"
           :color="appConnected ? 'light-green-13' : 'grey-5'"
-          size="sm"
-          @click="configOpen = true"
+          size="20px"
+          class="q-mr-xs"
         >
-          <q-tooltip>{{ appConnected ? 'Connected' : 'Disconnected' }} — Server configuration</q-tooltip>
+          <q-tooltip>{{ appConnected ? 'Connected' : 'Disconnected' }}</q-tooltip>
+        </q-icon>
+        <q-btn flat round icon="mdi-cog" color="grey-4" size="sm" @click="configOpen = true">
+          <q-tooltip>Settings</q-tooltip>
         </q-btn>
         <ServerConfigDialog v-model="configOpen" />
       </q-toolbar>
@@ -68,36 +66,6 @@ async function reconnect() {
   } catch (error) {
     console.error('Reconnect failed:', error)
   }
-}
-
-const themeIcon = computed(() => {
-  if ($q.dark.mode === 'auto') return 'mdi-brightness-auto'
-  return $q.dark.isActive ? 'mdi-weather-night' : 'mdi-white-balance-sunny'
-})
-
-const themeLabel = computed(() => {
-  if ($q.dark.mode === 'auto') return 'Auto'
-  return $q.dark.isActive ? 'Dark' : 'Light'
-})
-
-const themeColor = computed(() => {
-  if ($q.dark.mode === 'auto') return 'grey-5'
-  return $q.dark.isActive ? 'light-blue-3' : 'yellow'
-})
-
-function cycleTheme() {
-  if ($q.dark.mode === false) {
-    $q.dark.set(true)
-  } else if ($q.dark.mode === true) {
-    $q.dark.set('auto')
-  } else {
-    $q.dark.set(false)
-  }
-  // Persist right away: this button is the only theme control, so the choice
-  // must survive a restart without a trip through the server dialog's Save.
-  invoke('update_theme', { theme: themeLabel.value }).catch((error) => {
-    console.error('Failed to persist theme:', error)
-  })
 }
 
 // Registered Tauri listeners. Stored so we can detach them on unmount —
@@ -149,6 +117,27 @@ onMounted(async () => {
           color: 'red',
           position: 'bottom',
           timeout: 999000,
+        })
+      } else if (type === 'update') {
+        // Backend message names the new version; install_update downloads,
+        // verifies the signature, installs and restarts the app.
+        Notify.create({
+          message: message || 'Application update is available.',
+          color: 'primary',
+          position: 'bottom',
+          timeout: 999000,
+          actions: [
+            {
+              label: 'Install & restart',
+              color: 'white',
+              handler: () => {
+                void invoke('install_update').catch((e) => {
+                  console.error('install_update failed:', e)
+                })
+              },
+            },
+            { label: 'Later', color: 'white' },
+          ],
         })
       } else if (type === 'port_busy') {
         // Backend message names the COM port occupied by another application.

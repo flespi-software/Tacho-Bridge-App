@@ -14,7 +14,9 @@
       {
         "title": "tba",
         "width": 620,
-        "height": 400,
+        "height": 550,
+        "minWidth": 620,
+        "minHeight": 400,
         "resizable": true,
         "fullscreen": false
       }
@@ -23,8 +25,20 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ4MzU3RUZDM0FFNEIzNkQKUldSdHMrUTYvSDQxMktrdFFTbzB4NUFzRE4yZVlwUFIreHRpLzBkSHpqeHV5UjIyQlQwOS9RbkEK",
+      "endpoints": [
+        "https://github.com/flespi-software/Tacho-Bridge-App/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis", "app", "dmg", "deb", "rpm", "appimage"],
     "icon": [
       "icons/32x32.png",

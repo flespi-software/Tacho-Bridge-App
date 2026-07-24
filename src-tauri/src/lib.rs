@@ -10,6 +10,7 @@ mod smart_card;         // PCSC module for smart card operations.
 mod apdu_sniffer;       // Passive sniffer for plaintext EF data in proxied APDUs.
 mod global_app_handle;  // Global access to app state and emitters.
 mod com_port;           // Card rack over the COM (serial) port.
+mod updater;            // Self-update from GitHub releases.
 
 // ───── External Crates ─────
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,7 @@ pub fn run() {
         // Must be the first registered plugin. A second instance cannot work
         // anyway (exclusive COM port, duplicate MQTT client_ids kicking each
         // other) — surface the existing window instead of starting one.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             log::warn!("Second instance launch blocked; focusing the existing window.");
             if let Some(window) = app.get_webview_window("main") {
@@ -95,6 +97,12 @@ pub fn run() {
                         async_runtime::spawn(async {
                             com_port::rack_connection().await;
                         });
+
+                        // One-shot update check against the release endpoint.
+                        let updater_handle = front_app_handle.clone();
+                        async_runtime::spawn(async move {
+                            updater::check_for_updates(updater_handle).await;
+                        });
                     }
 
                     // ── Per-(re)load: replay current state to the fresh frontend ──
@@ -133,6 +141,9 @@ pub fn run() {
             config::remove_card,            // remove card from config
             smart_card::manual_sync_cards, // manual sync cards from the frontend
             app_connect::app_connection,     // App connection to the MQTT broker
+            updater::install_update,         // download + install the pending update
+            updater::check_updates_now,      // forced update check from the settings dialog
+            updater::get_changelog,          // bundled CHANGELOG.md for the settings dialog
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

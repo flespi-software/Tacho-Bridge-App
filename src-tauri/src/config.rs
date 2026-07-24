@@ -34,6 +34,10 @@ pub struct ConfigurationFile {
     // user's server host and card list.
     #[serde(default, deserialize_with = "cards_or_empty")]
     cards: HashMap<String, CardConfig>,     // Hashmap of the cards with the CardConfig structure
+    // Update channel: true → the app also offers pre-release (alpha/beta/rc)
+    // builds; false/absent → stable releases only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    beta_updates: Option<bool>,
 }
 
 /// Treats an explicitly empty `cards:` key (YAML null) as an empty map instead
@@ -419,6 +423,7 @@ pub fn update_server_config(
     host: &str,
     ident: &str,
     theme: &str,
+    beta_updates: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Serialize the whole read-modify-write against all other config writers.
     let _guard = config_write_guard();
@@ -432,6 +437,7 @@ pub fn update_server_config(
     config.appearance = Some(AppearanceConfig {
         dark_theme: dark_theme_from_label(theme),
     });
+    config.beta_updates = Some(beta_updates);
 
     save_config(config_path, &config)?;
     load_config_to_cache(&config)?;
@@ -526,8 +532,15 @@ pub async fn remove_card_from_config(
 /// This is a Tauri command: a thin async wrapper so the webview invoke never
 /// runs file I/O on the main thread — the blocking core goes to the blocking pool.
 #[tauri::command]
-pub async fn update_server(app: tauri::AppHandle, host: String, ident: String, theme: String) -> bool {
+pub async fn update_server(
+    app: tauri::AppHandle,
+    host: String,
+    ident: String,
+    theme: String,
+    beta_updates: bool,
+) -> bool {
     let old_host = get_from_cache(CacheSection::Server, "host");
+    let old_beta = get_from_cache(CacheSection::Updates, "beta_updates");
 
     let host_for_task = host.clone();
     let updated = tauri::async_runtime::spawn_blocking(move || {
@@ -539,7 +552,7 @@ pub async fn update_server(app: tauri::AppHandle, host: String, ident: String, t
             }
         };
 
-        match update_server_config(&config_path, &host_for_task, &ident, &theme) {
+        match update_server_config(&config_path, &host_for_task, &ident, &theme, beta_updates) {
             Ok(_) => {
                 log::info!("The server address is updated to '{}'.", host_for_task);
                 true
@@ -568,6 +581,14 @@ pub async fn update_server(app: tauri::AppHandle, host: String, ident: String, t
         // cards migrate via manual_sync_cards, the rack needs an explicit restart.
         if old_host != host {
             crate::com_port::restart_rack_mqtt("server_host_changed");
+        }
+
+        // Channel switched → re-check against the newly selected endpoint.
+        if old_beta != beta_updates.to_string() {
+            let updater_app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::updater::check_for_updates(updater_app).await;
+            });
         }
     }
 
@@ -615,6 +636,7 @@ pub struct CacheConfigData {
     pub server: Option<ServerConfig>,
     pub ident: Option<String>,
     pub appearance: Option<AppearanceConfig>,
+    pub beta_updates: Option<bool>,
 }
 
 lazy_static! {
@@ -665,7 +687,8 @@ pub enum CacheSection {
     Cards,
     Server,
     Ident,
-    Appearance
+    Appearance,
+    Updates,
 }
 
 /// Returns a clone of the CardConfig for the given card number from the runtime cache,
@@ -762,6 +785,9 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
             }
             (None, _) => "".to_string(),
         },
+
+        // "true"/"false"; absent flag reads as "false" (stable channel).
+        CacheSection::Updates => cache.beta_updates.unwrap_or(false).to_string(),
     }
 }
 
@@ -796,6 +822,7 @@ pub fn load_config_to_cache(
         server: config.server.clone(),
         ident: config.ident.clone(),
         appearance: config.appearance.clone(),
+        beta_updates: config.beta_updates,
     };
 
     // trace_cache(&*cache);
@@ -923,6 +950,7 @@ fn generate_default_config() -> ConfigurationFile {
         ident: Some(generate_ident()),
         server: None,
         cards: HashMap::new(),
+        beta_updates: None,
     }
 }
 
@@ -991,6 +1019,7 @@ mod tests {
                 host: "mqtt.example.com:8883".to_string(),
             }),
             cards,
+            beta_updates: None,
         }
     }
 
@@ -1210,6 +1239,10 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     config_app_payload.insert("host", host);
     config_app_payload.insert("ident", ident);
     config_app_payload.insert("dark_theme", appearance);
+    config_app_payload.insert(
+        "beta_updates",
+        get_from_cache(CacheSection::Updates, "beta_updates"),
+    );
 
     // Emit this data as a global event to update fornt-end fields
     if let Err(e) = app.emit("global-config-server", config_app_payload) {

@@ -125,6 +125,7 @@ All notable changes to this project will be documented in this file.
 [fix] Rack COM port no longer stays locked on Windows: a second app instance is blocked (the existing window is focused instead), and the port is explicitly released when the app window is closed.  
 [fix] An empty `cards:` key in config.yaml no longer fails the parse and resets the whole config (wiping the server host and card list).  
 [fix] Rack discovery log lines are emitted once per state change instead of every poll tick; "Access is denied" on port open now logs a hint that another process holds the port.  
+[fix] Reverted commit-hash version metadata and moved dev server to port 9314 (VS Code forwarding hijacked 9000 → white screen in dev).  
 [feature] Changing the server address now reconnects all inserted cards automatically — no need to re-insert them or restart the app.  
 [feature] The UI has been improved. Everything is now smoother, more rounded, and more beautiful.  
 [feature] Support for working with serial devices via the COM port has been added.  

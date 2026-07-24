@@ -8,13 +8,15 @@ The application is designed for use with the flespi platform. Communication with
 
 You can always find the latest release here: [<kbd>↴ DOWNLOAD</kbd>](https://github.com/flespi-software/Tacho-Bridge-App/releases/latest)  
 ### MAC
-- **tba_0.5.8_universal.dmg** _(All architectures machines)_
+- **tba_x.x.x_universal.dmg** _(All architectures machines)_
 
 ### Windows
-- **tba_x.x.x_x64_en-US.msi** _(64-bit Windows machines)_
+- **tba_x.x.x_x64-setup.exe** _(64-bit Windows machines, NSIS installer)_
 
 ### Linux
 - **tba_x.x.x_amd64.AppImage** _(64-bit Linux machines)_
+
+Once installed, the application keeps itself up to date — see [Auto-update](#versioning-releases--auto-update).
 
 ## Specifications
 
@@ -105,6 +107,63 @@ sudo apt install -y pcscd libpcsclite-dev libccid usbutils
 ```
 sudo apt install -y squashfs-tools fuse
 ```
+
+## Versioning, releases & auto-update
+
+The release cycle is fully automated by GitHub Actions — versions are **not**
+managed by hand:
+
+- **Every push bumps the version.** The first CI job increments the trailing
+  number of the version (`0.8.0-alpha.7 → 0.8.0-alpha.8`, stable
+  `0.7.3 → 0.7.4`) across `package.json`, `src-tauri/tauri.conf.json`,
+  `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock`, and pushes that change
+  back to the branch as a bot commit (`ci: version X`). Only the channel word
+  (`alpha`/`beta`/`rc`) and the `major.minor.patch` base are changed manually.
+  After pushing, run `git pull` to pick up the bot commit.
+- **The changelog writes itself.** The same job appends a `CHANGELOG.md`
+  section for the new version from the **commit messages** of the push:
+  subjects starting with `Fixed…`/`Fix…` go under *🛠 Fixes*, everything else
+  under *🆕 Features / Improvements*. Write commit subjects as user-facing
+  sentences — they are shown verbatim in the app's Changelog window
+  (Settings → Changelog).
+- **Every push produces a GitHub release** `v<version>` with signed binaries
+  for all three platforms. Versions containing `-` are marked as pre-releases,
+  so the `releases/latest` link above always points to the newest **stable**
+  build.
+### Auto-update: how it works
+
+The app updates itself using the official
+[`tauri-plugin-updater`](https://v2.tauri.app/plugin/updater/):
+
+1. **Check.** On startup (and on Settings → *Check for updates*) the app
+   fetches a small JSON manifest, `latest.json`, published as a release asset.
+   The manifest carries the release version and, per platform, the download URL
+   and a cryptographic signature of the update package. An update is offered
+   only when the manifest version is semver-greater than the running one.
+2. **Channels.** The endpoint depends on the *Receive pre-release updates*
+   toggle in Settings (off by default):
+   - **stable** — `releases/latest/download/latest.json`: GitHub keeps this
+     URL pointed at the newest **non-prerelease** release, so alphas/betas are
+     never offered;
+   - **pre-release** — the rolling `updater-beta` release, whose `latest.json`
+     is refreshed by CI on **every** build (stable or pre-release).
+3. **Verify.** Every update package is signed in CI with a
+   [minisign](https://jedisct1.github.io/minisign/) private key; the matching
+   public key is compiled into the app (`tauri.conf.json → plugins.updater.pubkey`).
+   A package whose signature does not match is rejected — a compromised
+   download link or repository cannot push a foreign binary to users.
+4. **Install & restart.** After the user clicks *Install & restart* the
+   platform-specific package is downloaded and applied:
+   - **Windows** — the NSIS `-setup.exe` runs in passive (silent) mode;
+   - **macOS** — the `.app` bundle is replaced from the signed
+     `tba.app.tar.gz` (the DMG is only used for the first install);
+   - **Linux** — the AppImage file is swapped in place.
+
+   Before restarting, the app releases the card-rack COM port so the new
+   instance can take it over cleanly.
+
+If the update check fails (no network, no manifest yet), the app simply keeps
+running the current version and retries on the next launch.
 
 ## Icon generating & customizing
 

@@ -13,11 +13,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # On every branch push the last numeric segment of the app version is bumped
+  # (0.8.0-alpha.7 -> 0.8.0-alpha.8; 0.7.3 -> 0.7.4) across package.json,
+  # tauri.conf.json, Cargo.toml and Cargo.lock, and committed back by the bot.
+  # The build jobs then check out that bump commit, so released binaries always
+  # match the committed source. The bot push does not re-trigger the workflow
+  # (pushes made with GITHUB_TOKEN never do). The channel word (alpha/beta/rc)
+  # and major.minor.patch base stay hand-managed.
+  version-bump:
+    name: Bump version (last digit)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.push.outputs.sha }}
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref_name }}
+          # Full history: the changelog generator walks back to the previous
+          # version-bump commit to collect what the push actually changed.
+          fetch-depth: 0
+
+      - name: Bump version in configs
+        id: bump
+        run: |
+          NEW_VERSION=$(node .github/scripts/bump-version.mjs)
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "New version: $NEW_VERSION"
+
+      - name: Generate changelog section
+        run: node .github/scripts/update-changelog.mjs "${{ steps.bump.outputs.version }}"
+
+      - name: Commit and push the bump
+        id: push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock CHANGELOG.md
+          git commit -m "ci: version ${{ steps.bump.outputs.version }}"
+          git push origin "HEAD:${{ github.ref_name }}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   macos-universal:
     name: macOS universal (x86_64 + arm64 DMG)
     runs-on: macos-latest
+    needs: [version-bump]
+    if: ${{ !cancelled() && (needs.version-bump.result == 'success' || needs.version-bump.result == 'skipped') }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version-bump.outputs.sha || github.sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
@@ -46,21 +94,30 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- --target universal-apple-darwin
 
       - name: Upload universal DMG artifact
         uses: actions/upload-artifact@v6
         with:
           name: tba-macos-universal-dmg
-          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
           if-no-files-found: error
           retention-days: 14
 
   windows-amd64:
     name: Windows amd64 (NSIS)
     runs-on: windows-latest
+    needs: [version-bump]
+    if: ${{ !cancelled() && (needs.version-bump.result == 'success' || needs.version-bump.result == 'skipped') }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version-bump.outputs.sha || github.sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
@@ -80,21 +137,30 @@ jobs:
         run: npm ci
 
       - name: Build (Tauri)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build
 
       - name: Upload NSIS artifact
         uses: actions/upload-artifact@v6
         with:
           name: tba-windows-amd64-nsis
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.sig
           if-no-files-found: error
           retention-days: 14
 
   ubuntu-2204-amd64:
     name: Ubuntu 22.04 amd64 (AppImage)
     runs-on: ubuntu-22.04
+    needs: [version-bump]
+    if: ${{ !cancelled() && (needs.version-bump.result == 'success' || needs.version-bump.result == 'skipped') }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version-bump.outputs.sha || github.sha }}
 
       - name: Install system dependencies (Tauri + PCSC + AppImage)
         run: |
@@ -125,24 +191,36 @@ jobs:
         run: npm ci
 
       - name: Build (Tauri)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v6
         with:
           name: tba-ubuntu-2204-amd64-appimage
-          path: src-tauri/target/release/bundle/appimage/*.AppImage
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
           if-no-files-found: error
           retention-days: 14
 
   release:
     name: Publish GitHub release (version from package.json)
-    needs: [macos-universal, windows-amd64, ubuntu-2204-amd64]
+    needs: [version-bump, macos-universal, windows-amd64, ubuntu-2204-amd64]
+    # PR builds are validation only — they must never publish anything.
+    if: ${{ !cancelled() && github.event_name != 'pull_request'
+        && needs.macos-universal.result == 'success'
+        && needs.windows-amd64.result == 'success'
+        && needs.ubuntu-2204-amd64.result == 'success' }}
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version-bump.outputs.sha || github.sha }}
 
       # The release is keyed by the version in package.json, not by git tags:
       # every push republishes the binaries into the `v<version>` release,
@@ -167,16 +245,85 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Updater manifest: version + per-platform artifact URL and minisign
+      # signature. The app polls it via releases/latest/download/latest.json,
+      # so only the latest STABLE release drives auto-updates.
+      - name: Generate latest.json updater manifest
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const version = require('./package.json').version;
+          const dir = 'dist';
+          const files = fs.readdirSync(dir);
+          const find = (re) => {
+            const f = files.find((f) => re.test(f));
+            if (!f) throw new Error(`no artifact matching ${re} in ${dir}: ${files.join(', ')}`);
+            return f;
+          };
+          const sigOf = (f) => fs.readFileSync(path.join(dir, f + '.sig'), 'utf8').trim();
+          const base = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/v${version}`;
+          const entry = (f) => ({ signature: sigOf(f), url: `${base}/${encodeURIComponent(f)}` });
+
+          const mac = entry(find(/\.app\.tar\.gz$/));
+          const platforms = {
+            // One universal bundle serves both mac architectures; the updater
+            // asks for its runtime arch, so all three keys must be present.
+            'darwin-universal': mac,
+            'darwin-x86_64': mac,
+            'darwin-aarch64': mac,
+            'windows-x86_64': entry(find(/-setup\.exe$/)),
+            'linux-x86_64': entry(find(/\.AppImage$/)),
+          };
+          const manifest = { version, pub_date: new Date().toISOString(), platforms };
+          fs.writeFileSync(path.join(dir, 'latest.json'), JSON.stringify(manifest, null, 2));
+          console.log(fs.readFileSync(path.join(dir, 'latest.json'), 'utf8'));
+          EOF
+
+      # Release body = this version's CHANGELOG.md section (written by the
+      # version-bump job), so the release page shows the same grouped
+      # 🛠 Fixes / 🆕 Features notes as the app's changelog window.
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          node -e '
+            const fs = require("fs");
+            const version = process.argv[1];
+            const text = fs.readFileSync("CHANGELOG.md", "utf8");
+            const re = new RegExp(
+              `### \\[${version.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\][^\n]*\n([\\s\\S]*?)(?=\n### \\[|$)`
+            );
+            const m = text.match(re);
+            fs.writeFileSync("release_notes.md", m ? m[1].trim() + "\n" : "");
+          ' "${{ steps.version.outputs.version }}"
+          cat release_notes.md
+
       - name: Create or update release and replace binaries
         uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
-          generate_release_notes: true
+          body_path: release_notes.md
           overwrite_files: true
           files: |
             dist/*.dmg
             dist/*.exe
             dist/*.AppImage
+            dist/*.app.tar.gz
+            dist/latest.json
+          fail_on_unmatched_files: true
+
+      # Rolling pointer for the pre-release update channel: always holds the
+      # manifest of the NEWEST build (stable or pre-release). Stable-channel
+      # clients use releases/latest/download/latest.json instead, which GitHub
+      # keeps pointed at the newest non-prerelease release.
+      - name: Update beta-channel updater manifest
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: updater-beta
+          name: Updater manifest (beta channel)
+          body: Rolling manifest for the pre-release update channel. Do not delete.
+          prerelease: true
+          overwrite_files: true
+          files: dist/latest.json
           fail_on_unmatched_files: true
