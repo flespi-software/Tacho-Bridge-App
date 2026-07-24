@@ -245,6 +245,17 @@ const RACK_ID_PAD: char = '0'; // filler placed between brand and serial
 /// be treated as a supported rack.
 const RACK_BRAND_MARKER: &str = "lisle";
 
+/// Fallback identity for platforms where the OS reports the *driver's* strings
+/// instead of the device's USB descriptors (Windows: manufacturer="FTDI",
+/// product="USB Serial Port (COMx)"), so the string match above can never
+/// succeed. The rack is an FTDI FT-X (vid/pid below) whose EEPROM serial
+/// follows the Lisle scheme `SC<digits>`; together these identify it. The
+/// canonical strings are substituted so the client_id and UI match the other
+/// platforms, where the same hardware reports them via its own descriptors.
+const RACK_FALLBACK_VID: u16 = 0x0403;
+const RACK_FALLBACK_PID: u16 = 0x6015;
+const RACK_FALLBACK_MANUFACTURER: &str = "Lisle Design Ltd";
+
 /// Extracts the brand prefix for the client_id from the manufacturer string:
 /// the first whitespace-separated word, kept to `[0-9A-Z]`, uppercased, and
 /// limited to `RACK_ID_BRAND_LEN` chars. e.g. "Lisle Design Ltd" -> "LISLE".
@@ -413,6 +424,7 @@ fn find_rack() -> Option<RackInfo> {
         }
     }
 
+    // First pass: match by the device's own descriptor strings (macOS/Linux).
     for p in &ports {
         if let SerialPortType::UsbPort(info) = &p.port_type {
             let manufacturer_ok = info
@@ -432,7 +444,135 @@ fn find_rack() -> Option<RackInfo> {
             }
         }
     }
+
+    // Second pass (Windows): the COM node carries the driver's strings, but
+    // the parent USB node still holds the device's real iProduct and clean
+    // EEPROM serial — match by those.
+    #[cfg(windows)]
+    if let Some(rack) = find_rack_by_usb_descriptor(&ports) {
+        return Some(rack);
+    }
+
+    // Last resort: no descriptor strings anywhere — match by the rack's chip
+    // identity plus the Lisle serial scheme, and substitute the canonical
+    // strings so client_id/UI stay identical across platforms.
+    for p in &ports {
+        if let SerialPortType::UsbPort(info) = &p.port_type {
+            if info.vid != RACK_FALLBACK_VID || info.pid != RACK_FALLBACK_PID {
+                continue;
+            }
+            let Some(serial) = info.serial_number.as_deref().and_then(lisle_serial) else {
+                continue;
+            };
+            log::info!(
+                "[RACK] phase=discovery status=fallback_match port={} serial={} reported_serial={:?} \
+                 reported_manufacturer={:?} reason=os_reports_driver_strings",
+                p.port_name,
+                serial,
+                info.serial_number.as_deref().unwrap_or("-"),
+                info.manufacturer.as_deref().unwrap_or("-"),
+            );
+            return Some(RackInfo {
+                port_name: p.port_name.clone(),
+                serial: Some(serial),
+                manufacturer: Some(RACK_FALLBACK_MANUFACTURER.to_string()),
+                product: Some(RACK_PRODUCT.to_string()),
+                vid: info.vid,
+                pid: info.pid,
+            });
+        }
+    }
     None
+}
+
+/// Windows: locate the rack via the parent USB node. The COM node only shows
+/// the FTDI driver's strings ("FTDI" / "USB Serial Port (COMx)"), but Windows
+/// caches the device's own iProduct on the USB node (`BusReportedDeviceDesc`,
+/// surfaced by nusb as `product_string`) along with the clean EEPROM serial —
+/// the same values macOS/Linux read from the descriptors directly, so the
+/// resulting client_id matches across platforms. The device is never opened.
+#[cfg(windows)]
+fn find_rack_by_usb_descriptor(ports: &[serialport::SerialPortInfo]) -> Option<RackInfo> {
+    use nusb::MaybeFuture;
+
+    let devices = match nusb::list_devices().wait() {
+        Ok(devices) => devices,
+        Err(e) => {
+            log::warn!("[RACK] phase=discovery status=usb_enum_failed err={e}");
+            return None;
+        }
+    };
+
+    for dev in devices {
+        if dev.product_string() != Some(RACK_PRODUCT) {
+            continue;
+        }
+        let Some(dev_serial) = dev.serial_number() else {
+            continue;
+        };
+        // Link the USB device to its COM port: same chip identity, and the
+        // port serial is the device serial plus an optional channel letter
+        // appended by the driver ("SC1799" -> "SC1799A").
+        for p in ports {
+            let SerialPortType::UsbPort(info) = &p.port_type else {
+                continue;
+            };
+            let serial_ok = info
+                .serial_number
+                .as_deref()
+                .map(|s| port_serial_belongs_to_device(dev_serial, s))
+                .unwrap_or(false);
+            if info.vid != dev.vendor_id() || info.pid != dev.product_id() || !serial_ok {
+                continue;
+            }
+            log::info!(
+                "[RACK] phase=discovery status=usb_descriptor_match port={} serial={} \
+                 product={:?} vid={:#06x} pid={:#06x}",
+                p.port_name,
+                dev_serial,
+                RACK_PRODUCT,
+                info.vid,
+                info.pid,
+            );
+            return Some(RackInfo {
+                port_name: p.port_name.clone(),
+                serial: Some(dev_serial.to_string()),
+                // iManufacturer is not reachable on Windows without opening
+                // the device; the product string is Lisle's own EEPROM value,
+                // so the canonical manufacturer is substituted for branding.
+                manufacturer: Some(RACK_FALLBACK_MANUFACTURER.to_string()),
+                product: Some(RACK_PRODUCT.to_string()),
+                vid: info.vid,
+                pid: info.pid,
+            });
+        }
+    }
+    None
+}
+
+/// True if a COM port's serial belongs to the USB device with `dev_serial`:
+/// either equal, or the device serial plus a single trailing channel letter
+/// the FTDI driver appends per port ("SC1799" -> "SC1799A").
+#[cfg_attr(not(windows), allow(dead_code))]
+fn port_serial_belongs_to_device(dev_serial: &str, port_serial: &str) -> bool {
+    if dev_serial.is_empty() {
+        return false;
+    }
+    match port_serial.strip_prefix(dev_serial) {
+        Some("") => true,
+        Some(rest) => rest.len() == 1 && rest.as_bytes()[0].is_ascii_uppercase(),
+        None => false,
+    }
+}
+
+/// Checks whether `serial` follows the Lisle scheme — `SC` + digits, optionally
+/// with the trailing channel letter the FTDI Windows driver appends — and
+/// returns it normalized to the descriptor form the same hardware reports on
+/// other platforms (channel letter stripped): "SC1799A" -> "SC1799".
+fn lisle_serial(serial: &str) -> Option<String> {
+    let body = serial.strip_prefix("SC")?;
+    let body = body.strip_suffix('A').unwrap_or(body);
+    (!body.is_empty() && body.bytes().all(|b| b.is_ascii_digit())).then(|| format!("SC{body}"))
 }
 
 /// Try to open the rack's serial port (8N1). Logs success/failure.
@@ -1522,6 +1662,47 @@ mod tests {
     fn rack_product_string_is_set() {
         assert!(!RACK_PRODUCT.is_empty());
         assert!(!RACK_BRAND_MARKER.is_empty());
+    }
+
+    #[test]
+    fn port_serial_linking_allows_optional_channel_letter() {
+        // Exact match (single-port chip without suffix) and driver-suffixed.
+        assert!(port_serial_belongs_to_device("SC1799", "SC1799"));
+        assert!(port_serial_belongs_to_device("SC1799", "SC1799A"));
+        assert!(port_serial_belongs_to_device("SC1799", "SC1799B"));
+        // Different device, longer suffixes, or empty serials do not link.
+        assert!(!port_serial_belongs_to_device("SC1799", "SC1798A"));
+        assert!(!port_serial_belongs_to_device("SC1799", "SC1799AB"));
+        assert!(!port_serial_belongs_to_device("SC1799", "SC17991"));
+        assert!(!port_serial_belongs_to_device("", "A"));
+    }
+
+    #[test]
+    fn lisle_serial_accepts_scheme_and_strips_channel_letter() {
+        // Windows FTDI driver appends the channel letter to the EEPROM serial.
+        assert_eq!(lisle_serial("SC1799A"), Some("SC1799".to_string()));
+        // Descriptor form (macOS/Linux) passes through unchanged.
+        assert_eq!(lisle_serial("SC1799"), Some("SC1799".to_string()));
+        // FTDI factory-default serials and other schemes are rejected.
+        assert_eq!(lisle_serial("A5XK3RJT"), None);
+        assert_eq!(lisle_serial("SC"), None);
+        assert_eq!(lisle_serial("SCA"), None);
+        assert_eq!(lisle_serial("SC17X9"), None);
+        assert_eq!(lisle_serial(""), None);
+    }
+
+    #[test]
+    fn fallback_identity_builds_same_client_id_as_descriptor_match() {
+        // The same physical rack: macOS reports the descriptors, Windows the
+        // driver strings + suffixed serial. Both must yield one client_id.
+        let windows_id = build_client_id(
+            RACK_FALLBACK_MANUFACTURER,
+            lisle_serial("SC1799A").as_deref(),
+        );
+        let macos_id = build_client_id("Lisle Design Ltd", Some("SC1799"));
+        assert_eq!(windows_id, macos_id);
+        assert_eq!(windows_id, "LISLE00000SC1799");
+        assert!(matches_server_contract(&windows_id));
     }
 
     #[test]

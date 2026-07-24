@@ -49,7 +49,7 @@ jobs:
         run: npm run tauri build -- --target universal-apple-darwin
 
       - name: Upload universal DMG artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: tba-macos-universal-dmg
           path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
@@ -83,7 +83,7 @@ jobs:
         run: npm run tauri build
 
       - name: Upload NSIS artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: tba-windows-amd64-nsis
           path: src-tauri/target/release/bundle/nsis/*.exe
@@ -128,7 +128,7 @@ jobs:
         run: npm run tauri build
 
       - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: tba-ubuntu-2204-amd64-appimage
           path: src-tauri/target/release/bundle/appimage/*.AppImage
@@ -155,13 +155,13 @@ jobs:
           fi
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - name: Create release and attach binaries
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}

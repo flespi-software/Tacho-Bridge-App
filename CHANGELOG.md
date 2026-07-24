@@ -121,6 +121,7 @@ All notable changes to this project will be documented in this file.
 [fix] Disconnected card readers are now removed from the UI — a reader renamed by the OS after sleep/wake no longer leaves a stale duplicate row behind.  
 [fix] Logs are now compact and readable: one line per connection event instead of three, correct severity levels, 50 MB rotation, and a TBA_LOG environment variable for per-module debug verbosity.  
 [fix] Card reset after an authentication session no longer lets PC/SC silently renegotiate the communication protocol — the card is reconnected with the same T protocol it was opened with.  
+[fix] Fixed ci/cd action runner configuration for building applications.  
 [feature] Changing the server address now reconnects all inserted cards automatically — no need to re-insert them or restart the app.  
 [feature] The UI has been improved. Everything is now smoother, more rounded, and more beautiful.  
 [feature] Support for working with serial devices via the COM port has been added.  

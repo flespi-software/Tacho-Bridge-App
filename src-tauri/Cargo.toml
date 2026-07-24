@@ -42,3 +42,10 @@ once_cell = "1.21.3"
 tokio-serial = "5.4.5"
 serialport = "4.8.1"
 
+# Windows only: the serial-port layer there reports the FTDI driver's strings,
+# not the device's own USB descriptors. nusb reads the real iProduct/serial
+# from the parent USB node (no device open, no extra drivers) so the rack can
+# be identified by the strings Lisle programs into the chip EEPROM.
+[target.'cfg(windows)'.dependencies]
+nusb = "0.2.5"
+
