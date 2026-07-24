@@ -29,7 +29,21 @@ pub struct ConfigurationFile {
     appearance: Option<AppearanceConfig>,   // Optional UI configuration settings.
     ident: Option<String>,                  // Optional ident for the application.
     server: Option<ServerConfig>,           // Optional server configuration settings.
+    // `default` keeps a missing or empty `cards:` key (YAML null) from failing
+    // the whole config parse — a parse failure resets the file and wipes the
+    // user's server host and card list.
+    #[serde(default, deserialize_with = "cards_or_empty")]
     cards: HashMap<String, CardConfig>,     // Hashmap of the cards with the CardConfig structure
+}
+
+/// Treats an explicitly empty `cards:` key (YAML null) as an empty map instead
+/// of a type error, so a hand-emptied section can't nuke the whole config.
+fn cards_or_empty<'de, D>(deserializer: D) -> Result<HashMap<String, CardConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let maybe: Option<HashMap<String, CardConfig>> = Option::deserialize(deserializer)?;
+    Ok(maybe.unwrap_or_default())
 }
 
 // Server Configuration structure, part of ConfigurationFile that contains data about the server.
@@ -919,6 +933,22 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn empty_or_missing_cards_key_does_not_fail_parse() {
+        // An empty `cards:` key is YAML null — before `cards_or_empty` this
+        // failed the whole parse and reset the config, wiping host and cards.
+        let with_null_cards = "name: tba\nversion: 1.0.0\ndescription: d\nserver:\n  host: example.com:1883\ncards:\n";
+        let parsed: ConfigurationFile =
+            serde_yaml::from_str(with_null_cards).expect("null cards must parse");
+        assert!(parsed.cards.is_empty());
+        assert_eq!(parsed.server.unwrap().host, "example.com:1883");
+
+        let without_cards = "name: tba\nversion: 1.0.0\ndescription: d\n";
+        let parsed: ConfigurationFile =
+            serde_yaml::from_str(without_cards).expect("missing cards must parse");
+        assert!(parsed.cards.is_empty());
+    }
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let pid = std::process::id();

@@ -209,6 +209,11 @@ fn next_reconnect_delay(current: u64) -> u64 {
 /// spawn duplicate monitors.
 static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Set when the app is closing: stops the presence monitor from re-opening the
+/// serial port after `shutdown()` released it (its self-heal branch would grab
+/// the port again within one poll tick).
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
 lazy_static::lazy_static! {
     /// Handle to the rack's MQTT task, if one is running. Started when the rack
     /// connects and aborted when it disconnects, so there is at most one rack
@@ -369,6 +374,22 @@ fn inventory_changed(snapshot: &str) -> bool {
     }
 }
 
+/// Same log-on-change guard for the discovery-match outcome: `find_rack` runs
+/// every poll tick, so match log lines must fire once per state change, not
+/// every 2 seconds while the rack stays plugged in.
+static LAST_MATCH_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Store the match key and report whether it differs from the previous one.
+fn match_changed(key: &str) -> bool {
+    let mut last = LAST_MATCH_KEY.lock().unwrap();
+    if *last == key {
+        false
+    } else {
+        key.clone_into(&mut last);
+        true
+    }
+}
+
 /// One-line description of an enumerated port for the inventory log. USB ports
 /// carry the metadata `find_rack` matches on; other transports just get their
 /// kind, so field reports show why a device was not considered a rack.
@@ -433,6 +454,7 @@ fn find_rack() -> Option<RackInfo> {
                 .map(|m| m.to_ascii_lowercase().contains(RACK_BRAND_MARKER))
                 .unwrap_or(false);
             if manufacturer_ok && info.product.as_deref() == Some(RACK_PRODUCT) {
+                match_changed(&format!("descriptor:{}", p.port_name));
                 return Some(RackInfo {
                     port_name: p.port_name.clone(),
                     serial: info.serial_number.clone(),
@@ -464,14 +486,16 @@ fn find_rack() -> Option<RackInfo> {
             let Some(serial) = info.serial_number.as_deref().and_then(lisle_serial) else {
                 continue;
             };
-            log::info!(
-                "[RACK] phase=discovery status=fallback_match port={} serial={} reported_serial={:?} \
-                 reported_manufacturer={:?} reason=os_reports_driver_strings",
-                p.port_name,
-                serial,
-                info.serial_number.as_deref().unwrap_or("-"),
-                info.manufacturer.as_deref().unwrap_or("-"),
-            );
+            if match_changed(&format!("chip:{}:{}", p.port_name, serial)) {
+                log::info!(
+                    "[RACK] phase=discovery status=fallback_match port={} serial={} reported_serial={:?} \
+                     reported_manufacturer={:?} reason=os_reports_driver_strings",
+                    p.port_name,
+                    serial,
+                    info.serial_number.as_deref().unwrap_or("-"),
+                    info.manufacturer.as_deref().unwrap_or("-"),
+                );
+            }
             return Some(RackInfo {
                 port_name: p.port_name.clone(),
                 serial: Some(serial),
@@ -482,6 +506,8 @@ fn find_rack() -> Option<RackInfo> {
             });
         }
     }
+    // Reset the match key so the next appearance of a rack is logged again.
+    match_changed("none");
     None
 }
 
@@ -525,15 +551,17 @@ fn find_rack_by_usb_descriptor(ports: &[serialport::SerialPortInfo]) -> Option<R
             if info.vid != dev.vendor_id() || info.pid != dev.product_id() || !serial_ok {
                 continue;
             }
-            log::info!(
-                "[RACK] phase=discovery status=usb_descriptor_match port={} serial={} \
-                 product={:?} vid={:#06x} pid={:#06x}",
-                p.port_name,
-                dev_serial,
-                RACK_PRODUCT,
-                info.vid,
-                info.pid,
-            );
+            if match_changed(&format!("usb:{}:{dev_serial}", p.port_name)) {
+                log::info!(
+                    "[RACK] phase=discovery status=usb_descriptor_match port={} serial={} \
+                     product={:?} vid={:#06x} pid={:#06x}",
+                    p.port_name,
+                    dev_serial,
+                    RACK_PRODUCT,
+                    info.vid,
+                    info.pid,
+                );
+            }
             return Some(RackInfo {
                 port_name: p.port_name.clone(),
                 serial: Some(dev_serial.to_string()),
@@ -593,10 +621,20 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
             Some(port)
         }
         Err(e) => {
+            // Access denied on Windows almost always means another process
+            // holds the port exclusively — most commonly a second TBA
+            // instance, or vendor software talking to the rack.
+            let hint = if matches!(e.kind, serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied))
+            {
+                " hint=port_held_by_another_process(second_TBA_instance_or_vendor_software?)"
+            } else {
+                ""
+            };
             log::error!(
-                "[RACK] phase=open status=failed port={} err={}",
+                "[RACK] phase=open status=failed port={} err={}{}",
                 rack.port_name,
-                e
+                e,
+                hint
             );
             None
         }
@@ -1503,6 +1541,16 @@ pub fn restart_rack_mqtt(reason: &str) {
     stop_rack_mqtt();
 }
 
+/// Releases the serial port and stops all rack tasks. Called when the app is
+/// closing: the process may linger briefly (WebView children, blocking PC/SC
+/// thread), and an undisposed COM handle makes a relaunched instance fail with
+/// "Access is denied" until the old process fully dies.
+pub fn shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    stop_rack_mqtt();
+    log::info!("[RACK] phase=shutdown status=port_released");
+}
+
 /// Stops the rack's MQTT task if one is running, along with every rack-backed
 /// card session — without the rack there is no transport to those cards.
 fn stop_rack_mqtt() {
@@ -1597,6 +1645,10 @@ pub async fn rack_connection() {
     let mut current: Option<RackInfo> = None;
 
     loop {
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            log::info!("[RACK] phase=rack_connection status=stopped reason=app_shutdown");
+            return;
+        }
         let found = find_rack();
 
         match (&current, found) {

@@ -136,8 +136,7 @@ jobs:
           retention-days: 14
 
   release:
-    name: Publish GitHub release (on v* tag)
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Publish GitHub release (version from package.json)
     needs: [macos-universal, windows-amd64, ubuntu-2204-amd64]
     runs-on: ubuntu-22.04
     permissions:
@@ -145,13 +144,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Verify tag matches package.json version
+      # The release is keyed by the version in package.json, not by git tags:
+      # every push republishes the binaries into the `v<version>` release,
+      # replacing same-name assets. Bump the version to start a new release.
+      - name: Resolve release version
+        id: version
         run: |
           PKG_VERSION=$(node -p "require('./package.json').version")
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
-            exit 1
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          # Pushing a v* tag that disagrees with package.json is a mistake.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+              exit 1
+            fi
           fi
 
       - name: Download all build artifacts
@@ -160,13 +167,14 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Create release and attach binaries
+      - name: Create or update release and replace binaries
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           generate_release_notes: true
+          overwrite_files: true
           files: |
             dist/*.dmg
             dist/*.exe

@@ -23,6 +23,17 @@ static BACKEND_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub fn run() {
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
     tauri::Builder::default()
+        // Must be the first registered plugin. A second instance cannot work
+        // anyway (exclusive COM port, duplicate MQTT client_ids kicking each
+        // other) — surface the existing window instead of starting one.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            log::warn!("Second instance launch blocked; focusing the existing window.");
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(move |app| {
             // Obtain a lightweight reference to the app for convenient interaction
             let app_handle = app.app_handle();
@@ -102,9 +113,12 @@ pub fn run() {
                     global_app_handle::emit_current_rack_state();
                 });
 
-                // Handle the application close event to log this.
+                // Handle the application close event: release the rack's COM
+                // port before the process winds down — a lingering handle
+                // keeps the port "Access is denied" for the next launch.
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { .. } = event {
+                        com_port::shutdown();
                         log::info!("-== Application is closed by user ==-\n");
                     }
                 });
