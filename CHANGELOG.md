@@ -223,3 +223,9 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Refactored recent additions: unified the change-guard mechanics in rack discovery, simplified theme handling in the settings dialog, and moved release-notes extraction into a standalone CI script.
+
+### [0.8.0-alpha.10] - 2026-07-24
+
+🛠 Fixes
+
+- Fixed the manual update check ignoring the on-screen channel toggle before Save, and made a channel without a published manifest report calmly instead of as an error.
