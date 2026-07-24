@@ -135,3 +135,4 @@ All notable changes to this project will be documented in this file.
 [feature] Added communication_protocol.md describing the TBA <-> server communication protocol.  
 [feature] The app connection now publishes a one-shot settings report (application version, OS, architecture) to the server right after connecting — visible on the server as a read-only device setting.  
 [feature] The server can now request the card T protocol (T0/T1) per session: an optional "protocol" field in the session-start command reconnects the card with the requested protocol, and the reply reports the protocol actually in use next to the ATR. Mid-session protocol changes are ignored to protect the authentication state.  
+[feature] When the card rack is detected but its COM port is held by another application (e.g. other tachograph software), the app now shows a notification naming the busy port instead of silently retrying.  
