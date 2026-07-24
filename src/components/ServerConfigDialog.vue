@@ -47,7 +47,7 @@
       <q-card-section class="q-py-sm">
         <div class="text-subtitle2 text-grey-7 q-mb-sm">Appearance</div>
         <q-btn-toggle
-          v-model="themeMode"
+          :model-value="themeMode"
           dense
           unelevated
           toggle-color="primary"
@@ -56,6 +56,7 @@
             { label: 'Light', value: 'Light', icon: 'mdi-white-balance-sunny' },
             { label: 'Dark', value: 'Dark', icon: 'mdi-weather-night' },
           ]"
+          @update:model-value="onThemeSelected"
         />
       </q-card-section>
 
@@ -144,7 +145,7 @@
 
 <script setup lang="ts">
 import { useQuasar, Notify } from 'quasar'
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
@@ -177,22 +178,19 @@ const betaUpdates = ref(false)
 
 const $q = useQuasar()
 
-// Theme selector. Applies immediately (like the old header button did) and is
-// also persisted right away, so it does not depend on pressing Save.
-const themeMode = ref<'Auto' | 'Light' | 'Dark'>('Auto')
-let syncingTheme = false
-watch(themeMode, (mode) => {
-  if (syncingTheme) return
+// Theme selector. Applies and persists immediately on a user's choice (like
+// the old header button did). Persistence hangs off the control's update
+// event — not a watcher — so seeding the ref from the config on mount cannot
+// trigger a redundant re-persist.
+type ThemeMode = 'Auto' | 'Light' | 'Dark'
+const themeMode = ref<ThemeMode>('Auto')
+function onThemeSelected(mode: ThemeMode) {
+  themeMode.value = mode
   if (mode === 'Auto') $q.dark.set('auto')
   else $q.dark.set(mode === 'Dark')
   invoke('update_theme', { theme: mode }).catch((error) => {
     console.error('Failed to persist theme:', error)
   })
-})
-
-function currentThemeLabel(): string {
-  if ($q.dark.mode === 'auto') return 'Auto'
-  return $q.dark.isActive ? 'Dark' : 'Light'
 }
 
 // Forced update check. An available update raises the standard `update`
@@ -252,7 +250,7 @@ const openChangelog = async () => {
 }
 
 const saveServerConfig = async () => {
-  const theme = currentThemeLabel()
+  const theme = themeMode.value
   console.log(`server_address: ${hostValue.value}, ident: ${identInput.value}, theme: ${theme}`)
 
   try {
@@ -308,10 +306,8 @@ onMounted(async () => {
       identInput.value = payload.ident
       betaUpdates.value = payload.beta_updates === 'true'
       if (payload.dark_theme === 'Auto' || payload.dark_theme === 'Light' || payload.dark_theme === 'Dark') {
-        // Reflect the persisted mode without re-persisting it.
-        syncingTheme = true
+        // Reflect the persisted mode; no watcher, so nothing re-persists.
         themeMode.value = payload.dark_theme
-        void Promise.resolve().then(() => (syncingTheme = false))
       }
     })
     unlistenFns.push(unlisten)

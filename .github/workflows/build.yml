@@ -292,18 +292,7 @@ jobs:
       # version-bump job), so the release page shows the same grouped
       # 🛠 Fixes / 🆕 Features notes as the app's changelog window.
       - name: Extract release notes from CHANGELOG.md
-        run: |
-          node -e '
-            const fs = require("fs");
-            const version = process.argv[1];
-            const text = fs.readFileSync("CHANGELOG.md", "utf8");
-            const re = new RegExp(
-              `### \\[${version.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}\\][^\n]*\n([\\s\\S]*?)(?=\n### \\[|$)`
-            );
-            const m = text.match(re);
-            fs.writeFileSync("release_notes.md", m ? m[1].trim() + "\n" : "");
-          ' "${{ steps.version.outputs.version }}"
-          cat release_notes.md
+        run: node .github/scripts/extract-release-notes.mjs "${{ steps.version.outputs.version }}" release_notes.md
 
       - name: Create or update release and replace binaries
         uses: softprops/action-gh-release@v3

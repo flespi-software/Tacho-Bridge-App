@@ -362,42 +362,43 @@ impl RackInfo {
     }
 }
 
-/// Remembers the last logged port-inventory snapshot so the poll loop logs
-/// the port list only when it actually changes, not on every tick.
-static LAST_PORT_INVENTORY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// "Once per state change" guard for the 2s poll loop: remembers the last
+/// seen value and reports whether a new one differs. Used to keep periodic
+/// discovery from logging/notifying the same fact on every tick.
+struct ChangeGuard(std::sync::Mutex<String>);
 
-/// Store `snapshot` and report whether it differs from the previous one.
-fn inventory_changed(snapshot: &str) -> bool {
-    let mut last = LAST_PORT_INVENTORY.lock().unwrap();
-    if *last == snapshot {
-        false
-    } else {
-        snapshot.clone_into(&mut last);
-        true
+impl ChangeGuard {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(String::new()))
+    }
+
+    /// Store `value` and report whether it differs from the previous one.
+    fn changed(&self, value: &str) -> bool {
+        let mut last = self.0.lock().unwrap();
+        if *last == value {
+            false
+        } else {
+            value.clone_into(&mut last);
+            true
+        }
+    }
+
+    /// Forget the stored value so the next `changed` reports true again.
+    fn reset(&self) {
+        self.0.lock().unwrap().clear();
     }
 }
 
-/// Port for which the "COM port busy" UI notification has already been shown,
-/// so the 2s open-retry loop doesn't re-toast the user every tick. Cleared
-/// when the port opens or the rack disappears, so a new busy episode (e.g.
-/// after replug) notifies again.
-static BUSY_NOTIFIED_PORT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Last logged port-inventory snapshot.
+static PORT_INVENTORY: ChangeGuard = ChangeGuard::new();
 
-/// Same log-on-change guard for the discovery-match outcome: `find_rack` runs
-/// every poll tick, so match log lines must fire once per state change, not
-/// every 2 seconds while the rack stays plugged in.
-static LAST_MATCH_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// Last logged discovery-match outcome.
+static DISCOVERY_MATCH: ChangeGuard = ChangeGuard::new();
 
-/// Store the match key and report whether it differs from the previous one.
-fn match_changed(key: &str) -> bool {
-    let mut last = LAST_MATCH_KEY.lock().unwrap();
-    if *last == key {
-        false
-    } else {
-        key.clone_into(&mut last);
-        true
-    }
-}
+/// Port for which the "COM port busy" UI notification has already been shown.
+/// Reset when the port opens or the rack disappears, so a new busy episode
+/// (e.g. after replug) notifies again.
+static BUSY_PORT_NOTICE: ChangeGuard = ChangeGuard::new();
 
 /// One-line description of an enumerated port for the inventory log. USB ports
 /// carry the metadata `find_rack` matches on; other transports just get their
@@ -427,7 +428,7 @@ fn find_rack() -> Option<RackInfo> {
         Ok(ports) => ports,
         Err(e) => {
             let snapshot = format!("enumeration_failed: {e}");
-            if inventory_changed(&snapshot) {
+            if PORT_INVENTORY.changed(&snapshot) {
                 log::error!("[RACK] phase=discovery status=enumeration_failed err={e}");
             }
             return None;
@@ -442,7 +443,7 @@ fn find_rack() -> Option<RackInfo> {
         .map(describe_port)
         .collect::<Vec<_>>()
         .join(" ");
-    if inventory_changed(&snapshot) {
+    if PORT_INVENTORY.changed(&snapshot) {
         if ports.is_empty() {
             log::info!("[RACK] phase=discovery status=inventory ports=0");
         } else {
@@ -463,7 +464,7 @@ fn find_rack() -> Option<RackInfo> {
                 .map(|m| m.to_ascii_lowercase().contains(RACK_BRAND_MARKER))
                 .unwrap_or(false);
             if manufacturer_ok && info.product.as_deref() == Some(RACK_PRODUCT) {
-                match_changed(&format!("descriptor:{}", p.port_name));
+                DISCOVERY_MATCH.changed(&format!("descriptor:{}", p.port_name));
                 return Some(RackInfo {
                     port_name: p.port_name.clone(),
                     serial: info.serial_number.clone(),
@@ -495,7 +496,7 @@ fn find_rack() -> Option<RackInfo> {
             let Some(serial) = info.serial_number.as_deref().and_then(lisle_serial) else {
                 continue;
             };
-            if match_changed(&format!("chip:{}:{}", p.port_name, serial)) {
+            if DISCOVERY_MATCH.changed(&format!("chip:{}:{}", p.port_name, serial)) {
                 log::info!(
                     "[RACK] phase=discovery status=fallback_match port={} serial={} reported_serial={:?} \
                      reported_manufacturer={:?} reason=os_reports_driver_strings",
@@ -517,8 +518,8 @@ fn find_rack() -> Option<RackInfo> {
     }
     // Reset the change guards so the next appearance of a rack is logged and,
     // if its port is still busy, re-notifies the user.
-    match_changed("none");
-    BUSY_NOTIFIED_PORT.lock().unwrap().clear();
+    DISCOVERY_MATCH.changed("none");
+    BUSY_PORT_NOTICE.reset();
     None
 }
 
@@ -562,7 +563,7 @@ fn find_rack_by_usb_descriptor(ports: &[serialport::SerialPortInfo]) -> Option<R
             if info.vid != dev.vendor_id() || info.pid != dev.product_id() || !serial_ok {
                 continue;
             }
-            if match_changed(&format!("usb:{}:{dev_serial}", p.port_name)) {
+            if DISCOVERY_MATCH.changed(&format!("usb:{}:{dev_serial}", p.port_name)) {
                 log::info!(
                     "[RACK] phase=discovery status=usb_descriptor_match port={} serial={} \
                      product={:?} vid={:#06x} pid={:#06x}",
@@ -629,7 +630,7 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
                 rack.port_name,
                 BAUD
             );
-            BUSY_NOTIFIED_PORT.lock().unwrap().clear();
+            BUSY_PORT_NOTICE.reset();
             Some(port)
         }
         Err(e) => {
@@ -661,11 +662,9 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
 
 /// Emits the "COM port busy" UI notification once per busy episode.
 fn notify_port_busy(port_name: &str) {
-    let mut notified = BUSY_NOTIFIED_PORT.lock().unwrap();
-    if *notified == port_name {
+    if !BUSY_PORT_NOTICE.changed(port_name) {
         return;
     }
-    port_name.clone_into(&mut notified);
     emit_notification_event(
         "global-notification",
         NotificationPayload {
