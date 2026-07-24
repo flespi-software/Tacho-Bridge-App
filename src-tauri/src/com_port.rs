@@ -343,11 +343,75 @@ impl RackInfo {
     }
 }
 
+/// Remembers the last logged port-inventory snapshot so the poll loop logs
+/// the port list only when it actually changes, not on every tick.
+static LAST_PORT_INVENTORY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Store `snapshot` and report whether it differs from the previous one.
+fn inventory_changed(snapshot: &str) -> bool {
+    let mut last = LAST_PORT_INVENTORY.lock().unwrap();
+    if *last == snapshot {
+        false
+    } else {
+        snapshot.clone_into(&mut last);
+        true
+    }
+}
+
+/// One-line description of an enumerated port for the inventory log. USB ports
+/// carry the metadata `find_rack` matches on; other transports just get their
+/// kind, so field reports show why a device was not considered a rack.
+fn describe_port(p: &serialport::SerialPortInfo) -> String {
+    match &p.port_type {
+        SerialPortType::UsbPort(info) => format!(
+            "{{port={} type=usb vid={:#06x} pid={:#06x} manufacturer={:?} product={:?} serial={:?}}}",
+            p.port_name,
+            info.vid,
+            info.pid,
+            info.manufacturer.as_deref().unwrap_or("-"),
+            info.product.as_deref().unwrap_or("-"),
+            info.serial_number.as_deref().unwrap_or("-"),
+        ),
+        SerialPortType::PciPort => format!("{{port={} type=pci}}", p.port_name),
+        SerialPortType::BluetoothPort => format!("{{port={} type=bluetooth}}", p.port_name),
+        SerialPortType::Unknown => format!("{{port={} type=unknown}}", p.port_name),
+    }
+}
+
 /// Find a candidate rack: a USB device whose product matches and whose
 /// manufacturer contains the brand marker (case-insensitive). vid/pid are
 /// recorded for logging but never used as match criteria.
 fn find_rack() -> Option<RackInfo> {
-    let ports = serialport::available_ports().ok()?;
+    let ports = match serialport::available_ports() {
+        Ok(ports) => ports,
+        Err(e) => {
+            let snapshot = format!("enumeration_failed: {e}");
+            if inventory_changed(&snapshot) {
+                log::error!("[RACK] phase=discovery status=enumeration_failed err={e}");
+            }
+            return None;
+        }
+    };
+
+    // Diagnostic for "rack not found" field reports: shows whether a COM port
+    // exists at all and what strings the OS reports for it (on Windows the
+    // driver, not the device, supplies manufacturer/product).
+    let snapshot = ports
+        .iter()
+        .map(describe_port)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if inventory_changed(&snapshot) {
+        if ports.is_empty() {
+            log::info!("[RACK] phase=discovery status=inventory ports=0");
+        } else {
+            log::info!(
+                "[RACK] phase=discovery status=inventory ports={} list=[{}]",
+                ports.len(),
+                snapshot
+            );
+        }
+    }
 
     for p in &ports {
         if let SerialPortType::UsbPort(info) = &p.port_type {
