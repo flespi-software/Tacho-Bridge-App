@@ -150,6 +150,14 @@ onMounted(async () => {
           position: 'bottom',
           timeout: 999000,
         })
+      } else if (type === 'port_busy') {
+        // Backend message names the COM port occupied by another application.
+        Notify.create({
+          message: message || 'The card rack COM port is busy by another application.',
+          color: 'orange',
+          position: 'bottom',
+          timeout: 999000,
+        })
       } else if (type === 'version') {
         // Use the backend-provided message verbatim — it contains the new
         // version string and the download URL.

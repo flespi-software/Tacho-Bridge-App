@@ -34,7 +34,10 @@ use tokio::sync::Mutex as AsyncMutex;
 
 // ───── Local Modules ─────
 use crate::config::{get_from_cache, split_host_to_parts, CacheSection};
-use crate::global_app_handle::{rack_emit_event, rack_update_cards, RackCard, RackState};
+use crate::global_app_handle::{
+    emit_notification_event, rack_emit_event, rack_update_cards, NotificationPayload, RackCard,
+    RackState,
+};
 use crate::smart_card::TASK_POOL;
 
 /// The open serial port to the rack, shared between the monitor (which opens it)
@@ -374,6 +377,12 @@ fn inventory_changed(snapshot: &str) -> bool {
     }
 }
 
+/// Port for which the "COM port busy" UI notification has already been shown,
+/// so the 2s open-retry loop doesn't re-toast the user every tick. Cleared
+/// when the port opens or the rack disappears, so a new busy episode (e.g.
+/// after replug) notifies again.
+static BUSY_NOTIFIED_PORT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 /// Same log-on-change guard for the discovery-match outcome: `find_rack` runs
 /// every poll tick, so match log lines must fire once per state change, not
 /// every 2 seconds while the rack stays plugged in.
@@ -506,8 +515,10 @@ fn find_rack() -> Option<RackInfo> {
             });
         }
     }
-    // Reset the match key so the next appearance of a rack is logged again.
+    // Reset the change guards so the next appearance of a rack is logged and,
+    // if its port is still busy, re-notifies the user.
     match_changed("none");
+    BUSY_NOTIFIED_PORT.lock().unwrap().clear();
     None
 }
 
@@ -618,15 +629,19 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
                 rack.port_name,
                 BAUD
             );
+            BUSY_NOTIFIED_PORT.lock().unwrap().clear();
             Some(port)
         }
         Err(e) => {
             // Access denied on Windows almost always means another process
-            // holds the port exclusively — most commonly a second TBA
-            // instance, or vendor software talking to the rack.
-            let hint = if matches!(e.kind, serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied))
-            {
-                " hint=port_held_by_another_process(second_TBA_instance_or_vendor_software?)"
+            // holds the port exclusively — e.g. other tachograph software
+            // (Teltonika, BCE) that grabs the rack's COM port on startup.
+            let busy = matches!(
+                e.kind,
+                serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied)
+            );
+            let hint = if busy {
+                " hint=port_held_by_another_process(other_tachograph_software_or_second_TBA_instance?)"
             } else {
                 ""
             };
@@ -636,9 +651,32 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
                 e,
                 hint
             );
+            if busy {
+                notify_port_busy(&rack.port_name);
+            }
             None
         }
     }
+}
+
+/// Emits the "COM port busy" UI notification once per busy episode.
+fn notify_port_busy(port_name: &str) {
+    let mut notified = BUSY_NOTIFIED_PORT.lock().unwrap();
+    if *notified == port_name {
+        return;
+    }
+    port_name.clone_into(&mut notified);
+    emit_notification_event(
+        "global-notification",
+        NotificationPayload {
+            notification_type: "port_busy".to_string(),
+            message: format!(
+                "Card rack detected on {port_name}, but the port is busy — another application \
+                 is using it. Close or uninstall the application that occupies the port \
+                 (e.g. other tachograph software), then reconnect the rack."
+            ),
+        },
+    );
 }
 
 /// MQTT event loop for the rack's own connection. Mirrors the app/per-card
