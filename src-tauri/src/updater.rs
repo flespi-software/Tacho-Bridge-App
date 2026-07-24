@@ -37,9 +37,14 @@ pub struct CheckResult {
 /// Runs one check against the channel endpoint. On an available update the
 /// frontend is notified (`update` notification with the Install action) and
 /// the update is parked in `PENDING_UPDATE` for `install_update`.
-async fn perform_check(app: &AppHandle) -> Result<CheckResult, String> {
-    let beta = crate::config::get_from_cache(crate::config::CacheSection::Updates, "beta_updates")
-        == "true";
+/// `beta_override` lets the settings dialog check the channel currently
+/// selected on screen, even before it has been saved; `None` uses the
+/// persisted setting.
+async fn perform_check(app: &AppHandle, beta_override: Option<bool>) -> Result<CheckResult, String> {
+    let beta = beta_override.unwrap_or_else(|| {
+        crate::config::get_from_cache(crate::config::CacheSection::Updates, "beta_updates")
+            == "true"
+    });
 
     let updater = if beta {
         let url = BETA_MANIFEST_URL
@@ -104,15 +109,19 @@ async fn perform_check(app: &AppHandle) -> Result<CheckResult, String> {
 /// Startup / background variant: outcome only matters via logs and the
 /// frontend notification, errors are swallowed.
 pub async fn check_for_updates(app: AppHandle) {
-    let _ = perform_check(&app).await;
+    let _ = perform_check(&app, None).await;
 }
 
 /// Forced check from the settings dialog. Returns the outcome so the dialog
-/// can tell the user "you are up to date" explicitly.
+/// can tell the user "you are up to date" explicitly. The dialog passes its
+/// on-screen channel toggle so the check honors it even before Save.
 #[tauri::command]
-pub async fn check_updates_now(app: AppHandle) -> Result<CheckResult, String> {
+pub async fn check_updates_now(
+    app: AppHandle,
+    beta_updates: Option<bool>,
+) -> Result<CheckResult, String> {
     log::info!("{TAG} phase=check status=manual_trigger");
-    perform_check(&app).await
+    perform_check(&app, beta_updates).await
 }
 
 /// The changelog bundled into this build — the settings dialog renders it.

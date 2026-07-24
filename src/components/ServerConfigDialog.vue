@@ -199,7 +199,10 @@ const checking = ref(false)
 const checkForUpdates = async () => {
   checking.value = true
   try {
-    const result = await invoke<{ status: string; version: string }>('check_updates_now')
+    // Pass the on-screen channel toggle so the check honors it before Save.
+    const result = await invoke<{ status: string; version: string }>('check_updates_now', {
+      betaUpdates: betaUpdates.value,
+    })
     if (result.status === 'up_to_date') {
       Notify.create({
         message: `You are running the latest version (${result.version}).`,
@@ -210,9 +213,15 @@ const checkForUpdates = async () => {
     }
   } catch (error) {
     console.error('Update check failed:', error)
+    // A channel without a published manifest yet (e.g. the stable channel
+    // before the first stable release ships one) is not a scary failure.
+    const raw = String(error)
+    const noManifest = raw.includes('Could not fetch a valid release JSON')
     Notify.create({
-      message: `Update check failed: ${String(error)}`,
-      color: 'red',
+      message: noManifest
+        ? 'No update information is published for this channel yet.'
+        : `Update check failed: ${raw}`,
+      color: noManifest ? 'orange' : 'red',
       position: 'bottom',
       timeout: 5000,
     })
