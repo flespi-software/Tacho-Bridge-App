@@ -202,3 +202,14 @@ All notable changes to this project will be documented in this file.
 - Added CI-managed versioning: every push auto-increments the version across all configs, builds signed installers for all three platforms and publishes the GitHub release automatically.
 - Added automatic changelog generation: the changelog and the release notes are assembled from commit messages on every release.
 - Added a minimum window size and a roomier default window so dialogs no longer feel cramped.
+
+### [0.8.0-alpha.8] - 2026-07-24
+
+🛠 Fixes
+
+- Fixed the release pipeline: updater artifacts uploaded in subdirectories (macOS .app.tar.gz) are now found by the manifest   generator and attached to the release.
+
+🆕 Features / Improvements
+
+- Polished the 0.8.0-alpha.7 changelog [skip ci].
+- Added a bulleted changelog: entries render as a proper list with hanging indents in the app's changelog window, the changelog   file was reformatted into grouped bullet style, and generated sections follow the same format.
