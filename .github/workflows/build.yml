@@ -310,6 +310,10 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}
+          # Pin the tag to the commit that was actually built. Without this the
+          # tag lands on the DEFAULT branch head (master), which dates the
+          # release by an old commit and mis-sorts it in the release list.
+          target_commitish: ${{ needs.version-bump.outputs.sha || github.sha }}
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
           body_path: release_notes.md
           overwrite_files: true
@@ -330,6 +334,7 @@ jobs:
         with:
           tag_name: updater-beta
           name: Updater manifest (beta channel)
+          target_commitish: ${{ needs.version-bump.outputs.sha || github.sha }}
           body: Rolling manifest for the pre-release update channel. Do not delete.
           prerelease: true
           overwrite_files: true
