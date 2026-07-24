@@ -213,3 +213,13 @@ All notable changes to this project will be documented in this file.
 
 - Polished the 0.8.0-alpha.7 changelog [skip ci].
 - Added a bulleted changelog: entries render as a proper list with hanging indents in the app's changelog window, the changelog   file was reformatted into grouped bullet style, and generated sections follow the same format.
+
+### [0.8.0-alpha.9] - 2026-07-24
+
+🛠 Fixes
+
+- Fixed release tags pointing at the default branch head: releases are now tagged on the exact commit that was built, restoring correct dates and ordering in the release list.
+
+🆕 Features / Improvements
+
+- Refactored recent additions: unified the change-guard mechanics in rack discovery, simplified theme handling in the settings dialog, and moved release-notes extraction into a standalone CI script.
