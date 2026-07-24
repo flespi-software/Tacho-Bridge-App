@@ -255,15 +255,23 @@ jobs:
           const path = require('path');
           const version = require('./package.json').version;
           const dir = 'dist';
-          const files = fs.readdirSync(dir);
+          // Recursive: multi-path artifact uploads keep their subdirectories
+          // (e.g. the macOS bundle arrives as dist/macos/tba.app.tar.gz).
+          const walk = (d) =>
+            fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => {
+              const p = path.join(d, e.name);
+              return e.isDirectory() ? walk(p) : [p];
+            });
+          const files = walk(dir);
           const find = (re) => {
             const f = files.find((f) => re.test(f));
             if (!f) throw new Error(`no artifact matching ${re} in ${dir}: ${files.join(', ')}`);
             return f;
           };
-          const sigOf = (f) => fs.readFileSync(path.join(dir, f + '.sig'), 'utf8').trim();
+          const sigOf = (f) => fs.readFileSync(f + '.sig', 'utf8').trim();
           const base = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/v${version}`;
-          const entry = (f) => ({ signature: sigOf(f), url: `${base}/${encodeURIComponent(f)}` });
+          // Release assets are attached flat, so URLs use the basename.
+          const entry = (f) => ({ signature: sigOf(f), url: `${base}/${encodeURIComponent(path.basename(f))}` });
 
           const mac = entry(find(/\.app\.tar\.gz$/));
           const platforms = {
@@ -306,10 +314,10 @@ jobs:
           body_path: release_notes.md
           overwrite_files: true
           files: |
-            dist/*.dmg
-            dist/*.exe
-            dist/*.AppImage
-            dist/*.app.tar.gz
+            dist/**/*.dmg
+            dist/**/*.exe
+            dist/**/*.AppImage
+            dist/**/*.app.tar.gz
             dist/latest.json
           fail_on_unmatched_files: true
 
