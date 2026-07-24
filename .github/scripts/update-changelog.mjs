@@ -36,8 +36,8 @@ const subjects = git(`log ${range} --no-merges --format=%s`)
   .reverse(); // git log is newest-first; the changelog reads chronologically
 
 const ensureDot = (s) => (/[.!?]$/.test(s) ? s : `${s}.`);
-// Two trailing spaces: markdown line break, matches the existing file style.
-const line = (s) => `${ensureDot(s)}  `;
+// Markdown list item, matches the file style (one commit = one bullet).
+const line = (s) => `- ${ensureDot(s)}`;
 
 const fixes = [];
 const features = [];

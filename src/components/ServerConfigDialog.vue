@@ -120,17 +120,22 @@
       <q-card-section class="col q-pt-sm" style="overflow-y: auto">
         <div v-for="section in changelogSections" :key="section.title" class="q-mb-md">
           <div class="text-subtitle2 text-primary">{{ section.title }}</div>
-          <!-- overflow-wrap: long unbreakable strings (URLs in the changelog)
-               must wrap instead of stretching the card sideways. Group
-               headers (🛠 Fixes / 🆕 Features) are set off in bold. -->
-          <div
-            v-for="(line, i) in section.lines"
-            :key="i"
-            :class="/^[🛠🆕]/u.test(line) ? 'text-body2 text-weight-bold q-mt-sm' : 'text-body2 q-ml-sm'"
-            style="overflow-wrap: anywhere"
-          >
-            {{ line }}
-          </div>
+          <!-- Group headers (🛠 Fixes / 🆕 Features) in bold; entries as a
+               bulleted list with a hanging indent so multi-line entries stay
+               visually separated. overflow-wrap: long unbreakable strings
+               (URLs) must wrap instead of stretching the card sideways. -->
+          <template v-for="(item, i) in section.lines" :key="i">
+            <div v-if="/^[🛠🆕]/u.test(item.text)" class="text-body2 text-weight-bold q-mt-sm">
+              {{ item.text }}
+            </div>
+            <div v-else-if="item.bullet" class="row no-wrap q-ml-sm q-mb-xs">
+              <span class="q-mr-sm">•</span>
+              <span class="text-body2" style="overflow-wrap: anywhere">{{ item.text }}</span>
+            </div>
+            <div v-else class="text-body2 q-ml-sm" style="overflow-wrap: anywhere">
+              {{ item.text }}
+            </div>
+          </template>
         </div>
       </q-card-section>
     </q-card>
@@ -220,17 +225,22 @@ const checkForUpdates = async () => {
 
 // Changelog viewer: the file is bundled into the binary at build time.
 const changelogOpen = ref(false)
-const changelogSections = ref<{ title: string; lines: string[] }[]>([])
+type ChangelogLine = { text: string; bullet: boolean }
+const changelogSections = ref<{ title: string; lines: ChangelogLine[] }[]>([])
 const openChangelog = async () => {
   try {
     const text = await invoke<string>('get_changelog')
-    const sections: { title: string; lines: string[] }[] = []
+    const sections: { title: string; lines: ChangelogLine[] }[] = []
     for (const rawLine of text.split('\n')) {
       const line = rawLine.trimEnd()
       if (line.startsWith('### ')) {
         sections.push({ title: line.slice(4), lines: [] })
       } else if (sections.length > 0 && line.trim().length > 0) {
-        sections[sections.length - 1]!.lines.push(line)
+        // `- ` is markdown list syntax; the dialog draws its own bullet dot.
+        sections[sections.length - 1]!.lines.push({
+          text: line.replace(/^-\s+/, ''),
+          bullet: /^-\s/.test(line),
+        })
       }
     }
     // The file is oldest-first; the dialog shows the newest release on top.
