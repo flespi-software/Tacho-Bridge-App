@@ -142,4 +142,9 @@ All notable changes to this project will be documented in this file.
 
 🆕 Features / Improvements
 
-Added application self-update with stable and pre-release channels: cryptographically signed update packages, one-click install-and-restart, a unified settings dialog (server, theme, update channel, forced update check, change log viewer), and CI-managed versioning with automatic changelog generation and release notes from commit messages.  
+- Added application self-update: the app checks GitHub releases on startup or on demand, verifies the cryptographically signed update package (minisign) and installs it in one - click with an automatic restart — NSIS on Windows, .app.tar.gz on macOS, AppImage on Linux.  
+- Added update channels: stable-only by default, with an opt-in "Receive pre-release updates" toggle for alpha/beta builds.  
+- Added a unified settings dialog behind the gear icon: server connection, theme switcher, update channel, forced update check and a built-in changelog viewer.  
+- Added CI-managed versioning: every push auto-increments the version across all configs, builds signed installers for all three platforms and publishes the GitHub release automatically.  
+- Added automatic changelog generation: the changelog and the release notes are assembled from commit messages on every release.  
+- Added a minimum window size and a roomier default window so dialogs no longer feel cramped.  
