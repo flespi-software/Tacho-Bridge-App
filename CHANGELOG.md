@@ -229,3 +229,9 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed the manual update check ignoring the on-screen channel toggle before Save, and made a channel without a published manifest report calmly instead of as an error.
+
+### [0.8.0-alpha.11] - 2026-07-25
+
+🛠 Fixes
+
+- Fixed Windows CI builds failing on a Node/libuv shutdown crash after a successful frontend build: the bundler now verifies fresh build output and continues instead of dying with the process.
