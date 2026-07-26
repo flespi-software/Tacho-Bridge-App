@@ -235,3 +235,9 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed Windows CI builds failing on a Node/libuv shutdown crash after a successful frontend build: the bundler now verifies fresh build output and continues instead of dying with the process.
+
+### [0.8.0-alpha.12] - 2026-07-26
+
+🛠 Fixes
+
+- Fixed authentication over the Lisle rack timing out on large commands: waiting for the rack's first reply byte now uses the command's own deadline, not the inter-byte silence window.
