@@ -44,7 +44,10 @@ use crate::smart_card::TASK_POOL;
 /// and the MQTT task (which writes server commands to it and reads replies).
 type SharedPort = Arc<AsyncMutex<Box<dyn SerialPort>>>;
 
-/// How long to wait for the rack's serial reply after writing a command.
+/// Line silence that ends one serial reply, when the server does not supply `idle_ms`.
+/// This is an *inter-byte* bound applied only after the reply has started — the wait for
+/// the first byte is governed by `SERIAL_READ_DEADLINE` instead, because it scales with
+/// the command size and the USB-serial adapter's latency.
 const SERIAL_REPLY_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Upper bound on a single serial reply. A healthy rack answers with small
@@ -53,9 +56,10 @@ const SERIAL_REPLY_TIMEOUT: Duration = Duration::from_millis(800);
 /// keep the read loop (and the port lock) stuck forever.
 const SERIAL_REPLY_MAX_BYTES: usize = 64 * 1024;
 
-/// Hard deadline for the whole read phase of one command. The per-read timeout
-/// (`SERIAL_REPLY_TIMEOUT`) only fires on a *silent* line — a device that keeps
-/// the line busy resets it on every byte, so the loop also needs a total bound.
+/// Hard deadline for the whole read phase of one command, and the budget for the
+/// rack's first reply byte. The inter-byte timeout (`SERIAL_REPLY_TIMEOUT`) only fires
+/// on a *silent* line — a device that keeps the line busy resets it on every byte, so
+/// the loop also needs a total bound.
 const SERIAL_READ_DEADLINE: Duration = Duration::from_secs(5);
 
 /// `serial_err` codes of the v2 response contract. The response envelope is
@@ -132,9 +136,9 @@ struct SerialEnvelope {
     cmd_hex: String,
     /// Predicted "accepted" first reply; any other first reply is returned to the server as is.
     expect_hex: Option<String>,
-    /// Line-silence interval that ends one serial read.
+    /// Line-silence interval that ends a reply already in flight.
     idle: Duration,
-    /// Hard bound of the read phase of one exchange.
+    /// Hard bound of the read phase of one exchange, first reply byte included.
     deadline: Duration,
     poll: Option<PollSpec>,
 }
@@ -1342,9 +1346,10 @@ fn request_id_from_topic(topic: &str) -> Option<u64> {
         .and_then(|id| id.parse::<u64>().ok())
 }
 
-/// One write+read exchange on an already-locked port. `idle` bounds each read (the reply ends
-/// with `idle` of line silence), `deadline` bounds the whole read phase. Payload hex only at
-/// debug — the rack protocol must not end up in users' log files at INFO level.
+/// One write+read exchange on an already-locked port. `deadline` bounds the whole read phase,
+/// including the wait for the rack's first reply byte; `idle` is the line silence that ends a
+/// reply once it has started. Payload hex only at debug — the rack protocol must not end up in
+/// users' log files at INFO level.
 fn exchange_once(
     port: &mut Box<dyn SerialPort>,
     cmd_hex: &str,
@@ -1361,9 +1366,10 @@ fn exchange_once(
         }
     };
 
-    // per-exchange idle override: the server knows how fast its device replies
-    if let Err(e) = port.set_timeout(idle) {
-        log::warn!("{} [SERIAL] set_timeout({:?}) failed: {}", log_header, idle, e);
+    // The read phase starts out waiting for the *first* byte, so the port timeout is
+    // `deadline` here, not `idle` — see the read loop below for why the two differ.
+    if let Err(e) = port.set_timeout(deadline) {
+        log::warn!("{} [SERIAL] set_timeout({:?}) failed: {}", log_header, deadline, e);
     }
 
     // drop stale bytes: a reply that arrived after a previous read window closed would
@@ -1380,9 +1386,21 @@ fn exchange_once(
     }
     let _ = port.flush();
 
-    // Read whatever arrives until the inter-byte timeout fires. The port's
-    // own read timeout bounds each read; we stop on the first timeout once
-    // we have some data, or return nothing if the rack stays silent.
+    // Read whatever arrives until the inter-byte timeout fires. Two timings are
+    // involved and they are NOT the same order of magnitude:
+    //
+    //   * time to the FIRST byte — the rack has to receive the whole command before
+    //     it starts answering, so this scales with the command size (a 210-byte frame
+    //     is ~18 ms of wire time at 115200 on its own) and carries the USB-serial
+    //     adapter's latency on top. It is bounded by `deadline`, the caller's budget
+    //     for the entire read phase.
+    //   * gap BETWEEN bytes of a reply already in flight — that is `idle`, the line
+    //     silence that marks the end of the reply. Tens of milliseconds.
+    //
+    // Using `idle` for both is what made every large command come back `no_reply`
+    // while short ones went through: the reply was on its way, we just stopped
+    // listening. So the port timeout starts at `deadline` and drops to `idle` as soon
+    // as the first bytes land.
     //
     // Two hard bounds protect against a misbehaving device that streams
     // bytes continuously (each read would then succeed before the timeout
@@ -1391,7 +1409,8 @@ fn exchange_once(
     let mut reply = Vec::new();
     let mut buf = [0u8; 512];
     let mut truncated = false;
-    let read_deadline = std::time::Instant::now() + deadline;
+    let read_started = std::time::Instant::now();
+    let read_deadline = read_started + deadline;
     loop {
         if reply.len() >= SERIAL_REPLY_MAX_BYTES {
             log::warn!(
@@ -1413,7 +1432,32 @@ fn exchange_once(
         }
         match port.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => reply.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                if reply.is_empty() {
+                    // reply started: from here on the read is bounded by line silence.
+                    // The elapsed time is logged because a first byte arriving later
+                    // than `idle` is exactly the condition that used to be reported as
+                    // `no_reply` — worth seeing in a log when tuning the server timings.
+                    let ttfb = read_started.elapsed();
+                    if ttfb > idle {
+                        log::debug!(
+                            "{} [SERIAL] first byte after {:?} (over idle {:?})",
+                            log_header,
+                            ttfb,
+                            idle
+                        );
+                    }
+                    if let Err(e) = port.set_timeout(idle) {
+                        log::warn!(
+                            "{} [SERIAL] set_timeout({:?}) failed: {}",
+                            log_header,
+                            idle,
+                            e
+                        );
+                    }
+                }
+                reply.extend_from_slice(&buf[..n]);
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
             Err(e) => {
                 log::warn!("{} [SERIAL] read error: {}", log_header, e);
