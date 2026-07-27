@@ -241,3 +241,9 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed authentication over the Lisle rack timing out on large commands: waiting for the rack's first reply byte now uses the command's own deadline, not the inter-byte silence window.
+
+### [0.8.0-alpha.13] - 2026-07-27
+
+🛠 Fixes
+
+- Fixed the lost card result over the Lisle rack: the app no longer stops listening — or throws away what arrived — between two reads of one operation.
