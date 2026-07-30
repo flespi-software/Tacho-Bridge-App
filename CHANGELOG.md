@@ -264,3 +264,9 @@ All notable changes to this project will be documented in this file.
 
 - Log rotation now works at runtime: at 50 MB log.txt rotates into log.1.txt, older generations are zipped into the archive folder (10 newest kept); an oversized legacy log.1.txt is archived on launch.
 - Refactored the recent additions: log rotation no longer stalls logging while the displaced 50 MB generation is compressed (zipping moved to a background thread), shared helpers replaced duplicated zip/publish/rack-spawn code, and the log period is parsed generically for forward compatibility with future period values.
+
+### [0.8.0-beta.2] - 2026-07-30
+
+🆕 Features / Improvements
+
+- Unified rack log line format: every line is now 'RACK <serial> . / RACKCARD <number> . [AREA] key=value', prose fragments replaced with status/reason keys.
