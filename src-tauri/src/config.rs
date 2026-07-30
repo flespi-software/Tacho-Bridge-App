@@ -379,12 +379,24 @@ where
 /// runs file I/O on the main thread — the blocking core goes to the blocking pool.
 #[tauri::command]
 pub async fn update_card(cardnumber: String, content: CardConfig) -> bool {
-    tauri::async_runtime::spawn_blocking(move || persist_card(&cardnumber, content))
+    let updated = tauri::async_runtime::spawn_blocking(move || persist_card(&cardnumber, content))
         .await
         .unwrap_or_else(|e| {
             log::error!("update_card: blocking task failed: {:?}", e);
             false
-        })
+        });
+
+    if updated {
+        // A card just linked to an inserted physical card has no MQTT session yet
+        // (its ICCID resolved to nothing when it was detected): wake the PCSC
+        // monitor to re-register reader-backed cards, and retry the rack cards
+        // the server reported before the ICCID was mapped to a number. Already
+        // connected cards are untouched: both paths skip cards with a live session.
+        crate::smart_card::request_rescan();
+        crate::com_port::connect_pending_rack_cards().await;
+    }
+
+    updated
 }
 
 /// Updates the server address in the configuration.

@@ -289,32 +289,19 @@ function handleRackState(raw: unknown): void {
 ///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
 
 const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
-  // Find the index of the reader with the same iccid
-  const readerIndex = state.readers.findIndex((reader) => reader.iccid === content.iccid)
-
-  // Save the card number to the currentReader object
   console.log(`Card Number: ${cardNumber}, Card iccid: ${content.iccid}`)
 
-  // update the configuration with the new card number in the dynamic cache
+  // The backend reconnects the affected card itself after a successful save
+  // (PCSC rescan + pending rack cards), no explicit sync call is needed here.
   const update_result = await invoke('update_card', {
     cardnumber: cardNumber,
     content: content,
   })
 
-  // Update the card number in the state if configuration update was successful
-  if (update_result && readerIndex > -1) {
-    const reader = state.readers[readerIndex]
-    if (reader) {
-      // Run update only if reader definitely exists
-      await invoke('manual_sync_cards', {
-        readername: reader.name,
-        restart: false,
-      })
-
-      console.log('Card number updated successfully')
-    } else {
-      console.error(`Reader at index ${readerIndex} does not exist`)
-    }
+  if (update_result) {
+    console.log('Card number updated successfully')
+  } else {
+    console.error(`Failed to update card ${cardNumber}`)
   }
 }
 

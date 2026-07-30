@@ -996,6 +996,56 @@ lazy_static::lazy_static! {
 
     /// Cards currently exposed by the rack, as shown in the UI (RackState.cards).
     static ref RACK_CARDS_UI: std::sync::Mutex<Vec<RackCard>> = std::sync::Mutex::new(Vec::new());
+
+    /// Serial port of the connected rack while its MQTT stack is running; lets
+    /// `connect_pending_rack_cards` spawn a card session outside the rack MQTT loop.
+    static ref RACK_PORT: std::sync::Mutex<Option<SharedPort>> = std::sync::Mutex::new(None);
+}
+
+/// Opens rack-backed sessions for discovered cards that became resolvable after
+/// a config change: the server's `connect` for a card with an unknown ICCID is
+/// skipped at discovery time, and the server does not repeat it until the rack
+/// content changes — so assigning the number in the UI must retry it locally.
+pub async fn connect_pending_rack_cards() {
+    let port = {
+        let guard = match RACK_PORT.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    let Some(port) = port else {
+        return; // no rack connected
+    };
+
+    let pending: Vec<(u16, String)> = {
+        let ui = match RACK_CARDS_UI.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        ui.iter()
+            .filter(|card| card.card_number.is_none())
+            .filter_map(|card| card.iccid.clone().map(|iccid| (card.slot, iccid)))
+            .collect()
+    };
+
+    for (slot, iccid) in pending {
+        let Some(card_number) = crate::config::find_card_number_by_iccid(&iccid) else {
+            continue; // still unassigned
+        };
+        // mirror handle_connect_spawn: a reader-backed session with this number wins
+        if TASK_POOL.lock().await.iter().any(|card| card.client_id == card_number) {
+            continue;
+        }
+        log::info!(
+            "[RACK] [SPAWN] pending card resolved after config update: slot={} iccid={} card={}",
+            slot,
+            iccid,
+            card_number
+        );
+        update_rack_card_ui(slot, &iccid, Some(card_number.clone()));
+        spawn_rack_card(card_number, iccid, slot, port.clone());
+    }
 }
 
 /// Starts the rack-backed MQTT session of one card, deduplicating by ICCID and
@@ -1741,6 +1791,13 @@ fn start_rack_mqtt(client_id: String, port: SharedPort) {
         Err(poisoned) => poisoned.into_inner(),
     };
     log::info!("[RACK] [MQTT] phase=start client_id={}", client_id);
+    {
+        let mut port_guard = match RACK_PORT.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *port_guard = Some(port.clone());
+    }
     let handle = async_runtime::spawn(rack_mqtt_loop(client_id, port));
     *guard = Some(handle);
 }
@@ -1779,6 +1836,13 @@ fn stop_rack_mqtt() {
             handle.abort();
             log::info!("[RACK] [MQTT] phase=stop status=aborted");
         }
+    }
+    {
+        let mut port_guard = match RACK_PORT.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *port_guard = None;
     }
     stop_rack_watch();
     stop_rack_cards();
