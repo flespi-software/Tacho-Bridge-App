@@ -253,3 +253,14 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Added the fetch_logs server command: on request the app collects the last day, week or month of its log, packs it into a zip and uploads it to the server in chunks over the app connection.
+
+### [0.8.0-alpha.15] - 2026-07-30
+
+🛠 Fixes
+
+- Fixed a newly linked company card staying offline until physically reinserted: after assigning the number the app now reconnects the card itself — both in a PC/SC reader and in a rack slot.
+
+🆕 Features / Improvements
+
+- Log rotation now works at runtime: at 50 MB log.txt rotates into log.1.txt, older generations are zipped into the archive folder (10 newest kept); an oversized legacy log.1.txt is archived on launch.
+- Refactored the recent additions: log rotation no longer stalls logging while the displaced 50 MB generation is compressed (zipping moved to a background thread), shared helpers replaced duplicated zip/publish/rack-spawn code, and the log period is parsed generically for forward compatibility with future period values.
