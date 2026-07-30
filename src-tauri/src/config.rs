@@ -530,7 +530,10 @@ pub async fn remove_card_from_config(
             use crate::smart_card::manual_sync_cards;
 
             sleep(Duration::from_millis(100)).await;
-            manual_sync_cards(card_number.to_string(), false).await;
+            if let Err(e) = manual_sync_cards(card_number.to_string(), false).await {
+                // the removal itself succeeded; a failed rescan only delays the readers list refresh
+                log::warn!("remove_card: card rescan failed: {}", e);
+            }
         }
 
         Ok(())

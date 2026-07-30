@@ -434,7 +434,7 @@ fn find_rack() -> Option<RackInfo> {
         Err(e) => {
             let snapshot = format!("enumeration_failed: {e}");
             if PORT_INVENTORY.changed(&snapshot) {
-                log::error!("[RACK] phase=discovery status=enumeration_failed err={e}");
+                log::error!("RACK | phase=discovery status=enumeration_failed err={e}");
             }
             return None;
         }
@@ -450,10 +450,10 @@ fn find_rack() -> Option<RackInfo> {
         .join(" ");
     if PORT_INVENTORY.changed(&snapshot) {
         if ports.is_empty() {
-            log::info!("[RACK] phase=discovery status=inventory ports=0");
+            log::info!("RACK | phase=discovery status=inventory ports=0");
         } else {
             log::info!(
-                "[RACK] phase=discovery status=inventory ports={} list=[{}]",
+                "RACK | phase=discovery status=inventory ports={} list=[{}]",
                 ports.len(),
                 snapshot
             );
@@ -503,7 +503,7 @@ fn find_rack() -> Option<RackInfo> {
             };
             if DISCOVERY_MATCH.changed(&format!("chip:{}:{}", p.port_name, serial)) {
                 log::info!(
-                    "[RACK] phase=discovery status=fallback_match port={} serial={} reported_serial={:?} \
+                    "RACK | phase=discovery status=fallback_match port={} serial={} reported_serial={:?} \
                      reported_manufacturer={:?} reason=os_reports_driver_strings",
                     p.port_name,
                     serial,
@@ -541,7 +541,7 @@ fn find_rack_by_usb_descriptor(ports: &[serialport::SerialPortInfo]) -> Option<R
     let devices = match nusb::list_devices().wait() {
         Ok(devices) => devices,
         Err(e) => {
-            log::warn!("[RACK] phase=discovery status=usb_enum_failed err={e}");
+            log::warn!("RACK | phase=discovery status=usb_enum_failed err={e}");
             return None;
         }
     };
@@ -570,7 +570,7 @@ fn find_rack_by_usb_descriptor(ports: &[serialport::SerialPortInfo]) -> Option<R
             }
             if DISCOVERY_MATCH.changed(&format!("usb:{}:{dev_serial}", p.port_name)) {
                 log::info!(
-                    "[RACK] phase=discovery status=usb_descriptor_match port={} serial={} \
+                    "RACK | phase=discovery status=usb_descriptor_match port={} serial={} \
                      product={:?} vid={:#06x} pid={:#06x}",
                     p.port_name,
                     dev_serial,
@@ -631,7 +631,7 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
     {
         Ok(port) => {
             log::info!(
-                "[RACK] phase=open status=ok port={} baud={} format=8N1",
+                "RACK | phase=open status=ok port={} baud={} format=8N1",
                 rack.port_name,
                 BAUD
             );
@@ -652,7 +652,7 @@ fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
                 ""
             };
             log::error!(
-                "[RACK] phase=open status=failed port={} err={}{}",
+                "RACK | phase=open status=failed port={} err={}{}",
                 rack.port_name,
                 e,
                 hint
@@ -843,7 +843,7 @@ async fn handle_serial_request(
         match last_response_payload {
             Some(cached) => {
                 log::warn!(
-                    "{} [MQTT] duplicate request_id={:?}: re-sending cached response, skipping serial exchange",
+                    "{} [MQTT] status=duplicate_request request_id={:?} action=resend_cached",
                     log_header,
                     req_id
                 );
@@ -852,11 +852,11 @@ async fn handle_serial_request(
                     .publish(resp_topic, QoS::AtLeastOnce, false, cached.clone())
                     .await
                 {
-                    log::error!("{} [MQTT] cached reply publish failed: {:?}", log_header, e);
+                    log::error!("{} [MQTT] status=cached_reply_publish_failed err={:?}", log_header, e);
                 }
             }
             None => log::warn!(
-                "{} [MQTT] duplicate request_id={:?} still in flight: ignoring",
+                "{} [MQTT] status=duplicate_request request_id={:?} action=ignored reason=in_flight",
                 log_header,
                 req_id
             ),
@@ -867,13 +867,13 @@ async fn handle_serial_request(
     let json = match serde_json::from_slice::<serde_json::Value>(payload) {
         Ok(json) => json,
         Err(e) => {
-            log::warn!("{} [MQTT] command ignored: bad JSON: {}", log_header, e);
+            log::warn!("{} [MQTT] status=ignored reason=bad_json err={}", log_header, e);
             return;
         }
     };
     let Some(parsed) = parse_envelope(&json) else {
         log::warn!(
-            "{} [MQTT] command has no 'serial_cmd' field, nothing to forward",
+            "{} [MQTT] status=ignored reason=no_serial_cmd",
             log_header
         );
         return;
@@ -897,7 +897,7 @@ async fn handle_serial_request(
         .publish(resp_topic, QoS::AtLeastOnce, false, resp_payload)
         .await
     {
-        log::error!("{} [MQTT] reply publish failed: {:?}", log_header, e);
+        log::error!("{} [MQTT] status=reply_publish_failed err={:?}", log_header, e);
     }
 }
 
@@ -910,7 +910,7 @@ async fn handle_connect_spawn(payload: &[u8], serial_port: &SharedPort, log_head
     let json = match serde_json::from_slice::<serde_json::Value>(payload) {
         Ok(json) => json,
         Err(e) => {
-            log::warn!("{} [SPAWN] connect ignored: bad JSON: {}", log_header, e);
+            log::warn!("{} [SPAWN] status=ignored reason=bad_json err={}", log_header, e);
             return;
         }
     };
@@ -918,7 +918,7 @@ async fn handle_connect_spawn(payload: &[u8], serial_port: &SharedPort, log_head
     let slot = json.get("slot").and_then(|v| v.as_u64()).unwrap_or(0);
     if iccid.is_empty() || !(1..=240).contains(&slot) {
         log::warn!(
-            "{} [SPAWN] connect ignored: iccid or slot missing/invalid (slot={})",
+            "{} [SPAWN] status=ignored reason=invalid_iccid_or_slot slot={}",
             log_header,
             slot
         );
@@ -929,14 +929,14 @@ async fn handle_connect_spawn(payload: &[u8], serial_port: &SharedPort, log_head
     let card_number = crate::config::find_card_number_by_iccid(iccid);
     match &card_number {
         Some(number) => log::info!(
-            "{} [SPAWN] rack card: slot={} iccid={} card={}",
+            "{} [SPAWN] status=discovered slot={} iccid={} card={}",
             log_header,
             slot,
             iccid,
             number
         ),
         None => log::warn!(
-            "{} [SPAWN] rack card: slot={} iccid={} — unknown card (not in the local config), session not spawned",
+            "{} [SPAWN] status=not_spawned reason=unknown_card slot={} iccid={}",
             log_header,
             slot,
             iccid
@@ -961,7 +961,7 @@ async fn handle_connect_spawn(payload: &[u8], serial_port: &SharedPort, log_head
 async fn spawn_rack_card_checked(card_number: String, iccid: String, slot: u16, port: SharedPort, log_header: &str) {
     if TASK_POOL.lock().await.iter().any(|card| card.client_id == card_number) {
         log::warn!(
-            "{} [SPAWN] card {} is already served by a reader connection — rack slot {} skipped",
+            "{} [SPAWN] card={} slot={} status=skipped reason=served_by_reader",
             log_header,
             card_number,
             slot
@@ -1037,13 +1037,13 @@ pub async fn connect_pending_rack_cards() {
             continue; // still unassigned
         };
         log::info!(
-            "[RACK] [SPAWN] pending card resolved after config update: slot={} iccid={} card={}",
+            "RACK | [SPAWN] status=pending_card_resolved slot={} iccid={} card={}",
             slot,
             iccid,
             card_number
         );
         update_rack_card_ui(slot, &iccid, Some(card_number.clone()));
-        spawn_rack_card_checked(card_number, iccid, slot, port.clone(), "[RACK]").await;
+        spawn_rack_card_checked(card_number, iccid, slot, port.clone(), "RACK |").await;
     }
 }
 
@@ -1057,7 +1057,7 @@ fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: S
     };
     if let Some((_, handle)) = tasks.get(&iccid) {
         if !handle.inner().is_finished() {
-            log::debug!("[RACK] [SPAWN] card {} session already running — skip", card_number);
+            log::debug!("RACK | [SPAWN] card={} status=skipped reason=already_running", card_number);
             return;
         }
     }
@@ -1065,14 +1065,14 @@ fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: S
         *other_iccid != iccid && *number == card_number && !handle.inner().is_finished()
     }) {
         log::warn!(
-            "[RACK] [SPAWN] card {} is already served by another slot — slot {} skipped",
+            "RACK | [SPAWN] card={} slot={} status=skipped reason=served_by_another_slot",
             card_number,
             slot
         );
         return;
     }
     log::info!(
-        "[RACK] [SPAWN] card {} slot={} — starting rack-backed session",
+        "RACK | [SPAWN] card={} slot={} status=starting_session",
         card_number,
         slot
     );
@@ -1148,10 +1148,10 @@ async fn rack_card_mqtt_loop(card_number: String, iccid: String, slot: u16, seri
                             .publish("rack", QoS::AtLeastOnce, false, report)
                             .await
                         {
-                            log::error!("{} [MQTT] rack link report publish failed: {:?}", log_header, e);
+                            log::error!("{} [MQTT] status=link_report_failed err={:?}", log_header, e);
                         } else {
                             log::info!(
-                                "{} [MQTT] rack link report sent slot={} iccid={}",
+                                "{} [MQTT] status=link_report_sent slot={} iccid={}",
                                 log_header,
                                 slot,
                                 iccid
@@ -1222,18 +1222,18 @@ fn start_rack_watch(
     let json = match serde_json::from_slice::<serde_json::Value>(payload) {
         Ok(json) => json,
         Err(e) => {
-            log::warn!("{} [WATCH] instruction ignored: bad JSON: {}", log_header, e);
+            log::warn!("{} [WATCH] status=ignored reason=bad_json err={}", log_header, e);
             return;
         }
     };
     let Some(cmd) = json.get("cmd").and_then(|v| v.as_str()) else {
-        log::warn!("{} [WATCH] instruction ignored: no 'cmd' field", log_header);
+        log::warn!("{} [WATCH] status=ignored reason=no_cmd_field", log_header);
         return;
     };
     let cmd_hex = match normalize_hex(cmd) {
         Ok(hex) => hex,
         Err(_) => {
-            log::warn!("{} [WATCH] instruction ignored: bad hex in 'cmd'", log_header);
+            log::warn!("{} [WATCH] status=ignored reason=bad_cmd_hex", log_header);
             return;
         }
     };
@@ -1248,7 +1248,7 @@ fn start_rack_watch(
     let mqtt_client = mqtt_client.clone();
     let log_header = log_header.to_string();
     log::info!(
-        "{} [WATCH] armed interval={:?} cmd_bytes={}",
+        "{} [WATCH] status=armed interval={:?} cmd_bytes={}",
         log_header,
         interval,
         cmd_hex.len() / 2
@@ -1276,7 +1276,7 @@ fn start_rack_watch(
             }
             last = Some(exchange.resp_hex.clone());
             log::info!(
-                "{} [WATCH] change detected rx bytes={} — publishing",
+                "{} [WATCH] status=change_detected rx_bytes={}",
                 log_header,
                 exchange.resp_hex.len() / 2
             );
@@ -1284,7 +1284,7 @@ fn start_rack_watch(
                 .publish("watch", QoS::AtLeastOnce, false, exchange.to_payload())
                 .await
             {
-                log::error!("{} [WATCH] publish failed: {:?}", log_header, e);
+                log::error!("{} [WATCH] status=publish_failed err={:?}", log_header, e);
                 // let the next change (or re-arm) retry; keep the baseline as published intent
             }
         }
@@ -1307,7 +1307,7 @@ fn stop_rack_watch() {
     };
     if let Some(handle) = guard.take() {
         handle.abort();
-        log::info!("[RACK] [WATCH] stopped");
+        log::info!("RACK | [WATCH] status=stopped");
     }
 }
 
@@ -1318,14 +1318,14 @@ fn handle_card_disconnect(payload: &[u8], log_header: &str) {
     let json = match serde_json::from_slice::<serde_json::Value>(payload) {
         Ok(json) => json,
         Err(e) => {
-            log::warn!("{} [SPAWN] disconnect ignored: bad JSON: {}", log_header, e);
+            log::warn!("{} [SPAWN] status=ignored reason=bad_json err={}", log_header, e);
             return;
         }
     };
     let iccid = json.get("iccid").and_then(|v| v.as_str()).unwrap_or("");
     let slot = json.get("slot").and_then(|v| v.as_u64()).unwrap_or(0);
     log::info!(
-        "{} [SPAWN] card removed: slot={} iccid={} — closing its session",
+        "{} [SPAWN] status=card_removed slot={} iccid={}",
         log_header,
         slot,
         iccid
@@ -1351,7 +1351,7 @@ fn handle_card_disconnect(payload: &[u8], log_header: &str) {
     };
     if let Some((card_number, handle)) = tasks.remove(iccid) {
         handle.abort();
-        log::info!("{} [SPAWN] card {} session aborted (card removed)", log_header, card_number);
+        log::info!("{} [SPAWN] card={} status=aborted reason=card_removed", log_header, card_number);
     }
 }
 
@@ -1364,7 +1364,7 @@ fn stop_rack_cards() {
     };
     for (_iccid, (card_number, handle)) in tasks.drain() {
         handle.abort();
-        log::info!("[RACK] [SPAWN] card {} session aborted (rack gone)", card_number);
+        log::info!("RACK | [SPAWN] card={} status=aborted reason=rack_gone", card_number);
     }
     let mut ui = match RACK_CARDS_UI.lock() {
         Ok(g) => g,
@@ -1770,7 +1770,7 @@ fn rack_mqtt_running() -> bool {
     };
     match guard.as_ref() {
         Some((handle, _)) if handle.inner().is_finished() => {
-            log::warn!("[RACK] [MQTT] task exited on its own — clearing stale handle");
+            log::warn!("RACK | [MQTT] status=stale_task_cleared reason=task_exited");
             *guard = None;
             false
         }
@@ -1782,14 +1782,14 @@ fn rack_mqtt_running() -> bool {
 /// Starts the rack's MQTT task if one is not already running.
 fn start_rack_mqtt(client_id: String, port: SharedPort) {
     if rack_mqtt_running() {
-        log::debug!("[RACK] [MQTT] start skipped: task already running");
+        log::debug!("RACK | [MQTT] phase=start status=skipped reason=already_running");
         return;
     }
     let mut guard = match RACK_MQTT_TASK.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    log::info!("[RACK] [MQTT] phase=start client_id={}", client_id);
+    log::info!("RACK | [MQTT] phase=start client_id={}", client_id);
     let handle = async_runtime::spawn(rack_mqtt_loop(client_id, port.clone()));
     *guard = Some((handle, port));
 }
@@ -1802,7 +1802,7 @@ pub fn restart_rack_mqtt(reason: &str) {
     if !rack_mqtt_running() {
         return;
     }
-    log::info!("[RACK] [MQTT] phase=restart reason={}", reason);
+    log::info!("RACK | [MQTT] phase=restart reason={}", reason);
     stop_rack_mqtt();
 }
 
@@ -1813,7 +1813,7 @@ pub fn restart_rack_mqtt(reason: &str) {
 pub fn shutdown() {
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
     stop_rack_mqtt();
-    log::info!("[RACK] phase=shutdown status=port_released");
+    log::info!("RACK | phase=shutdown status=port_released");
 }
 
 /// Stops the rack's MQTT task if one is running, along with every rack-backed
@@ -1826,7 +1826,7 @@ fn stop_rack_mqtt() {
         };
         if let Some((handle, _)) = guard.take() {
             handle.abort();
-            log::info!("[RACK] [MQTT] phase=stop status=aborted");
+            log::info!("RACK | [MQTT] phase=stop status=aborted");
         }
     }
     stop_rack_watch();
@@ -1839,7 +1839,7 @@ fn stop_rack_mqtt() {
 fn on_rack_connected(rack: &RackInfo, port: Box<dyn SerialPort>) {
     // vid/pid logged for data collection only — matching is by product string.
     log::info!(
-        "[RACK] phase=discovery status=found port={} serial={} manufacturer={} product={} vid={:#06x} pid={:#06x}",
+        "RACK | phase=discovery status=found port={} serial={} manufacturer={} product={} vid={:#06x} pid={:#06x}",
         rack.port_name,
         rack.serial.as_deref().unwrap_or("?"),
         rack.manufacturer.as_deref().unwrap_or("?"),
@@ -1851,7 +1851,7 @@ fn on_rack_connected(rack: &RackInfo, port: Box<dyn SerialPort>) {
     // the brand marker; otherwise we don't talk to the device at all.
     if !rack.is_supported() {
         log::warn!(
-            "[RACK] phase=ready status=unsupported reason=manufacturer_not_lisle manufacturer={} \
+            "RACK | phase=ready status=unsupported reason=manufacturer_not_lisle manufacturer={} \
              detail=not_a_lisle_design_tachograph_rack",
             rack.manufacturer.as_deref().unwrap_or("?")
         );
@@ -1860,7 +1860,7 @@ fn on_rack_connected(rack: &RackInfo, port: Box<dyn SerialPort>) {
 
     let client_id = rack.client_id();
     log::info!(
-        "[RACK] phase=ready status=rack_connected_ready_for_work serial={} client_id={}",
+        "RACK | phase=ready status=rack_connected_ready_for_work serial={} client_id={}",
         rack.serial.as_deref().unwrap_or("?"),
         client_id
     );
@@ -1882,7 +1882,7 @@ fn on_rack_connected(rack: &RackInfo, port: Box<dyn SerialPort>) {
 /// Called when the rack transitions to disconnected.
 fn on_rack_disconnected(rack: &RackInfo) {
     log::warn!(
-        "[RACK] phase=presence status=disconnected port={} serial={}",
+        "RACK | phase=presence status=disconnected port={} serial={}",
         rack.port_name,
         rack.serial.as_deref().unwrap_or("?")
     );
@@ -1900,18 +1900,18 @@ fn on_rack_disconnected(rack: &RackInfo) {
 pub async fn rack_connection() {
     // Ignore duplicate spawns from repeated `frontend-loaded` events.
     if MONITOR_RUNNING.swap(true, Ordering::SeqCst) {
-        log::debug!("[RACK] phase=rack_connection status=already_running");
+        log::debug!("RACK | phase=rack_connection status=already_running");
         return;
     }
 
-    log::info!("[RACK] phase=rack_connection status=start poll_secs={}", POLL_INTERVAL.as_secs());
+    log::info!("RACK | phase=rack_connection status=start poll_secs={}", POLL_INTERVAL.as_secs());
 
     // The rack we currently consider connected, if any.
     let mut current: Option<RackInfo> = None;
 
     loop {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
-            log::info!("[RACK] phase=rack_connection status=stopped reason=app_shutdown");
+            log::info!("RACK | phase=rack_connection status=stopped reason=app_shutdown");
             return;
         }
         let found = find_rack();
@@ -1946,7 +1946,7 @@ pub async fn rack_connection() {
             // handle, so reopen the port and restart the task.
             (Some(_), Some(rack)) if rack.is_supported() && !rack_mqtt_running() => {
                 log::warn!(
-                    "[RACK] phase=presence status=mqtt_task_dead port={} action=restart",
+                    "RACK | phase=presence status=mqtt_task_dead port={} action=restart",
                     rack.port_name
                 );
                 // The dead loop's siblings (watch task, card sessions) may still
