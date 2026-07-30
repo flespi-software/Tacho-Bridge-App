@@ -1,7 +1,8 @@
 use std::env;
-use std::path::PathBuf;
-// use std::fs;
-// use std::error::Error; // Импортируем трэйт Error
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use fern;
 use log;
@@ -30,10 +31,19 @@ struct Release {
 /// * On Windows, the log file is created in the `%USERPROFILE%\Documents\tba` directory.
 ///
 
-/// Rotate when the log grows past this size; one archived generation is kept
-/// as `log.1.txt`. 50 MB is months of INFO-level logs — without the cap the
-/// file grows forever.
+/// Rotate when the log grows to this size. Rotation happens at runtime (the
+/// app is a server-style solution and can run for months without a restart):
+/// `log.txt` -> `log.1.txt`, the displaced `log.1.txt` -> zipped generation
+/// in the `archive/` subdirectory.
 const LOG_ROTATE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// How many zipped archive generations to keep in `archive/`; the oldest are
+/// pruned on every rotation so a long-running instance cannot fill the disk.
+const LOG_ARCHIVE_KEEP: usize = 10;
+
+/// Minimal pause between rotation retries after a failed rotation, so a
+/// persistent failure (e.g. a locked file) does not retry on every log line.
+const ROTATE_RETRY_PAUSE: Duration = Duration::from_secs(60);
 
 /// Parses a level name from the `TBA_LOG` spec ("debug", "warn", ...).
 fn parse_level(s: &str) -> Option<log::LevelFilter> {
@@ -85,37 +95,224 @@ pub fn log_file_paths() -> (PathBuf, PathBuf) {
     (dir.join("log.txt"), dir.join("log.1.txt"))
 }
 
-pub fn setup_logging() {
-    let mut log_path = log_dir();
+/// Log sink with runtime size-based rotation.
+///
+/// Counts the bytes it writes; once `log.txt` reaches the limit the next write
+/// rotates the chain: the previous `log.1.txt` is zipped into `archive/` (the
+/// oldest archives are pruned to `keep`), `log.txt` is renamed to `log.1.txt`
+/// and a fresh `log.txt` is opened. Rotation failures are reported to stderr
+/// and retried later — the logging path itself must never fail the app.
+struct RotatingLogWriter {
+    dir: PathBuf,
+    file: Option<File>,
+    written: u64,
+    limit: u64,
+    keep: usize,
+    failed_rotate_at: Option<Instant>,
+}
 
-    if let Err(e) = std::fs::create_dir_all(&log_path) {
-        eprintln!("Failed to create log directory {:?}: {}", log_path, e);
-        return;
+impl RotatingLogWriter {
+    fn new(dir: PathBuf, limit: u64, keep: usize) -> std::io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(dir.join("log.txt"))?;
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self { dir, file: Some(file), written, limit, keep, failed_rotate_at: None })
     }
 
-    log_path.push("log.txt");
+    /// True when the size limit is reached and no recent rotation attempt failed.
+    fn rotation_due(&self) -> bool {
+        self.written >= self.limit
+            && self.failed_rotate_at.map_or(true, |at| at.elapsed() >= ROTATE_RETRY_PAUSE)
+    }
 
-    // Size-based rotation with one archived generation (log.1.txt).
-    if let Ok(meta) = std::fs::metadata(&log_path) {
-        if meta.len() > LOG_ROTATE_BYTES {
-            let archived = log_path.with_file_name("log.1.txt");
-            // Windows rename does not overwrite an existing destination.
-            let _ = std::fs::remove_file(&archived);
-            match std::fs::rename(&log_path, &archived) {
-                Ok(()) => eprintln!("Log rotated: log.txt -> log.1.txt"),
-                Err(e) => eprintln!("Failed to rotate log file: {}", e),
+    fn rotate(&mut self) {
+        // close our handle first: Windows cannot rename a file that is open
+        if let Some(file) = self.file.take() {
+            let _ = file.sync_all();
+        }
+
+        let current = self.dir.join("log.txt");
+        let archived = self.dir.join("log.1.txt");
+
+        // zip the displaced generation into archive/ before it is overwritten;
+        // on failure the generation is dropped, same as the rename would do
+        if archived.exists() {
+            if let Err(e) = archive_log_generation(&self.dir, &archived, self.keep) {
+                eprintln!("Failed to archive {:?}: {}", archived, e);
+            }
+            let _ = std::fs::remove_file(&archived); // Windows rename does not overwrite
+        }
+
+        if let Err(e) = std::fs::rename(&current, &archived) {
+            eprintln!("Failed to rotate log file: {}", e);
+        }
+
+        match OpenOptions::new().create(true).append(true).open(&current) {
+            Ok(file) => {
+                self.written = file.metadata().map(|m| m.len()).unwrap_or(0);
+                // rename failure leaves the oversized file in place: pause the retries
+                self.failed_rotate_at = (self.written >= self.limit).then(Instant::now);
+                self.file = Some(file);
+            }
+            Err(e) => {
+                eprintln!("Failed to reopen log file after rotation: {}", e);
+                self.failed_rotate_at = Some(Instant::now());
+            }
+        }
+    }
+}
+
+impl Write for RotatingLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.rotation_due() {
+            self.rotate();
+        }
+        match self.file.as_mut() {
+            Some(file) => {
+                let written = file.write(buf)?;
+                self.written += written as u64;
+                Ok(written)
+            }
+            // the sink is broken (reopen failed): swallow the line instead of
+            // erroring — fern must keep serving the stdout chain in dev builds
+            None => {
+                if self.failed_rotate_at.map_or(true, |at| at.elapsed() >= ROTATE_RETRY_PAUSE) {
+                    self.rotate();
+                }
+                Ok(buf.len())
             }
         }
     }
 
-    // Open the log file exactly once. Reusing the same handle eliminates the
-    // race where the file could be removed between two open() calls and the
-    // second one would panic via .unwrap().
-    let log_file = match fern::log_file(&log_path) {
-        Ok(file) => file,
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Zips a displaced log generation into `archive/log_<timestamp>.zip` (content
+/// is streamed, not buffered) and prunes the oldest archives beyond `keep`.
+fn archive_log_generation(dir: &Path, archived: &Path, keep: usize) -> std::io::Result<()> {
+    let archive_dir = dir.join("archive");
+    std::fs::create_dir_all(&archive_dir)?;
+
+    // several generations can be archived within one second (startup sweep):
+    // pick a free destination name instead of truncating an existing archive
+    let base = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let mut dest = archive_dir.join(format!("log_{}.zip", base));
+    let mut suffix = 1;
+    while dest.exists() {
+        dest = archive_dir.join(format!("log_{}_{}.zip", base, suffix));
+        suffix += 1;
+    }
+
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut writer = zip::ZipWriter::new(std::io::BufWriter::new(File::create(&dest)?));
+    writer.start_file("log.txt", options).map_err(std::io::Error::other)?;
+    std::io::copy(&mut File::open(archived)?, &mut writer)?;
+    writer.finish().map_err(std::io::Error::other)?.into_inner()?.flush()?;
+
+    prune_archives(&archive_dir, keep);
+    Ok(())
+}
+
+/// Detaches an oversized `log.1.txt` (leftover of the legacy startup-only
+/// rotation, can be way past the limit) into a uniquely named temp file, and
+/// picks up temp files of an archiving interrupted by a previous shutdown.
+/// The rename is cheap, so the caller can zip the result in the background
+/// without racing the regular rotation chain.
+fn detach_oversized_generation(dir: &Path, limit: u64) -> Vec<PathBuf> {
+    let mut detached: Vec<PathBuf> = Vec::new();
+
+    // temp files left by an interrupted archiving run
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        detached.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("log.1.archiving.") && name.ends_with(".txt"))
+        }));
+    }
+
+    let generation = dir.join("log.1.txt");
+    if std::fs::metadata(&generation).map(|m| m.len() >= limit).unwrap_or(false) {
+        let temp = dir.join(format!("log.1.archiving.{}.txt", chrono::Local::now().format("%Y%m%d_%H%M%S")));
+        match std::fs::rename(&generation, &temp) {
+            Ok(()) => detached.push(temp),
+            Err(e) => eprintln!("Failed to detach oversized log generation: {}", e),
+        }
+    }
+
+    detached
+}
+
+/// Zips detached generations into `archive/` and removes them; a file that
+/// failed to archive is kept for the sweep of the next application start.
+fn archive_detached_generations(dir: &Path, detached: &[PathBuf], keep: usize) {
+    for path in detached {
+        match archive_log_generation(dir, path, keep) {
+            Ok(()) => {
+                if let Err(e) = std::fs::remove_file(path) {
+                    eprintln!("Failed to remove archived log generation {:?}: {}", path, e);
+                }
+            }
+            Err(e) => eprintln!("Failed to archive log generation {:?}: {}", path, e),
+        }
+    }
+}
+
+/// Removes the oldest `log_*.zip` archives so at most `keep` remain. The
+/// timestamped names sort chronologically, so a name sort is enough.
+fn prune_archives(archive_dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(archive_dir) else {
+        return;
+    };
+    let mut archives: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("log_") && name.ends_with(".zip"))
+        })
+        .collect();
+    if archives.len() <= keep {
+        return;
+    }
+    archives.sort();
+    for path in &archives[..archives.len() - keep] {
+        if let Err(e) = std::fs::remove_file(path) {
+            eprintln!("Failed to prune log archive {:?}: {}", path, e);
+        }
+    }
+}
+
+pub fn setup_logging() {
+    let dir = log_dir();
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("Failed to create log directory {:?}: {}", dir, e);
+        return;
+    }
+
+    // An oversized log.1.txt (left by the legacy startup-only rotation) is
+    // detached right away and zipped in the background: waiting for the next
+    // rotation to displace it would keep hundreds of MB on disk for months and
+    // then stall the logging mutex while such a generation is compressed.
+    let detached = detach_oversized_generation(&dir, LOG_ROTATE_BYTES);
+    if !detached.is_empty() {
+        let sweep_dir = dir.clone();
+        std::thread::spawn(move || archive_detached_generations(&sweep_dir, &detached, LOG_ARCHIVE_KEEP));
+    }
+
+    // Runtime-rotating sink: rotation triggers on size while the app runs, so
+    // an instance living for months keeps rotating without a restart. An
+    // oversized log.txt left by a previous run rotates on the first write.
+    let log_writer = match RotatingLogWriter::new(dir.clone(), LOG_ROTATE_BYTES, LOG_ARCHIVE_KEEP) {
+        Ok(writer) => writer,
         Err(e) => {
             eprintln!("Failed to create log file: {}", e);
-            log::warn!("No permission to write log file at: {:?}", log_path);
+            log::warn!("No permission to write log file at: {:?}", dir);
 
             let payload = NotificationPayload {
                 notification_type: "access".to_string(),
@@ -170,7 +367,7 @@ pub fn setup_logging() {
         level_spec = spec;
     }
 
-    dispatch = dispatch.chain(log_file);
+    dispatch = dispatch.chain(fern::Output::writer(Box::new(log_writer), "\n"));
 
     // In dev builds mirror the log to stdout so `npm run tauri dev` shows it
     // live in the terminal.
@@ -182,7 +379,7 @@ pub fn setup_logging() {
     if let Err(e) = dispatch.apply() {
         eprintln!(
             "Failed to initialize logging at {:?}: {}",
-            log_path, e
+            dir, e
         );
     }
 
@@ -281,6 +478,104 @@ fn version_to_number(version: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Creates a unique empty scratch directory for a rotation test.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("tba-logger-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn list_archives(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir.join("archive"))
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn rotation_moves_current_log_to_generation_at_limit() {
+        let dir = scratch_dir("rotate");
+        let mut writer = RotatingLogWriter::new(dir.clone(), 32, 3).unwrap();
+
+        writer.write_all(b"old line big enough to cross the 32 bytes limit\n").unwrap();
+        writer.write_all(b"new line\n").unwrap(); // limit reached: this write rotates first
+        writer.flush().unwrap();
+
+        let archived = std::fs::read_to_string(dir.join("log.1.txt")).unwrap();
+        assert!(archived.contains("old line"));
+        let current = std::fs::read_to_string(dir.join("log.txt")).unwrap();
+        assert_eq!(current, "new line\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn displaced_generation_is_zipped_into_archive() {
+        let dir = scratch_dir("archive");
+        let mut writer = RotatingLogWriter::new(dir.clone(), 8, 3).unwrap();
+
+        writer.write_all(b"generation one\n").unwrap();
+        writer.write_all(b"generation two\n").unwrap(); // rotation 1: no log.1 yet, nothing to archive
+        writer.write_all(b"generation three\n").unwrap(); // rotation 2: "generation one" leaves log.1 for archive
+
+        let archives = list_archives(&dir);
+        assert_eq!(archives.len(), 1);
+        let zipped = std::fs::read(&archives[0]).unwrap();
+        assert_eq!(&zipped[..4], b"PK\x03\x04");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_generation_is_detached_and_archived_on_startup() {
+        let dir = scratch_dir("detach");
+        std::fs::write(dir.join("log.1.txt"), b"a big legacy generation").unwrap();
+
+        let detached = detach_oversized_generation(&dir, 10);
+        assert_eq!(detached.len(), 1);
+        assert!(!dir.join("log.1.txt").exists());
+        assert!(detached[0].exists());
+
+        archive_detached_generations(&dir, &detached, 3);
+        assert!(!detached[0].exists());
+        assert_eq!(list_archives(&dir).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn small_generation_is_left_in_the_rotation_chain() {
+        let dir = scratch_dir("detach-small");
+        std::fs::write(dir.join("log.1.txt"), b"small").unwrap();
+
+        let detached = detach_oversized_generation(&dir, 10);
+        assert!(detached.is_empty());
+        assert!(dir.join("log.1.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_keeps_only_newest_archives() {
+        let dir = scratch_dir("prune");
+        let archive_dir = dir.join("archive");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        for i in 0..5 {
+            std::fs::write(archive_dir.join(format!("log_2026010{}_000000.zip", i)), b"x").unwrap();
+        }
+
+        prune_archives(&archive_dir, 2);
+
+        let mut left: Vec<String> = list_archives(&dir)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["log_20260103_000000.zip", "log_20260104_000000.zip"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn version_to_number_strips_v_prefix_and_packs_components() {
