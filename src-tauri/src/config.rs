@@ -293,6 +293,9 @@ fn update_card_config(
 /// Synchronous core of the full-content card update (file I/O + fsync under
 /// the global config lock). Blocking by design — call it from a blocking
 /// thread, never from an async task or the main thread.
+/// NOTE: a successful save may create a new ICCID -> card number association;
+/// callers must then trigger session reconciliation the way update_card does
+/// (smart_card::request_rescan + com_port::connect_pending_rack_cards).
 pub fn persist_card(card_number: &str, content: CardConfig) -> bool {
     let config_path = match get_config_path() {
         Ok(path) => path,

@@ -128,7 +128,7 @@ pub async fn app_connection() {
                     match notification {
                         Event::Incoming(Incoming::Publish(publish)) => {
                             let topic = match std::str::from_utf8(&publish.topic) {
-                                Ok(topic) => topic.to_string(),
+                                Ok(topic) => topic,
                                 Err(e) => {
                                     log::error!("{} invalid UTF-8 in publish topic: {:?}", log_header, e);
                                     continue;
@@ -142,7 +142,7 @@ pub async fn app_connection() {
                                     if !crate::logs_upload::dispatch_request(
                                         &mqtt_client_for_task,
                                         &log_header,
-                                        &topic,
+                                        topic,
                                         &json_payload,
                                     ) {
                                         log::warn!(

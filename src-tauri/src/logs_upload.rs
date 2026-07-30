@@ -7,7 +7,7 @@
 //! `logs/<request_id>/done` — either `{"name":...,"size":...,"chunks":...}`
 //! or `{"error":...}` when the slice could not be collected.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -17,7 +17,7 @@ use rumqttc::v5::AsyncClient;
 use serde_json::{json, Value};
 use tauri::async_runtime;
 
-use crate::logger::log_file_paths;
+use crate::logger::{log_file_paths, zip_log_entry, LOG_LINE_TS_FORMAT, LOG_LINE_TS_LEN};
 
 /// Upload chunk size. Large enough to move a multi-megabyte zip in a handful
 /// of publishes, small enough to keep memory and re-send costs sane.
@@ -32,18 +32,14 @@ const MAX_SLICE_BYTES: usize = 128 * 1024 * 1024;
 /// ACTIVE_REQUEST occupied, silently dropping every future fetch_logs.
 const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Length of the `YYYY-mm-dd HH:MM:SS.mmm` timestamp prefix of a log line.
-const TS_PREFIX_LEN: usize = 23;
-
-/// Timestamp format of a log line prefix (see the fern format in logger.rs).
-const TS_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
-
 /// The request currently being served; the server re-sends the command when
 /// the reply is slow, so duplicates must not start a second upload.
 static ACTIVE_REQUEST: Mutex<Option<u64>> = Mutex::new(None);
 
-/// Handles a server request published on the app connection.
-/// Returns true when the publish was a recognized command request.
+/// Handles a `fetch_logs` request published on the app connection; any other
+/// publish is left to the caller (returns false). If more app-level commands
+/// appear, promote the topic/name parsing to the connection layer and keep
+/// only the fetch_logs handling here.
 pub fn dispatch_request(client: &AsyncClient, log_header: &str, topic: &str, payload: &Value) -> bool {
     let Some(request_id) = crate::mqtt::request_id_from_topic(topic) else {
         return false;
@@ -83,7 +79,7 @@ pub fn dispatch_request(client: &AsyncClient, log_header: &str, topic: &str, pay
     let client = client.clone();
     let log_header = log_header.to_string();
     async_runtime::spawn(async move {
-        run_upload(&client, &log_header, request_id, &period).await;
+        run_upload(&client, &log_header, request_id, period).await;
         *ACTIVE_REQUEST.lock().unwrap() = None;
     });
     true
@@ -91,10 +87,10 @@ pub fn dispatch_request(client: &AsyncClient, log_header: &str, topic: &str, pay
 
 /// Collects, zips and publishes the log slice; reports failures to the server
 /// through the `done` topic so the command fails with a readable error.
-async fn run_upload(client: &AsyncClient, log_header: &str, request_id: u64, period: &str) {
+async fn run_upload(client: &AsyncClient, log_header: &str, request_id: u64, period: String) {
     let done_topic = format!("logs/{}/done", request_id);
 
-    let days = match period_days(period) {
+    let days = match period_days(&period) {
         Some(days) => days,
         None => {
             log::warn!("{} [LOGS] status=bad_period period={}", log_header, period);
@@ -104,8 +100,7 @@ async fn run_upload(client: &AsyncClient, log_header: &str, request_id: u64, per
     };
 
     // file IO and zipping are blocking work, keep them off the async workers
-    let period_owned = period.to_string();
-    let collected = async_runtime::spawn_blocking(move || collect_zipped_logs(days, &period_owned)).await;
+    let collected = async_runtime::spawn_blocking(move || collect_zipped_logs(days, &period)).await;
     let (name, data) = match collected {
         Ok(Ok(collected)) => collected,
         Ok(Err(e)) => {
@@ -123,23 +118,10 @@ async fn run_upload(client: &AsyncClient, log_header: &str, request_id: u64, per
     let mut chunks = 0usize;
     for chunk in data.chunks(CHUNK_SIZE) {
         let topic = format!("logs/{}/{}", request_id, chunks);
-        let published = tokio::time::timeout(
-            PUBLISH_TIMEOUT,
-            client.publish(topic, QoS::AtLeastOnce, false, chunk.to_vec()),
-        )
-        .await;
-        match published {
-            Ok(Ok(())) => {}
-            // the connection queue broke or stalled: the server will time the command
-            // out, nothing else meaningful can be delivered on this connection
-            Ok(Err(e)) => {
-                log::error!("{} [LOGS] status=chunk_publish_failed chunk={} err={:?}", log_header, chunks, e);
-                return;
-            }
-            Err(_) => {
-                log::error!("{} [LOGS] status=chunk_publish_timeout chunk={}", log_header, chunks);
-                return;
-            }
+        // a failed or stalled chunk ends the upload: the server will time the command
+        // out, nothing else meaningful can be delivered on this connection
+        if !publish_with_timeout(client, log_header, topic, chunk.to_vec()).await {
+            return;
         }
         chunks += 1;
     }
@@ -161,27 +143,37 @@ async fn run_upload(client: &AsyncClient, log_header: &str, request_id: u64, per
     );
 }
 
-async fn publish_json(client: &AsyncClient, log_header: &str, topic: &str, value: Value) {
+/// Publishes one payload under the per-publish deadline.
+/// Returns false when the publish failed or stalled and the upload must stop.
+async fn publish_with_timeout(client: &AsyncClient, log_header: &str, topic: String, payload: Vec<u8>) -> bool {
     let published = tokio::time::timeout(
         PUBLISH_TIMEOUT,
-        client.publish(topic.to_string(), QoS::AtLeastOnce, false, value.to_string()),
+        client.publish(topic.clone(), QoS::AtLeastOnce, false, payload),
     )
     .await;
     match published {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => log::error!("{} [LOGS] status=done_publish_failed topic={} err={:?}", log_header, topic, e),
-        Err(_) => log::error!("{} [LOGS] status=done_publish_timeout topic={}", log_header, topic),
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            log::error!("{} [LOGS] status=publish_failed topic={} err={:?}", log_header, topic, e);
+            false
+        }
+        Err(_) => {
+            log::error!("{} [LOGS] status=publish_timeout topic={}", log_header, topic);
+            false
+        }
     }
 }
 
-/// Maps the wire period value to a day count.
+async fn publish_json(client: &AsyncClient, log_header: &str, topic: &str, value: Value) {
+    publish_with_timeout(client, log_header, topic.to_string(), value.to_string().into_bytes()).await;
+}
+
+/// Parses the wire period "<days>d" to a day count. The parse is generic on
+/// purpose: the authoritative whitelist is the server-side command enum, so an
+/// older app stays compatible when new periods are added there.
 fn period_days(period: &str) -> Option<i64> {
-    match period {
-        "1d" => Some(1),
-        "7d" => Some(7),
-        "30d" => Some(30),
-        _ => None,
-    }
+    let days = period.strip_suffix('d')?.parse::<i64>().ok()?;
+    (1..=365).contains(&days).then_some(days)
 }
 
 /// Reads the log slice for the last `days` days and returns the zip file
@@ -196,12 +188,10 @@ fn collect_zipped_logs(days: i64, period: &str) -> Result<(String, Vec<u8>), Str
     let archive_needed = first_ts.map_or(true, |ts| ts > cutoff);
 
     let mut data = Vec::new();
-    if archive_needed && archived_path.exists() {
+    if archive_needed {
         filter_log_file(&archived_path, cutoff, &mut data).map_err(|e| format!("cannot read archived log file: {}", e))?;
     }
-    if current_path.exists() {
-        filter_log_file(&current_path, cutoff, &mut data).map_err(|e| format!("cannot read log file: {}", e))?;
-    }
+    filter_log_file(&current_path, cutoff, &mut data).map_err(|e| format!("cannot read log file: {}", e))?;
     if data.is_empty() {
         return Err(format!("no log entries for the last {} day(s)", days));
     }
@@ -228,13 +218,16 @@ fn first_entry_timestamp(path: &Path) -> std::io::Result<Option<NaiveDateTime>> 
     Ok(None)
 }
 
-/// Appends the lines of the log file dated at or after the cutoff to `out`.
-/// Lines without a timestamp prefix (continuations) follow the fate of the
-/// last timestamped line before them.
+/// Appends the lines of the log file dated at or after the cutoff to `out`;
+/// a missing file contributes nothing. Lines without a timestamp prefix
+/// (continuations) follow the fate of the last timestamped line before them.
 fn filter_log_file(path: &Path, cutoff: NaiveDateTime, out: &mut Vec<u8>) -> std::io::Result<()> {
-    let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    filter_log_lines(reader, cutoff, out)
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    filter_log_lines(BufReader::new(file), cutoff, out)
 }
 
 fn filter_log_lines<R: BufRead>(reader: R, cutoff: NaiveDateTime, out: &mut Vec<u8>) -> std::io::Result<()> {
@@ -257,17 +250,13 @@ fn filter_log_lines<R: BufRead>(reader: R, cutoff: NaiveDateTime, out: &mut Vec<
 
 /// Parses the timestamp prefix of a log line, None for continuation lines.
 fn line_timestamp(line: &str) -> Option<NaiveDateTime> {
-    let prefix = line.get(..TS_PREFIX_LEN)?;
-    NaiveDateTime::parse_from_str(prefix, TS_FORMAT).ok()
+    let prefix = line.get(..LOG_LINE_TS_LEN)?;
+    NaiveDateTime::parse_from_str(prefix, LOG_LINE_TS_FORMAT).ok()
 }
 
 /// Packs the collected log slice into a single-entry zip archive.
-fn zip_log(data: &[u8]) -> zip::result::ZipResult<Vec<u8>> {
-    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    writer.start_file("log.txt", options)?;
-    writer.write_all(data)?;
-    Ok(writer.finish()?.into_inner())
+fn zip_log(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    Ok(zip_log_entry(&mut std::io::Cursor::new(data), std::io::Cursor::new(Vec::new()))?.into_inner())
 }
 
 #[cfg(test)]
@@ -276,14 +265,17 @@ mod tests {
     use std::io::Cursor;
 
     fn ts(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.3f").unwrap()
+        NaiveDateTime::parse_from_str(s, LOG_LINE_TS_FORMAT).unwrap()
     }
 
     #[test]
-    fn period_days_maps_wire_values_only() {
+    fn period_days_parses_bounded_day_counts() {
         assert_eq!(period_days("1d"), Some(1));
         assert_eq!(period_days("7d"), Some(7));
         assert_eq!(period_days("30d"), Some(30));
+        assert_eq!(period_days("2d"), Some(2)); // forward-compatible with new enum values
+        assert_eq!(period_days("0d"), None);
+        assert_eq!(period_days("366d"), None);
         assert_eq!(period_days("2w"), None);
         assert_eq!(period_days(""), None);
     }

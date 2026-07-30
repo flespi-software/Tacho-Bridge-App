@@ -222,10 +222,11 @@ static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 lazy_static::lazy_static! {
-    /// Handle to the rack's MQTT task, if one is running. Started when the rack
-    /// connects and aborted when it disconnects, so there is at most one rack
-    /// MQTT connection at a time.
-    static ref RACK_MQTT_TASK: std::sync::Mutex<Option<JoinHandle<()>>> =
+    /// Handle to the rack's MQTT task, if one is running, together with the rack's
+    /// serial port. Started when the rack connects and aborted when it disconnects,
+    /// so there is at most one rack MQTT connection at a time; the port rides along
+    /// so `connect_pending_rack_cards` can spawn card sessions outside the MQTT loop.
+    static ref RACK_MQTT_TASK: std::sync::Mutex<Option<(JoinHandle<()>, SharedPort)>> =
         std::sync::Mutex::new(None);
 }
 
@@ -950,8 +951,14 @@ async fn handle_connect_spawn(payload: &[u8], serial_port: &SharedPort, log_head
         return;
     };
 
-    // a reader-backed session for the same card number wins: never open a second
-    // connection with the same client_id (the server treats that as an ident collision)
+    spawn_rack_card_checked(card_number, iccid.to_string(), slot as u16, serial_port.clone(), log_header).await;
+}
+
+/// Final spawn step shared by the server `connect` handler and the pending-card
+/// retry: a reader-backed session for the same card number wins — never open a
+/// second connection with the same client_id (the server treats that as an
+/// ident collision).
+async fn spawn_rack_card_checked(card_number: String, iccid: String, slot: u16, port: SharedPort, log_header: &str) {
     if TASK_POOL.lock().await.iter().any(|card| card.client_id == card_number) {
         log::warn!(
             "{} [SPAWN] card {} is already served by a reader connection — rack slot {} skipped",
@@ -962,7 +969,7 @@ async fn handle_connect_spawn(payload: &[u8], serial_port: &SharedPort, log_head
         return;
     }
 
-    spawn_rack_card(card_number, iccid.to_string(), slot as u16, serial_port.clone());
+    spawn_rack_card(card_number, iccid, slot, port);
 }
 
 /// Puts one discovered rack card into the UI card list (keyed by slot) and re-emits the
@@ -996,10 +1003,6 @@ lazy_static::lazy_static! {
 
     /// Cards currently exposed by the rack, as shown in the UI (RackState.cards).
     static ref RACK_CARDS_UI: std::sync::Mutex<Vec<RackCard>> = std::sync::Mutex::new(Vec::new());
-
-    /// Serial port of the connected rack while its MQTT stack is running; lets
-    /// `connect_pending_rack_cards` spawn a card session outside the rack MQTT loop.
-    static ref RACK_PORT: std::sync::Mutex<Option<SharedPort>> = std::sync::Mutex::new(None);
 }
 
 /// Opens rack-backed sessions for discovered cards that became resolvable after
@@ -1008,11 +1011,11 @@ lazy_static::lazy_static! {
 /// content changes — so assigning the number in the UI must retry it locally.
 pub async fn connect_pending_rack_cards() {
     let port = {
-        let guard = match RACK_PORT.lock() {
+        let guard = match RACK_MQTT_TASK.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.clone()
+        guard.as_ref().map(|(_, port)| port.clone())
     };
     let Some(port) = port else {
         return; // no rack connected
@@ -1033,10 +1036,6 @@ pub async fn connect_pending_rack_cards() {
         let Some(card_number) = crate::config::find_card_number_by_iccid(&iccid) else {
             continue; // still unassigned
         };
-        // mirror handle_connect_spawn: a reader-backed session with this number wins
-        if TASK_POOL.lock().await.iter().any(|card| card.client_id == card_number) {
-            continue;
-        }
         log::info!(
             "[RACK] [SPAWN] pending card resolved after config update: slot={} iccid={} card={}",
             slot,
@@ -1044,7 +1043,7 @@ pub async fn connect_pending_rack_cards() {
             card_number
         );
         update_rack_card_ui(slot, &iccid, Some(card_number.clone()));
-        spawn_rack_card(card_number, iccid, slot, port.clone());
+        spawn_rack_card_checked(card_number, iccid, slot, port.clone(), "[RACK]").await;
     }
 }
 
@@ -1770,7 +1769,7 @@ fn rack_mqtt_running() -> bool {
         Err(poisoned) => poisoned.into_inner(),
     };
     match guard.as_ref() {
-        Some(handle) if handle.inner().is_finished() => {
+        Some((handle, _)) if handle.inner().is_finished() => {
             log::warn!("[RACK] [MQTT] task exited on its own — clearing stale handle");
             *guard = None;
             false
@@ -1791,15 +1790,8 @@ fn start_rack_mqtt(client_id: String, port: SharedPort) {
         Err(poisoned) => poisoned.into_inner(),
     };
     log::info!("[RACK] [MQTT] phase=start client_id={}", client_id);
-    {
-        let mut port_guard = match RACK_PORT.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *port_guard = Some(port.clone());
-    }
-    let handle = async_runtime::spawn(rack_mqtt_loop(client_id, port));
-    *guard = Some(handle);
+    let handle = async_runtime::spawn(rack_mqtt_loop(client_id, port.clone()));
+    *guard = Some((handle, port));
 }
 
 /// Tears down the rack's MQTT stack so the presence monitor rebuilds it on the
@@ -1832,17 +1824,10 @@ fn stop_rack_mqtt() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(handle) = guard.take() {
+        if let Some((handle, _)) = guard.take() {
             handle.abort();
             log::info!("[RACK] [MQTT] phase=stop status=aborted");
         }
-    }
-    {
-        let mut port_guard = match RACK_PORT.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *port_guard = None;
     }
     stop_rack_watch();
     stop_rack_cards();

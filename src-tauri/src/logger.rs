@@ -45,6 +45,23 @@ const LOG_ARCHIVE_KEEP: usize = 10;
 /// persistent failure (e.g. a locked file) does not retry on every log line.
 const ROTATE_RETRY_PAUSE: Duration = Duration::from_secs(60);
 
+/// Timestamp format of a log line prefix; the fern formatter and the
+/// fetch_logs period filter (logs_upload) must agree on it.
+pub const LOG_LINE_TS_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
+
+/// Length of the formatted `LOG_LINE_TS_FORMAT` prefix in a log line.
+pub const LOG_LINE_TS_LEN: usize = 23;
+
+/// Distinguishes detached-generation temp files created within one second.
+static DETACH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Builds a unique temp path a displaced log generation is detached under
+/// before being zipped in the background.
+fn detach_temp_path(dir: &Path) -> PathBuf {
+    let seq = DETACH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dir.join(format!("log.1.archiving.{}.{}.txt", chrono::Local::now().format("%Y%m%d_%H%M%S"), seq))
+}
+
 /// Parses a level name from the `TBA_LOG` spec ("debug", "warn", ...).
 fn parse_level(s: &str) -> Option<log::LevelFilter> {
     match s.trim().to_ascii_lowercase().as_str() {
@@ -118,28 +135,36 @@ impl RotatingLogWriter {
         Ok(Self { dir, file: Some(file), written, limit, keep, failed_rotate_at: None })
     }
 
-    /// True when the size limit is reached and no recent rotation attempt failed.
+    /// True when a rotation attempt is needed: the size limit is reached, or the
+    /// sink is broken and a reopen is due — unless a recent attempt already failed.
     fn rotation_due(&self) -> bool {
-        self.written >= self.limit
+        (self.file.is_none() || self.written >= self.limit)
             && self.failed_rotate_at.map_or(true, |at| at.elapsed() >= ROTATE_RETRY_PAUSE)
     }
 
     fn rotate(&mut self) {
         // close our handle first: Windows cannot rename a file that is open
-        if let Some(file) = self.file.take() {
-            let _ = file.sync_all();
-        }
+        drop(self.file.take());
 
         let current = self.dir.join("log.txt");
         let archived = self.dir.join("log.1.txt");
 
-        // zip the displaced generation into archive/ before it is overwritten;
-        // on failure the generation is dropped, same as the rename would do
+        // the displaced generation is detached under a unique temp name and zipped in
+        // a background thread: deflating 50 MB inline would stall every logging thread
+        // on the fern mutex for the whole compression
         if archived.exists() {
-            if let Err(e) = archive_log_generation(&self.dir, &archived, self.keep) {
-                eprintln!("Failed to archive {:?}: {}", archived, e);
+            let temp = detach_temp_path(&self.dir);
+            match std::fs::rename(&archived, &temp) {
+                Ok(()) => {
+                    let dir = self.dir.clone();
+                    let keep = self.keep;
+                    std::thread::spawn(move || archive_detached_generations(&dir, &[temp], keep));
+                }
+                Err(e) => {
+                    eprintln!("Failed to detach {:?} for archiving: {}", archived, e);
+                    let _ = std::fs::remove_file(&archived); // Windows rename does not overwrite
+                }
             }
-            let _ = std::fs::remove_file(&archived); // Windows rename does not overwrite
         }
 
         if let Err(e) = std::fs::rename(&current, &archived) {
@@ -172,14 +197,9 @@ impl Write for RotatingLogWriter {
                 self.written += written as u64;
                 Ok(written)
             }
-            // the sink is broken (reopen failed): swallow the line instead of
-            // erroring — fern must keep serving the stdout chain in dev builds
-            None => {
-                if self.failed_rotate_at.map_or(true, |at| at.elapsed() >= ROTATE_RETRY_PAUSE) {
-                    self.rotate();
-                }
-                Ok(buf.len())
-            }
+            // the sink is broken (reopen failed, next attempt not due yet): swallow the
+            // line instead of erroring — fern must keep serving the stdout chain in dev
+            None => Ok(buf.len()),
         }
     }
 
@@ -191,8 +211,18 @@ impl Write for RotatingLogWriter {
     }
 }
 
-/// Zips a displaced log generation into `archive/log_<timestamp>.zip` (content
-/// is streamed, not buffered) and prunes the oldest archives beyond `keep`.
+/// Zips a single `log.txt` entry read from `source` into `sink` (streamed, not
+/// buffered). Shared by the rotation archiver and the fetch_logs upload packer.
+pub fn zip_log_entry<W: Write + std::io::Seek>(source: &mut impl std::io::Read, sink: W) -> std::io::Result<W> {
+    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut writer = zip::ZipWriter::new(sink);
+    writer.start_file("log.txt", options).map_err(std::io::Error::other)?;
+    std::io::copy(source, &mut writer)?;
+    writer.finish().map_err(std::io::Error::other)
+}
+
+/// Zips a displaced log generation into `archive/log_<timestamp>.zip` and
+/// prunes the oldest archives beyond `keep`.
 fn archive_log_generation(dir: &Path, archived: &Path, keep: usize) -> std::io::Result<()> {
     let archive_dir = dir.join("archive");
     std::fs::create_dir_all(&archive_dir)?;
@@ -207,11 +237,7 @@ fn archive_log_generation(dir: &Path, archived: &Path, keep: usize) -> std::io::
         suffix += 1;
     }
 
-    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    let mut writer = zip::ZipWriter::new(std::io::BufWriter::new(File::create(&dest)?));
-    writer.start_file("log.txt", options).map_err(std::io::Error::other)?;
-    std::io::copy(&mut File::open(archived)?, &mut writer)?;
-    writer.finish().map_err(std::io::Error::other)?.into_inner()?.flush()?;
+    zip_log_entry(&mut File::open(archived)?, std::io::BufWriter::new(File::create(&dest)?))?.flush()?;
 
     prune_archives(&archive_dir, keep);
     Ok(())
@@ -236,7 +262,7 @@ fn detach_oversized_generation(dir: &Path, limit: u64) -> Vec<PathBuf> {
 
     let generation = dir.join("log.1.txt");
     if std::fs::metadata(&generation).map(|m| m.len() >= limit).unwrap_or(false) {
-        let temp = dir.join(format!("log.1.archiving.{}.txt", chrono::Local::now().format("%Y%m%d_%H%M%S")));
+        let temp = detach_temp_path(dir);
         match std::fs::rename(&generation, &temp) {
             Ok(()) => detached.push(temp),
             Err(e) => eprintln!("Failed to detach oversized log generation: {}", e),
@@ -332,7 +358,7 @@ pub fn setup_logging() {
             let target = target.strip_prefix("app_lib::").unwrap_or(target);
             out.finish(format_args!(
                 "{} {:<5} [{}] {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                chrono::Local::now().format(LOG_LINE_TS_FORMAT),
                 record.level(),
                 target,
                 message
@@ -519,10 +545,18 @@ mod tests {
         writer.write_all(b"generation two\n").unwrap(); // rotation 1: no log.1 yet, nothing to archive
         writer.write_all(b"generation three\n").unwrap(); // rotation 2: "generation one" leaves log.1 for archive
 
-        let archives = list_archives(&dir);
-        assert_eq!(archives.len(), 1);
-        let zipped = std::fs::read(&archives[0]).unwrap();
-        assert_eq!(&zipped[..4], b"PK\x03\x04");
+        // the displaced generation is zipped in a background thread: poll for it
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let archives = list_archives(&dir);
+            if archives.len() == 1 {
+                let zipped = std::fs::read(&archives[0]).unwrap();
+                assert_eq!(&zipped[..4], b"PK\x03\x04");
+                break;
+            }
+            assert!(Instant::now() < deadline, "archive did not appear in time");
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
