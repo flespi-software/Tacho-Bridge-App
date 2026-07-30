@@ -247,3 +247,9 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed the lost card result over the Lisle rack: the app no longer stops listening — or throws away what arrived — between two reads of one operation.
+
+### [0.8.0-alpha.14] - 2026-07-30
+
+🆕 Features / Improvements
+
+- Added the fetch_logs server command: on request the app collects the last day, week or month of its log, packs it into a zip and uploads it to the server in chunks over the app connection.
