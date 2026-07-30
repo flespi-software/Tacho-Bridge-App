@@ -128,7 +128,7 @@ fn request_to_response_topic(topic: &str) -> String {
 /// Extracts the request id (the first segment after `request/`) from a topic of
 /// the form `request/<id>/<sender>`. Used for idempotent handling of repeated
 /// requests: the server re-sends the same id when it does not get a timely reply.
-fn request_id_from_topic(topic: &str) -> Option<u64> {
+pub(crate) fn request_id_from_topic(topic: &str) -> Option<u64> {
     topic
         .strip_prefix("request/")
         .and_then(|rest| rest.split('/').next())

@@ -127,26 +127,31 @@ pub async fn app_connection() {
 
                     match notification {
                         Event::Incoming(Incoming::Publish(publish)) => {
-                            // Extracting the topic from the incoming data
-                            // let topic_str = match std::str::from_utf8(&publish.topic) {
-                            //     Ok(str) => str,
-                            //     Err(e) => {
-                            //         eprintln!("Error converting topic from bytes to string: {:?}", e);
-                            //         return;
-                            //     }
-                            // };
+                            let topic = match std::str::from_utf8(&publish.topic) {
+                                Ok(topic) => topic.to_string(),
+                                Err(e) => {
+                                    log::error!("{} invalid UTF-8 in publish topic: {:?}", log_header, e);
+                                    continue;
+                                }
+                            };
 
-                            // Convert &str to String for further use
-                            // let topic = topic_str.to_string();
-                            // The contents of response and request are the same.
-                            // Card number and parcel ID. So we just change the initial topic
-                            // let topic_ack = topic.replace("request", "response");
-
-                            // serializable data to interpret it as json
+                            // server command requests come as JSON publishes on request/<id>/0
                             match serde_json::from_slice::<Value>(&publish.payload) {
                                 Ok(json_payload) => {
                                     log::debug!("Parsed JSON payload: {:?}", json_payload);
-                                    // The "hex" parameter contains the apdu instruction that needs to be transferred to the card
+                                    if !crate::logs_upload::dispatch_request(
+                                        &mqtt_client_for_task,
+                                        &log_header,
+                                        &topic,
+                                        &json_payload,
+                                    ) {
+                                        log::warn!(
+                                            "{} unsupported publish topic={} payload={:?}",
+                                            log_header,
+                                            topic,
+                                            json_payload
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     log::error!("{} parsing JSON payload issue: {:?}", log_header, e);

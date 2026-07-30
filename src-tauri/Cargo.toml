@@ -41,6 +41,9 @@ sys-info = "0.9.1"
 once_cell = "1.21.3"
 tokio-serial = "5.4.5"
 serialport = "4.8.1"
+# Log upload for the fetch_logs server command: the log slice is delivered as
+# a zip archive (the server-side media pipeline accepts zip only).
+zip = { version = "7.2", default-features = false, features = ["deflate"] }
 # A second running instance can't share the rack's COM port (exclusive open on
 # Windows) — it just fights the first one for it. Block it and focus the
 # existing window instead.

@@ -48,7 +48,8 @@ fn parse_level(s: &str) -> Option<log::LevelFilter> {
     }
 }
 
-pub fn setup_logging() {
+/// Resolves the directory holding the application log files.
+pub fn log_dir() -> PathBuf {
     let mut log_path = PathBuf::new();
 
     // Resolve the home directory without panicking if the env var is missing —
@@ -74,6 +75,18 @@ pub fn setup_logging() {
             log_path.push("tba-logs");
         }
     }
+
+    log_path
+}
+
+/// Returns the current and archived log file paths (log.txt, log.1.txt).
+pub fn log_file_paths() -> (PathBuf, PathBuf) {
+    let dir = log_dir();
+    (dir.join("log.txt"), dir.join("log.1.txt"))
+}
+
+pub fn setup_logging() {
+    let mut log_path = log_dir();
 
     if let Err(e) = std::fs::create_dir_all(&log_path) {
         eprintln!("Failed to create log directory {:?}: {}", log_path, e);

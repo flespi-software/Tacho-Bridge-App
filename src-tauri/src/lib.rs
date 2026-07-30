@@ -5,6 +5,7 @@ mod app_connect;        // Application connection to the MQTT broker.
 mod commands_settings;  // Settings reporting to the server.
 mod config;             // Configuration handling.
 mod logger;             // Logging functionality.
+mod logs_upload;        // Log upload to the server (fetch_logs command).
 mod mqtt;               // MQTT communication.
 mod smart_card;         // PCSC module for smart card operations.
 mod apdu_sniffer;       // Passive sniffer for plaintext EF data in proxied APDUs.

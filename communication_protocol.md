@@ -214,8 +214,8 @@ message: the server discovers them from a watch update and sends a regular
 ## 7. App connection
 
 The application-level connection identifies a running TBA instance (presence,
-diagnostics). It follows the same topic scheme; currently it carries no
-command traffic.
+diagnostics). It follows the same topic scheme. The only command it carries
+is the log fetch (below).
 
 The username/password fields of the MQTT CONNECT packet are reserved for
 future authorization and must not be used to carry anything else.
@@ -248,6 +248,41 @@ connection). On the server the values are exposed as a read-only "Application
 Information" device setting; unknown top-level keys are ignored. Servers
 without settings-report support reject the unknown topic, so the server side
 must be deployed before a TBA release that sends it.
+
+### Log fetch (`fetch_logs`)
+
+The server requests the application log with a JSON publish to
+`request/<request_id>/0` on the app connection:
+
+```json
+{ "name": "fetch_logs", "period": "1d" }
+```
+
+- `period` — the time span of the log to return, counted back from now:
+  `"1d"` (one day), `"7d"` (one week) or `"30d"` (one month).
+
+TBA slices the requested period out of its log files (the current `log.txt`
+first; when it does not reach back far enough, the archived `log.1.txt`
+generation is prepended), packs the slice into a single-entry **zip** archive
+(the server media pipeline accepts zip only) and publishes it back in binary
+chunks of up to 1 MiB:
+
+```
+logs/<request_id>/<seq>      # zip content, seq starts from 0
+logs/<request_id>/done       # JSON finalizer
+```
+
+The finalizer is either a success summary or an error report; the error text
+becomes the command failure reason on the server:
+
+```json
+{ "name": "tba_logs_20260730_0930_1d.zip", "size": 123456, "chunks": 1 }
+{ "error": "no log entries for the last 1 day(s)" }
+```
+
+Idempotency: while an upload is running, a re-sent `fetch_logs` with any
+`request_id` is dropped — the upload in flight produces the reply. Chunks of
+an abandoned exchange are discarded by the server via the `request_id` check.
 
 ## 8. Configuration inputs
 
