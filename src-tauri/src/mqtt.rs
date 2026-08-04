@@ -4,13 +4,14 @@
 
 // ───── Std Lib ─────
 use std::ffi::CStr;                  // For handling C-style strings in Rust.
-use std::time::Duration;            // For specifying time durations.
+use std::time::{Duration, Instant}; // For specifying time durations and shutdown deadlines.
 
 // ───── MQTT Client Library (rumqttc) ─────
 use rumqttc::v5::mqttbytes::QoS;                    // Quality of Service levels for MQTT.
 use rumqttc::v5::ConnectionError;                   // For handling MQTT connection errors.
 use rumqttc::v5::StateError;                        // MQTT protocol state errors.
 use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};        // Core MQTT async client and options.
+use rumqttc::Outgoing;                              // Outgoing event markers (graceful DISCONNECT detection).
 
 // ───── Tauri ─────
 use tauri::async_runtime::{self, JoinHandle};       // Async runtime and task join handles for Tauri apps.
@@ -35,6 +36,12 @@ const RECONNECT_DELAY_INITIAL_SECS: u64 = 10;
 const RECONNECT_DELAY_MAX_SECS: u64 = 300;
 const GLOBAL_CARDS_SYNC_EVENT: &str = "global-cards-sync";
 const CARD_PRESENT_STATE: &str = "PRESENT";
+
+/// How long a closing MQTT task gets to flush its DISCONNECT packet and exit
+/// before being force-aborted.
+const SHUTDOWN_FLUSH_TIMEOUT_MS: u64 = 2000;
+/// Poll step while waiting for closing MQTT tasks to finish.
+const SHUTDOWN_POLL_INTERVAL_MS: u64 = 50;
 
 /// Returns the next reconnect delay given the current one (exponential, capped).
 fn next_reconnect_delay(current: u64) -> u64 {
@@ -558,6 +565,13 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             // Send the global-cards-sync event to the frontend that card is connected
                             emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(false));
                         }
+                        Event::Outgoing(Outgoing::Disconnect) => {
+                            // graceful teardown: the DISCONNECT packet is already flushed to the
+                            // socket, so exit instead of letting the loop treat the closing
+                            // connection as a network failure and reconnect
+                            log::info!("{} [CONN] phase=shutdown status=disconnect_sent", log_header);
+                            break;
+                        }
                         _ => {} // This handles any other events that you haven't explicitly matched above
                     }
                 }
@@ -601,60 +615,120 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     }
 }
 
+/// Gracefully terminates MQTT tasks whose entries are already removed from
+/// TASK_POOL: queues a clean DISCONNECT for each one (the server then logs a
+/// normal close instead of an internal error), waits for the event loops to
+/// flush the packet and exit on their own, and force-aborts the stragglers.
+pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
+    // Phase 1: queue DISCONNECTs; a task whose request queue is unreachable
+    // (already dead or clogged) has nothing to flush and is aborted right away.
+    let mut waiting: Vec<ProcessingCard> = Vec::with_capacity(cards.len());
+    for card in cards {
+        match card.mqtt_client.try_disconnect() {
+            Ok(()) => {
+                log::info!(
+                    "{} | [CONN] phase=shutdown status=disconnect_queued reason={}",
+                    card.client_id,
+                    reason
+                );
+                waiting.push(card);
+            }
+            Err(e) => {
+                log::warn!(
+                    "{} | [CONN] phase=shutdown status=force_abort reason={} err={:?}",
+                    card.client_id,
+                    reason,
+                    e
+                );
+                card.task_handle.abort();
+            }
+        }
+    }
+
+    // Phase 2: one shared deadline for all tasks - the event loop exits itself
+    // after flushing the DISCONNECT (see the Outgoing::Disconnect break arm).
+    let deadline = Instant::now() + Duration::from_millis(SHUTDOWN_FLUSH_TIMEOUT_MS);
+    while !waiting.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(SHUTDOWN_POLL_INTERVAL_MS)).await;
+        waiting.retain(|card| {
+            if card.task_handle.inner().is_finished() {
+                log::info!(
+                    "{} | [CONN] phase=shutdown status=closed_cleanly reason={}",
+                    card.client_id,
+                    reason
+                );
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    // A task still alive here is offline or wedged (e.g. sitting in reconnect
+    // backoff, unable to process the queued DISCONNECT) - kill it like before.
+    for card in waiting {
+        log::warn!(
+            "{} | [CONN] phase=shutdown status=force_abort reason=flush_timeout_{}ms",
+            card.client_id,
+            SHUTDOWN_FLUSH_TIMEOUT_MS
+        );
+        card.task_handle.abort();
+    }
+}
+
 /// Terminates connections for the specified client IDs (card numbers).
 pub async fn remove_connections(client_ids: Vec<String>) {
     log::debug!("Removing connections for client_ids: {:?}", client_ids);
 
-    // Lock the task pool
-    let mut task_pool = TASK_POOL.lock().await;
+    // Collect the matching cards under the pool lock, then close them outside
+    // of it so the disconnect flush cannot block new card registrations.
+    let mut removed: Vec<ProcessingCard> = Vec::new();
+    {
+        let mut task_pool = TASK_POOL.lock().await;
+        for client_id in client_ids {
+            // Find the index of the card with the matching client_id
+            if let Some(index) = task_pool.iter().position(|card| card.client_id == client_id) {
+                let card = task_pool.remove(index);
 
-    for client_id in client_ids {
-        // Find the index of the card with the matching client_id
-        if let Some(index) = task_pool.iter().position(|card| card.client_id == client_id) {
-            let card = task_pool.remove(index);
-            card.task_handle.abort();
+                // Drop any APDU sniffer state we accumulated for this client so the
+                // global HashMap does not grow without bound across reconnects.
+                crate::apdu_sniffer::forget(&card.client_id);
 
-            // Drop any APDU sniffer state we accumulated for this client so the
-            // global HashMap does not grow without bound across reconnects.
-            crate::apdu_sniffer::forget(&card.client_id);
-
-            log::debug!(
-                "TASK_POOL: Connection terminated for client_id: {}, reader: {}, atr: {}",
-                card.client_id,
-                card.reader_name.as_deref().unwrap_or("unknown"),
-                card.atr.as_deref().unwrap_or("unknown"),
-            );
-        } else {
-            log::warn!(
-                "TASK_POOL: No active connection found for requested client_id: {}",
-                client_id
-            );
-            // Also clear any stale sniffer state, just in case (no-op if absent).
-            crate::apdu_sniffer::forget(&client_id);
+                log::debug!(
+                    "TASK_POOL: Connection scheduled for shutdown for client_id: {}, reader: {}, atr: {}",
+                    card.client_id,
+                    card.reader_name.as_deref().unwrap_or("unknown"),
+                    card.atr.as_deref().unwrap_or("unknown"),
+                );
+                removed.push(card);
+            } else {
+                log::warn!(
+                    "TASK_POOL: No active connection found for requested client_id: {}",
+                    client_id
+                );
+                // Also clear any stale sniffer state, just in case (no-op if absent).
+                crate::apdu_sniffer::forget(&client_id);
+            }
         }
     }
+
+    shutdown_connections(removed, "removed_by_request").await;
 }
 
 /// Terminates all active card-related MQTT connections and clears the task pool.
 pub async fn remove_connections_all() {
     log::info!("Removing all card connections...");
 
-    // Lock the task pool
-    let mut task_pool = TASK_POOL.lock().await;
-
-    // Abort each task and log which client is being disconnected
-    for card in task_pool.drain(..) {
-        log::debug!(
-            "TASK_POOL: Aborting task for client_id: {}, reader: {}, atr: {}",
-            card.client_id,
-            card.reader_name.as_deref().unwrap_or("unknown"),
-            card.atr.as_deref().unwrap_or("unknown"),
-        );
-        card.task_handle.abort();
-    }
+    // Drain the pool under the lock, then close the connections outside of it.
+    let cards: Vec<ProcessingCard> = {
+        let mut task_pool = TASK_POOL.lock().await;
+        task_pool.drain(..).collect()
+    };
 
     // Clear all APDU sniffer state in one shot.
     crate::apdu_sniffer::forget_all();
+
+    shutdown_connections(cards, "remove_all").await;
 
     log::info!("All card connections have been terminated and the task pool has been cleared.");
 }

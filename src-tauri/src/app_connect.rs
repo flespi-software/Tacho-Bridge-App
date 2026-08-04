@@ -67,16 +67,21 @@ pub async fn app_connection() {
 
     // The app-level connection is the only pool entry without a reader. If one
     // already exists (possibly stuck deep in reconnect backoff, or registered
-    // under a previous ident), replace it: abort the old task and start fresh,
+    // under a previous ident), replace it: close the old task and start fresh,
     // so a manual reconnect acts immediately instead of being silently skipped.
     if let Some(index) = task_pool.iter().position(|card| card.reader_name.is_none()) {
         let old = task_pool.remove(index);
-        old.task_handle.abort();
         log::info!(
             "[CONN] phase=app_connection status=replacing_existing old_client_id={} client_id={}",
             old.client_id,
             client_id
         );
+        // Close gracefully (clean MQTT DISCONNECT); detached so the new
+        // connection is not delayed behind the old one's shutdown.
+        async_runtime::spawn(crate::mqtt::shutdown_connections(
+            vec![old],
+            "app_connection_replaced",
+        ));
     }
 
     //////////////////////////////////////////////////
@@ -168,6 +173,13 @@ pub async fn app_connection() {
                                 &log_header,
                             )
                             .await;
+                        }
+                        Event::Outgoing(rumqttc::Outgoing::Disconnect) => {
+                            // graceful teardown: the DISCONNECT packet is already flushed to the
+                            // socket, so exit instead of letting the loop treat the closing
+                            // connection as a network failure and reconnect
+                            log::info!("{} [CONN] phase=shutdown status=disconnect_sent", log_header);
+                            break;
                         }
                         _ => {} // This handles any other events that you haven't explicitly matched above
                     }

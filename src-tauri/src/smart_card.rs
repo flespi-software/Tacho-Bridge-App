@@ -305,12 +305,17 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProce
         });
         if let Some(index) = to_remove {
             let removed = pool.remove(index);
-            removed.task_handle.abort();
             log::warn!(
                 "Removed stale ProcessingCard for reader {} with old ATR {}",
                 removed.reader_name.as_deref().unwrap_or("unknown"),
                 removed.atr.as_deref().unwrap_or("unknown"),
             );
+            // Close the connection gracefully (clean MQTT DISCONNECT instead of a
+            // dropped socket); detached so the reader monitor is not delayed.
+            tauri::async_runtime::spawn(crate::mqtt::shutdown_connections(
+                vec![removed],
+                "card_removed",
+            ));
         }
 
         return CardProcessingResult::Delete;

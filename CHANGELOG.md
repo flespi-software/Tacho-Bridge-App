@@ -270,3 +270,9 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Unified rack log line format: every line is now 'RACK <serial> . / RACKCARD <number> . [AREA] key=value', prose fragments replaced with status/reason keys.
+
+### [unreleased]
+
+🛠 Fixes
+
+- Card and app MQTT connections are now closed with a proper MQTT DISCONNECT when a card is pulled from the reader, removed from the config, the server host changes or the app quits. Previously the socket was just dropped, and the server logged every such close as "internal error" (close_code=5); now it is a normal close.

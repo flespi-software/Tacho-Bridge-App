@@ -128,6 +128,10 @@ pub fn run() {
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { .. } = event {
                         com_port::shutdown();
+                        // Close the app/card MQTT connections with clean DISCONNECTs so the
+                        // server logs normal closes instead of internal errors; bounded by the
+                        // shutdown flush timeout, so quitting stays snappy even when offline.
+                        tauri::async_runtime::block_on(mqtt::remove_connections_all());
                         log::info!("-== Application is closed by user ==-\n");
                     }
                 });
