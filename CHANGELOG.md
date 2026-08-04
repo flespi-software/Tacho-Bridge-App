@@ -276,3 +276,9 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Card and app MQTT connections are now closed with a proper MQTT DISCONNECT when a card is pulled from the reader, removed from the config, the server host changes or the app quits. Previously the socket was just dropped, and the server logged every such close as "internal error" (close_code=5); now it is a normal close.
+
+### [0.8.0-beta.3] - 2026-08-04
+
+🆕 Features / Improvements
+
+- Card and app MQTT connections now close with a proper MQTT DISCONNECT on card removal, config change and app quit: the server logs a normal close instead of 'internal error' (close_code=5); force-abort remains as a 2s fallback for offline or wedged connections.
