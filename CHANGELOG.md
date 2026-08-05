@@ -301,3 +301,14 @@ All notable changes to this project will be documented in this file.
 
 - Updated zip archive library to version 8.
 - code refactoring.
+
+### [0.8.0-beta.7] - 2026-08-05
+
+🛠 Fixes
+
+- Fixed silent failure reporting and data races in the UI: settings and card saves now surface errors, reader list survives a webview reload, concurrent card metadata is no longer overwritten.
+
+🆕 Features / Improvements
+
+- Internal: applied standard Rust code formatting across the backend.
+- Internal reliability refactoring: fixed resource leaks, data races and APDU retry safety across the Rust backend.
