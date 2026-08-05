@@ -64,14 +64,22 @@ pub struct TachoState {
     pub authentication: Option<bool>,
 }
 
-pub fn card_emit_event(event_name: &str, iccid: String, reader_name: String, card_state: String, card_number: String, online: Option<bool>, authentication: Option<bool>) {
+pub fn card_emit_event(
+    event_name: &str,
+    iccid: String,
+    reader_name: String,
+    card_state: String,
+    card_number: String,
+    online: Option<bool>,
+    authentication: Option<bool>,
+) {
     let payload = TachoState {
         iccid,
         reader_name,
         card_state,
         card_number,
         online,
-        authentication
+        authentication,
     };
 
     if let Some(app_handle) = get_app_handle() {

@@ -40,7 +40,10 @@ pub struct CheckResult {
 /// `beta_override` lets the settings dialog check the channel currently
 /// selected on screen, even before it has been saved; `None` uses the
 /// persisted setting.
-async fn perform_check(app: &AppHandle, beta_override: Option<bool>) -> Result<CheckResult, String> {
+async fn perform_check(
+    app: &AppHandle,
+    beta_override: Option<bool>,
+) -> Result<CheckResult, String> {
     let beta = beta_override.unwrap_or_else(|| {
         crate::config::get_from_cache(crate::config::CacheSection::Updates, "beta_updates")
             == "true"

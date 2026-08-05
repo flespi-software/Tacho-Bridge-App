@@ -50,7 +50,13 @@ mod tests {
         let app_info = &report["app_info"];
         assert_eq!(app_info["version"], env!("CARGO_PKG_VERSION"));
         assert!(!app_info["os"].as_str().expect("os is a string").is_empty());
-        assert!(!app_info["os_release"].as_str().expect("os_release is a string").is_empty());
-        assert!(!app_info["arch"].as_str().expect("arch is a string").is_empty());
+        assert!(!app_info["os_release"]
+            .as_str()
+            .expect("os_release is a string")
+            .is_empty());
+        assert!(!app_info["arch"]
+            .as_str()
+            .expect("arch is a string")
+            .is_empty());
     }
 }

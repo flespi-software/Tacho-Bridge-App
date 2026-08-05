@@ -91,7 +91,10 @@ impl SerialExchange {
 
     /// Failed exchange with no data to return.
     fn error(err: &'static str) -> Self {
-        Self { resp_hex: String::new(), err }
+        Self {
+            resp_hex: String::new(),
+            err,
+        }
     }
 
     /// True when the exchange fully succeeded (the only cacheable outcome).
@@ -163,7 +166,9 @@ fn parse_envelope_fields(
     cmd: &str,
 ) -> Result<SerialEnvelope, &'static str> {
     let ms = |v: &serde_json::Value, key: &str| {
-        v.get(key).and_then(|x| x.as_u64()).map(|x| x.min(SERIAL_MS_MAX))
+        v.get(key)
+            .and_then(|x| x.as_u64())
+            .map(|x| x.min(SERIAL_MS_MAX))
     };
 
     let expect_hex = match json.get("expect").and_then(|v| v.as_str()) {
@@ -173,8 +178,14 @@ fn parse_envelope_fields(
     let poll = match json.get("poll") {
         Some(p) => {
             // a poll spec without its command/while bytes is a malformed envelope
-            let poll_cmd = p.get("cmd").and_then(|v| v.as_str()).ok_or(SERIAL_ERR_BAD_HEX)?;
-            let poll_while = p.get("while").and_then(|v| v.as_str()).ok_or(SERIAL_ERR_BAD_HEX)?;
+            let poll_cmd = p
+                .get("cmd")
+                .and_then(|v| v.as_str())
+                .ok_or(SERIAL_ERR_BAD_HEX)?;
+            let poll_while = p
+                .get("while")
+                .and_then(|v| v.as_str())
+                .ok_or(SERIAL_ERR_BAD_HEX)?;
             Some(PollSpec {
                 cmd_hex: normalize_hex(poll_cmd)?,
                 while_hex: normalize_hex(poll_while)?,
@@ -345,7 +356,10 @@ impl RackInfo {
     /// The MQTT client_id the server uses to address this rack. The brand prefix
     /// is derived from the device's own manufacturer string.
     fn client_id(&self) -> String {
-        build_client_id(self.manufacturer.as_deref().unwrap_or(""), self.serial.as_deref())
+        build_client_id(
+            self.manufacturer.as_deref().unwrap_or(""),
+            self.serial.as_deref(),
+        )
     }
 
     /// Build the frontend payload for this rack. The card list is empty for now;
@@ -806,13 +820,21 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                 }
             }
             Err(e) => {
-                let transition = if is_online { "ONLINE->OFFLINE" } else { "OFFLINE" };
+                let transition = if is_online {
+                    "ONLINE->OFFLINE"
+                } else {
+                    "OFFLINE"
+                };
                 is_online = false;
 
                 // One line per failed poll: kind + retry delay; full error
                 // details only for genuinely unexpected failures.
                 crate::mqtt::log_connection_failure(
-                    &log_header, "MQTT", transition, &e, reconnect_delay_secs,
+                    &log_header,
+                    "MQTT",
+                    transition,
+                    &e,
+                    reconnect_delay_secs,
                 );
 
                 tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
@@ -867,15 +889,16 @@ async fn handle_serial_request(
     let json = match serde_json::from_slice::<serde_json::Value>(payload) {
         Ok(json) => json,
         Err(e) => {
-            log::warn!("{} [MQTT] status=ignored reason=bad_json err={}", log_header, e);
+            log::warn!(
+                "{} [MQTT] status=ignored reason=bad_json err={}",
+                log_header,
+                e
+            );
             return;
         }
     };
     let Some(parsed) = parse_envelope(&json) else {
-        log::warn!(
-            "{} [MQTT] status=ignored reason=no_serial_cmd",
-            log_header
-        );
+        log::warn!("{} [MQTT] status=ignored reason=no_serial_cmd", log_header);
         return;
     };
 
@@ -897,7 +920,11 @@ async fn handle_serial_request(
         .publish(resp_topic, QoS::AtLeastOnce, false, resp_payload)
         .await
     {
-        log::error!("{} [MQTT] status=reply_publish_failed err={:?}", log_header, e);
+        log::error!(
+            "{} [MQTT] status=reply_publish_failed err={:?}",
+            log_header,
+            e
+        );
     }
 }
 
@@ -910,7 +937,11 @@ async fn handle_connect_spawn(payload: &[u8], serial_port: &SharedPort, log_head
     let json = match serde_json::from_slice::<serde_json::Value>(payload) {
         Ok(json) => json,
         Err(e) => {
-            log::warn!("{} [SPAWN] status=ignored reason=bad_json err={}", log_header, e);
+            log::warn!(
+                "{} [SPAWN] status=ignored reason=bad_json err={}",
+                log_header,
+                e
+            );
             return;
         }
     };
@@ -951,15 +982,33 @@ async fn handle_connect_spawn(payload: &[u8], serial_port: &SharedPort, log_head
         return;
     };
 
-    spawn_rack_card_checked(card_number, iccid.to_string(), slot as u16, serial_port.clone(), log_header).await;
+    spawn_rack_card_checked(
+        card_number,
+        iccid.to_string(),
+        slot as u16,
+        serial_port.clone(),
+        log_header,
+    )
+    .await;
 }
 
 /// Final spawn step shared by the server `connect` handler and the pending-card
 /// retry: a reader-backed session for the same card number wins — never open a
 /// second connection with the same client_id (the server treats that as an
 /// ident collision).
-async fn spawn_rack_card_checked(card_number: String, iccid: String, slot: u16, port: SharedPort, log_header: &str) {
-    if TASK_POOL.lock().await.iter().any(|card| card.client_id == card_number) {
+async fn spawn_rack_card_checked(
+    card_number: String,
+    iccid: String,
+    slot: u16,
+    port: SharedPort,
+    log_header: &str,
+) {
+    if TASK_POOL
+        .lock()
+        .await
+        .iter()
+        .any(|card| card.client_id == card_number)
+    {
         log::warn!(
             "{} [SPAWN] card={} slot={} status=skipped reason=served_by_reader",
             log_header,
@@ -984,7 +1033,12 @@ fn update_rack_card_ui(slot: u16, iccid: &str, card_number: Option<String>) {
             Err(poisoned) => poisoned.into_inner(),
         };
         ui.retain(|c| c.slot != slot);
-        ui.push(RackCard { slot, iccid: Some(iccid.to_string()), card_number, name });
+        ui.push(RackCard {
+            slot,
+            iccid: Some(iccid.to_string()),
+            card_number,
+            name,
+        });
         ui.sort_by_key(|c| c.slot);
         ui.clone()
     };
@@ -1057,7 +1111,10 @@ fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: S
     };
     if let Some((_, handle)) = tasks.get(&iccid) {
         if !handle.inner().is_finished() {
-            log::debug!("RACK | [SPAWN] card={} status=skipped reason=already_running", card_number);
+            log::debug!(
+                "RACK | [SPAWN] card={} status=skipped reason=already_running",
+                card_number
+            );
             return;
         }
     }
@@ -1090,7 +1147,12 @@ fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: S
 /// report** right after CONNACK (topic `rack`, `{"iccid":"...","slot":N}`) that binds this card
 /// session to its slot on the server. Without the report the server treats the card as
 /// reader-backed and uses the plain PC/SC envelope.
-async fn rack_card_mqtt_loop(card_number: String, iccid: String, slot: u16, serial_port: SharedPort) {
+async fn rack_card_mqtt_loop(
+    card_number: String,
+    iccid: String,
+    slot: u16,
+    serial_port: SharedPort,
+) {
     let log_header = format!("RACKCARD {} |", card_number);
 
     // same waiting policy as the rack loop: the server may not be configured yet
@@ -1133,7 +1195,10 @@ async fn rack_card_mqtt_loop(card_number: String, iccid: String, slot: u16, seri
                 if !is_online {
                     is_online = true;
                     reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
-                    log::info!("{} [MQTT] state=OFFLINE->ONLINE cause=eventloop_poll_ok", log_header);
+                    log::info!(
+                        "{} [MQTT] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
+                        log_header
+                    );
                 }
 
                 match notification {
@@ -1148,7 +1213,11 @@ async fn rack_card_mqtt_loop(card_number: String, iccid: String, slot: u16, seri
                             .publish("rack", QoS::AtLeastOnce, false, report)
                             .await
                         {
-                            log::error!("{} [MQTT] status=link_report_failed err={:?}", log_header, e);
+                            log::error!(
+                                "{} [MQTT] status=link_report_failed err={:?}",
+                                log_header,
+                                e
+                            );
                         } else {
                             log::info!(
                                 "{} [MQTT] status=link_report_sent slot={} iccid={}",
@@ -1189,10 +1258,18 @@ async fn rack_card_mqtt_loop(card_number: String, iccid: String, slot: u16, seri
                 }
             }
             Err(e) => {
-                let transition = if is_online { "ONLINE->OFFLINE" } else { "OFFLINE" };
+                let transition = if is_online {
+                    "ONLINE->OFFLINE"
+                } else {
+                    "OFFLINE"
+                };
                 is_online = false;
                 crate::mqtt::log_connection_failure(
-                    &log_header, "MQTT", transition, &e, reconnect_delay_secs,
+                    &log_header,
+                    "MQTT",
+                    transition,
+                    &e,
+                    reconnect_delay_secs,
                 );
                 tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
                 reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
@@ -1222,7 +1299,11 @@ fn start_rack_watch(
     let json = match serde_json::from_slice::<serde_json::Value>(payload) {
         Ok(json) => json,
         Err(e) => {
-            log::warn!("{} [WATCH] status=ignored reason=bad_json err={}", log_header, e);
+            log::warn!(
+                "{} [WATCH] status=ignored reason=bad_json err={}",
+                log_header,
+                e
+            );
             return;
         }
     };
@@ -1238,11 +1319,17 @@ fn start_rack_watch(
         }
     };
     let ms = |key: &str| {
-        json.get(key).and_then(|v| v.as_u64()).map(|v| v.min(SERIAL_MS_MAX))
+        json.get(key)
+            .and_then(|v| v.as_u64())
+            .map(|v| v.min(SERIAL_MS_MAX))
     };
     let interval = Duration::from_millis(ms("interval_ms").unwrap_or(1000));
-    let idle = ms("idle_ms").map(Duration::from_millis).unwrap_or(SERIAL_REPLY_TIMEOUT);
-    let deadline = ms("deadline_ms").map(Duration::from_millis).unwrap_or(SERIAL_READ_DEADLINE);
+    let idle = ms("idle_ms")
+        .map(Duration::from_millis)
+        .unwrap_or(SERIAL_REPLY_TIMEOUT);
+    let deadline = ms("deadline_ms")
+        .map(Duration::from_millis)
+        .unwrap_or(SERIAL_READ_DEADLINE);
 
     let serial_port = serial_port.clone();
     let mqtt_client = mqtt_client.clone();
@@ -1318,7 +1405,11 @@ fn handle_card_disconnect(payload: &[u8], log_header: &str) {
     let json = match serde_json::from_slice::<serde_json::Value>(payload) {
         Ok(json) => json,
         Err(e) => {
-            log::warn!("{} [SPAWN] status=ignored reason=bad_json err={}", log_header, e);
+            log::warn!(
+                "{} [SPAWN] status=ignored reason=bad_json err={}",
+                log_header,
+                e
+            );
             return;
         }
     };
@@ -1351,7 +1442,11 @@ fn handle_card_disconnect(payload: &[u8], log_header: &str) {
     };
     if let Some((card_number, handle)) = tasks.remove(iccid) {
         handle.abort();
-        log::info!("{} [SPAWN] card={} status=aborted reason=card_removed", log_header, card_number);
+        log::info!(
+            "{} [SPAWN] card={} status=aborted reason=card_removed",
+            log_header,
+            card_number
+        );
     }
 }
 
@@ -1364,7 +1459,10 @@ fn stop_rack_cards() {
     };
     for (_iccid, (card_number, handle)) in tasks.drain() {
         handle.abort();
-        log::info!("RACK | [SPAWN] card={} status=aborted reason=rack_gone", card_number);
+        log::info!(
+            "RACK | [SPAWN] card={} status=aborted reason=rack_gone",
+            card_number
+        );
     }
     let mut ui = match RACK_CARDS_UI.lock() {
         Ok(g) => g,
@@ -1453,14 +1551,23 @@ fn read_reply(
     let mut first_byte_pending = reply.is_empty();
     let initial_timeout = if first_byte_pending { first_wait } else { idle };
     if let Err(e) = port.set_timeout(initial_timeout) {
-        log::warn!("{} [SERIAL] set_timeout({:?}) failed: {}", log_header, initial_timeout, e);
+        log::warn!(
+            "{} [SERIAL] set_timeout({:?}) failed: {}",
+            log_header,
+            initial_timeout,
+            e
+        );
     }
 
     let mut buf = [0u8; 512];
     let mut truncated = false;
     let read_started = std::time::Instant::now();
     // the total bound must never undercut the first-byte budget it contains
-    let total = if deadline > first_wait { deadline } else { first_wait };
+    let total = if deadline > first_wait {
+        deadline
+    } else {
+        first_wait
+    };
     let read_deadline = read_started + total;
     loop {
         if reply.len() >= SERIAL_REPLY_MAX_BYTES {
@@ -1534,8 +1641,7 @@ fn wait_for_push(
     deadline: Duration,
     log_header: &str,
 ) -> Vec<u8> {
-    let (bytes, _truncated) =
-        read_reply(port, Vec::new(), interval, idle, deadline, log_header);
+    let (bytes, _truncated) = read_reply(port, Vec::new(), interval, idle, deadline, log_header);
     if !bytes.is_empty() {
         log::debug!(
             "{} [SERIAL] rx pushed bytes={} hex={}",
@@ -1604,7 +1710,12 @@ fn exchange_once(
         carry
     };
 
-    log::debug!("{} [SERIAL] tx bytes={} hex={}", log_header, bytes.len(), cmd_hex);
+    log::debug!(
+        "{} [SERIAL] tx bytes={} hex={}",
+        log_header,
+        bytes.len(),
+        cmd_hex
+    );
 
     if let Err(e) = port.write_all(&bytes) {
         log::error!("{} [SERIAL] write failed: {}", log_header, e);
@@ -1616,7 +1727,10 @@ fn exchange_once(
     let exchange = if truncated {
         // Partial data + error code: the server sees what came through AND
         // knows the exchange is unusable.
-        SerialExchange { resp_hex: hex::encode_upper(&reply), err: SERIAL_ERR_TRUNCATED }
+        SerialExchange {
+            resp_hex: hex::encode_upper(&reply),
+            err: SERIAL_ERR_TRUNCATED,
+        }
     } else if reply.is_empty() {
         SerialExchange::error(SERIAL_ERR_NO_REPLY)
     } else {
@@ -1683,8 +1797,14 @@ fn run_envelope(
             polls += 1;
             // not the first exchange: pending bytes are this operation's pushed result,
             // they get carried into the poll reply rather than dropped
-            let reply =
-                exchange_once(port, &poll.cmd_hex, env.idle, env.deadline, false, log_header);
+            let reply = exchange_once(
+                port,
+                &poll.cmd_hex,
+                env.idle,
+                env.deadline,
+                false,
+                log_header,
+            );
             if !reply.is_ok() || reply.resp_hex != poll.while_hex {
                 // the first differing reply is the operation result (or a transport error)
                 break 'op reply;
@@ -1904,7 +2024,10 @@ pub async fn rack_connection() {
         return;
     }
 
-    log::info!("RACK | phase=rack_connection status=start poll_secs={}", POLL_INTERVAL.as_secs());
+    log::info!(
+        "RACK | phase=rack_connection status=start poll_secs={}",
+        POLL_INTERVAL.as_secs()
+    );
 
     // The rack we currently consider connected, if any.
     let mut current: Option<RackInfo> = None;
@@ -2032,7 +2155,10 @@ mod tests {
 
     #[test]
     fn request_id_from_topic_parses_first_segment_only() {
-        assert_eq!(request_id_from_topic("request/42/RACK0000000000AB"), Some(42));
+        assert_eq!(
+            request_id_from_topic("request/42/RACK0000000000AB"),
+            Some(42)
+        );
         assert_eq!(request_id_from_topic("request/0"), Some(0));
         // Non-numeric id or wrong prefix → None.
         assert_eq!(request_id_from_topic("request/abc/X"), None);
@@ -2041,7 +2167,10 @@ mod tests {
 
     // The server contract: client_id must match ^[0-9A-Z]{16}$.
     fn matches_server_contract(id: &str) -> bool {
-        id.len() == 16 && id.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        id.len() == 16
+            && id
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
     }
 
     #[test]
@@ -2069,11 +2198,11 @@ mod tests {
     fn client_id_always_matches_server_contract() {
         for serial in [
             Some("SC1234"),
-            Some("sc1234"),                 // lowercase gets uppercased
-            Some("SC-12/34"),               // punctuation stripped
-            Some(""),                       // empty serial
-            None,                           // no serial at all
-            Some("VERYLONGSERIALNUMBER123"),// longer than 16 → truncated
+            Some("sc1234"),                  // lowercase gets uppercased
+            Some("SC-12/34"),                // punctuation stripped
+            Some(""),                        // empty serial
+            None,                            // no serial at all
+            Some("VERYLONGSERIALNUMBER123"), // longer than 16 → truncated
         ] {
             let id = build_client_id(MFR, serial);
             assert!(
@@ -2116,9 +2245,21 @@ mod tests {
             pid: 0,
         };
         assert!(base.is_supported());
-        assert!(RackInfo { manufacturer: Some("LISLE DESIGN".into()), ..base.clone() }.is_supported());
-        assert!(!RackInfo { manufacturer: Some("Acme Co".into()), ..base.clone() }.is_supported());
-        assert!(!RackInfo { manufacturer: None, ..base.clone() }.is_supported());
+        assert!(RackInfo {
+            manufacturer: Some("LISLE DESIGN".into()),
+            ..base.clone()
+        }
+        .is_supported());
+        assert!(!RackInfo {
+            manufacturer: Some("Acme Co".into()),
+            ..base.clone()
+        }
+        .is_supported());
+        assert!(!RackInfo {
+            manufacturer: None,
+            ..base.clone()
+        }
+        .is_supported());
     }
 
     // ── Response envelope (contract v2): both fields always present, one shape ──
@@ -2127,10 +2268,20 @@ mod tests {
     fn parse_payload(payload: &str) -> (String, String) {
         let v: serde_json::Value = serde_json::from_str(payload).expect("payload must be JSON");
         let obj = v.as_object().expect("payload must be an object");
-        assert_eq!(obj.len(), 2, "envelope must have exactly the two contract fields");
+        assert_eq!(
+            obj.len(),
+            2,
+            "envelope must have exactly the two contract fields"
+        );
         (
-            obj["serial_resp"].as_str().expect("serial_resp must be a string").to_string(),
-            obj["serial_err"].as_str().expect("serial_err must be a string").to_string(),
+            obj["serial_resp"]
+                .as_str()
+                .expect("serial_resp must be a string")
+                .to_string(),
+            obj["serial_err"]
+                .as_str()
+                .expect("serial_err must be a string")
+                .to_string(),
         )
     }
 
@@ -2150,7 +2301,10 @@ mod tests {
     #[test]
     fn exchange_payload_write_failed() {
         let p = SerialExchange::error(SERIAL_ERR_WRITE_FAILED).to_payload();
-        assert_eq!(parse_payload(&p), ("".to_string(), "write_failed".to_string()));
+        assert_eq!(
+            parse_payload(&p),
+            ("".to_string(), "write_failed".to_string())
+        );
     }
 
     #[test]
@@ -2162,8 +2316,15 @@ mod tests {
     #[test]
     fn exchange_payload_truncated_keeps_partial_data() {
         // Truncation carries BOTH the partial hex and the error code.
-        let p = SerialExchange { resp_hex: "A1B2C3".into(), err: SERIAL_ERR_TRUNCATED }.to_payload();
-        assert_eq!(parse_payload(&p), ("A1B2C3".to_string(), "truncated".to_string()));
+        let p = SerialExchange {
+            resp_hex: "A1B2C3".into(),
+            err: SERIAL_ERR_TRUNCATED,
+        }
+        .to_payload();
+        assert_eq!(
+            parse_payload(&p),
+            ("A1B2C3".to_string(), "truncated".to_string())
+        );
     }
 
     // ── Envelope parsing (poll primitive contract) ──
@@ -2178,22 +2339,29 @@ mod tests {
 
     #[test]
     fn envelope_bad_hex_reports_contract_code() {
-        let json: serde_json::Value =
-            serde_json::from_str(r#"{"serial_cmd":"ZZ"}"#).unwrap();
-        assert_eq!(parse_envelope(&json).unwrap().unwrap_err(), SERIAL_ERR_BAD_HEX);
+        let json: serde_json::Value = serde_json::from_str(r#"{"serial_cmd":"ZZ"}"#).unwrap();
+        assert_eq!(
+            parse_envelope(&json).unwrap().unwrap_err(),
+            SERIAL_ERR_BAD_HEX
+        );
         // bad hex inside the poll spec is just as malformed
-        let json: serde_json::Value = serde_json::from_str(
-            r#"{"serial_cmd":"AB","poll":{"cmd":"AB","while":"XX"}}"#,
-        )
-        .unwrap();
-        assert_eq!(parse_envelope(&json).unwrap().unwrap_err(), SERIAL_ERR_BAD_HEX);
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"serial_cmd":"AB","poll":{"cmd":"AB","while":"XX"}}"#)
+                .unwrap();
+        assert_eq!(
+            parse_envelope(&json).unwrap().unwrap_err(),
+            SERIAL_ERR_BAD_HEX
+        );
     }
 
     #[test]
     fn envelope_poll_without_bytes_is_malformed() {
         let json: serde_json::Value =
             serde_json::from_str(r#"{"serial_cmd":"AB","poll":{"interval_ms":20}}"#).unwrap();
-        assert_eq!(parse_envelope(&json).unwrap().unwrap_err(), SERIAL_ERR_BAD_HEX);
+        assert_eq!(
+            parse_envelope(&json).unwrap().unwrap_err(),
+            SERIAL_ERR_BAD_HEX
+        );
     }
 
     #[test]
@@ -2201,7 +2369,11 @@ mod tests {
         // Idempotency contract: cache only fully successful exchanges.
         assert!(SerialExchange::ok("AA".into()).is_ok());
         assert!(!SerialExchange::error(SERIAL_ERR_NO_REPLY).is_ok());
-        assert!(!SerialExchange { resp_hex: "AA".into(), err: SERIAL_ERR_TRUNCATED }.is_ok());
+        assert!(!SerialExchange {
+            resp_hex: "AA".into(),
+            err: SERIAL_ERR_TRUNCATED
+        }
+        .is_ok());
     }
 
     // ── Poll primitive against a scripted port ──
@@ -2293,7 +2465,11 @@ mod tests {
         /// Bytes already sitting in the buffer when the exchange starts — a leftover of an
         /// operation that is already over, or a result pushed while nobody was reading.
         fn with_pending(self, hex: &str) -> Self {
-            self.state.lock().unwrap().inbox.extend(hex::decode(hex).unwrap());
+            self.state
+                .lock()
+                .unwrap()
+                .inbox
+                .extend(hex::decode(hex).unwrap());
             self
         }
     }
@@ -2316,7 +2492,10 @@ mod tests {
                 };
                 let now = std::time::Instant::now();
                 if now >= deadline {
-                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "scripted"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "scripted",
+                    ));
                 }
                 if wake > now {
                     std::thread::sleep(wake - now);
@@ -2420,7 +2599,10 @@ mod tests {
             Ok(())
         }
         fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> {
-            Err(serialport::Error::new(serialport::ErrorKind::Unknown, "not cloneable"))
+            Err(serialport::Error::new(
+                serialport::ErrorKind::Unknown,
+                "not cloneable",
+            ))
         }
         fn set_break(&self) -> serialport::Result<()> {
             Ok(())
@@ -2469,7 +2651,10 @@ mod tests {
             "result went missing, got {:?}",
             outcome.resp_hex
         );
-        assert_ne!(outcome.resp_hex, IDLE_STATUS, "the lost-result symptom is back");
+        assert_ne!(
+            outcome.resp_hex, IDLE_STATUS,
+            "the lost-result symptom is back"
+        );
         assert!(outcome.is_ok());
     }
 

@@ -1,15 +1,15 @@
 // ───── Modules ─────
-mod app_connect;        // Application connection to the MQTT broker.
-mod commands_settings;  // Settings reporting to the server.
-mod config;             // Configuration handling.
-mod logger;             // Logging functionality.
-mod logs_upload;        // Log upload to the server (fetch_logs command).
-mod mqtt;               // MQTT communication.
-mod smart_card;         // PCSC module for smart card operations.
-mod apdu_sniffer;       // Passive sniffer for plaintext EF data in proxied APDUs.
-mod global_app_handle;  // Global access to app state and emitters.
-mod com_port;           // Card rack over the COM (serial) port.
-mod updater;            // Self-update from GitHub releases.
+mod apdu_sniffer; // Passive sniffer for plaintext EF data in proxied APDUs.
+mod app_connect; // Application connection to the MQTT broker.
+mod com_port; // Card rack over the COM (serial) port.
+mod commands_settings; // Settings reporting to the server.
+mod config; // Configuration handling.
+mod global_app_handle; // Global access to app state and emitters.
+mod logger; // Logging functionality.
+mod logs_upload; // Log upload to the server (fetch_logs command).
+mod mqtt; // MQTT communication.
+mod smart_card; // PCSC module for smart card operations.
+mod updater; // Self-update from GitHub releases.
 
 // ───── External Crates ─────
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,11 +136,13 @@ pub fn run() {
                 // Frontend loading is late, so we execute a callback to the "frontend-loaded" event which the front sends when it is loaded
                 window.listen("frontend-loaded", move |event: tauri::Event| {
                     #[cfg(target_os = "linux")]
-                    {   // Temporary solution only for linux because webview does not load even after response from front.
+                    {
+                        // Temporary solution only for linux because webview does not load even after response from front.
                         // Apparently loading occurs later, not like Windows and MacOS. Fix later.
                         std::thread::sleep(std::time::Duration::from_millis(300));
                     }
-                    #[cfg(target_os = "windows")] {
+                    #[cfg(target_os = "windows")]
+                    {
                         std::thread::sleep(std::time::Duration::from_millis(300));
                     }
 
@@ -219,12 +221,12 @@ pub fn run() {
             config::update_card,           // update list of cards from the frontend
             config::update_server,         // update server config from the frontend
             config::update_theme,          // persist theme from the header button
-            config::remove_card,            // remove card from config
+            config::remove_card,           // remove card from config
             smart_card::manual_sync_cards, // manual sync cards from the frontend
-            app_connect::app_connection,     // App connection to the MQTT broker
-            updater::install_update,         // download + install the pending update
-            updater::check_updates_now,      // forced update check from the settings dialog
-            updater::get_changelog,          // bundled CHANGELOG.md for the settings dialog
+            app_connect::app_connection,   // App connection to the MQTT broker
+            updater::install_update,       // download + install the pending update
+            updater::check_updates_now,    // forced update check from the settings dialog
+            updater::get_changelog,        // bundled CHANGELOG.md for the settings dialog
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

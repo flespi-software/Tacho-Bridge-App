@@ -3,29 +3,29 @@
 //! This module provides functionality for creating and managing MQTT connections.
 
 // ───── Std Lib ─────
-use std::ffi::CStr;                  // For handling C-style strings in Rust.
+use std::ffi::CStr; // For handling C-style strings in Rust.
 use std::time::{Duration, Instant}; // For specifying time durations and shutdown deadlines.
 
 // ───── MQTT Client Library (rumqttc) ─────
-use rumqttc::v5::mqttbytes::QoS;                    // Quality of Service levels for MQTT.
-use rumqttc::v5::ConnectionError;                   // For handling MQTT connection errors.
-use rumqttc::v5::StateError;                        // MQTT protocol state errors.
-use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};        // Core MQTT async client and options.
-use rumqttc::Outgoing;                              // Outgoing event markers (graceful DISCONNECT detection).
+use rumqttc::v5::mqttbytes::QoS; // Quality of Service levels for MQTT.
+use rumqttc::v5::ConnectionError; // For handling MQTT connection errors.
+use rumqttc::v5::StateError; // MQTT protocol state errors.
+use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions}; // Core MQTT async client and options.
+use rumqttc::Outgoing; // Outgoing event markers (graceful DISCONNECT detection).
 
 // ───── Tauri ─────
-use tauri::async_runtime::{self, JoinHandle};       // Async runtime and task join handles for Tauri apps.
+use tauri::async_runtime::{self, JoinHandle}; // Async runtime and task join handles for Tauri apps.
 
 // ───── Serde (Serialization / Deserialization) ─────
-use serde_json::Value;                              // For working with JSON data structures.
+use serde_json::Value; // For working with JSON data structures.
 
 // ───── Local Modules ─────
-use crate::config::get_from_cache;                  // Function to get data from cache for syncing server data.
-use crate::config::split_host_to_parts;             // Function to split the host into parts for MQTT connection.
-use crate::config::CacheSection;                    // Enum for cache sections for getting data from cache.
-use crate::smart_card::{ManagedCard, TASK_POOL};    // Managed card object and global task pool for MQTT handling.
-use crate::global_app_handle::card_emit_event;           // Sends events to the frontend via global app handle.
+use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
+use crate::config::split_host_to_parts; // Function to split the host into parts for MQTT connection.
+use crate::config::CacheSection; // Enum for cache sections for getting data from cache.
+use crate::global_app_handle::card_emit_event; // Sends events to the frontend via global app handle.
 use crate::smart_card::ProcessingCard;
+use crate::smart_card::{ManagedCard, TASK_POOL}; // Managed card object and global task pool for MQTT handling.
 
 /// Initial delay (in seconds) before the first reconnect attempt after a
 /// connection failure. Subsequent failures back off exponentially up to
@@ -111,12 +111,21 @@ pub(crate) fn log_connection_failure(
     if expected {
         log::warn!(
             "{} [{}] state={} kind={} retry_in={}s",
-            log_header, scope, transition, kind, retry_in_secs
+            log_header,
+            scope,
+            transition,
+            kind,
+            retry_in_secs
         );
     } else {
         log::error!(
             "{} [{}] state={} kind={} err={:?} retry_in={}s",
-            log_header, scope, transition, kind, e, retry_in_secs
+            log_header,
+            scope,
+            transition,
+            kind,
+            e,
+            retry_in_secs
         );
     }
 }
@@ -177,7 +186,12 @@ async fn publish_ack(
 }
 
 // /// Ensures an MQTT connection for the specified client ID.
-pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: String, mut managed_card: ManagedCard) {
+pub async fn ensure_connection(
+    reader_name: &CStr,
+    client_id: String,
+    atr: String,
+    mut managed_card: ManagedCard,
+) {
     log::info!(
         "[CONN] phase=ensure_connection status=start reader={} client_id={} atr_len={}",
         reader_name.to_string_lossy(),
@@ -187,7 +201,10 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
 
     // Return early if the client_id is empty, as we cannot ensure a connection without a valid ID
     if client_id.is_empty() {
-        log::warn!("Reader: {:?}. ClientID is empty. Cannot ensure connection.", reader_name);
+        log::warn!(
+            "Reader: {:?}. ClientID is empty. Cannot ensure connection.",
+            reader_name
+        );
         return;
     }
 
@@ -256,9 +273,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
     // format of the logging header
     let log_header: String = format!("{} |", client_id);
 
-    let mut is_online: bool = false;    // flag to control the card connection (to the server) status
-    let mut was_online = false;   // Flag to track the previous connection status
-    let mut auth_process: bool = false;  // Flag to control the authentication process
+    let mut is_online: bool = false; // flag to control the card connection (to the server) status
+    let mut was_online = false; // Flag to track the previous connection status
+    let mut auth_process: bool = false; // Flag to control the authentication process
     let mut reconnect_delay_secs: u64 = RECONNECT_DELAY_INITIAL_SECS; // exponential backoff state
 
     // Idempotency state for the current MQTT connection. The server re-sends a command with the
@@ -306,7 +323,13 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                         if !was_online {
                             was_online = true;
                             // Send the global-cards-sync event to the frontend that card is connected
-                            emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), None);
+                            emit_card_sync_event(
+                                &iccid,
+                                &reader_name,
+                                &client_id_cloned,
+                                Some(true),
+                                None,
+                            );
 
                             log::info!(
                                 "{} [CONN] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
@@ -352,7 +375,13 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                             log_header,
                                             req_id
                                         );
-                                        publish_ack(&mqtt_client, topic_ack.clone(), cached.clone(), &log_header).await;
+                                        publish_ack(
+                                            &mqtt_client,
+                                            topic_ack.clone(),
+                                            cached.clone(),
+                                            &log_header,
+                                        )
+                                        .await;
                                     }
                                     None => log::warn!(
                                         "{} duplicate request_id={:?} still in flight: ignoring",
@@ -389,7 +418,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                         });
 
                                     // Check for the presence of the "finish" parameter
-                                    if let Some(finish_value) = json_payload.get("finish").and_then(|v| v.as_bool()) {
+                                    if let Some(finish_value) =
+                                        json_payload.get("finish").and_then(|v| v.as_bool())
+                                    {
                                         log::debug!(
                                             "{} Finish parameter: {}",
                                             log_header,
@@ -399,7 +430,13 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                         // Processing the "finish" parameter depending on its value
                                         if finish_value {
                                             // Send the global-cards-sync event to the frontend that card is connected
-                                            emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(false));
+                                            emit_card_sync_event(
+                                                &iccid,
+                                                &reader_name,
+                                                &client_id_cloned,
+                                                Some(true),
+                                                Some(false),
+                                            );
 
                                             log::info!(
                                                 "{} Authentication process is finished",
@@ -407,21 +444,27 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                             );
 
                                             // Persist successful auth timestamp (offloaded to blocking thread).
-                                            crate::config::record_auth_result_async(&client_id_cloned, true).await;
+                                            crate::config::record_auth_result_async(
+                                                &client_id_cloned,
+                                                true,
+                                            )
+                                            .await;
 
                                             // Reset the card to its original state
                                             managed_card.reconnect().await;
 
                                             payload_ack = process_rapdu_mqtt_hex("".to_string());
 
-                                            auth_process = false;   // Authorization process is finished
+                                            auth_process = false; // Authorization process is finished
 
-                                            // handle the case when finish == true
+                                        // handle the case when finish == true
                                         } else {
                                             // finish flag is false here
                                             // PROCESS AUTHORIZATION WITH APDU COMMUNICATION
                                             // The "hex" parameter contains the apdu instruction that needs to be transferred to the card
-                                            if let Some(hex_value) = json_payload.get("payload").and_then(|v| v.as_str()) {
+                                            if let Some(hex_value) =
+                                                json_payload.get("payload").and_then(|v| v.as_str())
+                                            {
                                                 log::debug!(
                                                     "{} TRACKER: Payload hex value: {}",
                                                     log_header,
@@ -437,7 +480,11 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                             log_header
                                                         );
                                                         // Persist failed auth timestamp (aborted mid-flow, offloaded to blocking thread).
-                                                        crate::config::record_auth_result_async(&client_id_cloned, false).await;
+                                                        crate::config::record_auth_result_async(
+                                                            &client_id_cloned,
+                                                            false,
+                                                        )
+                                                        .await;
                                                         // Reset the card to its original state
                                                         managed_card.reconnect().await;
                                                     }
@@ -447,7 +494,9 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     // Session-scoped by design - not persisted to the config,
                                                     // the server owns the value per tracker.
                                                     if let Some(protocol) = requested_protocol {
-                                                        managed_card.switch_protocol(protocol).await;
+                                                        managed_card
+                                                            .switch_protocol(protocol)
+                                                            .await;
                                                     }
 
                                                     // If the input value is empty, then pass the ATR to the server.
@@ -457,14 +506,23 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     );
 
                                                     // Send the global-cards-sync event to the frontend that card is connected
-                                                    emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(false));
+                                                    emit_card_sync_event(
+                                                        &iccid,
+                                                        &reader_name,
+                                                        &client_id_cloned,
+                                                        Some(true),
+                                                        Some(false),
+                                                    );
 
                                                     atr_clone.clone()
                                                 } else {
                                                     // a differing T protocol mid-session is ignored: switching resets
                                                     // the card and would destroy the authentication state
                                                     if let Some(protocol) = requested_protocol {
-                                                        if crate::smart_card::protocol_to_str(protocol) != managed_card.protocol_str() {
+                                                        if crate::smart_card::protocol_to_str(
+                                                            protocol,
+                                                        ) != managed_card.protocol_str()
+                                                        {
                                                             log::warn!(
                                                                 "{} server requested T protocol {} mid-session while card is on {}: ignoring",
                                                                 log_header,
@@ -482,15 +540,27 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                         );
                                                     }
 
-                                                    let rapdu = managed_card.send_apdu(hex_value, &client_id_cloned).await;
+                                                    let rapdu = managed_card
+                                                        .send_apdu(hex_value, &client_id_cloned)
+                                                        .await;
 
                                                     // Passive sniffer: extract plaintext EF data from SM'd responses
-                                                    crate::apdu_sniffer::sniff(&client_id_cloned, hex_value, &rapdu);
+                                                    crate::apdu_sniffer::sniff(
+                                                        &client_id_cloned,
+                                                        hex_value,
+                                                        &rapdu,
+                                                    );
 
                                                     // Send the global-cards-sync event to the frontend that card is connected
-                                                    emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(true));
+                                                    emit_card_sync_event(
+                                                        &iccid,
+                                                        &reader_name,
+                                                        &client_id_cloned,
+                                                        Some(true),
+                                                        Some(true),
+                                                    );
 
-                                                    auth_process = true;    // Authorization process is in progress
+                                                    auth_process = true; // Authorization process is in progress
                                                     rapdu
                                                 };
 
@@ -498,7 +568,10 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                     // the session-start (ATR) reply also reports the actual T protocol -
                                                     // the server seeds its per-tracker value from it and it signals that
                                                     // this application understands the 'protocol' request field
-                                                    process_session_start_mqtt_hex(rapdu_mqtt_hex, managed_card.protocol_str())
+                                                    process_session_start_mqtt_hex(
+                                                        rapdu_mqtt_hex,
+                                                        managed_card.protocol_str(),
+                                                    )
                                                 } else {
                                                     process_rapdu_mqtt_hex(rapdu_mqtt_hex)
                                                 };
@@ -530,7 +603,13 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                         }
 
                                         // publish a message to the channel
-                                        publish_ack(&mqtt_client, topic_ack, payload_ack, &log_header).await;
+                                        publish_ack(
+                                            &mqtt_client,
+                                            topic_ack,
+                                            payload_ack,
+                                            &log_header,
+                                        )
+                                        .await;
                                     } else {
                                         log::error!(
                                             "{} Finish parameter not found or is not a boolean",
@@ -557,19 +636,25 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                             log::debug!("{} [CONN] event=CONNACK status=received", log_header)
                         }
                         Event::Incoming(Incoming::PingResp(..)) => {
-                            log::debug!(
-                                "{} Ping response received from the server.",
-                                log_header
-                            );
+                            log::debug!("{} Ping response received from the server.", log_header);
 
                             // Send the global-cards-sync event to the frontend that card is connected
-                            emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(true), Some(false));
+                            emit_card_sync_event(
+                                &iccid,
+                                &reader_name,
+                                &client_id_cloned,
+                                Some(true),
+                                Some(false),
+                            );
                         }
                         Event::Outgoing(Outgoing::Disconnect) => {
                             // graceful teardown: the DISCONNECT packet is already flushed to the
                             // socket, so exit instead of letting the loop treat the closing
                             // connection as a network failure and reconnect
-                            log::info!("{} [CONN] phase=shutdown status=disconnect_sent", log_header);
+                            log::info!(
+                                "{} [CONN] phase=shutdown status=disconnect_sent",
+                                log_header
+                            );
                             break;
                         }
                         _ => {} // This handles any other events that you haven't explicitly matched above
@@ -577,15 +662,31 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                 }
                 Err(e) => {
                     // Send the global-cards-sync event to the frontend that card is connected
-                    emit_card_sync_event(&iccid, &reader_name, &client_id_cloned, Some(false), None);
+                    emit_card_sync_event(
+                        &iccid,
+                        &reader_name,
+                        &client_id_cloned,
+                        Some(false),
+                        None,
+                    );
 
-                    let transition = if is_online { "ONLINE->OFFLINE" } else { "OFFLINE" };
+                    let transition = if is_online {
+                        "ONLINE->OFFLINE"
+                    } else {
+                        "OFFLINE"
+                    };
                     is_online = false;
                     was_online = false; // Reset the flag when the connection is lost
 
                     // One line per failed poll: kind + retry delay; full error
                     // details only for genuinely unexpected failures.
-                    log_connection_failure(&log_header, "CONN", transition, &e, reconnect_delay_secs);
+                    log_connection_failure(
+                        &log_header,
+                        "CONN",
+                        transition,
+                        &e,
+                        reconnect_delay_secs,
+                    );
 
                     tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
                     reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
@@ -602,7 +703,10 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
         task_handle: handle,
     });
 
-    log::info!("MQTT task registered in TASK_POOL. Current size: {}", task_pool.len());
+    log::info!(
+        "MQTT task registered in TASK_POOL. Current size: {}",
+        task_pool.len()
+    );
 
     for (i, card) in task_pool.iter().enumerate() {
         log::debug!(
@@ -687,7 +791,10 @@ pub async fn remove_connections(client_ids: Vec<String>) {
         let mut task_pool = TASK_POOL.lock().await;
         for client_id in client_ids {
             // Find the index of the card with the matching client_id
-            if let Some(index) = task_pool.iter().position(|card| card.client_id == client_id) {
+            if let Some(index) = task_pool
+                .iter()
+                .position(|card| card.client_id == client_id)
+            {
                 let card = task_pool.remove(index);
 
                 // Drop any APDU sniffer state we accumulated for this client so the
@@ -760,7 +867,10 @@ mod tests {
     fn process_session_start_mqtt_hex_reports_payload_and_protocol() {
         let json = process_session_start_mqtt_hex("3BDB96FF".to_string(), "T1");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert_eq!(parsed.get("payload").and_then(|v| v.as_str()), Some("3BDB96FF"));
+        assert_eq!(
+            parsed.get("payload").and_then(|v| v.as_str()),
+            Some("3BDB96FF")
+        );
         assert_eq!(parsed.get("protocol").and_then(|v| v.as_str()), Some("T1"));
     }
 
@@ -800,7 +910,10 @@ mod tests {
 
     #[test]
     fn request_id_from_topic_parses_first_segment_only() {
-        assert_eq!(request_id_from_topic("request/354/0000000067664100"), Some(354));
+        assert_eq!(
+            request_id_from_topic("request/354/0000000067664100"),
+            Some(354)
+        );
         assert_eq!(request_id_from_topic("request/1/ABCDEF"), Some(1));
     }
 
@@ -816,7 +929,10 @@ mod tests {
         assert_eq!(next_reconnect_delay(10), 20);
         assert_eq!(next_reconnect_delay(20), 40);
         assert_eq!(next_reconnect_delay(150), RECONNECT_DELAY_MAX_SECS);
-        assert_eq!(next_reconnect_delay(RECONNECT_DELAY_MAX_SECS), RECONNECT_DELAY_MAX_SECS);
+        assert_eq!(
+            next_reconnect_delay(RECONNECT_DELAY_MAX_SECS),
+            RECONNECT_DELAY_MAX_SECS
+        );
     }
 
     #[test]
@@ -829,6 +945,9 @@ mod tests {
     fn process_rapdu_mqtt_hex_emits_payload_field() {
         let json = process_rapdu_mqtt_hex("DEADBEEF".to_string());
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert_eq!(parsed.get("payload").and_then(|v| v.as_str()), Some("DEADBEEF"));
+        assert_eq!(
+            parsed.get("payload").and_then(|v| v.as_str()),
+            Some("DEADBEEF")
+        );
     }
 }

@@ -40,7 +40,12 @@ static ACTIVE_REQUEST: Mutex<Option<u64>> = Mutex::new(None);
 /// publish is left to the caller (returns false). If more app-level commands
 /// appear, promote the topic/name parsing to the connection layer and keep
 /// only the fetch_logs handling here.
-pub fn dispatch_request(client: &AsyncClient, log_header: &str, topic: &str, payload: &Value) -> bool {
+pub fn dispatch_request(
+    client: &AsyncClient,
+    log_header: &str,
+    topic: &str,
+    payload: &Value,
+) -> bool {
     let Some(request_id) = crate::mqtt::request_id_from_topic(topic) else {
         return false;
     };
@@ -94,7 +99,13 @@ async fn run_upload(client: &AsyncClient, log_header: &str, request_id: u64, per
         Some(days) => days,
         None => {
             log::warn!("{} [LOGS] status=bad_period period={}", log_header, period);
-            publish_json(client, log_header, &done_topic, json!({"error": format!("unsupported log period '{}'", period)})).await;
+            publish_json(
+                client,
+                log_header,
+                &done_topic,
+                json!({"error": format!("unsupported log period '{}'", period)}),
+            )
+            .await;
             return;
         }
     };
@@ -110,7 +121,13 @@ async fn run_upload(client: &AsyncClient, log_header: &str, request_id: u64, per
         }
         Err(e) => {
             log::error!("{} [LOGS] status=collect_task_failed err={}", log_header, e);
-            publish_json(client, log_header, &done_topic, json!({"error": "log collection task failed"})).await;
+            publish_json(
+                client,
+                log_header,
+                &done_topic,
+                json!({"error": "log collection task failed"}),
+            )
+            .await;
             return;
         }
     };
@@ -145,7 +162,12 @@ async fn run_upload(client: &AsyncClient, log_header: &str, request_id: u64, per
 
 /// Publishes one payload under the per-publish deadline.
 /// Returns false when the publish failed or stalled and the upload must stop.
-async fn publish_with_timeout(client: &AsyncClient, log_header: &str, topic: String, payload: Vec<u8>) -> bool {
+async fn publish_with_timeout(
+    client: &AsyncClient,
+    log_header: &str,
+    topic: String,
+    payload: Vec<u8>,
+) -> bool {
     let published = tokio::time::timeout(
         PUBLISH_TIMEOUT,
         client.publish(topic.clone(), QoS::AtLeastOnce, false, payload),
@@ -154,18 +176,33 @@ async fn publish_with_timeout(client: &AsyncClient, log_header: &str, topic: Str
     match published {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
-            log::error!("{} [LOGS] status=publish_failed topic={} err={:?}", log_header, topic, e);
+            log::error!(
+                "{} [LOGS] status=publish_failed topic={} err={:?}",
+                log_header,
+                topic,
+                e
+            );
             false
         }
         Err(_) => {
-            log::error!("{} [LOGS] status=publish_timeout topic={}", log_header, topic);
+            log::error!(
+                "{} [LOGS] status=publish_timeout topic={}",
+                log_header,
+                topic
+            );
             false
         }
     }
 }
 
 async fn publish_json(client: &AsyncClient, log_header: &str, topic: &str, value: Value) {
-    publish_with_timeout(client, log_header, topic.to_string(), value.to_string().into_bytes()).await;
+    publish_with_timeout(
+        client,
+        log_header,
+        topic.to_string(),
+        value.to_string().into_bytes(),
+    )
+    .await;
 }
 
 /// Parses the wire period "<days>d" to a day count. The parse is generic on
@@ -184,19 +221,26 @@ fn collect_zipped_logs(days: i64, period: &str) -> Result<(String, Vec<u8>), Str
     let (current_path, archived_path) = log_file_paths();
 
     // the current log covers the whole period when its first entry is older than the cutoff
-    let first_ts = first_entry_timestamp(&current_path).map_err(|e| format!("cannot read log file: {}", e))?;
+    let first_ts =
+        first_entry_timestamp(&current_path).map_err(|e| format!("cannot read log file: {}", e))?;
     let archive_needed = first_ts.is_none_or(|ts| ts > cutoff);
 
     let mut data = Vec::new();
     if archive_needed {
-        filter_log_file(&archived_path, cutoff, &mut data).map_err(|e| format!("cannot read archived log file: {}", e))?;
+        filter_log_file(&archived_path, cutoff, &mut data)
+            .map_err(|e| format!("cannot read archived log file: {}", e))?;
     }
-    filter_log_file(&current_path, cutoff, &mut data).map_err(|e| format!("cannot read log file: {}", e))?;
+    filter_log_file(&current_path, cutoff, &mut data)
+        .map_err(|e| format!("cannot read log file: {}", e))?;
     if data.is_empty() {
         return Err(format!("no log entries for the last {} day(s)", days));
     }
 
-    let name = format!("tba_logs_{}_{}.zip", Local::now().format("%Y%m%d_%H%M"), period);
+    let name = format!(
+        "tba_logs_{}_{}.zip",
+        Local::now().format("%Y%m%d_%H%M"),
+        period
+    );
     let zipped = zip_log(&data).map_err(|e| format!("cannot zip log data: {}", e))?;
     Ok((name, zipped))
 }
@@ -230,7 +274,11 @@ fn filter_log_file(path: &Path, cutoff: NaiveDateTime, out: &mut Vec<u8>) -> std
     filter_log_lines(BufReader::new(file), cutoff, out)
 }
 
-fn filter_log_lines<R: BufRead>(reader: R, cutoff: NaiveDateTime, out: &mut Vec<u8>) -> std::io::Result<()> {
+fn filter_log_lines<R: BufRead>(
+    reader: R,
+    cutoff: NaiveDateTime,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
     let mut include = false;
     for line in reader.lines() {
         let line = line?;
@@ -256,7 +304,11 @@ fn line_timestamp(line: &str) -> Option<NaiveDateTime> {
 
 /// Packs the collected log slice into a single-entry zip archive.
 fn zip_log(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    Ok(zip_log_entry(&mut std::io::Cursor::new(data), std::io::Cursor::new(Vec::new()))?.into_inner())
+    Ok(zip_log_entry(
+        &mut std::io::Cursor::new(data),
+        std::io::Cursor::new(Vec::new()),
+    )?
+    .into_inner())
 }
 
 #[cfg(test)]

@@ -43,7 +43,11 @@ static DETACH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// before being zipped in the background.
 fn detach_temp_path(dir: &Path) -> PathBuf {
     let seq = DETACH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    dir.join(format!("log.1.archiving.{}.{}.txt", chrono::Local::now().format("%Y%m%d_%H%M%S"), seq))
+    dir.join(format!(
+        "log.1.archiving.{}.{}.txt",
+        chrono::Local::now().format("%Y%m%d_%H%M%S"),
+        seq
+    ))
 }
 
 /// Parses a level name from the `TBA_LOG` spec ("debug", "warn", ...).
@@ -114,16 +118,28 @@ struct RotatingLogWriter {
 
 impl RotatingLogWriter {
     fn new(dir: PathBuf, limit: u64, keep: usize) -> std::io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(dir.join("log.txt"))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("log.txt"))?;
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
-        Ok(Self { dir, file: Some(file), written, limit, keep, failed_rotate_at: None })
+        Ok(Self {
+            dir,
+            file: Some(file),
+            written,
+            limit,
+            keep,
+            failed_rotate_at: None,
+        })
     }
 
     /// True when a rotation attempt is needed: the size limit is reached, or the
     /// sink is broken and a reopen is due — unless a recent attempt already failed.
     fn rotation_due(&self) -> bool {
         (self.file.is_none() || self.written >= self.limit)
-            && self.failed_rotate_at.is_none_or(|at| at.elapsed() >= ROTATE_RETRY_PAUSE)
+            && self
+                .failed_rotate_at
+                .is_none_or(|at| at.elapsed() >= ROTATE_RETRY_PAUSE)
     }
 
     fn rotate(&mut self) {
@@ -197,10 +213,16 @@ impl Write for RotatingLogWriter {
 
 /// Zips a single `log.txt` entry read from `source` into `sink` (streamed, not
 /// buffered). Shared by the rotation archiver and the fetch_logs upload packer.
-pub fn zip_log_entry<W: Write + std::io::Seek>(source: &mut impl std::io::Read, sink: W) -> std::io::Result<W> {
-    let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+pub fn zip_log_entry<W: Write + std::io::Seek>(
+    source: &mut impl std::io::Read,
+    sink: W,
+) -> std::io::Result<W> {
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     let mut writer = zip::ZipWriter::new(sink);
-    writer.start_file("log.txt", options).map_err(std::io::Error::other)?;
+    writer
+        .start_file("log.txt", options)
+        .map_err(std::io::Error::other)?;
     std::io::copy(source, &mut writer)?;
     writer.finish().map_err(std::io::Error::other)
 }
@@ -221,7 +243,11 @@ fn archive_log_generation(dir: &Path, archived: &Path, keep: usize) -> std::io::
         suffix += 1;
     }
 
-    zip_log_entry(&mut File::open(archived)?, std::io::BufWriter::new(File::create(&dest)?))?.flush()?;
+    zip_log_entry(
+        &mut File::open(archived)?,
+        std::io::BufWriter::new(File::create(&dest)?),
+    )?
+    .flush()?;
 
     prune_archives(&archive_dir, keep);
     Ok(())
@@ -245,7 +271,10 @@ fn detach_oversized_generation(dir: &Path, limit: u64) -> Vec<PathBuf> {
     }
 
     let generation = dir.join("log.1.txt");
-    if std::fs::metadata(&generation).map(|m| m.len() >= limit).unwrap_or(false) {
+    if std::fs::metadata(&generation)
+        .map(|m| m.len() >= limit)
+        .unwrap_or(false)
+    {
         let temp = detach_temp_path(dir);
         match std::fs::rename(&generation, &temp) {
             Ok(()) => detached.push(temp),
@@ -321,7 +350,9 @@ pub fn setup_logging() {
     let detached = detach_oversized_generation(&dir, LOG_ROTATE_BYTES);
     if !detached.is_empty() {
         let sweep_dir = dir.clone();
-        std::thread::spawn(move || archive_detached_generations(&sweep_dir, &detached, LOG_ARCHIVE_KEEP));
+        std::thread::spawn(move || {
+            archive_detached_generations(&sweep_dir, &detached, LOG_ARCHIVE_KEEP)
+        });
     }
 
     // Runtime-rotating sink: rotation triggers on size while the app runs, so
@@ -370,8 +401,7 @@ pub fn setup_logging() {
             match part.split_once('=') {
                 Some((module, level)) => match parse_level(level) {
                     Some(level) => {
-                        dispatch =
-                            dispatch.level_for(format!("app_lib::{}", module.trim()), level);
+                        dispatch = dispatch.level_for(format!("app_lib::{}", module.trim()), level);
                     }
                     None => eprintln!("TBA_LOG: unknown level in '{}'", part),
                 },
@@ -396,10 +426,7 @@ pub fn setup_logging() {
     }
 
     if let Err(e) = dispatch.apply() {
-        eprintln!(
-            "Failed to initialize logging at {:?}: {}",
-            dir, e
-        );
+        eprintln!("Failed to initialize logging at {:?}: {}", dir, e);
     }
 
     // Log the application launch
@@ -425,12 +452,21 @@ fn log_system_info() {
     let os_release = sys_info::os_release().unwrap_or_else(|_| "Unknown".to_string());
     let hostname = sys_info::hostname().unwrap_or_else(|_| "Unknown".to_string());
     let cpu_num = sys_info::cpu_num().unwrap_or(0);
-    let cpu_speed = sys_info::cpu_speed().map_or_else(|_| "Unknown".to_string(), |speed| format!("{} MHz", speed));
-    let mem_info = sys_info::mem_info().map_or_else(|_| "Unknown".to_string(), |mem| format!("total {} KB, free {} KB", mem.total, mem.free));
+    let cpu_speed = sys_info::cpu_speed()
+        .map_or_else(|_| "Unknown".to_string(), |speed| format!("{} MHz", speed));
+    let mem_info = sys_info::mem_info().map_or_else(
+        |_| "Unknown".to_string(),
+        |mem| format!("total {} KB, free {} KB", mem.total, mem.free),
+    );
 
     log::info!(
         "OS Type: {}, OS Release: {}, Hostname: {}, Number of CPUs: {} ({}), Memory: {}",
-        os_type, os_release, hostname, cpu_num, cpu_speed, mem_info
+        os_type,
+        os_release,
+        hostname,
+        cpu_num,
+        cpu_speed,
+        mem_info
     );
 }
 
@@ -469,7 +505,10 @@ async fn check_latest_version() -> Result<(), reqwest::Error> {
 
             let payload = NotificationPayload {
                 notification_type: "version".to_string(),
-                message: format!("New version {} is available, use the link to download: {}", latest_version, url),
+                message: format!(
+                    "New version {} is available, use the link to download: {}",
+                    latest_version, url
+                ),
             };
             emit_notification_event("global-notification", payload);
         } else {
@@ -480,7 +519,10 @@ async fn check_latest_version() -> Result<(), reqwest::Error> {
             );
         }
     } else {
-        log::warn!("Version. Failed to fetch the latest release info: {}", response.status());
+        log::warn!(
+            "Version. Failed to fetch the latest release info: {}",
+            response.status()
+        );
     }
 
     Ok(())
@@ -517,7 +559,9 @@ mod tests {
         let dir = scratch_dir("rotate");
         let mut writer = RotatingLogWriter::new(dir.clone(), 32, 3).unwrap();
 
-        writer.write_all(b"old line big enough to cross the 32 bytes limit\n").unwrap();
+        writer
+            .write_all(b"old line big enough to cross the 32 bytes limit\n")
+            .unwrap();
         writer.write_all(b"new line\n").unwrap(); // limit reached: this write rotates first
         writer.flush().unwrap();
 
@@ -550,7 +594,10 @@ mod tests {
                     break;
                 }
             }
-            assert!(Instant::now() < deadline, "zipped archive did not appear in time");
+            assert!(
+                Instant::now() < deadline,
+                "zipped archive did not appear in time"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
 
@@ -592,7 +639,11 @@ mod tests {
         let archive_dir = dir.join("archive");
         std::fs::create_dir_all(&archive_dir).unwrap();
         for i in 0..5 {
-            std::fs::write(archive_dir.join(format!("log_2026010{}_000000.zip", i)), b"x").unwrap();
+            std::fs::write(
+                archive_dir.join(format!("log_2026010{}_000000.zip", i)),
+                b"x",
+            )
+            .unwrap();
         }
 
         prune_archives(&archive_dir, 2);
@@ -602,7 +653,10 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, vec!["log_20260103_000000.zip", "log_20260104_000000.zip"]);
+        assert_eq!(
+            left,
+            vec!["log_20260103_000000.zip", "log_20260104_000000.zip"]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

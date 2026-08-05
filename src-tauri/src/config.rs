@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ───── External Crates ─────
-use serde::{Deserialize, Serialize};
 use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
 // ───── Local Modules ─────
@@ -21,17 +21,17 @@ use crate::mqtt::remove_connections;
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ConfigurationFile {
-    name: String,                           // The name of the application.
-    version: String,                        // The version of the application.
-    description: String,                    // A brief description of the application.
-    appearance: Option<AppearanceConfig>,   // Optional UI configuration settings.
-    ident: Option<String>,                  // Optional ident for the application.
-    server: Option<ServerConfig>,           // Optional server configuration settings.
+    name: String,                         // The name of the application.
+    version: String,                      // The version of the application.
+    description: String,                  // A brief description of the application.
+    appearance: Option<AppearanceConfig>, // Optional UI configuration settings.
+    ident: Option<String>,                // Optional ident for the application.
+    server: Option<ServerConfig>,         // Optional server configuration settings.
     // `default` keeps a missing or empty `cards:` key (YAML null) from failing
     // the whole config parse — a parse failure resets the file and wipes the
     // user's server host and card list.
     #[serde(default, deserialize_with = "cards_or_empty")]
-    cards: HashMap<String, CardConfig>,     // Hashmap of the cards with the CardConfig structure
+    cards: HashMap<String, CardConfig>, // Hashmap of the cards with the CardConfig structure
     // Update channel: true → the app also offers pre-release (alpha/beta/rc)
     // builds; false/absent → stable releases only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,15 +64,15 @@ pub enum DarkTheme {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CardConfig {
-    pub iccid: String,                          // ICCID
-    pub expire: Option<u64>,                    // Expire date
-    pub name: Option<String>,                   // Custom card name (for ease of user identification)
-    pub t_protocol: Option<String>,             // Card communication protocol "T0"/"T1"; auto-filled from ATR on first connection, may be overridden manually
-    pub card_type: Option<u8>,                  // typeOfTachographCardId: 1=Driver, 2=Workshop, 3=Control, 4=Company
-    pub structure_version: Option<(u8, u8)>,    // cardStructureVersion (major, minor): major 0x00=Gen1, 0x01=Gen2; minor = data-element revision
-    pub company_name: Option<String>,           // Company name (from EF_Identification, Company Card only)
-    pub company_address: Option<String>,        // Company address (from EF_Identification, Company Card only)
-    pub last_auth: Option<(u64, bool)>,         // Last completed authentication: (unix_timestamp, success_flag)
+    pub iccid: String,                       // ICCID
+    pub expire: Option<u64>,                 // Expire date
+    pub name: Option<String>,                // Custom card name (for ease of user identification)
+    pub t_protocol: Option<String>, // Card communication protocol "T0"/"T1"; auto-filled from ATR on first connection, may be overridden manually
+    pub card_type: Option<u8>, // typeOfTachographCardId: 1=Driver, 2=Workshop, 3=Control, 4=Company
+    pub structure_version: Option<(u8, u8)>, // cardStructureVersion (major, minor): major 0x00=Gen1, 0x01=Gen2; minor = data-element revision
+    pub company_name: Option<String>, // Company name (from EF_Identification, Company Card only)
+    pub company_address: Option<String>, // Company address (from EF_Identification, Company Card only)
+    pub last_auth: Option<(u64, bool)>, // Last completed authentication: (unix_timestamp, success_flag)
 }
 // UI Configuration structure, part of ConfigurationFile that contains data about how UI looks like.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -141,12 +141,12 @@ fn save_config(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let yaml = serde_yaml::to_string(config)?;
 
-    let parent = config_path.parent().ok_or_else(|| {
-        io::Error::other("config path has no parent directory")
-    })?;
-    let file_name = config_path.file_name().ok_or_else(|| {
-        io::Error::other("config path has no file name")
-    })?;
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| io::Error::other("config path has no parent directory"))?;
+    let file_name = config_path
+        .file_name()
+        .ok_or_else(|| io::Error::other("config path has no file name"))?;
 
     let mut tmp_path = parent.to_path_buf();
     let mut tmp_name = file_name.to_os_string();
@@ -272,7 +272,7 @@ fn update_card_config(
             emit_card_config_event(
                 "global-card-config-updated",
                 card_number.to_string(),
-                Some(card_config.clone())
+                Some(card_config.clone()),
             );
         }
 
@@ -457,9 +457,7 @@ pub fn update_server_config(
 }
 
 #[tauri::command]
-pub async fn remove_card(
-    cardnumber: String,
-) -> Result<(), String> {
+pub async fn remove_card(cardnumber: String) -> Result<(), String> {
     let config_path = get_config_path().map_err(|e| {
         log::error!("Failed to get config path: {}", e);
         format!("Failed to get config path: {}", e)
@@ -518,12 +516,13 @@ pub async fn remove_card_from_config(
 
         emit_card_config_event("global-card-config-updated", card_number.to_string(), None);
 
-        #[cfg(target_os = "linux")] {
+        #[cfg(target_os = "linux")]
+        {
             // "Super hack" to reload card states and trigger an event to update readers.
 
+            use crate::smart_card::manual_sync_cards;
             use tokio::time::sleep;
             use tokio::time::Duration;
-            use crate::smart_card::manual_sync_cards;
 
             sleep(Duration::from_millis(100)).await;
             if let Err(e) = manual_sync_cards(card_number.to_string(), false).await {
@@ -942,11 +941,7 @@ pub fn emit_all_card_configs() {
     };
 
     for (card_number, card_config) in cards {
-        emit_card_config_event(
-            "global-card-config-updated",
-            card_number,
-            Some(card_config),
-        );
+        emit_card_config_event("global-card-config-updated", card_number, Some(card_config));
     }
 }
 

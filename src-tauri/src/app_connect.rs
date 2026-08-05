@@ -3,24 +3,24 @@
 //! This module provides functionality for creating and managing MQTT connections.
 
 // ───── Std Lib ─────
-use std::time::Duration;                 // For specifying time durations.
+use std::time::Duration; // For specifying time durations.
 
 // ───── MQTT Client Library (rumqttc) ─────
 use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions}; // Core MQTT async client and options.
 
 // ───── Smart Card ─────
-use crate::smart_card::TASK_POOL;        // Task pool for managing MQTT connections.
+use crate::smart_card::TASK_POOL; // Task pool for managing MQTT connections.
 
 // ───── Tauri ─────
 use tauri::async_runtime::{self, JoinHandle}; // Async runtime and task join handles for Tauri apps.
 
 // ───── Serialization ─────
-use serde_json::Value;                   // For working with JSON data structures.
+use serde_json::Value; // For working with JSON data structures.
 
 // ───── Local Modules ─────
-use crate::config::get_from_cache;       // Function to get data from cache for syncing server data.
-use crate::config::split_host_to_parts;  // Function to split the host into parts for MQTT connection.
-use crate::config::CacheSection;         // Enum for cache sections for getting data from cache.
+use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
+use crate::config::split_host_to_parts; // Function to split the host into parts for MQTT connection.
+use crate::config::CacheSection; // Enum for cache sections for getting data from cache.
 use crate::global_app_handle::app_emit_event; // Emits app connection status to the frontend.
 use crate::smart_card::ProcessingCard;
 
@@ -46,11 +46,18 @@ pub async fn app_connection() {
     let full_host = get_from_cache(CacheSection::Server, "host");
     let (host, port) = match split_host_to_parts(&full_host) {
         Ok((host, port)) => {
-            log::debug!("[CONN] phase=config status=host_loaded host={}:{}", host, port);
+            log::debug!(
+                "[CONN] phase=config status=host_loaded host={}:{}",
+                host,
+                port
+            );
             (host, port)
         }
         Err(e) => {
-            log::error!("[CONN] phase=config status=failed reason=invalid_host err={}", e);
+            log::error!(
+                "[CONN] phase=config status=failed reason=invalid_host err={}",
+                e
+            );
             return;
         }
     };
@@ -135,7 +142,11 @@ pub async fn app_connection() {
                             let topic = match std::str::from_utf8(&publish.topic) {
                                 Ok(topic) => topic,
                                 Err(e) => {
-                                    log::error!("{} invalid UTF-8 in publish topic: {:?}", log_header, e);
+                                    log::error!(
+                                        "{} invalid UTF-8 in publish topic: {:?}",
+                                        log_header,
+                                        e
+                                    );
                                     continue;
                                 }
                             };
@@ -159,7 +170,11 @@ pub async fn app_connection() {
                                     }
                                 }
                                 Err(e) => {
-                                    log::error!("{} parsing JSON payload issue: {:?}", log_header, e);
+                                    log::error!(
+                                        "{} parsing JSON payload issue: {:?}",
+                                        log_header,
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -178,14 +193,21 @@ pub async fn app_connection() {
                             // graceful teardown: the DISCONNECT packet is already flushed to the
                             // socket, so exit instead of letting the loop treat the closing
                             // connection as a network failure and reconnect
-                            log::info!("{} [CONN] phase=shutdown status=disconnect_sent", log_header);
+                            log::info!(
+                                "{} [CONN] phase=shutdown status=disconnect_sent",
+                                log_header
+                            );
                             break;
                         }
                         _ => {} // This handles any other events that you haven't explicitly matched above
                     }
                 }
                 Err(e) => {
-                    let transition = if is_online { "ONLINE->OFFLINE" } else { "OFFLINE" };
+                    let transition = if is_online {
+                        "ONLINE->OFFLINE"
+                    } else {
+                        "OFFLINE"
+                    };
                     if is_online {
                         is_online = false;
                         app_emit_event(false);
@@ -194,7 +216,11 @@ pub async fn app_connection() {
                     // One line per failed poll: kind + retry delay; full error
                     // details only for genuinely unexpected failures.
                     crate::mqtt::log_connection_failure(
-                        &log_header, "CONN", transition, &e, reconnect_delay_secs,
+                        &log_header,
+                        "CONN",
+                        transition,
+                        &e,
+                        reconnect_delay_secs,
                     );
 
                     tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
@@ -238,7 +264,10 @@ mod tests {
         assert_eq!(next_reconnect_delay(10), 20);
         assert_eq!(next_reconnect_delay(40), 80);
         assert_eq!(next_reconnect_delay(160), RECONNECT_DELAY_MAX_SECS);
-        assert_eq!(next_reconnect_delay(RECONNECT_DELAY_MAX_SECS), RECONNECT_DELAY_MAX_SECS);
+        assert_eq!(
+            next_reconnect_delay(RECONNECT_DELAY_MAX_SECS),
+            RECONNECT_DELAY_MAX_SECS
+        );
     }
 
     #[test]

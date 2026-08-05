@@ -56,7 +56,9 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
         if let Ok(mut state) = STATE.lock() {
             state
                 .entry(client_id.to_string())
-                .or_insert(SniffState { last_selected_ef: None })
+                .or_insert(SniffState {
+                    last_selected_ef: None,
+                })
                 .last_selected_ef = Some(fid);
         }
         return;
@@ -68,14 +70,18 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
     }
 
     let fid = {
-        let Ok(state) = STATE.lock() else { return; };
-        state
-            .get(client_id)
-            .and_then(|s| s.last_selected_ef)
+        let Ok(state) = STATE.lock() else {
+            return;
+        };
+        state.get(client_id).and_then(|s| s.last_selected_ef)
     };
-    let Some(fid) = fid else { return; };
+    let Some(fid) = fid else {
+        return;
+    };
 
-    let Some(data) = extract_plain_body(&resp) else { return; };
+    let Some(data) = extract_plain_body(&resp) else {
+        return;
+    };
 
     match fid {
         0x0520 => parse_ef_identification(client_id, &data),
@@ -176,11 +182,7 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
         log::info!("  cardIssuingMemberState: 0x{:02X} ({})", b[0], b[0]);
     }
     if let Some(b) = slice(data, 1, 16) {
-        log::info!(
-            "  cardNumber: \"{}\" (raw={})",
-            ia5(b),
-            hex::encode(b)
-        );
+        log::info!("  cardNumber: \"{}\" (raw={})", ia5(b), hex::encode(b));
     }
     if let Some(b) = slice(data, 17, 36) {
         log::info!("  cardIssuingAuthorityName: {}", name_str(b));
@@ -222,14 +224,22 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
     // Outer Option = field present in this response; inner value = new content.
     let new_expire = slice(data, 61, 4).map(|b| {
         let ts = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-        if ts == 0 { None } else { Some(ts as u64) }
+        if ts == 0 {
+            None
+        } else {
+            Some(ts as u64)
+        }
     });
     let new_company_name = slice(data, 65, 36).map(extract_name);
     let new_company_address = slice(data, 101, 36).map(extract_name);
 
     let would_change = new_expire.as_ref().is_some_and(|v| &cfg.expire != v)
-        || new_company_name.as_ref().is_some_and(|v| &cfg.company_name != v)
-        || new_company_address.as_ref().is_some_and(|v| &cfg.company_address != v);
+        || new_company_name
+            .as_ref()
+            .is_some_and(|v| &cfg.company_name != v)
+        || new_company_address
+            .as_ref()
+            .is_some_and(|v| &cfg.company_address != v);
     if !would_change {
         return;
     }
@@ -295,11 +305,7 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
         log::info!("  typeOfTachographCardId: 0x{:02X} ({})", t, ts);
     }
     if data.len() >= 3 {
-        log::info!(
-            "  cardStructureVersion: {:02X}.{:02X}",
-            data[1],
-            data[2]
-        );
+        log::info!("  cardStructureVersion: {:02X}.{:02X}", data[1], data[2]);
     }
     if data.len() >= 5 {
         let n = u16::from_be_bytes([data[3], data[4]]);
@@ -313,7 +319,11 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
         return;
     };
 
-    let new_card_type = if !data.is_empty() { Some(data[0]) } else { None };
+    let new_card_type = if !data.is_empty() {
+        Some(data[0])
+    } else {
+        None
+    };
     // Gen2 cards expose EF_Application_Identification under BOTH DF_Tachograph (Gen1, ver 00.00)
     // and DF_Tachograph_G2 (Gen2, ver 01.xx). Keep only the highest version seen —
     // tuple comparison is lexicographic: (0,0) < (1,0) < (1,1) < (1,2) ...
@@ -334,7 +344,10 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
         return;
     }
 
-    log::debug!("EF_Application_Identification → config update for {}", client_id);
+    log::debug!(
+        "EF_Application_Identification → config update for {}",
+        client_id
+    );
 
     // Same offload pattern as EF_Identification: blocking write on the blocking
     // pool, change re-applied to fresh file state under the global config lock.
@@ -443,7 +456,10 @@ mod tests {
     fn select_ef_fid_sm_form() {
         // SM-wrapped SELECT EF for FID 0x0501:
         // 0C A4 02 0C Lc 81 02 05 01 ... MAC ... 00
-        let cmd = [0x0C, 0xA4, 0x02, 0x0C, 0x09, 0x81, 0x02, 0x05, 0x01, 0x8E, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0x00];
+        let cmd = [
+            0x0C, 0xA4, 0x02, 0x0C, 0x09, 0x81, 0x02, 0x05, 0x01, 0x8E, 0x04, 0xAA, 0xBB, 0xCC,
+            0xDD, 0x00,
+        ];
         assert_eq!(select_ef_fid(&cmd), Some(0x0501));
     }
 
@@ -470,7 +486,9 @@ mod tests {
     #[test]
     fn extract_plain_body_handles_do81() {
         // DO'81 body of length 3, then DO'8E and SW.
-        let resp = [0x81, 0x03, 0xAA, 0xBB, 0xCC, 0x8E, 0x02, 0xFF, 0xFF, 0x90, 0x00];
+        let resp = [
+            0x81, 0x03, 0xAA, 0xBB, 0xCC, 0x8E, 0x02, 0xFF, 0xFF, 0x90, 0x00,
+        ];
         assert_eq!(extract_plain_body(&resp), Some(vec![0xAA, 0xBB, 0xCC]));
     }
 
@@ -510,8 +528,16 @@ mod tests {
     fn forget_removes_only_target_client() {
         forget_all();
         // Push state for two clients via SELECT
-        sniff("clientA", "00A4020C02 0520".replace(' ', "").as_str(), "9000");
-        sniff("clientB", "00A4020C02 0501".replace(' ', "").as_str(), "9000");
+        sniff(
+            "clientA",
+            "00A4020C02 0520".replace(' ', "").as_str(),
+            "9000",
+        );
+        sniff(
+            "clientB",
+            "00A4020C02 0501".replace(' ', "").as_str(),
+            "9000",
+        );
         {
             let state = STATE.lock().unwrap();
             assert!(state.contains_key("clientA"));
