@@ -5,9 +5,7 @@ import type { SmartCard } from './models'
 
 /// Builds the meta string shown in parentheses after the card number,
 /// e.g. "Gen1 | Company Card". Omits missing parts.
-export function formatCardMeta(
-  card: Pick<SmartCard, 'structure_version' | 'card_type'>,
-): string {
+export function formatCardMeta(card: Pick<SmartCard, 'structure_version' | 'card_type'>): string {
   const parts: string[] = []
   if (card.structure_version) parts.push(formatStructureVersion(card.structure_version))
   if (card.card_type != null) parts.push(formatCardType(card.card_type))

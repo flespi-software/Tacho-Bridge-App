@@ -69,14 +69,7 @@
         </div>
         <!-- link the unknown card to a configured number, same flow as for readers -->
         <div v-if="!card.card_number && card.iccid" class="text-grey-8 q-gutter-xs">
-          <q-btn
-            size="12px"
-            flat
-            dense
-            round
-            icon="mdi-link"
-            @click="emit('link', card.iccid)"
-          />
+          <q-btn size="12px" flat dense round icon="mdi-link" @click="emit('link', card.iccid)" />
         </div>
       </div>
     </div>
@@ -97,4 +90,3 @@ const emit = defineEmits<{
 
 <!-- Styles live in src/css/app.scss alongside the readers block so the rack
      matches it and follows the light/dark theme. -->
-

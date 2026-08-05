@@ -1,5 +1,9 @@
 <template>
-  <q-dialog :model-value="modelValue" persistent @update:model-value="$emit('update:modelValue', $event)">
+  <q-dialog
+    :model-value="modelValue"
+    persistent
+    @update:model-value="$emit('update:modelValue', $event)"
+  >
     <q-card style="width: 560px; max-width: 95vw">
       <q-card-section class="row items-center q-pb-sm">
         <q-icon name="mdi-cog" size="28px" color="primary" class="q-mr-sm" />
@@ -95,12 +99,15 @@
 
       <q-card-actions align="right" class="q-px-md q-pb-md">
         <q-btn flat label="Cancel" color="grey-7" v-close-popup />
+        <!-- No v-close-popup: the dialog closes from saveServerConfig only after
+             the settings are confirmed persisted; on failure it stays open so
+             the user can see the error and retry. -->
         <q-btn
           unelevated
           rounded
           label="Save"
           color="primary"
-          v-close-popup
+          :loading="saving"
           @click="saveServerConfig"
         />
       </q-card-actions>
@@ -153,7 +160,7 @@ defineProps<{
   modelValue: boolean
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   'update:modelValue': [value: boolean]
 }>()
 
@@ -188,9 +195,21 @@ function onThemeSelected(mode: ThemeMode) {
   themeMode.value = mode
   if (mode === 'Auto') $q.dark.set('auto')
   else $q.dark.set(mode === 'Dark')
-  invoke('update_theme', { theme: mode }).catch((error) => {
-    console.error('Failed to persist theme:', error)
-  })
+  // update_theme resolves with `false` on a persistence failure instead of
+  // rejecting — check the value, or a read-only config dir would fail silently.
+  invoke<boolean>('update_theme', { theme: mode })
+    .then((ok) => {
+      if (!ok) throw new Error('the backend could not persist the theme')
+    })
+    .catch((error) => {
+      console.error('Failed to persist theme:', error)
+      Notify.create({
+        message: `Theme was applied but not saved: ${String(error)}`,
+        color: 'red',
+        position: 'bottom',
+        timeout: 5000,
+      })
+    })
 }
 
 // Forced update check. An available update raises the standard `update`
@@ -255,22 +274,34 @@ const openChangelog = async () => {
     changelogOpen.value = true
   } catch (error) {
     console.error('Failed to load changelog:', error)
+    Notify.create({
+      message: `Failed to open the changelog: ${String(error)}`,
+      color: 'red',
+      position: 'bottom',
+      timeout: 5000,
+    })
   }
 }
 
+const saving = ref(false)
 const saveServerConfig = async () => {
   const theme = themeMode.value
   console.log(`server_address: ${hostValue.value}, ident: ${identInput.value}, theme: ${theme}`)
 
+  saving.value = true
   try {
-    const response = await invoke('update_server', {
+    // update_server resolves with `false` on a persistence failure (read-only
+    // config dir, disk error) instead of rejecting — a bare await would show
+    // the green toast over an unsaved config.
+    const ok = await invoke<boolean>('update_server', {
       host: hostValue.value,
       ident: identInput.value,
       theme,
       betaUpdates: betaUpdates.value,
     })
-
-    console.log('Response from update_server:', response)
+    if (!ok) {
+      throw new Error('the backend could not persist the settings')
+    }
 
     Notify.create({
       message: 'Settings have been updated.',
@@ -278,21 +309,43 @@ const saveServerConfig = async () => {
       position: 'bottom',
       timeout: 3000,
     })
-
-    await invoke('manual_sync_cards', {
-      readername: "",
-      restart: true,
-    })
-    console.log('Server configuration updated successfully_1')
-    await invoke('app_connection')
-    console.log('Server configuration updated successfully_2')
+    emit('update:modelValue', false)
   } catch (error) {
     console.error('Error updating server configuration:', error)
     Notify.create({
-      message: 'Failed to update settings.',
+      message: `Failed to update settings: ${String(error)}`,
       color: 'red',
       position: 'bottom',
-      timeout: 3000,
+      timeout: 5000,
+    })
+    return
+  } finally {
+    saving.value = false
+  }
+
+  // Reconnect steps run after a confirmed save, each on its own: a PCSC sync
+  // failure (e.g. the smart-card service is down) must not prevent the app
+  // connection from moving to the new broker.
+  try {
+    await invoke('manual_sync_cards', { readername: '', restart: true })
+  } catch (error) {
+    console.error('Card sync after settings save failed:', error)
+    Notify.create({
+      message: `Settings saved, but card sync failed: ${String(error)}`,
+      color: 'orange',
+      position: 'bottom',
+      timeout: 5000,
+    })
+  }
+  try {
+    await invoke('app_connection')
+  } catch (error) {
+    console.error('App reconnect after settings save failed:', error)
+    Notify.create({
+      message: `Settings saved, but reconnect failed: ${String(error)}`,
+      color: 'orange',
+      position: 'bottom',
+      timeout: 5000,
     })
   }
 }
@@ -312,9 +365,18 @@ onMounted(async () => {
         beta_updates?: string
       }
       hostValue.value = payload.host
-      identInput.value = payload.ident
+      // Seed the backing ref directly, NOT through the identInput setter: the
+      // setter strips dashes/non-digits, so a non-conforming persisted ident
+      // would be silently rewritten here and the next Save would persist the
+      // mangled identity of a device already registered on the server. The
+      // faithful value renders as-is and isIdentValid flags it instead.
+      ident.value = payload.ident.replace(/^TBA/i, '')
       betaUpdates.value = payload.beta_updates === 'true'
-      if (payload.dark_theme === 'Auto' || payload.dark_theme === 'Light' || payload.dark_theme === 'Dark') {
+      if (
+        payload.dark_theme === 'Auto' ||
+        payload.dark_theme === 'Light' ||
+        payload.dark_theme === 'Dark'
+      ) {
         // Reflect the persisted mode; no watcher, so nothing re-persists.
         themeMode.value = payload.dark_theme
       }

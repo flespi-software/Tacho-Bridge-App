@@ -182,6 +182,20 @@ fn update_card_config(
 
     let mut changed = false;
 
+    // Metadata fields are owned by the backend (APDU sniffer, auth recorder):
+    // the frontend form only owns `name` and `iccid`, and a save must not let
+    // an echoed snapshot clobber a concurrent backend write (e.g. `last_auth`
+    // persisted while the edit dialog was open). Same rule t_protocol always
+    // had: None means "not provided", never "clear it".
+    macro_rules! update_provided {
+        ($existing:ident, $field:ident) => {
+            if content.$field.is_some() && $existing.$field != content.$field {
+                $existing.$field = content.$field.clone();
+                changed = true;
+            }
+        };
+    }
+
     match config.cards.get_mut(card_number) {
         Some(existing_card) => {
             if existing_card.iccid.is_empty() {
@@ -192,56 +206,28 @@ fn update_card_config(
                     content.name,
                     content.expire
                 );
-                existing_card.iccid = content.iccid;
-                existing_card.expire = content.expire;
-                existing_card.name = content.name;
-                existing_card.card_type = content.card_type;
-                existing_card.structure_version = content.structure_version;
-                existing_card.company_name = content.company_name;
-                existing_card.company_address = content.company_address;
-                existing_card.last_auth = content.last_auth;
-                // t_protocol is not part of the frontend card form; None means "not provided", not "clear it"
-                if content.t_protocol.is_some() {
-                    existing_card.t_protocol = content.t_protocol;
-                }
-                // needs_restart = true;
+                existing_card.iccid = content.iccid.clone();
+                existing_card.name = content.name.clone();
                 changed = true;
             } else {
-                // Update optional fields only (no restart required)
-                if existing_card.expire != content.expire
-                    || existing_card.name != content.name
-                    || existing_card.card_type != content.card_type
-                    || existing_card.structure_version != content.structure_version
-                    || existing_card.company_name != content.company_name
-                    || existing_card.company_address != content.company_address
-                    || existing_card.last_auth != content.last_auth
-                {
+                // Update the user-editable field (no restart required)
+                if existing_card.name != content.name {
                     log::debug!(
-                        "Updating optional fields for card {}: name = {:?}, expire = {:?}, card_type = {:?}, structure_version = {:?}, company_name = {:?}, company_address = {:?}, last_auth = {:?}",
+                        "Updating name for card {}: name = {:?}",
                         card_number,
-                        content.name,
-                        content.expire,
-                        content.card_type,
-                        content.structure_version,
-                        content.company_name,
-                        content.company_address,
-                        content.last_auth
+                        content.name
                     );
-                    existing_card.expire = content.expire;
-                    existing_card.name = content.name;
-                    existing_card.card_type = content.card_type;
-                    existing_card.structure_version = content.structure_version;
-                    existing_card.company_name = content.company_name;
-                    existing_card.company_address = content.company_address;
-                    existing_card.last_auth = content.last_auth;
-                    changed = true;
-                }
-                // t_protocol is not part of the frontend card form; None means "not provided", not "clear it"
-                if content.t_protocol.is_some() && existing_card.t_protocol != content.t_protocol {
-                    existing_card.t_protocol = content.t_protocol;
+                    existing_card.name = content.name.clone();
                     changed = true;
                 }
             }
+            update_provided!(existing_card, expire);
+            update_provided!(existing_card, card_type);
+            update_provided!(existing_card, structure_version);
+            update_provided!(existing_card, company_name);
+            update_provided!(existing_card, company_address);
+            update_provided!(existing_card, last_auth);
+            update_provided!(existing_card, t_protocol);
         }
         None => {
             // Add new card entirely

@@ -3,9 +3,7 @@
     <q-header elevated>
       <q-toolbar>
         <q-icon name="mdi-steering" size="24px" class="q-ml-md q-mr-sm" style="opacity: 0.8" />
-        <q-toolbar-title>
-          Tacho Bridge
-        </q-toolbar-title>
+        <q-toolbar-title> Tacho Bridge </q-toolbar-title>
 
         <q-btn
           v-if="!appConnected && serverConfigured"
@@ -58,7 +56,9 @@ const configOpen = ref(false)
 const appConnected = ref(false)
 const serverHost = ref('')
 const serverIdent = ref('')
-const serverConfigured = computed(() => serverHost.value.length > 0 && TBA_IDENT_REGEXP.test(serverIdent.value))
+const serverConfigured = computed(
+  () => serverHost.value.length > 0 && TBA_IDENT_REGEXP.test(serverIdent.value),
+)
 
 async function reconnect() {
   try {
@@ -132,7 +132,16 @@ onMounted(async () => {
               color: 'white',
               handler: () => {
                 void invoke('install_update').catch((e) => {
+                  // On success the app restarts and this never runs; a silent
+                  // catch here meant a failed download looked like nothing
+                  // happened after the user clicked "Install & restart".
                   console.error('install_update failed:', e)
+                  Notify.create({
+                    message: `Update installation failed: ${String(e)}. You can retry from the update notification.`,
+                    color: 'red',
+                    position: 'bottom',
+                    timeout: 8000,
+                  })
                 })
               },
             },

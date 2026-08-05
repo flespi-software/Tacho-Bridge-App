@@ -150,7 +150,7 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
 
     let mut downloaded: usize = 0;
     let mut last_logged_pct: u64 = 0;
-    update
+    if let Err(e) = update
         .download_and_install(
             move |chunk, total| {
                 downloaded += chunk;
@@ -166,10 +166,14 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
             || log::info!("{TAG} phase=install status=downloaded"),
         )
         .await
-        .map_err(|e| {
-            log::error!("{TAG} phase=install status=failed err={e}");
-            e.to_string()
-        })?;
+    {
+        log::error!("{TAG} phase=install status=failed err={e}");
+        // Put the update back: the slot was take()n above, and without this a
+        // transient download failure would consume it — the user could never
+        // retry the install until a fresh update check found it again.
+        *PENDING_UPDATE.lock().await = Some(update);
+        return Err(e.to_string());
+    }
 
     log::info!("{TAG} phase=install status=installed action=restart");
     // Release the rack's serial port before the restart, same as window close.

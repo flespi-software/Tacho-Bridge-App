@@ -25,8 +25,7 @@
             <q-item-label
               v-if="
                 reader.card_number &&
-                (authInProgress[reader.card_number] ||
-                  state.cards[reader.card_number]?.last_auth)
+                (authInProgress[reader.card_number] || state.cards[reader.card_number]?.last_auth)
               "
               caption
             >
@@ -43,7 +42,8 @@
                       ? 'text-green-8'
                       : 'text-red text-weight-medium'
                   "
-                >{{ state.cards[reader.card_number]?.last_auth?.[1] ? 'success' : 'fail' }}</span>)
+                  >{{ state.cards[reader.card_number]?.last_auth?.[1] ? 'success' : 'fail' }}</span
+                >)
               </template>
             </q-item-label>
           </q-item-section>
@@ -57,7 +57,13 @@
             <template v-if="!reader.card_number && reader.iccid">
               <q-item-label lines="1">UNKNOWN CARD</q-item-label>
               <q-item-label lines="1" caption>
-                <q-chip dense size="sm" color="blue-grey-2" text-color="blue-grey-9" class="text-bold">
+                <q-chip
+                  dense
+                  size="sm"
+                  color="blue-grey-2"
+                  text-color="blue-grey-9"
+                  class="text-bold"
+                >
                   ICCID: {{ reader.iccid }}
                 </q-chip>
               </q-item-label>
@@ -249,9 +255,16 @@ function handleCardsSync(raw: unknown): void {
     return
   }
 
-  // Split the status by the pipe character and get the second element
-  const splitted = (raw.card_state?.match(/\((.*)\)/i) ?? [])[1]?.split('|') ?? []
-  const status = splitted[1]?.trim() ?? splitted[0] ?? ''
+  // The PCSC monitor sends the bitflags Debug form "State(CHANGED | PRESENT)";
+  // the MQTT emitter sends a bare "PRESENT". Parse the parenthesized form and
+  // fall back to the raw string, then pick the first meaningful flag — the
+  // positional [1] this used to be broke on single-flag and no-CHANGED forms.
+  const inner = raw.card_state.match(/\(([^)]*)\)/)?.[1] ?? raw.card_state
+  const flags = inner
+    .split('|')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const status = flags.find((f) => f !== 'CHANGED') ?? flags[0] ?? ''
 
   const iccid = raw.iccid
   // Find the index of the reader with the same name
@@ -293,15 +306,26 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
 
   // The backend reconnects the affected card itself after a successful save
   // (PCSC rescan + pending rack cards), no explicit sync call is needed here.
-  const update_result = await invoke('update_card', {
-    cardnumber: cardNumber,
-    content: content,
-  })
-
-  if (update_result) {
+  // The local card list is NOT updated here: on success the backend emits
+  // `global-card-config-updated`, the single source of truth — an optimistic
+  // local write would show a "saved" card that a failed write never persisted.
+  try {
+    const update_result = await invoke('update_card', {
+      cardnumber: cardNumber,
+      content: content,
+    })
+    if (!update_result) {
+      throw new Error('the backend refused the update')
+    }
     console.log('Card number updated successfully')
-  } else {
-    console.error(`Failed to update card ${cardNumber}`)
+  } catch (error) {
+    console.error(`Failed to update card ${cardNumber}:`, error)
+    Notify.create({
+      message: `Failed to save card ${cardNumber}: ${String(error)}`,
+      color: 'red',
+      position: 'bottom',
+      timeout: 8000,
+    })
   }
 }
 
@@ -361,12 +385,10 @@ function linkMode(iccid: string) {
   }
 }
 async function addCard(number: string, data: SmartCard) {
-  state.cards[number] = data
   await saveCardNumber(number, data)
 }
 
 async function updateCard(number: string, data: SmartCard) {
-  state.cards[number] = data
   await saveCardNumber(number, data)
 }
 
@@ -433,7 +455,10 @@ onMounted(async () => {
   }
 
   // Now that the listeners are wired, tell the backend it can start
-  // emitting initial state.
+  // emitting initial state. The replay bursts one event per EXISTING card and
+  // nothing for absent ones — clear the map first so the replay is
+  // authoritative and cards deleted while the webview was away don't linger.
+  state.cards = {}
   try {
     await emit('frontend-loaded', { message: 'Hello from frontend!' })
   } catch (error) {

@@ -142,7 +142,9 @@
         - Add    → all fields empty (ICCID pre-filled if coming from link flow)
         - Edit   → card number and ICCID locked (they identify the record)
     -->
-    <q-dialog v-model="isDialogOpen">
+    <!-- @hide also covers ESC and backdrop dismissal: without it, link mode
+         survived an ESC and the next card click silently bound the stale ICCID. -->
+    <q-dialog v-model="isDialogOpen" @hide="closeCard">
       <q-card style="min-width: 420px">
         <q-card-section class="row items-center q-pb-sm">
           <q-icon
@@ -159,14 +161,7 @@
         <q-separator />
 
         <q-card-section class="q-pt-md q-pb-sm">
-          <q-input
-            v-model="dialogCardICCID"
-            label="ICCID"
-            outlined
-            dense
-            disable
-            class="q-mb-sm"
-          >
+          <q-input v-model="dialogCardICCID" label="ICCID" outlined dense disable class="q-mb-sm">
             <template v-slot:prepend>
               <q-icon name="mdi-chip" size="xs" />
             </template>
@@ -285,7 +280,10 @@ function linkMode(iccid: string) {
 
 function cardClick(number: string) {
   if (isLinkMode.value) {
-    const cardData: SmartCard = { ...props.cards[number], iccid: linkICCID.value }
+    // Send only the fields this action owns: echoing the whole card snapshot
+    // back would overwrite backend-owned metadata (last_auth, company data)
+    // written concurrently by the sniffer. Absent fields are preserved.
+    const cardData: SmartCard = { name: props.cards[number]?.name ?? '', iccid: linkICCID.value }
     emit('update-card', number, cardData)
     isLinkMode.value = false
     linkICCID.value = ''
@@ -329,7 +327,10 @@ function saveCard(): void {
 
   if (!validateCardNumber()) return
 
-  const cardData: SmartCard = { ...props.cards[number], name, iccid: dialogCardICCID.value || '' }
+  // Only the form-owned fields: the backend preserves absent metadata fields,
+  // so a save cannot clobber a concurrent sniffer/auth write with this
+  // dialog's stale snapshot.
+  const cardData: SmartCard = { name, iccid: dialogCardICCID.value || '' }
 
   if (isEditMode.value) {
     emit('update-card', number, cardData)
@@ -363,7 +364,6 @@ function removeCard(number: string): void {
     emit('delete-card', number)
   })
 }
-
 
 defineExpose({
   linkMode,

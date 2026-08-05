@@ -3,7 +3,7 @@
 This document describes how the Tacho Bridge App (TBA) communicates with the
 server: what connections it opens, which messages travel over them, when and
 why. It documents the **transport envelope** implemented by TBA. TBA is a
-bridge: the server decides *what* to do; TBA executes and reports back.
+bridge: the server decides _what_ to do; TBA executes and reports back.
 
 Status: living document. Sections marked **TBD** are planned and will be
 filled in as the corresponding functionality lands.
@@ -32,11 +32,11 @@ follow one rule:
 TBA maintains several MQTT connections in parallel, one per role. Each has its
 own `client_id`, which is how the server tells them apart.
 
-| Connection | client_id | Purpose |
-|------------|-----------|---------|
-| App | `TBA` + 13 digits (e.g. `TBA1740000000000`) | Application presence: one per running TBA instance. |
-| Card | 16-character company card number | One per inserted card; carries the card's authentication traffic. |
-| Rack | 16 characters: brand prefix + zero padding + device serial (e.g. `LISLE00000SC1234`) | One per connected serial card-rack device; carries opaque serial exchanges. |
+| Connection | client_id                                                                            | Purpose                                                                     |
+| ---------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
+| App        | `TBA` + 13 digits (e.g. `TBA1740000000000`)                                          | Application presence: one per running TBA instance.                         |
+| Card       | 16-character company card number                                                     | One per inserted card; carries the card's authentication traffic.           |
+| Rack       | 16 characters: brand prefix + zero padding + device serial (e.g. `LISLE00000SC1234`) | One per connected serial card-rack device; carries opaque serial exchanges. |
 
 Lifecycle: a card connection is opened when a configured card is inserted and
 closed when it is removed. A rack connection is opened when a supported serial
@@ -77,11 +77,11 @@ All payloads are JSON. Incoming command shape:
 
 `protocol` is optional (see below); old servers do not send it.
 
-| `finish` | `payload` | Meaning | TBA reply |
-|----------|-----------|---------|-----------|
-| `false` | empty | Session start: the server asks for the card's ATR. Also aborts a previous unfinished session (the card is reset). | `{ "payload": "<ATR hex>", "protocol": "T0" }` |
-| `false` | APDU hex | Transmit the APDU to the card. | `{ "payload": "<card response hex>" }` |
-| `true` | — | Authentication session finished. TBA records the result and resets the card. | `{ "payload": "" }` |
+| `finish` | `payload` | Meaning                                                                                                           | TBA reply                                      |
+| -------- | --------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `false`  | empty     | Session start: the server asks for the card's ATR. Also aborts a previous unfinished session (the card is reset). | `{ "payload": "<ATR hex>", "protocol": "T0" }` |
+| `false`  | APDU hex  | Transmit the APDU to the card.                                                                                    | `{ "payload": "<card response hex>" }`         |
+| `true`   | —         | Authentication session finished. TBA records the result and resets the card.                                      | `{ "payload": "" }`                            |
 
 On an unrecoverable card error TBA replies with the standard status word
 `6F00` so the server always gets an answer.

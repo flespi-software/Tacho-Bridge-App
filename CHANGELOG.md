@@ -144,7 +144,7 @@ All notable changes to this project will be documented in this file.
 - Logging no longer panics when the HOME / USERPROFILE environment variable is unset — it falls back to a local log directory so the app still starts. The log file is also opened only once, removing a race that could panic if the file was removed between two open calls.
 - Reader rows in the UI are now keyed by reader name instead of list index, fixing stale and duplicated reader entries.
 - Persisting the authentication result no longer blocks the MQTT event loop — the config write is offloaded to a dedicated blocking thread.
-- Card-number duplicate check hardened so reserved names like constructor or __proto__ can no longer falsely report "already exists".
+- Card-number duplicate check hardened so reserved names like constructor or **proto** can no longer falsely report "already exists".
 - request/… → response/… topic rewrite now swaps only the leading segment instead of a blind text replace, so the literal substring "request" deeper in a topic can no longer be mangled.
 
 🆕 Features / Improvements
@@ -207,12 +207,12 @@ All notable changes to this project will be documented in this file.
 
 🛠 Fixes
 
-- Fixed the release pipeline: updater artifacts uploaded in subdirectories (macOS .app.tar.gz) are now found by the manifest   generator and attached to the release.
+- Fixed the release pipeline: updater artifacts uploaded in subdirectories (macOS .app.tar.gz) are now found by the manifest generator and attached to the release.
 
 🆕 Features / Improvements
 
 - Polished the 0.8.0-alpha.7 changelog [skip ci].
-- Added a bulleted changelog: entries render as a proper list with hanging indents in the app's changelog window, the changelog   file was reformatted into grouped bullet style, and generated sections follow the same format.
+- Added a bulleted changelog: entries render as a proper list with hanging indents in the app's changelog window, the changelog file was reformatted into grouped bullet style, and generated sections follow the same format.
 
 ### [0.8.0-alpha.9] - 2026-07-24
 

@@ -197,6 +197,13 @@ pub fn run() {
                     // Last known rack state: the rack monitor runs independently
                     // and may have reported the rack before the frontend subscribed.
                     global_app_handle::emit_current_rack_state();
+
+                    // Reader state has no replay of its own: the PCSC monitor only
+                    // emits on card-state CHANGES, so a reloaded webview would show
+                    // "no readers" forever while a card sits inserted. A rescan from
+                    // UNAWARE makes PCSC re-report every present card through the
+                    // normal pipeline.
+                    smart_card::request_rescan();
                 });
 
                 // With an active tray, the close button only hides the window
