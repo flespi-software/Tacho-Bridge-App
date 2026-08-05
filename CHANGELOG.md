@@ -294,3 +294,10 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Updated Rust dependencies to latest compatible versions.
+
+### [0.8.0-beta.6] - 2026-08-05
+
+🆕 Features / Improvements
+
+- Updated zip archive library to version 8.
+- code refactoring.
