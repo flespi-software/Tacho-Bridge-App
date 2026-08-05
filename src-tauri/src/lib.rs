@@ -15,12 +15,84 @@ mod updater;            // Self-update from GitHub releases.
 
 // ───── External Crates ─────
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::{async_runtime, Listener, Manager, WindowEvent}; // Tauri application framework and async runtime.
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{async_runtime, Listener, Manager, RunEvent, WindowEvent}; // Tauri application framework and async runtime.
 
 /// `frontend-loaded` fires on every webview (re)load — dev hot-reload, manual
 /// refresh, sometimes twice at startup. The one-time backend initialization
 /// (logging, config, background tasks) must only run for the first one.
 static BACKEND_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Set once the tray icon is successfully created. While the tray is active,
+/// closing the window only hides it and the APDU bridge keeps running in the
+/// background; if the tray could not be created (e.g. a Linux desktop without
+/// appindicator support), the close button keeps its original quit behavior
+/// so the user is never left without a way to exit.
+static TRAY_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Brings the main window back from the tray / hidden state.
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// Final cleanup shared by every exit path: tray Quit, macOS Cmd+Q, window
+/// close without a tray, and the updater restart. Guarded so overlapping
+/// paths run it only once.
+fn shutdown_cleanup() {
+    static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
+    if CLEANUP_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // Release the rack's COM port before the process winds down — a lingering
+    // handle keeps the port "Access is denied" for the next launch.
+    com_port::shutdown();
+    // Close the app/card MQTT connections with clean DISCONNECTs so the
+    // server logs normal closes instead of internal errors; bounded by the
+    // shutdown flush timeout, so quitting stays snappy even when offline.
+    tauri::async_runtime::block_on(mqtt::remove_connections_all());
+    log::info!("-== Application is closed by user ==-\n");
+}
+
+/// Creates the system tray icon with its Show/Quit menu. Failure is reported
+/// to the caller instead of aborting setup — the app is fully usable without
+/// a tray, closing the window then simply quits as before.
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+    let mut tray = TrayIconBuilder::with_id("tba-tray")
+        .tooltip("Tacho Bridge Application")
+        .menu(&tray_menu)
+        // macOS convention is menu on left click; on Windows the left click
+        // restores the window and the menu stays on right click.
+        .show_menu_on_left_click(cfg!(target_os = "macos"))
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
+}
 
 pub fn run() {
     // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
@@ -31,11 +103,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             log::warn!("Second instance launch blocked; focusing the existing window.");
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            show_main_window(app);
         }))
         .setup(move |app| {
             // Obtain a lightweight reference to the app for convenient interaction
@@ -43,6 +111,15 @@ pub fn run() {
 
             // Initialize the global application handle
             global_app_handle::set_app_handle(app_handle.clone());
+
+            // System tray: with it active, closing the window hides the app
+            // to the tray and card bridging keeps running in the background.
+            // Logging is not initialized yet at this point, so eprintln is
+            // the best we have for a failure.
+            match setup_tray(app) {
+                Ok(()) => TRAY_ACTIVE.store(true, Ordering::SeqCst),
+                Err(e) => eprintln!("Tray icon unavailable, window close will quit the app: {e}"),
+            }
 
             if let Some(window) = app.get_webview_window("main") {
                 // getting Application version foriom the Cargo.toml file
@@ -122,17 +199,18 @@ pub fn run() {
                     global_app_handle::emit_current_rack_state();
                 });
 
-                // Handle the application close event: release the rack's COM
-                // port before the process winds down — a lingering handle
-                // keeps the port "Access is denied" for the next launch.
+                // With an active tray, the close button only hides the window
+                // and the APDU bridge keeps working; the real shutdown runs on
+                // RunEvent::Exit (tray Quit, Cmd+Q, updater restart). Without
+                // a tray, the close proceeds and quits the app as before.
+                let close_window = window.clone();
                 window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { .. } = event {
-                        com_port::shutdown();
-                        // Close the app/card MQTT connections with clean DISCONNECTs so the
-                        // server logs normal closes instead of internal errors; bounded by the
-                        // shutdown flush timeout, so quitting stays snappy even when offline.
-                        tauri::async_runtime::block_on(mqtt::remove_connections_all());
-                        log::info!("-== Application is closed by user ==-\n");
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        if TRAY_ACTIVE.load(Ordering::SeqCst) {
+                            api.prevent_close();
+                            let _ = close_window.hide();
+                            log::info!("Window hidden to tray; background bridging continues.");
+                        }
                     }
                 });
             }
@@ -150,6 +228,15 @@ pub fn run() {
             updater::check_updates_now,      // forced update check from the settings dialog
             updater::get_changelog,          // bundled CHANGELOG.md for the settings dialog
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app_handle, event| match event {
+            // Single exit point for every quit path: tray Quit, Cmd+Q on
+            // macOS, window close without a tray, updater restart.
+            RunEvent::Exit => shutdown_cleanup(),
+            // macOS: clicking the Dock icon while the window is hidden.
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => show_main_window(_app_handle),
+            _ => {}
+        });
 }
