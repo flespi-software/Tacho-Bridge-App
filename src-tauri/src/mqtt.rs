@@ -151,7 +151,7 @@ fn emit_card_sync_event(
 ) {
     card_emit_event(
         GLOBAL_CARDS_SYNC_EVENT,
-        iccid.to_owned().into(),
+        iccid.to_owned(),
         reader_name.to_string_lossy().into(),
         CARD_PRESENT_STATE.into(),
         client_id.to_owned(),
@@ -482,7 +482,7 @@ pub async fn ensure_connection(reader_name: &CStr, client_id: String, atr: Strin
                                                         );
                                                     }
 
-                                                    let rapdu = managed_card.send_apdu(&hex_value, &client_id_cloned).await;
+                                                    let rapdu = managed_card.send_apdu(hex_value, &client_id_cloned).await;
 
                                                     // Passive sniffer: extract plaintext EF data from SM'd responses
                                                     crate::apdu_sniffer::sniff(&client_id_cloned, hex_value, &rapdu);

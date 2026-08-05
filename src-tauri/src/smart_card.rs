@@ -244,10 +244,10 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
         if action != CardProcessingResult::Ignore {
             card_emit_event(
                 "global-cards-sync",
-                iccid.into(),
+                iccid,
                 reader_name_string.into(),
-                card_state_string.into(),
-                card_number.clone().into(),
+                card_state_string,
+                card_number.clone(),
                 None,
                 None,
             );

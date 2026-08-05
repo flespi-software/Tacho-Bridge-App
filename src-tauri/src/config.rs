@@ -11,14 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // ───── External Crates ─────
 use serde::{Deserialize, Serialize};
-use serde_yaml;
 use lazy_static::lazy_static;
 use tauri::Emitter;
 
 // ───── Local Modules ─────
 use crate::global_app_handle::emit_card_config_event;
 use crate::mqtt::remove_connections;
-// use crate::smart_card::manual_sync_cards;
 
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize, Debug)]
@@ -100,8 +98,7 @@ pub fn get_config_path() -> io::Result<PathBuf> {
         }
         Err(e) => {
             log::error!("Failed to get home directory environment variable: {}", e);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "Failed to get home directory environment variable",
             ));
         }
@@ -145,10 +142,10 @@ fn save_config(
     let yaml = serde_yaml::to_string(config)?;
 
     let parent = config_path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "config path has no parent directory")
+        io::Error::other("config path has no parent directory")
     })?;
     let file_name = config_path.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "config path has no file name")
+        io::Error::other("config path has no file name")
     })?;
 
     let mut tmp_path = parent.to_path_buf();
@@ -183,7 +180,6 @@ fn update_card_config(
     let mut config = load_config(config_path)?;
     log::debug!("Loaded configuration: {:?}", config);
 
-    // let mut needs_restart = false;
     let mut changed = false;
 
     match config.cards.get_mut(card_number) {
@@ -476,7 +472,7 @@ pub async fn remove_card(
             format!("Failed to remove card from config: {}", e)
         })?;
 
-    log::info!("Card {} removed from config", &cardnumber);
+    log::info!("Card {} removed from config", cardnumber);
 
     Ok(())
 }
@@ -922,13 +918,11 @@ pub fn init_config() -> io::Result<()> {
         config = generate_default_config();
     }
 
-    save_config(&config_path, &config)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    save_config(&config_path, &config).map_err(io::Error::other)?;
 
     log::debug!("config: saved config");
 
-    load_config_to_cache(&config)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    load_config_to_cache(&config).map_err(io::Error::other)?;
 
     Ok(())
 }
@@ -970,6 +964,29 @@ fn generate_default_config() -> ConfigurationFile {
         cards: HashMap::new(),
         beta_updates: None,
     }
+}
+
+/// Emits the server-related part of the config (host, ident, theme, update
+/// channel) to the frontend as the `global-config-server` event.
+pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
+    let host = get_from_cache(CacheSection::Server, "host");
+    let ident = get_from_cache(CacheSection::Ident, "ident");
+    let appearance = get_from_cache(CacheSection::Appearance, "dark_theme");
+
+    let mut config_app_payload = HashMap::new();
+    config_app_payload.insert("host", host);
+    config_app_payload.insert("ident", ident);
+    config_app_payload.insert("dark_theme", appearance);
+    config_app_payload.insert(
+        "beta_updates",
+        get_from_cache(CacheSection::Updates, "beta_updates"),
+    );
+
+    if let Err(e) = app.emit("global-config-server", config_app_payload) {
+        return Err(Box::new(e));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1242,30 +1259,4 @@ mod tests {
         assert!(back.expire.is_none());
         assert!(back.last_auth.is_none());
     }
-}
-
-pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
-    // small note: the structure requires the clone trait because the configuration is passed by reference,
-    // so the value cannot be fully transferred to ownership.
-
-    // Gettting Host value from the "operation cahce" with the ServerConfig structure
-    let host = get_from_cache(CacheSection::Server, "host");
-    let ident = get_from_cache(CacheSection::Ident, "ident");
-    let appearance = get_from_cache(CacheSection::Appearance, "dark_theme");
-
-    let mut config_app_payload = HashMap::new();
-    config_app_payload.insert("host", host);
-    config_app_payload.insert("ident", ident);
-    config_app_payload.insert("dark_theme", appearance);
-    config_app_payload.insert(
-        "beta_updates",
-        get_from_cache(CacheSection::Updates, "beta_updates"),
-    );
-
-    // Emit this data as a global event to update fornt-end fields
-    if let Err(e) = app.emit("global-config-server", config_app_payload) {
-        return Err(Box::new(e));
-    }
-
-    Ok(())
 }

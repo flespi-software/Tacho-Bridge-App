@@ -1,5 +1,3 @@
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-
 // ───── Modules ─────
 mod app_connect;        // Application connection to the MQTT broker.
 mod commands_settings;  // Settings reporting to the server.
@@ -94,8 +92,8 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // start builder to run tauri applicationrustup target add aarch64-pc-windows-msvc
     tauri::Builder::default()
         // Must be the first registered plugin. A second instance cannot work
         // anyway (exclusive COM port, duplicate MQTT client_ids kicking each

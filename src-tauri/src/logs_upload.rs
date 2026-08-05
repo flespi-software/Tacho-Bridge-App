@@ -185,7 +185,7 @@ fn collect_zipped_logs(days: i64, period: &str) -> Result<(String, Vec<u8>), Str
 
     // the current log covers the whole period when its first entry is older than the cutoff
     let first_ts = first_entry_timestamp(&current_path).map_err(|e| format!("cannot read log file: {}", e))?;
-    let archive_needed = first_ts.map_or(true, |ts| ts > cutoff);
+    let archive_needed = first_ts.is_none_or(|ts| ts > cutoff);
 
     let mut data = Vec::new();
     if archive_needed {

@@ -110,6 +110,7 @@ fn is_read_binary(cmd: &[u8]) -> bool {
 /// - SM response: body is the value of DO'81 (plain value), expected as the
 ///   first data object before DO'99/DO'8E and the trailing SW.
 /// - Plain response: body is everything except the trailing 2-byte SW.
+///
 /// Returns None if the response has no payload (e.g. only SW).
 fn extract_plain_body(resp: &[u8]) -> Option<Vec<u8>> {
     if resp.len() < 2 {

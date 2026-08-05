@@ -4,13 +4,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fern;
-use log;
-use sys_info;
-use reqwest;
 use serde::Deserialize;
 use tauri::async_runtime;
-// use tauri::Emitter;
 
 use crate::global_app_handle::emit_notification_event;
 use crate::global_app_handle::NotificationPayload;
@@ -19,17 +14,6 @@ use crate::global_app_handle::NotificationPayload;
 struct Release {
     tag_name: String,
 }
-
-/// Sets up logging for the application.
-///
-/// This function configures the logging system using the `fern` crate. It sets the log file path
-/// based on the operating system and initializes the logging format and level.
-///
-/// # Platform-specific behavior
-///
-/// * On macOS, the log file is created in the `~/Documents/tba` directory.
-/// * On Windows, the log file is created in the `%USERPROFILE%\Documents\tba` directory.
-///
 
 /// Rotate when the log grows to this size. Rotation happens at runtime (the
 /// app is a server-style solution and can run for months without a restart):
@@ -139,7 +123,7 @@ impl RotatingLogWriter {
     /// sink is broken and a reopen is due — unless a recent attempt already failed.
     fn rotation_due(&self) -> bool {
         (self.file.is_none() || self.written >= self.limit)
-            && self.failed_rotate_at.map_or(true, |at| at.elapsed() >= ROTATE_RETRY_PAUSE)
+            && self.failed_rotate_at.is_none_or(|at| at.elapsed() >= ROTATE_RETRY_PAUSE)
     }
 
     fn rotate(&mut self) {
@@ -313,6 +297,15 @@ fn prune_archives(archive_dir: &Path, keep: usize) {
     }
 }
 
+/// Sets up logging for the application.
+///
+/// This function configures the logging system using the `fern` crate. It sets the log file path
+/// based on the operating system and initializes the logging format and level.
+///
+/// # Platform-specific behavior
+///
+/// * On macOS, the log file is created in the `~/Documents/tba` directory.
+/// * On Windows, the log file is created in the `%USERPROFILE%\Documents\tba` directory.
 pub fn setup_logging() {
     let dir = log_dir();
 
@@ -431,7 +424,7 @@ fn log_system_info() {
     let os_type = sys_info::os_type().unwrap_or_else(|_| "Unknown".to_string());
     let os_release = sys_info::os_release().unwrap_or_else(|_| "Unknown".to_string());
     let hostname = sys_info::hostname().unwrap_or_else(|_| "Unknown".to_string());
-    let cpu_num = sys_info::cpu_num().unwrap_or_else(|_| 0);
+    let cpu_num = sys_info::cpu_num().unwrap_or(0);
     let cpu_speed = sys_info::cpu_speed().map_or_else(|_| "Unknown".to_string(), |speed| format!("{} MHz", speed));
     let mem_info = sys_info::mem_info().map_or_else(|_| "Unknown".to_string(), |mem| format!("total {} KB, free {} KB", mem.total, mem.free));
 
@@ -476,7 +469,7 @@ async fn check_latest_version() -> Result<(), reqwest::Error> {
 
             let payload = NotificationPayload {
                 notification_type: "version".to_string(),
-                message: format!("New version {} is available, use the link to download: {}", latest_version, url).into(),
+                message: format!("New version {} is available, use the link to download: {}", latest_version, url),
             };
             emit_notification_event("global-notification", payload);
         } else {
@@ -545,16 +538,19 @@ mod tests {
         writer.write_all(b"generation two\n").unwrap(); // rotation 1: no log.1 yet, nothing to archive
         writer.write_all(b"generation three\n").unwrap(); // rotation 2: "generation one" leaves log.1 for archive
 
-        // the displaced generation is zipped in a background thread: poll for it
+        // the displaced generation is zipped in a background thread, and the
+        // archive file becomes visible before its content is flushed: poll
+        // until the zip signature lands, not just until the file appears
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let archives = list_archives(&dir);
             if archives.len() == 1 {
                 let zipped = std::fs::read(&archives[0]).unwrap();
-                assert_eq!(&zipped[..4], b"PK\x03\x04");
-                break;
+                if zipped.starts_with(b"PK\x03\x04") {
+                    break;
+                }
             }
-            assert!(Instant::now() < deadline, "archive did not appear in time");
+            assert!(Instant::now() < deadline, "zipped archive did not appear in time");
             std::thread::sleep(Duration::from_millis(10));
         }
 
