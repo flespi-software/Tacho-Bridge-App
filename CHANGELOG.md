@@ -282,3 +282,9 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Card and app MQTT connections now close with a proper MQTT DISCONNECT on card removal, config change and app quit: the server logs a normal close instead of 'internal error' (close_code=5); force-abort remains as a 2s fallback for offline or wedged connections.
+
+### [0.8.0-beta.4] - 2026-08-05
+
+🆕 Features / Improvements
+
+- Added system tray support: closing the window now hides the app to the tray while card bridging keeps running in the background; use Show Window to bring it back and Quit to exit.
