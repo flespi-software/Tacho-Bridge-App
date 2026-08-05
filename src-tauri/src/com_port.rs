@@ -120,6 +120,19 @@ const POLL_DEADLINE_DEFAULT: Duration = Duration::from_secs(5);
 /// abort — `spawn_blocking` closures cannot be cancelled.
 const SERIAL_MS_MAX: u64 = 300_000;
 
+/// Lower bound for server-supplied *interval* fields (`interval_ms` of the
+/// watch and of a poll spec). Without a floor, `interval_ms: 0` turns the
+/// watch/poll loop into a busy loop that hammers the wire and monopolises the
+/// port lock, starving every card session behind it.
+const SERIAL_MS_MIN: u64 = 20;
+
+/// One blocking `port.read` never waits longer than this slice, whatever the
+/// server-supplied timings say: the read loop re-checks its deadlines and the
+/// app shutdown flag between slices. This is what keeps the uncancellable
+/// `spawn_blocking` serial closures from pinning the port (and a blocking-pool
+/// thread) for up to `SERIAL_MS_MAX` after the app started closing.
+const SERIAL_READ_SLICE: Duration = Duration::from_millis(500);
+
 /// Server-scripted poll loop of one envelope: after the command is accepted, keep sending
 /// `cmd` every `interval` while the device answers exactly `while_hex`; the first differing
 /// reply is the operation result. Pure byte comparison - no protocol knowledge on this side.
@@ -190,7 +203,7 @@ fn parse_envelope_fields(
                 cmd_hex: normalize_hex(poll_cmd)?,
                 while_hex: normalize_hex(poll_while)?,
                 interval: ms(p, "interval_ms")
-                    .map(Duration::from_millis)
+                    .map(|v| Duration::from_millis(v.max(SERIAL_MS_MIN)))
                     .unwrap_or(POLL_INTERVAL_DEFAULT),
                 deadline: ms(p, "deadline_ms")
                     .map(Duration::from_millis)
@@ -1045,14 +1058,21 @@ fn update_rack_card_ui(slot: u16, iccid: &str, card_number: Option<String>) {
     rack_update_cards(cards);
 }
 
+/// One rack-backed card session in `RACK_CARD_TASKS`: the spawn-time card
+/// number, the rack slot it occupies, and the session task handle.
+type RackCardTask = (String, u16, JoinHandle<()>);
+
 lazy_static::lazy_static! {
     /// Rack-backed per-card MQTT tasks, keyed by ICCID (the rack's stable card
-    /// identifier) with the spawn-time card number kept alongside. Keying by the
-    /// config-resolved card number would leak the session if the config entry is
-    /// deleted or edited while the card sits in the rack — the disconnect lookup
-    /// would then miss the running task. All aborted when the rack disconnects —
-    /// without the rack there is no transport to those cards.
-    static ref RACK_CARD_TASKS: std::sync::Mutex<std::collections::HashMap<String, (String, JoinHandle<()>)>> =
+    /// identifier) with the spawn-time card number and slot kept alongside.
+    /// Keying by the config-resolved card number would leak the session if the
+    /// config entry is deleted or edited while the card sits in the rack — the
+    /// disconnect lookup would then miss the running task. The slot is kept so
+    /// a `connect` for the same slot with a different ICCID (card swapped
+    /// without an explicit `disconnect`) evicts the stale session instead of
+    /// leaking it. All aborted when the rack disconnects — without the rack
+    /// there is no transport to those cards.
+    static ref RACK_CARD_TASKS: std::sync::Mutex<std::collections::HashMap<String, RackCardTask>> =
         std::sync::Mutex::new(std::collections::HashMap::new());
 
     /// Cards currently exposed by the rack, as shown in the UI (RackState.cards).
@@ -1105,11 +1125,51 @@ pub async fn connect_pending_rack_cards() {
 /// by card number (two slots mapped to the same number in the config must not
 /// open two MQTT connections with the same client_id).
 fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: SharedPort) {
+    // The rack may have been torn down while the caller was awaiting between
+    // its dedup check and this spawn (config-change path racing the monitor).
+    // A session installed after the teardown would hold the stale serial port
+    // and an MQTT client_id forever — verify the port is still the live one.
+    let port_is_live = {
+        let guard = match RACK_MQTT_TASK.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .as_ref()
+            .map(|(_, live)| Arc::ptr_eq(live, &serial_port))
+            .unwrap_or(false)
+    };
+    if !port_is_live {
+        log::warn!(
+            "RACK | [SPAWN] card={} slot={} status=skipped reason=rack_gone",
+            card_number,
+            slot
+        );
+        return;
+    }
+
     let mut tasks = match RACK_CARD_TASKS.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some((_, handle)) = tasks.get(&iccid) {
+    // A different card now occupies this slot: the previous occupant's session
+    // is dead weight (its card is gone) — evict it even without a `disconnect`.
+    let stale: Vec<String> = tasks
+        .iter()
+        .filter(|(other_iccid, (_, other_slot, _))| **other_iccid != iccid && *other_slot == slot)
+        .map(|(other_iccid, _)| other_iccid.clone())
+        .collect();
+    for old_iccid in stale {
+        if let Some((old_number, _, handle)) = tasks.remove(&old_iccid) {
+            handle.abort();
+            log::info!(
+                "RACK | [SPAWN] card={} slot={} status=aborted reason=slot_reassigned",
+                old_number,
+                slot
+            );
+        }
+    }
+    if let Some((_, _, handle)) = tasks.get(&iccid) {
         if !handle.inner().is_finished() {
             log::debug!(
                 "RACK | [SPAWN] card={} status=skipped reason=already_running",
@@ -1118,7 +1178,7 @@ fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: S
             return;
         }
     }
-    if tasks.iter().any(|(other_iccid, (number, handle))| {
+    if tasks.iter().any(|(other_iccid, (number, _, handle))| {
         *other_iccid != iccid && *number == card_number && !handle.inner().is_finished()
     }) {
         log::warn!(
@@ -1139,7 +1199,7 @@ fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: S
         slot,
         serial_port,
     ));
-    tasks.insert(iccid, (card_number, handle));
+    tasks.insert(iccid, (card_number, slot, handle));
 }
 
 /// MQTT loop of one rack-backed card connection. Mirrors the rack's own loop — the same opaque
@@ -1323,7 +1383,7 @@ fn start_rack_watch(
             .and_then(|v| v.as_u64())
             .map(|v| v.min(SERIAL_MS_MAX))
     };
-    let interval = Duration::from_millis(ms("interval_ms").unwrap_or(1000));
+    let interval = Duration::from_millis(ms("interval_ms").unwrap_or(1000).max(SERIAL_MS_MIN));
     let idle = ms("idle_ms")
         .map(Duration::from_millis)
         .unwrap_or(SERIAL_REPLY_TIMEOUT);
@@ -1361,18 +1421,23 @@ fn start_rack_watch(
             if last.as_deref() == Some(exchange.resp_hex.as_str()) {
                 continue;
             }
-            last = Some(exchange.resp_hex.clone());
             log::info!(
                 "{} [WATCH] status=change_detected rx_bytes={}",
                 log_header,
                 exchange.resp_hex.len() / 2
             );
-            if let Err(e) = mqtt_client
+            match mqtt_client
                 .publish("watch", QoS::AtLeastOnce, false, exchange.to_payload())
                 .await
             {
-                log::error!("{} [WATCH] status=publish_failed err={:?}", log_header, e);
-                // let the next change (or re-arm) retry; keep the baseline as published intent
+                // The baseline advances only once the server was actually told:
+                // publish can fail immediately (bounded client channel while the
+                // connection is down), and advancing it anyway would silently
+                // drop this presence change — the next tick must retry it.
+                Ok(()) => last = Some(exchange.resp_hex.clone()),
+                Err(e) => {
+                    log::error!("{} [WATCH] status=publish_failed err={:?}", log_header, e);
+                }
             }
         }
     });
@@ -1415,6 +1480,17 @@ fn handle_card_disconnect(payload: &[u8], log_header: &str) {
     };
     let iccid = json.get("iccid").and_then(|v| v.as_str()).unwrap_or("");
     let slot = json.get("slot").and_then(|v| v.as_u64()).unwrap_or(0);
+    // Same validation as the connect path: an out-of-range slot would wrap in
+    // the `as u16` cast below and evict the wrong card from the UI, and an
+    // empty ICCID must not silently "match" nothing.
+    if iccid.is_empty() || !(1..=240).contains(&slot) {
+        log::warn!(
+            "{} [SPAWN] status=ignored reason=invalid_iccid_or_slot slot={}",
+            log_header,
+            slot
+        );
+        return;
+    }
     log::info!(
         "{} [SPAWN] status=card_removed slot={} iccid={}",
         log_header,
@@ -1440,7 +1516,7 @@ fn handle_card_disconnect(payload: &[u8], log_header: &str) {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some((card_number, handle)) = tasks.remove(iccid) {
+    if let Some((card_number, _slot, handle)) = tasks.remove(iccid) {
         handle.abort();
         log::info!(
             "{} [SPAWN] card={} status=aborted reason=card_removed",
@@ -1457,7 +1533,7 @@ fn stop_rack_cards() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    for (_iccid, (card_number, handle)) in tasks.drain() {
+    for (_iccid, (card_number, _slot, handle)) in tasks.drain() {
         handle.abort();
         log::info!(
             "RACK | [SPAWN] card={} status=aborted reason=rack_gone",
@@ -1549,15 +1625,6 @@ fn read_reply(
 ) -> (Vec<u8>, bool) {
     let mut reply = carry;
     let mut first_byte_pending = reply.is_empty();
-    let initial_timeout = if first_byte_pending { first_wait } else { idle };
-    if let Err(e) = port.set_timeout(initial_timeout) {
-        log::warn!(
-            "{} [SERIAL] set_timeout({:?}) failed: {}",
-            log_header,
-            initial_timeout,
-            e
-        );
-    }
 
     let mut buf = [0u8; 512];
     let mut truncated = false;
@@ -1569,6 +1636,9 @@ fn read_reply(
         first_wait
     };
     let read_deadline = read_started + total;
+    // The silence bound that ends the reply: first-byte budget while nothing
+    // has arrived yet, line-idle from the last received byte afterwards.
+    let mut silence_deadline = read_started + if first_byte_pending { first_wait } else { idle };
     loop {
         if reply.len() >= SERIAL_REPLY_MAX_BYTES {
             log::warn!(
@@ -1579,7 +1649,8 @@ fn read_reply(
             truncated = true;
             break;
         }
-        if std::time::Instant::now() >= read_deadline {
+        let now = std::time::Instant::now();
+        if now >= read_deadline {
             log::warn!(
                 "{} [SERIAL] read deadline {:?} reached — returning {} bytes read so far",
                 log_header,
@@ -1587,6 +1658,33 @@ fn read_reply(
                 reply.len()
             );
             break;
+        }
+        // App is closing: stop waiting so the blocking closure releases the
+        // port lock promptly — `spawn_blocking` cannot be aborted from outside.
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            log::info!(
+                "{} [SERIAL] read stopped reason=app_shutdown bytes={}",
+                log_header,
+                reply.len()
+            );
+            break;
+        }
+        // Wait in short slices so the deadline/shutdown checks above run even
+        // while the server-supplied budgets are minutes long.
+        let wait = silence_deadline
+            .min(read_deadline)
+            .saturating_duration_since(now);
+        if wait.is_zero() {
+            break; // line went silent: the reply (or its absence) is complete
+        }
+        let slice = wait.min(SERIAL_READ_SLICE);
+        if let Err(e) = port.set_timeout(slice) {
+            log::warn!(
+                "{} [SERIAL] set_timeout({:?}) failed: {}",
+                log_header,
+                slice,
+                e
+            );
         }
         match port.read(&mut buf) {
             Ok(0) => break,
@@ -1606,18 +1704,13 @@ fn read_reply(
                             idle
                         );
                     }
-                    if let Err(e) = port.set_timeout(idle) {
-                        log::warn!(
-                            "{} [SERIAL] set_timeout({:?}) failed: {}",
-                            log_header,
-                            idle,
-                            e
-                        );
-                    }
                 }
                 reply.extend_from_slice(&buf[..n]);
+                silence_deadline = std::time::Instant::now() + idle;
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+            // A timed-out slice is not the end of the reply by itself — the
+            // loop re-evaluates the silence bound and keeps listening.
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(e) => {
                 log::warn!("{} [SERIAL] read error: {}", log_header, e);
                 break;
@@ -1633,24 +1726,26 @@ fn read_reply(
 /// as the card is done (verified on live hardware — "accepted"+result in a single read at
 /// `polls=0`), and it hands that result out exactly once, going back to "idle" afterwards.
 /// A result landing in an unwatched gap was therefore lost for good. Empty return = the
-/// interval elapsed in silence, time to send the next status poll.
+/// interval elapsed in silence, time to send the next status poll. The truncation flag
+/// rides along so a capped frame is reported as a transport failure, never as a result.
 fn wait_for_push(
     port: &mut Box<dyn SerialPort>,
     interval: Duration,
     idle: Duration,
     deadline: Duration,
     log_header: &str,
-) -> Vec<u8> {
-    let (bytes, _truncated) = read_reply(port, Vec::new(), interval, idle, deadline, log_header);
+) -> (Vec<u8>, bool) {
+    let (bytes, truncated) = read_reply(port, Vec::new(), interval, idle, deadline, log_header);
     if !bytes.is_empty() {
         log::debug!(
-            "{} [SERIAL] rx pushed bytes={} hex={}",
+            "{} [SERIAL] rx pushed bytes={} truncated={} hex={}",
             log_header,
             bytes.len(),
+            truncated,
             hex::encode_upper(&bytes)
         );
     }
-    bytes
+    (bytes, truncated)
 }
 
 /// One write+read exchange on an already-locked port. `deadline` bounds the whole read phase,
@@ -1782,14 +1877,27 @@ fn run_envelope(
         }
         let poll_deadline = std::time::Instant::now() + poll.deadline;
         loop {
+            // App is closing: abandon the operation so the port lock is released.
+            if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                break 'op SerialExchange::error(SERIAL_ERR_NO_REPLY);
+            }
             // listen through the poll interval instead of sleeping through it: the rack
             // pushes the card result on its own and only once, so an unwatched gap loses
             // it. A pushed frame that is exactly the predicted "busy" bytes is just a
             // late poll reply — same rule as below, keep waiting for the real outcome.
-            let pushed = wait_for_push(port, poll.interval, env.idle, env.deadline, log_header);
+            let (pushed, pushed_truncated) =
+                wait_for_push(port, poll.interval, env.idle, env.deadline, log_header);
             if !pushed.is_empty() {
                 pushes += 1;
                 let pushed_hex = hex::encode_upper(&pushed);
+                if pushed_truncated {
+                    // capped frame: partial data + error code, same contract as
+                    // exchange_once — the server must not parse it as a result
+                    break 'op SerialExchange {
+                        resp_hex: pushed_hex,
+                        err: SERIAL_ERR_TRUNCATED,
+                    };
+                }
                 if pushed_hex != poll.while_hex {
                     break 'op SerialExchange::ok(pushed_hex);
                 }
@@ -1957,6 +2065,14 @@ fn stop_rack_mqtt() {
 /// frontend event, and starts the rack's own MQTT connection wired to the open
 /// serial port.
 fn on_rack_connected(rack: &RackInfo, port: Box<dyn SerialPort>) {
+    // The shutdown flag may have been set between the monitor's loop-top check
+    // and this call (find_rack + open_rack take hundreds of ms): starting the
+    // MQTT stack now would leave an open COM handle and live tasks that
+    // nothing will ever stop. Dropping `port` here closes the handle.
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        log::info!("RACK | phase=ready status=skipped reason=app_shutdown");
+        return;
+    }
     // vid/pid logged for data collection only — matching is by product string.
     log::info!(
         "RACK | phase=discovery status=found port={} serial={} manufacturer={} product={} vid={:#06x} pid={:#06x}",
@@ -2037,12 +2153,18 @@ pub async fn rack_connection() {
             log::info!("RACK | phase=rack_connection status=stopped reason=app_shutdown");
             return;
         }
-        let found = find_rack();
+        // Device enumeration is synchronous OS work (SetupAPI/IOKit, and a
+        // blocking USB scan on Windows) that can take hundreds of ms — run it
+        // on the blocking pool so this 2s tick never stalls the async workers
+        // driving the MQTT event loops.
+        let found = tokio::task::spawn_blocking(find_rack)
+            .await
+            .unwrap_or_default();
 
         match (&current, found) {
             // Newly appeared.
             (None, Some(rack)) => {
-                if let Some(port) = open_rack(&rack) {
+                if let Some(port) = open_rack_blocking(&rack).await {
                     on_rack_connected(&rack, port);
                     current = Some(rack);
                 }
@@ -2057,7 +2179,7 @@ pub async fn rack_connection() {
             // unit / port rename): treat as disconnect + reconnect.
             (Some(prev), Some(rack)) if *prev != rack => {
                 on_rack_disconnected(prev);
-                if let Some(port) = open_rack(&rack) {
+                if let Some(port) = open_rack_blocking(&rack).await {
                     on_rack_connected(&rack, port);
                     current = Some(rack);
                 } else {
@@ -2078,7 +2200,7 @@ pub async fn rack_connection() {
                 // each retry tick also reaps a watch task that raced past a
                 // previous stop_rack_mqtt.
                 stop_rack_mqtt();
-                if let Some(port) = open_rack(&rack) {
+                if let Some(port) = open_rack_blocking(&rack).await {
                     on_rack_connected(&rack, port);
                     current = Some(rack);
                 }
@@ -2090,6 +2212,15 @@ pub async fn rack_connection() {
 
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// `open_rack` moved to the blocking pool: opening a busy COM port can block,
+/// and the monitor runs on an async worker.
+async fn open_rack_blocking(rack: &RackInfo) -> Option<Box<dyn SerialPort>> {
+    let rack = rack.clone();
+    tokio::task::spawn_blocking(move || open_rack(&rack))
+        .await
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

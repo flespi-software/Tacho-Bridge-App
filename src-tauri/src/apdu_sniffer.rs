@@ -51,15 +51,28 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
         Err(_) => return,
     };
 
-    // Track SELECTed EF (ignore SELECT AID / SELECT MF)
-    if let Some(fid) = select_ef_fid(&cmd) {
+    // Track the card's currently selected file. Two guards keep a later
+    // READ BINARY from being parsed against the wrong EF (which would persist
+    // garbage identification data into the card's config):
+    //  * a FAILED SELECT (SW != 9000) leaves the card's selection unchanged
+    //    per ISO 7816 — the attempted FID must NOT be recorded;
+    //  * a successful SELECT the sniffer does not recognize (by AID, by path,
+    //    MF) DID change the selection to something unknown — the tracked FID
+    //    must be cleared, not left stale.
+    let is_select = cmd.len() >= 2 && (cmd[0] == 0x00 || cmd[0] == 0x0C) && cmd[1] == 0xA4;
+    if is_select {
+        let sw_ok = resp.len() >= 2 && resp[resp.len() - 2] == 0x90 && resp[resp.len() - 1] == 0x00;
+        if !sw_ok {
+            return; // selection unchanged on the card: keep the tracked state
+        }
+        let fid = select_ef_fid(&cmd); // None for recognized-but-untracked selects
         if let Ok(mut state) = STATE.lock() {
             state
                 .entry(client_id.to_string())
                 .or_insert(SniffState {
                     last_selected_ef: None,
                 })
-                .last_selected_ef = Some(fid);
+                .last_selected_ef = fid;
         }
         return;
     }

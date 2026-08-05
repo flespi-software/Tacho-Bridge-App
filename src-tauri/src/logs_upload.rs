@@ -36,6 +36,27 @@ const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// the reply is slow, so duplicates must not start a second upload.
 static ACTIVE_REQUEST: Mutex<Option<u64>> = Mutex::new(None);
 
+/// Poison-recovering lock, matching the convention in config.rs: a panic in
+/// one holder must not make every later fetch_logs dispatch panic in turn.
+fn lock_active_request() -> std::sync::MutexGuard<'static, Option<u64>> {
+    ACTIVE_REQUEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Clears ACTIVE_REQUEST when dropped. Held across the upload so the slot is
+/// freed on EVERY exit path — normal return, panic inside run_upload, or the
+/// task being aborted (the app connection can be replaced mid-upload). A plain
+/// trailing statement would skip the latter two and permanently wedge
+/// fetch_logs until an app restart.
+struct ActiveRequestReset;
+
+impl Drop for ActiveRequestReset {
+    fn drop(&mut self) {
+        *lock_active_request() = None;
+    }
+}
+
 /// Handles a `fetch_logs` request published on the app connection; any other
 /// publish is left to the caller (returns false). If more app-level commands
 /// appear, promote the topic/name parsing to the connection layer and keep
@@ -59,7 +80,7 @@ pub fn dispatch_request(
         .to_string();
 
     {
-        let mut active = ACTIVE_REQUEST.lock().unwrap();
+        let mut active = lock_active_request();
         if let Some(active_id) = *active {
             // server re-send of the request in flight, or a stray overlap: drop it,
             // the upload already running will produce the command result
@@ -84,8 +105,8 @@ pub fn dispatch_request(
     let client = client.clone();
     let log_header = log_header.to_string();
     async_runtime::spawn(async move {
+        let _reset = ActiveRequestReset;
         run_upload(&client, &log_header, request_id, period).await;
-        *ACTIVE_REQUEST.lock().unwrap() = None;
     });
     true
 }
@@ -220,18 +241,41 @@ fn collect_zipped_logs(days: i64, period: &str) -> Result<(String, Vec<u8>), Str
     let cutoff = Local::now().naive_local() - Duration::days(days);
     let (current_path, archived_path) = log_file_paths();
 
+    // Snapshot both generations at one instant BEFORE any reading: the logger
+    // rotates concurrently (log.txt -> log.1.txt -> archive), and path-based
+    // opens spread over the collection would miss a whole generation when a
+    // rotation lands between them. An open handle keeps following its file
+    // across the rename, so the pair below stays a consistent chain.
+    let mut current_file =
+        open_optional(&current_path).map_err(|e| format!("cannot read log file: {}", e))?;
+    let archived_file = open_optional(&archived_path)
+        .map_err(|e| format!("cannot read archived log file: {}", e))?;
+
     // the current log covers the whole period when its first entry is older than the cutoff
-    let first_ts =
-        first_entry_timestamp(&current_path).map_err(|e| format!("cannot read log file: {}", e))?;
+    let first_ts = match current_file.as_mut() {
+        Some(file) => {
+            let ts = first_entry_timestamp(BufReader::new(&mut *file))
+                .map_err(|e| format!("cannot read log file: {}", e))?;
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(0))
+                .map_err(|e| format!("cannot rewind log file: {}", e))?;
+            ts
+        }
+        None => None,
+    };
     let archive_needed = first_ts.is_none_or(|ts| ts > cutoff);
 
     let mut data = Vec::new();
     if archive_needed {
-        filter_log_file(&archived_path, cutoff, &mut data)
-            .map_err(|e| format!("cannot read archived log file: {}", e))?;
+        if let Some(file) = archived_file {
+            filter_log_lines(BufReader::new(file), cutoff, &mut data)
+                .map_err(|e| format!("cannot read archived log file: {}", e))?;
+        }
     }
-    filter_log_file(&current_path, cutoff, &mut data)
-        .map_err(|e| format!("cannot read log file: {}", e))?;
+    if let Some(file) = current_file {
+        filter_log_lines(BufReader::new(file), cutoff, &mut data)
+            .map_err(|e| format!("cannot read log file: {}", e))?;
+    }
     if data.is_empty() {
         return Err(format!("no log entries for the last {} day(s)", days));
     }
@@ -245,33 +289,25 @@ fn collect_zipped_logs(days: i64, period: &str) -> Result<(String, Vec<u8>), Str
     Ok((name, zipped))
 }
 
-/// Returns the timestamp of the first timestamped line of the file,
-/// None when the file is missing, empty or holds no timestamped lines.
-fn first_entry_timestamp(path: &Path) -> std::io::Result<Option<NaiveDateTime>> {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let reader = BufReader::new(file);
+/// Opens a log file, mapping "not found" to None — a missing generation
+/// simply contributes nothing to the slice.
+fn open_optional(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    match std::fs::File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Returns the timestamp of the first timestamped line of the reader,
+/// None when it is empty or holds no timestamped lines.
+fn first_entry_timestamp<R: BufRead>(reader: R) -> std::io::Result<Option<NaiveDateTime>> {
     for line in reader.lines() {
         if let Some(ts) = line_timestamp(&line?) {
             return Ok(Some(ts));
         }
     }
     Ok(None)
-}
-
-/// Appends the lines of the log file dated at or after the cutoff to `out`;
-/// a missing file contributes nothing. Lines without a timestamp prefix
-/// (continuations) follow the fate of the last timestamped line before them.
-fn filter_log_file(path: &Path, cutoff: NaiveDateTime, out: &mut Vec<u8>) -> std::io::Result<()> {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    filter_log_lines(BufReader::new(file), cutoff, out)
 }
 
 fn filter_log_lines<R: BufRead>(

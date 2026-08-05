@@ -211,18 +211,38 @@ pub async fn ensure_connection(
     // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
 
-    // This part of function checks if a connection already exists for the given client ID
-    // in the task pool. If not, it initiates a new connection. This is useful for maintaining
-    // a list of active MQTT connections and ensuring that each client ID is only connected once.
-    let exists = task_pool.iter().any(|card| card.client_id == client_id);
-    // If existing connection is found, then return, no add a new connection for this client_id
-    if exists {
-        log::info!(
-            "[CONN] phase=ensure_connection status=skip_existing reader={} client_id={}",
+    // Only one connection per client_id. An existing entry blocks a new one
+    // unless it is unusable: a finished task (returned early or panicked) will
+    // never serve the card again, and an entry bound to a DIFFERENT reader
+    // means the card was physically moved — its old session is dead weight and
+    // would otherwise keep the card offline until a replug (the PCSC sweep may
+    // process the new reader before the old reader's removal).
+    if let Some(index) = task_pool
+        .iter()
+        .position(|card| card.client_id == client_id)
+    {
+        let finished = task_pool[index].task_handle.inner().is_finished();
+        let same_reader =
+            task_pool[index].reader_name.as_deref() == Some(reader_name.to_string_lossy().as_ref());
+        if !finished && same_reader {
+            log::info!(
+                "[CONN] phase=ensure_connection status=skip_existing reader={} client_id={}",
+                reader_name.to_string_lossy(),
+                client_id
+            );
+            return;
+        }
+        let old = task_pool.remove(index);
+        crate::apdu_sniffer::forget(&old.client_id);
+        log::warn!(
+            "[CONN] phase=ensure_connection status=replacing_stale reader={} client_id={} reason={}",
             reader_name.to_string_lossy(),
-            client_id
+            client_id,
+            if finished { "task_finished" } else { "reader_changed" }
         );
-        return;
+        // Close the old session gracefully; detached so the fresh registration
+        // below is not delayed behind its shutdown flush.
+        async_runtime::spawn(shutdown_connections(vec![old], "stale_entry_replaced"));
     }
 
     // Getting server data from the cache
@@ -472,6 +492,12 @@ pub async fn ensure_connection(
                                                 );
 
                                                 let is_session_start = hex_value.is_empty();
+                                                if is_session_start {
+                                                    // A fresh VU session starts with no file
+                                                    // selected — stale sniffer state from the
+                                                    // previous session must not leak into it.
+                                                    crate::apdu_sniffer::forget(&client_id_cloned);
+                                                }
                                                 let rapdu_mqtt_hex = if is_session_start {
                                                     // This case is needed to reset the card when authorization is not completed, otherwise the card will not respond to commands correctly.
                                                     if auth_process {
@@ -728,6 +754,18 @@ pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
     // (already dead or clogged) has nothing to flush and is aborted right away.
     let mut waiting: Vec<ProcessingCard> = Vec::with_capacity(cards.len());
     for card in cards {
+        // Single choke point every removal path goes through: drop the card's
+        // sniffer state here so no path (e.g. physical card extraction) leaks
+        // an entry in the sniffer's global map. No-op when absent.
+        crate::apdu_sniffer::forget(&card.client_id);
+        // The app-level connection (the one entry with no reader) never emits
+        // its own offline transition when force-aborted mid-backoff — tell the
+        // frontend explicitly so the UI cannot keep showing a dead connection
+        // as online. The replacement path skips this: its successor connection
+        // starts immediately and a late `false` would race the new `true`.
+        if card.reader_name.is_none() && reason != "app_connection_replaced" {
+            crate::global_app_handle::app_emit_event(false);
+        }
         match card.mqtt_client.try_disconnect() {
             Ok(()) => {
                 log::info!(

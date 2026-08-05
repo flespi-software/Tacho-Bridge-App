@@ -23,7 +23,6 @@ use crate::global_app_handle::card_emit_event;
 use crate::mqtt::{ensure_connection, remove_connections_all};
 
 // ───── Constants ─────
-const MAX_BUFFER_SIZE: usize = 260; // Buffer size for smart card communication.
 const READERS_BUFFER_SIZE: usize = 2048;
 const MANUAL_SYNC_TIMEOUT_SECS: u64 = 1;
 const SW_TECHNICAL_PROBLEM: &str = "6F00";
@@ -34,6 +33,23 @@ const MONITOR_POLL_TIMEOUT_SECS: u64 = 30;
 
 type DynError = Box<dyn StdError + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
+
+/// True when a transmit failure proves the PCSC handle (or the whole stack
+/// under it) is gone and the command was NOT delivered to the card — the only
+/// situation where recreating the handle and re-sending the same APDU is safe.
+fn error_indicates_dead_handle(err: &(dyn StdError + 'static)) -> bool {
+    matches!(
+        err.downcast_ref::<pcsc::Error>(),
+        Some(
+            pcsc::Error::InvalidHandle
+                | pcsc::Error::ResetCard
+                | pcsc::Error::RemovedCard
+                | pcsc::Error::ReaderUnavailable
+                | pcsc::Error::NoService
+                | pcsc::Error::ServiceStopped
+        )
+    )
+}
 
 /// Represents a card currently being processed (i.e., connected and active).
 #[derive(Debug)]
@@ -361,6 +377,29 @@ pub fn sc_monitor() {
     }
 
     loop {
+        // One full context lifecycle per pass. A panic anywhere inside (PCSC
+        // FFI, event emission, config I/O) must not silently kill card
+        // detection for the rest of the process — nothing ever respawns this
+        // monitor. Catch it, log it, start a fresh pass.
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(monitor_pass)) {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            log::error!(
+                "sc_monitor pass panicked: {}. Restarting in 5 seconds...",
+                msg
+            );
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+}
+
+/// One pass of the reader monitor: establish a PCSC context, watch reader
+/// state changes until the context needs re-establishing, then return.
+fn monitor_pass() {
+    {
         log::debug!("Starting the outer loop to establish context...");
         let ctx = match Context::establish(Scope::User) {
             Ok(ctx) => {
@@ -373,7 +412,7 @@ pub fn sc_monitor() {
                     e
                 );
                 std::thread::sleep(Duration::from_secs(5));
-                continue;
+                return;
             }
         };
 
@@ -465,6 +504,19 @@ pub fn sc_monitor() {
             }
 
             log::debug!("Waiting for the next status change...");
+        }
+
+        // The context is about to be dropped: clear the published clone so
+        // request_rescan() cannot cancel a dead handle (a useless cancel that
+        // would delay the rescan by a full poll window) — with the slot empty
+        // it falls back to the RESCAN_REQUESTED flag, which the fresh pass
+        // picks up on its bounded wait.
+        {
+            let mut slot = match MONITOR_CTX.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *slot = None;
         }
 
         log::debug!("Re-establishing context...");
@@ -905,9 +957,11 @@ impl ManagedCard {
         let card = Arc::clone(&self.inner);
 
         // The send/response pair is logged by send_apdu() with the client_id
-        // header; this layer only logs failures.
+        // header; this layer only logs failures. The buffer is sized for
+        // extended-length responses: a RAPDU past 258 bytes is legitimate
+        // (chained/extended reads) and must not fail the exchange.
         let response = tauri::async_runtime::spawn_blocking(move || {
-            let mut rapdu_buf = [0u8; MAX_BUFFER_SIZE];
+            let mut rapdu_buf = vec![0u8; pcsc::MAX_BUFFER_SIZE_EXTENDED];
 
             let locked = card.blocking_lock();
 
@@ -915,7 +969,9 @@ impl ManagedCard {
                 Ok(response) => Ok(hex::encode(response)),
                 Err(err) => {
                     error!("APDU transmit failed: {}", err);
-                    Err(format!("Transmit error: {}", err))
+                    // Preserved as the typed pcsc error so send_apdu can tell a
+                    // dead handle from an error of an already-delivered command.
+                    Err(err)
                 }
             }
         })
@@ -934,8 +990,20 @@ impl ManagedCard {
                 return response;
             }
             Err(err) => {
+                // Recreate-and-retry is only safe when the failure proves the
+                // command never reached the card (dead handle / reader / PCSC
+                // service). For anything else the card may already have
+                // executed it — recreating resets the card (destroying the SM
+                // auth state) and replaying a stateful APDU would run it twice.
+                if !error_indicates_dead_handle(err.as_ref()) {
+                    error!(
+                        "{} Failed to send APDU: {}. Not retried: the command may have reached the card.",
+                        client_id, err
+                    );
+                    return SW_TECHNICAL_PROBLEM.to_string();
+                }
                 error!(
-                    "{} Failed to send APDU: {}. Attempting to recreate card...",
+                    "{} Failed to send APDU: {}. Dead PCSC handle - attempting to recreate card...",
                     client_id, err
                 );
             }

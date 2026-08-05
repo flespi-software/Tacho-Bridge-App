@@ -908,7 +908,27 @@ pub fn init_config() -> io::Result<()> {
                 config = loaded_config;
             }
             Err(e) => {
-                log::error!("Config parse failed ({}). Resetting to default config.", e);
+                // The reset below persists a default config over this file —
+                // rescue the original first. Whatever made it unparseable
+                // (truncation, a cloud-sync half-write, a downgrade), it still
+                // holds the user's server host and card list, and overwriting
+                // it silently would destroy them beyond recovery.
+                let backup = config_path.with_extension(format!(
+                    "yaml.corrupt.{}",
+                    chrono::Local::now().format("%Y%m%d_%H%M%S")
+                ));
+                match fs::rename(&config_path, &backup) {
+                    Ok(()) => log::error!(
+                        "Config parse failed ({}). Original saved as {:?}, resetting to default config.",
+                        e,
+                        backup
+                    ),
+                    Err(rename_err) => log::error!(
+                        "Config parse failed ({}) and backup failed ({}). Resetting to default config.",
+                        e,
+                        rename_err
+                    ),
+                }
                 config = generate_default_config();
             }
         }

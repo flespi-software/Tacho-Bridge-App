@@ -114,6 +114,12 @@ struct RotatingLogWriter {
     limit: u64,
     keep: usize,
     failed_rotate_at: Option<Instant>,
+    /// True when the last byte written was a newline. fern delivers one record
+    /// as several `write` calls (message body, then the line separator), and
+    /// rotating between them would split the record across two files — an
+    /// unterminated tail in the archived generation and a timestamp-less head
+    /// in the fresh one, which then confuses the fetch_logs period filter.
+    at_line_start: bool,
 }
 
 impl RotatingLogWriter {
@@ -130,13 +136,16 @@ impl RotatingLogWriter {
             limit,
             keep,
             failed_rotate_at: None,
+            at_line_start: true,
         })
     }
 
     /// True when a rotation attempt is needed: the size limit is reached, or the
-    /// sink is broken and a reopen is due — unless a recent attempt already failed.
+    /// sink is broken and a reopen is due — unless a recent attempt already
+    /// failed. Only ever true at a record boundary (see `at_line_start`).
     fn rotation_due(&self) -> bool {
-        (self.file.is_none() || self.written >= self.limit)
+        self.at_line_start
+            && (self.file.is_none() || self.written >= self.limit)
             && self
                 .failed_rotate_at
                 .is_none_or(|at| at.elapsed() >= ROTATE_RETRY_PAUSE)
@@ -161,8 +170,12 @@ impl RotatingLogWriter {
                     std::thread::spawn(move || archive_detached_generations(&dir, &[temp], keep));
                 }
                 Err(e) => {
+                    // Keep the displaced generation. Deleting it here would destroy up
+                    // to 50 MB of history over a transient failure (e.g. an antivirus
+                    // or the log collector briefly holding the file on Windows). The
+                    // rotation below then fails against the still-present log.1.txt,
+                    // pauses via failed_rotate_at and retries the detach in a minute.
                     eprintln!("Failed to detach {:?} for archiving: {}", archived, e);
-                    let _ = std::fs::remove_file(&archived); // Windows rename does not overwrite
                 }
             }
         }
@@ -195,11 +208,19 @@ impl Write for RotatingLogWriter {
             Some(file) => {
                 let written = file.write(buf)?;
                 self.written += written as u64;
+                if written > 0 {
+                    self.at_line_start = buf[written - 1] == b'\n';
+                }
                 Ok(written)
             }
             // the sink is broken (reopen failed, next attempt not due yet): swallow the
             // line instead of erroring — fern must keep serving the stdout chain in dev
-            None => Ok(buf.len()),
+            None => {
+                if let Some(&last) = buf.last() {
+                    self.at_line_start = last == b'\n';
+                }
+                Ok(buf.len())
+            }
         }
     }
 
@@ -243,11 +264,24 @@ fn archive_log_generation(dir: &Path, archived: &Path, keep: usize) -> std::io::
         suffix += 1;
     }
 
-    zip_log_entry(
+    // Deflate into a `.part` file and rename into place only when complete:
+    // a mid-stream failure (disk full while compressing 50 MB) must not leave
+    // a truncated `.zip` that prune_archives would count against the retention
+    // window and a reader could not open.
+    let part = archive_dir.join(format!(
+        "{}.part",
+        dest.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let zip_result = zip_log_entry(
         &mut File::open(archived)?,
-        std::io::BufWriter::new(File::create(&dest)?),
-    )?
-    .flush()?;
+        std::io::BufWriter::new(File::create(&part)?),
+    )
+    .and_then(|mut sink| sink.flush());
+    if let Err(e) = zip_result {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    std::fs::rename(&part, &dest)?;
 
     prune_archives(&archive_dir, keep);
     Ok(())

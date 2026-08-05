@@ -183,11 +183,17 @@ pub async fn app_connection() {
                             // at info; CONNACK itself is a detail.
                             log::debug!("{} [CONN] event=CONNACK status=received", log_header);
                             // One-shot settings report per established connection.
-                            crate::commands_settings::publish_settings_report(
-                                &mqtt_client_for_task,
-                                &log_header,
-                            )
-                            .await;
+                            // Spawned, never awaited here: publish() parks when the
+                            // client's bounded request channel is full (e.g. log-upload
+                            // chunks buffered during a network blip), and that channel
+                            // is drained only by the poll() this loop must return to —
+                            // awaiting would deadlock the connection permanently.
+                            let client = mqtt_client_for_task.clone();
+                            let header = log_header.clone();
+                            async_runtime::spawn(async move {
+                                crate::commands_settings::publish_settings_report(&client, &header)
+                                    .await;
+                            });
                         }
                         Event::Outgoing(rumqttc::Outgoing::Disconnect) => {
                             // graceful teardown: the DISCONNECT packet is already flushed to the
