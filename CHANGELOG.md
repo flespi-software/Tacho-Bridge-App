@@ -288,3 +288,9 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Added system tray support: closing the window now hides the app to the tray while card bridging keeps running in the background; use Show Window to bring it back and Quit to exit.
+
+### [0.8.0-beta.5] - 2026-08-05
+
+🆕 Features / Improvements
+
+- Updated Rust dependencies to latest compatible versions.
