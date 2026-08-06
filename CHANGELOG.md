@@ -312,3 +312,10 @@ All notable changes to this project will be documented in this file.
 
 - Internal: applied standard Rust code formatting across the backend.
 - Internal reliability refactoring: fixed resource leaks, data races and APDU retry safety across the Rust backend.
+
+### [0.8.0-beta.8] - 2026-08-06
+
+🆕 Features / Improvements
+
+- Added automatic update installation: an opt-in setting makes the app check hourly and install new versions on its own, waiting for a pause in card activity so an authentication is never interrupted.
+- Added launch at system startup: a new System setting registers the app to start on login, minimized to the tray.
