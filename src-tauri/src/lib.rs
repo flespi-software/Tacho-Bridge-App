@@ -29,6 +29,43 @@ static BACKEND_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// so the user is never left without a way to exit.
 static TRAY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Reports whether the app is registered to start at login. Dev builds always
+/// answer "no" — see `autostart_set`.
+#[tauri::command]
+async fn autostart_get(app: tauri::AppHandle) -> Result<bool, String> {
+    if cfg!(debug_assertions) {
+        return Ok(false);
+    }
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+/// Registers/unregisters the app for launch at login (registry Run key on
+/// Windows, LaunchAgent on macOS, autostart .desktop on Linux). Blocked in dev
+/// builds: it would pin the transient target/debug binary path into the OS
+/// autostart location.
+#[tauri::command]
+async fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    if cfg!(debug_assertions) {
+        return Err("autostart is not available in dev builds".to_string());
+    }
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    let result = if enabled {
+        autolaunch.enable()
+    } else {
+        autolaunch.disable()
+    };
+    match &result {
+        Ok(()) => log::info!(
+            "[AUTOSTART] status={}",
+            if enabled { "enabled" } else { "disabled" }
+        ),
+        Err(e) => log::error!("[AUTOSTART] status=failed enabled={} err={}", enabled, e),
+    }
+    result.map_err(|e| e.to_string())
+}
+
 /// Brings the main window back from the tray / hidden state.
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -99,6 +136,12 @@ pub fn run() {
         // anyway (exclusive COM port, duplicate MQTT client_ids kicking each
         // other) — surface the existing window instead of starting one.
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Launch-at-login support; the `--minimized` argument makes an
+        // auto-started instance stay in the tray instead of opening a window.
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             log::warn!("Second instance launch blocked; focusing the existing window.");
             show_main_window(app);
@@ -120,6 +163,16 @@ pub fn run() {
             }
 
             if let Some(window) = app.get_webview_window("main") {
+                // Auto-started at login: stay in the tray instead of popping
+                // the window up over whatever the user is doing. Only when the
+                // tray actually exists — otherwise a hidden window would be
+                // unreachable.
+                if std::env::args().any(|arg| arg == "--minimized")
+                    && TRAY_ACTIVE.load(Ordering::SeqCst)
+                {
+                    let _ = window.hide();
+                }
+
                 // getting Application version foriom the Cargo.toml file
                 let version = env!("CARGO_PKG_VERSION");
                 // Form new Title with the version
@@ -242,6 +295,8 @@ pub fn run() {
             updater::install_update,       // download + install the pending update
             updater::check_updates_now,    // forced update check from the settings dialog
             updater::get_changelog,        // bundled CHANGELOG.md for the settings dialog
+            autostart_get,                 // is the app registered to start at login
+            autostart_set,                 // register/unregister launch at login
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

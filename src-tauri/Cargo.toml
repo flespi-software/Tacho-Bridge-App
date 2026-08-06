@@ -50,6 +50,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 tauri-plugin-single-instance = "2"
 # Self-update from GitHub releases (latest.json + minisign-signed artifacts).
 tauri-plugin-updater = "2"
+tauri-plugin-autostart = "2.5.1"
 
 # Windows only: the serial-port layer there reports the FTDI driver's strings,
 # not the device's own USB descriptors. nusb reads the real iProduct/serial

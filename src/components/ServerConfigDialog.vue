@@ -67,6 +67,26 @@
       <q-separator inset />
 
       <q-card-section class="q-py-sm">
+        <div class="text-subtitle2 text-grey-7 q-mb-sm">System</div>
+        <!-- Applies immediately (like the theme), no Save needed: the OS is
+             the source of truth, the state is re-read every dialog open. -->
+        <q-toggle
+          :model-value="autostartEnabled"
+          label="Launch at system startup"
+          dense
+          class="q-mb-sm"
+          @update:model-value="onAutostartToggled"
+        >
+          <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
+            Starts the application automatically when you log in, minimized to the tray. Recommended
+            for unattended machines with a card rack.
+          </q-tooltip>
+        </q-toggle>
+      </q-card-section>
+
+      <q-separator inset />
+
+      <q-card-section class="q-py-sm">
         <div class="text-subtitle2 text-grey-7 q-mb-sm">Updates</div>
         <q-toggle
           v-model="betaUpdates"
@@ -81,9 +101,9 @@
           class="q-mb-sm"
         >
           <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
-            Checks for updates hourly and installs them without asking. The
-            application restarts on its own, waiting for a pause in card
-            activity so an authentication in progress is never interrupted.
+            Checks for updates hourly and installs them without asking. The application restarts on
+            its own, waiting for a pause in card activity so an authentication in progress is never
+            interrupted.
           </q-tooltip>
         </q-toggle>
         <div class="row q-gutter-sm">
@@ -164,11 +184,11 @@
 
 <script setup lang="ts">
 import { useQuasar, Notify } from 'quasar'
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
-defineProps<{
+const props = defineProps<{
   modelValue: boolean
 }>()
 
@@ -197,6 +217,39 @@ const betaUpdates = ref(false)
 // Unattended updates: the backend checks hourly and installs on its own,
 // restarting the app during a pause in card activity.
 const autoInstallUpdates = ref(false)
+
+// Launch at login. The OS registration is the source of truth (no config
+// field): the state is read on every dialog open and the toggle applies
+// immediately, reverting itself when the OS call fails.
+const autostartEnabled = ref(false)
+async function refreshAutostartState() {
+  try {
+    autostartEnabled.value = await invoke<boolean>('autostart_get')
+  } catch (error) {
+    console.error('Failed to read autostart state:', error)
+  }
+}
+async function onAutostartToggled(value: boolean) {
+  autostartEnabled.value = value
+  try {
+    await invoke('autostart_set', { enabled: value })
+  } catch (error) {
+    autostartEnabled.value = !value
+    console.error('Failed to change autostart:', error)
+    Notify.create({
+      message: `Failed to ${value ? 'enable' : 'disable'} launch at startup: ${String(error)}`,
+      color: 'red',
+      position: 'bottom',
+      timeout: 5000,
+    })
+  }
+}
+watch(
+  () => props.modelValue,
+  (open) => {
+    if (open) void refreshAutostartState()
+  },
+)
 
 const $q = useQuasar()
 
