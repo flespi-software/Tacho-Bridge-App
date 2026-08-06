@@ -870,6 +870,10 @@ async fn handle_serial_request(
     last_request_id: &mut Option<u64>,
     last_response_payload: &mut Option<String>,
 ) {
+    // A server-driven rack exchange counts as card activity: the auto-updater
+    // must not restart the app in the middle of a rack card operation. The
+    // 1 Hz presence watch does NOT go through here, so idle racks stay quiet.
+    crate::mqtt::touch_card_activity();
     // Idempotency: the server re-sends a request with the same id after a timeout. If we already
     // answered this id, re-send the cached response without touching the port again; if it is
     // still in flight, drop the duplicate.

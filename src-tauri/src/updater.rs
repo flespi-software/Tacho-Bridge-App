@@ -115,6 +115,90 @@ pub async fn check_for_updates(app: AppHandle) {
     let _ = perform_check(&app, None).await;
 }
 
+/// How often the auto-install loop wakes up to look at its state. Cheap: no
+/// network unless a check is due, so the loop reacts to the settings toggle
+/// and to card activity going quiet within minutes.
+const AUTO_TICK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Minimal spacing between two network checks of the manifest endpoint.
+/// Releases ship at most a few times a day — polling GitHub more often than
+/// hourly buys nothing and just burns traffic.
+const AUTO_CHECK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The card link must be this quiet before an unattended install may restart
+/// the app. An active authentication is a continuous APDU flow with sub-minute
+/// gaps, so one silent minute means no session is in progress.
+const AUTO_INSTALL_QUIET_SECS: u64 = 60;
+
+/// Unattended update loop, spawned once at startup and running for the whole
+/// app lifetime. Does nothing while the `auto_install_updates` setting is off.
+/// When on: re-checks the channel manifest at most once an hour, and installs
+/// a found update (parked in `PENDING_UPDATE` by the shared check path) as
+/// soon as the card link has been quiet for `AUTO_INSTALL_QUIET_SECS` — an
+/// install restarts the app, and a restart mid-authentication would break the
+/// VU's session. While cards stay busy the install is re-attempted every tick.
+pub async fn auto_update_loop(app: AppHandle) {
+    // The startup check in lib.rs has just run; start the hourly clock now.
+    let mut last_network_check = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(AUTO_TICK).await;
+
+        let enabled = crate::config::get_from_cache(
+            crate::config::CacheSection::Updates,
+            "auto_install_updates",
+        ) == "true";
+        if !enabled {
+            continue;
+        }
+
+        // Look for a new version when the hourly budget allows and nothing is
+        // already waiting to be installed.
+        if PENDING_UPDATE.lock().await.is_none()
+            && last_network_check.elapsed() >= AUTO_CHECK_MIN_INTERVAL
+        {
+            last_network_check = std::time::Instant::now();
+            let _ = perform_check(&app, None).await;
+        }
+
+        // Install the parked update once the card link is quiet.
+        let (pending, version) = {
+            let guard = PENDING_UPDATE.lock().await;
+            match guard.as_ref() {
+                Some(update) => (true, update.version.clone()),
+                None => (false, String::new()),
+            }
+        };
+        if !pending {
+            continue;
+        }
+        let quiet_for = crate::mqtt::seconds_since_card_activity();
+        if quiet_for < AUTO_INSTALL_QUIET_SECS {
+            log::info!(
+                "{TAG} phase=auto_install status=postponed version={} reason=card_activity quiet_secs={}",
+                version,
+                quiet_for
+            );
+            continue;
+        }
+
+        log::info!("{TAG} phase=auto_install status=starting version={version}");
+        emit_notification_event(
+            "global-notification",
+            NotificationPayload {
+                notification_type: "version".to_string(),
+                message: format!(
+                    "Installing update {version} — the application will restart shortly."
+                ),
+            },
+        );
+        // On success this restarts the app and never returns; on failure the
+        // update is put back into PENDING_UPDATE and the next tick retries.
+        if let Err(e) = install_update(app.clone()).await {
+            log::error!("{TAG} phase=auto_install status=failed version={version} err={e}");
+        }
+    }
+}
+
 /// Forced check from the settings dialog. Returns the outcome so the dialog
 /// can tell the user "you are up to date" explicitly. The dialog passes its
 /// on-screen channel toggle so the check honors it even before Save.

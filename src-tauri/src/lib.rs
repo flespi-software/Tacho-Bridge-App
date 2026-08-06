@@ -181,6 +181,14 @@ pub fn run() {
                         async_runtime::spawn(async move {
                             updater::check_for_updates(updater_handle).await;
                         });
+
+                        // Unattended update loop: idle while the setting is off,
+                        // otherwise checks hourly and installs during a pause in
+                        // card activity (an install restarts the app).
+                        let auto_update_handle = front_app_handle.clone();
+                        async_runtime::spawn(async move {
+                            updater::auto_update_loop(auto_update_handle).await;
+                        });
                     }
 
                     // ── Per-(re)load: replay current state to the fresh frontend ──

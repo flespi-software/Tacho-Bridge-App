@@ -4,6 +4,7 @@
 
 // ───── Std Lib ─────
 use std::ffi::CStr; // For handling C-style strings in Rust.
+use std::sync::atomic::{AtomicU64, Ordering}; // Card-activity timestamp for the auto-updater.
 use std::time::{Duration, Instant}; // For specifying time durations and shutdown deadlines.
 
 // ───── MQTT Client Library (rumqttc) ─────
@@ -46,6 +47,31 @@ const SHUTDOWN_POLL_INTERVAL_MS: u64 = 50;
 /// Returns the next reconnect delay given the current one (exponential, capped).
 fn next_reconnect_delay(current: u64) -> u64 {
     current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
+}
+
+/// Unix seconds of the most recent card-facing exchange: a server request on a
+/// reader-backed card connection, or a rack serial envelope. A timestamp (not
+/// a session counter) on purpose — a counter would leak on an aborted task and
+/// block auto-updates forever, while an APDU flow going quiet is a robust
+/// "no authentication in progress" signal.
+static LAST_CARD_ACTIVITY_SECS: AtomicU64 = AtomicU64::new(0);
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Records "a card exchange is happening right now". Called on every server
+/// request that reaches a card (reader APDU bridge and rack serial bridge).
+pub fn touch_card_activity() {
+    LAST_CARD_ACTIVITY_SECS.store(unix_now_secs(), Ordering::Relaxed);
+}
+
+/// Seconds since the last card exchange; a large value when none happened yet.
+pub fn seconds_since_card_activity() -> u64 {
+    unix_now_secs().saturating_sub(LAST_CARD_ACTIVITY_SECS.load(Ordering::Relaxed))
 }
 
 /// Maps a connection error to a short stable `kind` for one-line logs, plus a
@@ -362,6 +388,10 @@ pub async fn ensure_connection(
 
                     match notification {
                         Event::Incoming(Incoming::Publish(publish)) => {
+                            // Every publish on a card connection is a VU-driven
+                            // exchange: mark card activity so the auto-updater
+                            // never restarts the app mid-authentication.
+                            touch_card_activity();
                             // Extracting the topic from the incoming data
                             let topic_str = match std::str::from_utf8(&publish.topic) {
                                 Ok(str) => str,

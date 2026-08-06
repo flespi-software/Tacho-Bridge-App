@@ -36,6 +36,11 @@ pub struct ConfigurationFile {
     // builds; false/absent → stable releases only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     beta_updates: Option<bool>,
+    // Unattended updates: true → a background loop periodically checks the
+    // selected channel and installs a found update on its own, waiting for a
+    // pause in card activity so a restart never interrupts an authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_install_updates: Option<bool>,
 }
 
 /// Treats an explicitly empty `cards:` key (YAML null) as an empty map instead
@@ -421,6 +426,7 @@ pub fn update_server_config(
     ident: &str,
     theme: &str,
     beta_updates: bool,
+    auto_install_updates: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Serialize the whole read-modify-write against all other config writers.
     let _guard = config_write_guard();
@@ -435,6 +441,7 @@ pub fn update_server_config(
         dark_theme: dark_theme_from_label(theme),
     });
     config.beta_updates = Some(beta_updates);
+    config.auto_install_updates = Some(auto_install_updates);
 
     save_config(config_path, &config)?;
     load_config_to_cache(&config)?;
@@ -537,9 +544,11 @@ pub async fn update_server(
     ident: String,
     theme: String,
     beta_updates: bool,
+    auto_install_updates: bool,
 ) -> bool {
     let old_host = get_from_cache(CacheSection::Server, "host");
     let old_beta = get_from_cache(CacheSection::Updates, "beta_updates");
+    let old_auto_install = get_from_cache(CacheSection::Updates, "auto_install_updates");
 
     let host_for_task = host.clone();
     let updated = tauri::async_runtime::spawn_blocking(move || {
@@ -551,7 +560,14 @@ pub async fn update_server(
             }
         };
 
-        match update_server_config(&config_path, &host_for_task, &ident, &theme, beta_updates) {
+        match update_server_config(
+            &config_path,
+            &host_for_task,
+            &ident,
+            &theme,
+            beta_updates,
+            auto_install_updates,
+        ) {
             Ok(_) => {
                 log::info!("The server address is updated to '{}'.", host_for_task);
                 true
@@ -583,7 +599,11 @@ pub async fn update_server(
         }
 
         // Channel switched → re-check against the newly selected endpoint.
-        if old_beta != beta_updates.to_string() {
+        // Auto-install just enabled → check right away too, so the feature
+        // acts within seconds instead of waiting for the next background tick.
+        let auto_install_enabled =
+            auto_install_updates && old_auto_install != auto_install_updates.to_string();
+        if old_beta != beta_updates.to_string() || auto_install_enabled {
             let updater_app = app.clone();
             tauri::async_runtime::spawn(async move {
                 crate::updater::check_for_updates(updater_app).await;
@@ -636,6 +656,7 @@ pub struct CacheConfigData {
     pub ident: Option<String>,
     pub appearance: Option<AppearanceConfig>,
     pub beta_updates: Option<bool>,
+    pub auto_install_updates: Option<bool>,
 }
 
 lazy_static! {
@@ -785,8 +806,16 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
             (None, _) => "".to_string(),
         },
 
-        // "true"/"false"; absent flag reads as "false" (stable channel).
-        CacheSection::Updates => cache.beta_updates.unwrap_or(false).to_string(),
+        // "true"/"false"; absent flags read as "false" (stable channel,
+        // manual installs).
+        CacheSection::Updates => match key {
+            "beta_updates" => cache.beta_updates.unwrap_or(false).to_string(),
+            "auto_install_updates" => cache.auto_install_updates.unwrap_or(false).to_string(),
+            _ => {
+                log::debug!("cache: unknown key for updates section: {}", key);
+                "".to_string()
+            }
+        },
     }
 }
 
@@ -822,6 +851,7 @@ pub fn load_config_to_cache(
         ident: config.ident.clone(),
         appearance: config.appearance.clone(),
         beta_updates: config.beta_updates,
+        auto_install_updates: config.auto_install_updates,
     };
 
     // trace_cache(&*cache);
@@ -964,6 +994,7 @@ fn generate_default_config() -> ConfigurationFile {
         server: None,
         cards: HashMap::new(),
         beta_updates: None,
+        auto_install_updates: None,
     }
 }
 
@@ -981,6 +1012,10 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     config_app_payload.insert(
         "beta_updates",
         get_from_cache(CacheSection::Updates, "beta_updates"),
+    );
+    config_app_payload.insert(
+        "auto_install_updates",
+        get_from_cache(CacheSection::Updates, "auto_install_updates"),
     );
 
     if let Err(e) = app.emit("global-config-server", config_app_payload) {
@@ -1056,6 +1091,7 @@ mod tests {
             }),
             cards,
             beta_updates: None,
+            auto_install_updates: None,
         }
     }
 

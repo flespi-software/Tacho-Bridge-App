@@ -74,6 +74,18 @@
           dense
           class="q-mb-sm"
         />
+        <q-toggle
+          v-model="autoInstallUpdates"
+          label="Automatically install new updates"
+          dense
+          class="q-mb-sm"
+        >
+          <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
+            Checks for updates hourly and installs them without asking. The
+            application restarts on its own, waiting for a pause in card
+            activity so an authentication in progress is never interrupted.
+          </q-tooltip>
+        </q-toggle>
         <div class="row q-gutter-sm">
           <q-btn
             outline
@@ -182,6 +194,9 @@ const isIdentValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))
 const hostValue = ref('')
 // Update channel: off = stable releases only (default), on = pre-releases too.
 const betaUpdates = ref(false)
+// Unattended updates: the backend checks hourly and installs on its own,
+// restarting the app during a pause in card activity.
+const autoInstallUpdates = ref(false)
 
 const $q = useQuasar()
 
@@ -298,6 +313,7 @@ const saveServerConfig = async () => {
       ident: identInput.value,
       theme,
       betaUpdates: betaUpdates.value,
+      autoInstallUpdates: autoInstallUpdates.value,
     })
     if (!ok) {
       throw new Error('the backend could not persist the settings')
@@ -363,6 +379,7 @@ onMounted(async () => {
         ident: string
         dark_theme?: string
         beta_updates?: string
+        auto_install_updates?: string
       }
       hostValue.value = payload.host
       // Seed the backing ref directly, NOT through the identInput setter: the
@@ -372,6 +389,7 @@ onMounted(async () => {
       // faithful value renders as-is and isIdentValid flags it instead.
       ident.value = payload.ident.replace(/^TBA/i, '')
       betaUpdates.value = payload.beta_updates === 'true'
+      autoInstallUpdates.value = payload.auto_install_updates === 'true'
       if (
         payload.dark_theme === 'Auto' ||
         payload.dark_theme === 'Light' ||
