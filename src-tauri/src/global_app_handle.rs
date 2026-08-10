@@ -173,6 +173,11 @@ pub struct RackState {
     pub vid: Option<u16>,
     pub pid: Option<u16>,
     pub cards: Vec<RackCard>,
+    /// True once the server has finished enumerating the rack, so the UI can
+    /// stop its "scanning" indicator instead of guessing from a silence
+    /// timeout. Set when the presence `watch` is armed — the server arms it
+    /// after its discovery chain has walked the rack (see `start_rack_watch`).
+    pub scan_complete: bool,
 }
 
 // Last known rack state. The rack monitor runs independently of the frontend,
@@ -221,6 +226,34 @@ pub fn rack_update_cards(cards: Vec<RackCard>) {
         if let Some(app_handle) = get_app_handle() {
             if let Err(e) = app_handle.emit("rack-state", state) {
                 log::error!("emit 'rack-state' (cards update) failed: {:?}", e);
+            }
+        }
+    }
+}
+
+/// Marks the rack scan as finished and re-emits the state, so the UI can end
+/// its "scanning" indicator on a real signal rather than a silence timeout.
+/// A no-op when no rack state is cached, or when it is already marked.
+pub fn rack_mark_scan_complete() {
+    let state = {
+        let mut guard = match LAST_RACK_STATE.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.as_mut() {
+            Some(state) if !state.scan_complete => {
+                state.scan_complete = true;
+                Some(state.clone())
+            }
+            // Already complete, or no rack — nothing to announce.
+            _ => None,
+        }
+    };
+    if let Some(state) = state {
+        log::info!("RACK | phase=discovery status=scan_complete");
+        if let Some(app_handle) = get_app_handle() {
+            if let Err(e) = app_handle.emit("rack-state", state) {
+                log::error!("emit 'rack-state' (scan complete) failed: {:?}", e);
             }
         }
     }

@@ -112,13 +112,14 @@ const emit = defineEmits<{
 }>()
 
 /**
- * How long the rack may stay silent before we consider the scan finished.
+ * Fallback only: how long the rack may stay silent before we give up waiting.
  *
- * Generous on purpose: a populated multi-block rack reports its slots one
- * `connect` at a time and can pause noticeably between blocks, so a tight
- * window ended the animation while slots were still arriving. The window is
- * re-armed on every change to the card list, so this only ever bounds the gap
- * between two reports, never the whole scan.
+ * The scan normally ends on the backend's `scan_complete` flag, which the
+ * server raises when it finishes enumerating the rack. This timeout exists for
+ * the case where that signal never arrives (older server that does not arm the
+ * presence watch), so the indicator cannot spin forever. It is re-armed on
+ * every change to the card list, so it only ever bounds the gap between two
+ * reports, never the whole scan.
  */
 const SCAN_WINDOW_MS = 30000
 
@@ -157,16 +158,25 @@ watch(
   () =>
     [
       props.rack?.connected ?? false,
+      props.rack?.scan_complete ?? false,
       (props.rack?.cards ?? []).map((c) => `${c.slot}:${c.iccid ?? ''}`).join(','),
     ] as const,
-  ([connected, fingerprint], previous) => {
+  ([connected, scanComplete, fingerprint], previous) => {
     if (!connected) {
       // Disconnected racks show their own message; no scan is in flight.
       stopScanTimer()
       scanning.value = false
       return
     }
-    const [wasConnected, previousFingerprint] = previous ?? [false, '']
+    // The backend says enumeration is over — end the indicator at once instead
+    // of waiting out the fallback window. This is what stops the bar from
+    // lingering for half a minute after every card is already on screen.
+    if (scanComplete) {
+      stopScanTimer()
+      scanning.value = false
+      return
+    }
+    const [wasConnected, , previousFingerprint] = previous ?? [false, false, '']
     if (!wasConnected || fingerprint !== previousFingerprint) {
       armScanWindow()
     }

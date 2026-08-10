@@ -390,6 +390,9 @@ impl RackInfo {
             vid: Some(self.vid),
             pid: Some(self.pid),
             cards: Vec::new(),
+            // A freshly (re)connected rack has not been enumerated yet; the
+            // server's `watch` instruction flips this once discovery is done.
+            scan_complete: false,
         }
     }
 }
@@ -822,6 +825,13 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                                 &mqtt_client,
                                 &log_header,
                             );
+                            // The server arms the presence watch once its discovery
+                            // chain has walked the rack, so this doubles as the
+                            // "enumeration finished" signal the UI needs to stop
+                            // showing a scan in progress. Treated as a hint, not a
+                            // contract: the frontend still has its own timeout in
+                            // case a server version never sends `watch`.
+                            crate::global_app_handle::rack_mark_scan_complete();
                         } else if topic == "disconnect" {
                             // a card left its slot: close the session, drop it from the UI
                             handle_card_disconnect(&publish.payload, &log_header);

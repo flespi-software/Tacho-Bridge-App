@@ -47,4 +47,7 @@ export interface RackState {
   vid?: number | null
   pid?: number | null
   cards: RackCard[]
+  // True once the server has finished enumerating the rack. Absent on older
+  // backends, where the UI falls back to its silence timeout.
+  scan_complete?: boolean
 }
