@@ -332,6 +332,15 @@ pub async fn ensure_connection(
     // restarts the server-side request_id counter at 1.
     let mut last_request_id: Option<u64> = None;
     let mut last_response_payload: Option<String> = None;
+    // Generation of the physical card state. Bumped on every reset of the card
+    // (`reconnect`, protocol switch), which wipes the security state a cached
+    // reply was produced against. The cache records the generation it belongs
+    // to, so a reply captured before a reset can never be replayed after one:
+    // it would answer the server with data describing a card state that no
+    // longer exists. Resets happen without the MQTT session dropping, so the
+    // CONNACK reset below is not enough on its own.
+    let mut card_generation: u64 = 0;
+    let mut cached_generation: u64 = 0;
 
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
@@ -347,6 +356,28 @@ pub async fn ensure_connection(
                     e
                 );
                 emit_card_sync_event("", &reader_name, &client_id_cloned, Some(false), None);
+                // Drop our own pool entry before giving up. The task is about to
+                // end, so the entry would sit there dead — `ensure_connection`
+                // only reclaims it when the SAME card is detected again, which
+                // for a reader-backed card needs a re-plug or a rescan. Until
+                // then the stale entry makes the card look served and blocks a
+                // rack-backed session for the same number from starting.
+                //
+                // Ordering is safe: the spawning `ensure_connection` holds the
+                // TASK_POOL lock across the spawn and releases it only after
+                // pushing our entry, so this lock cannot be taken before the
+                // entry exists.
+                let mut pool = TASK_POOL.lock().await;
+                if let Some(index) = pool
+                    .iter()
+                    .position(|card| card.client_id == client_id_cloned)
+                {
+                    pool.remove(index);
+                    log::info!(
+                        "{} [CONN] phase=init status=pool_entry_dropped reason=iccid_resolve_failed",
+                        log_header
+                    );
+                }
                 return;
             }
         };
@@ -419,7 +450,11 @@ pub async fn ensure_connection(
                             let req_id = request_id_from_topic(&topic);
                             if req_id.is_some() && req_id == last_request_id {
                                 match &last_response_payload {
-                                    Some(cached) => {
+                                    // Only replay a reply captured against the card state that is
+                                    // still in place. After a reset the cached bytes describe a
+                                    // card that no longer exists, so the duplicate must go to the
+                                    // card again rather than be answered from a stale snapshot.
+                                    Some(cached) if cached_generation == card_generation => {
                                         log::warn!(
                                             "{} duplicate request_id={:?}: re-sending cached response, skipping card exchange",
                                             log_header,
@@ -432,14 +467,27 @@ pub async fn ensure_connection(
                                             &log_header,
                                         )
                                         .await;
+                                        continue;
                                     }
-                                    None => log::warn!(
-                                        "{} duplicate request_id={:?} still in flight: ignoring",
-                                        log_header,
-                                        req_id
-                                    ),
+                                    Some(_) => {
+                                        log::warn!(
+                                            "{} duplicate request_id={:?} predates a card reset: \
+                                             re-running it on the card instead of replaying the cache",
+                                            log_header,
+                                            req_id
+                                        );
+                                        last_request_id = None;
+                                        last_response_payload = None;
+                                    }
+                                    None => {
+                                        log::warn!(
+                                            "{} duplicate request_id={:?} still in flight: ignoring",
+                                            log_header,
+                                            req_id
+                                        );
+                                        continue;
+                                    }
                                 }
-                                continue;
                             }
 
                             // serializable data to interpret it as json
@@ -508,6 +556,9 @@ pub async fn ensure_connection(
 
                                             // Reset the card to its original state
                                             managed_card.reconnect().await;
+                                            // The card lost its security state: nothing captured
+                                            // before this point may be replayed from cache.
+                                            card_generation = card_generation.wrapping_add(1);
 
                                             payload_ack = process_rapdu_mqtt_hex("".to_string());
 
@@ -549,6 +600,8 @@ pub async fn ensure_connection(
                                                         );
                                                         // Reset the card to its original state
                                                         managed_card.reconnect().await;
+                                                        card_generation =
+                                                            card_generation.wrapping_add(1);
                                                     }
 
                                                     // Session start is the only safe point to honor the requested
@@ -559,6 +612,10 @@ pub async fn ensure_connection(
                                                         managed_card
                                                             .switch_protocol(protocol)
                                                             .await;
+                                                        // A protocol switch physically resets the
+                                                        // card, same as a reconnect.
+                                                        card_generation =
+                                                            card_generation.wrapping_add(1);
                                                     }
 
                                                     // If the input value is empty, then pass the ATR to the server.
@@ -672,6 +729,9 @@ pub async fn ensure_connection(
                                         {
                                             last_request_id = req_id;
                                             last_response_payload = Some(payload_ack.clone());
+                                            // Pin the reply to the card state it was produced
+                                            // against; a later reset invalidates it.
+                                            cached_generation = card_generation;
                                         }
 
                                         // publish a message to the channel
