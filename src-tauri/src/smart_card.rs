@@ -211,7 +211,8 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
         };
 
         let atr = hex::encode(rs.atr());
-        let protocol = parse_atr_and_get_protocol(&atr);
+        let atr_protocol = parse_atr_and_get_protocol(&atr);
+        let protocol = atr_protocol.protocol();
         let mut effective_protocol = protocol;
 
         let card_state_string = format!("{:?}", rs.event_state());
@@ -234,7 +235,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
                         // The card number (and thus the config entry) is known only after
                         // reading the ICCID, so the card is opened with the ATR-derived
                         // protocol first and switched if the config says otherwise.
-                        effective_protocol = resolve_t_protocol(&card_number, protocol);
+                        effective_protocol = resolve_t_protocol(&card_number, &atr_protocol);
                         if effective_protocol != protocol {
                             managed_card.switch_protocol(effective_protocol).await;
                         }
@@ -549,7 +550,9 @@ pub fn protocol_from_str(value: &str) -> Option<Protocols> {
 /// protocol is persisted so later connects and reconnects reuse it.
 /// Blocking (config file I/O on first connection) — the reader monitor thread is
 /// allowed to block, so this must not be called from an async worker.
-fn resolve_t_protocol(card_number: &str, atr_protocol: Protocols) -> Protocols {
+fn resolve_t_protocol(card_number: &str, atr: &AtrProtocol) -> Protocols {
+    let atr_protocol = atr.protocol();
+
     if card_number.is_empty() {
         // Card is not configured yet - nowhere to store the protocol.
         return atr_protocol;
@@ -579,6 +582,20 @@ fn resolve_t_protocol(card_number: &str, atr_protocol: Protocols) -> Protocols {
             }
         },
         None => {
+            // Only a conclusive ATR read may be persisted. Storing a fallback
+            // guess would freeze it: every later connection reuses the stored
+            // value without consulting the ATR again, so one truncated read
+            // would pin the wrong protocol until the user edits config.yaml.
+            if !atr.is_resolved() {
+                warn!(
+                    "Card {}: ATR did not conclusively identify the T protocol; \
+                     using {} for this connection without storing it",
+                    card_number,
+                    protocol_to_str(atr_protocol)
+                );
+                return atr_protocol;
+            }
+
             let value = protocol_to_str(atr_protocol);
             if mutate_card_config(card_number, |card| {
                 card.t_protocol = Some(value.to_string());
@@ -594,18 +611,57 @@ fn resolve_t_protocol(card_number: &str, atr_protocol: Protocols) -> Protocols {
     }
 }
 
+/// Outcome of reading the protocol out of an ATR.
+///
+/// The distinction matters because the ATR-derived protocol gets *persisted* on
+/// a card's first connection (see `resolve_t_protocol`). A truncated ATR and a
+/// genuine T=0 ATR both used to yield `Protocols::T0`, so one malformed read
+/// could pin the wrong protocol into the config forever — only fixable by hand
+/// editing the YAML. Keeping "I could not tell" separate from "it is T0" lets
+/// the caller decline to store a guess.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AtrProtocol {
+    /// The interface bytes were present and complete: this is the card's protocol.
+    Resolved(Protocols),
+    /// The ATR is absent, malformed, or truncated mid-way through its interface
+    /// bytes. Carries the protocol to *use* for this connection (T0, the safe
+    /// default), but it must not be written to the config.
+    Indeterminate(Protocols),
+}
+
+impl AtrProtocol {
+    /// The protocol to open the card with, whether or not the parse was conclusive.
+    pub fn protocol(&self) -> Protocols {
+        match self {
+            AtrProtocol::Resolved(p) | AtrProtocol::Indeterminate(p) => *p,
+        }
+    }
+
+    /// True only when the ATR conclusively identified the protocol — the sole
+    /// case where it is safe to persist.
+    pub fn is_resolved(&self) -> bool {
+        matches!(self, AtrProtocol::Resolved(_))
+    }
+}
+
 /// Parses the ATR and extracts the communication protocol (T=0 or T=1).
+///
+/// Walks the interface bytes per ISO/IEC 7816-3: TS, T0, then the TA/TB/TC/TD
+/// groups selected by each Y nibble. Every skip is bounds-checked — running past
+/// the end means the ATR was cut short and nothing can be concluded from it.
 ///
 /// # Arguments
 /// - `atr`: A string containing the ATR in hexadecimal format.
 ///
 /// # Returns
-/// - `Protocols`: The communication protocol (T0 or T1; T0 when the ATR is absent or malformed).
-pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
+/// - `AtrProtocol`: `Resolved` when the interface bytes were complete,
+///   `Indeterminate` when the ATR was absent, malformed or truncated.
+pub fn parse_atr_and_get_protocol(atr: &str) -> AtrProtocol {
     fn protocol_from_td(td: u8) -> Protocols {
         match td & 0x0F {
-            0x00 => Protocols::T0,
             0x01 => Protocols::T1,
+            // T=0 and every other (unsupported) protocol indication fall back
+            // to T0, which is what PCSC negotiates for them anyway.
             _ => Protocols::T0,
         }
     }
@@ -614,80 +670,78 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> Protocols {
         Ok(bytes) => bytes,
         Err(_) => {
             log::error!("Invalid ATR format: {}", atr);
-            return Protocols::T0;
+            return AtrProtocol::Indeterminate(Protocols::T0);
         }
     };
 
     // An empty ATR is the normal "no card in the reader" case (e.g. a card
     // removal event) — nothing to parse, and not worth a warning.
     if atr_bytes.is_empty() {
-        return Protocols::T0;
+        return AtrProtocol::Indeterminate(Protocols::T0);
     }
 
     if atr_bytes.len() < 2 {
         log::warn!("ATR is too short: {:?}", atr_bytes);
-        return Protocols::T0;
+        return AtrProtocol::Indeterminate(Protocols::T0);
     }
 
+    // Advances past the TA/TB/TC bytes selected by `y`, reporting whether they
+    // all actually fit in the ATR. Previously these skips were unchecked, so a
+    // truncated ATR silently walked `index` past the end and the TD lookups
+    // below quietly found nothing — reported as a confident T0.
+    fn skip_interface_bytes(index: &mut usize, y: u8, len: usize) -> bool {
+        for bit in [0x1, 0x2, 0x4] {
+            if y & bit != 0 {
+                *index += 1;
+                if *index > len {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    let len = atr_bytes.len();
     let mut index = 1;
     let y1 = atr_bytes[index] >> 4;
     index += 1;
 
-    // Skip TA1, TB1, TC1 depends on Y1
-    if y1 & 0x1 != 0 {
-        index += 1;
-    } // TA1
-    if y1 & 0x2 != 0 {
-        index += 1;
-    } // TB1
-    if y1 & 0x4 != 0 {
-        index += 1;
-    } // TC1
-
-    // TD1
-    let td1 = if y1 & 0x8 != 0 && index < atr_bytes.len() {
-        let td1 = atr_bytes[index];
-        index += 1;
-        Some(td1)
-    } else {
-        None
-    };
-
-    // TD2 (if was TD1)
-    let td2 = if let Some(td1) = td1 {
-        let y2 = td1 >> 4;
-        // Skip TA2, TB2, TC2
-        if y2 & 0x1 != 0 {
-            index += 1;
-        } // TA2
-        if y2 & 0x2 != 0 {
-            index += 1;
-        } // TB2
-        if y2 & 0x4 != 0 {
-            index += 1;
-        } // TC2
-
-        if y2 & 0x8 != 0 && index < atr_bytes.len() {
-            Some(atr_bytes[index])
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // If TD2 exists — it is default protocol
-    if let Some(td2) = td2 {
-        return protocol_from_td(td2);
+    // TA1, TB1, TC1 — presence selected by Y1.
+    if !skip_interface_bytes(&mut index, y1, len) {
+        log::warn!("ATR truncated inside its first interface bytes: {}", atr);
+        return AtrProtocol::Indeterminate(Protocols::T0);
     }
 
-    // If TD2 is not presented, but TD1 it is — use it
-    if let Some(td1) = td1 {
-        return protocol_from_td(td1);
+    // TD1 absent → only the default protocol (T=0) is offered, which IS
+    // conclusive: an ATR without TD1 defines T=0 per ISO 7816-3.
+    if y1 & 0x8 == 0 {
+        return AtrProtocol::Resolved(Protocols::T0);
+    }
+    if index >= len {
+        log::warn!("ATR claims TD1 but ends before it: {}", atr);
+        return AtrProtocol::Indeterminate(Protocols::T0);
+    }
+    let td1 = atr_bytes[index];
+    index += 1;
+
+    // TA2, TB2, TC2 — presence selected by Y2 (the high nibble of TD1).
+    let y2 = td1 >> 4;
+    if !skip_interface_bytes(&mut index, y2, len) {
+        log::warn!("ATR truncated inside its second interface bytes: {}", atr);
+        return AtrProtocol::Indeterminate(Protocols::T0);
     }
 
-    // Default value if have no TD1 and TD2
-    Protocols::T0
+    // TD2 absent → TD1 carries the protocol.
+    if y2 & 0x8 == 0 {
+        return AtrProtocol::Resolved(protocol_from_td(td1));
+    }
+    if index >= len {
+        log::warn!("ATR claims TD2 but ends before it: {}", atr);
+        return AtrProtocol::Indeterminate(Protocols::T0);
+    }
+
+    // TD2 present → it names the preferred protocol.
+    AtrProtocol::Resolved(protocol_from_td(atr_bytes[index]))
 }
 
 // Manual card sync function.
@@ -1128,5 +1182,87 @@ mod tests {
         assert_eq!(protocol_from_str("T2"), None);
         assert_eq!(protocol_from_str("T=0"), None);
         assert_eq!(protocol_from_str("ANY"), None);
+    }
+
+    #[test]
+    fn atr_without_td1_resolves_to_t0() {
+        // TS=3B, T0=0x60 → Y1=0110 (TB1+TC1 present, no TD1). No TD1 means the
+        // card offers only the default protocol, which is conclusive.
+        assert_eq!(
+            parse_atr_and_get_protocol("3B6000FF"),
+            AtrProtocol::Resolved(Protocols::T0)
+        );
+    }
+
+    #[test]
+    fn atr_with_td1_resolves_from_td1() {
+        // TS=3B, T0=0x81 → Y1=1000 (TD1 present), TD1=0x31 → protocol T=1,
+        // Y2=0011 (TA2+TB2 present, no TD2) → TD1 carries the protocol.
+        assert_eq!(
+            parse_atr_and_get_protocol("3B8131AABB"),
+            AtrProtocol::Resolved(Protocols::T1)
+        );
+    }
+
+    #[test]
+    fn atr_with_td2_prefers_td2() {
+        // TD1=0x80 → Y2=1000 (TD2 present, no TA2/TB2/TC2), TD2=0x01 → T=1.
+        // TD2 wins over TD1's own protocol nibble (0 here).
+        assert_eq!(
+            parse_atr_and_get_protocol("3B8180 01".replace(' ', "").as_str()),
+            AtrProtocol::Resolved(Protocols::T1)
+        );
+    }
+
+    #[test]
+    fn truncated_atr_is_indeterminate_not_a_confident_t0() {
+        // Regression: these all used to return a plain Protocols::T0, which
+        // resolve_t_protocol then persisted — pinning the wrong protocol for
+        // good on a card that is actually T=1.
+
+        // Claims TD1 (Y1=1000) but ends right after T0.
+        assert_eq!(
+            parse_atr_and_get_protocol("3B81"),
+            AtrProtocol::Indeterminate(Protocols::T0)
+        );
+        // Claims TA1+TB1+TC1+TD1 but only one interface byte follows.
+        assert_eq!(
+            parse_atr_and_get_protocol("3BFF00"),
+            AtrProtocol::Indeterminate(Protocols::T0)
+        );
+        // TD1 claims TD2 (Y2=1000) but the ATR ends there.
+        assert_eq!(
+            parse_atr_and_get_protocol("3B8180"),
+            AtrProtocol::Indeterminate(Protocols::T0)
+        );
+    }
+
+    #[test]
+    fn absent_or_malformed_atr_is_indeterminate() {
+        // No card in the reader, and non-hex garbage.
+        assert_eq!(
+            parse_atr_and_get_protocol(""),
+            AtrProtocol::Indeterminate(Protocols::T0)
+        );
+        assert_eq!(
+            parse_atr_and_get_protocol("3B"),
+            AtrProtocol::Indeterminate(Protocols::T0)
+        );
+        assert_eq!(
+            parse_atr_and_get_protocol("nothex"),
+            AtrProtocol::Indeterminate(Protocols::T0)
+        );
+    }
+
+    #[test]
+    fn indeterminate_still_offers_a_usable_protocol() {
+        // The connection must still be attempted — T0 is the safe default.
+        let parsed = parse_atr_and_get_protocol("3B81");
+        assert_eq!(parsed.protocol(), Protocols::T0);
+        assert!(!parsed.is_resolved(), "a truncated ATR must not be stored");
+
+        let parsed = parse_atr_and_get_protocol("3B8131AABB");
+        assert_eq!(parsed.protocol(), Protocols::T1);
+        assert!(parsed.is_resolved(), "a complete ATR is safe to store");
     }
 }
