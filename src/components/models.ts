@@ -28,6 +28,12 @@ export interface RackCard {
   iccid?: string | null
   card_number?: string | null
   name?: string | null
+  // Session state of this rack-backed card, mirroring Reader.online /
+  // Reader.authentication: `online` is true once its MQTT session is up,
+  // `authentication` is true while an APDU exchange is actually running.
+  // Both absent for a card the rack reports but TBA does not serve.
+  online?: boolean | null
+  authentication?: boolean | null
 }
 
 // State of the connected card rack, pushed from the backend via `rack-state`.

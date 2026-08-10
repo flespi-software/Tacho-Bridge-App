@@ -136,6 +136,45 @@
   font-size: 13px;
 }
 
+// Scan indicator, shown under the already-reported rack rows while more slots
+// are still arriving. Separated from the rows by a hairline so it reads as
+// "more to come" rather than as another card.
+.rack-scan {
+  padding: 8px 0 4px;
+  font-size: 13px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.body--dark .rack-scan {
+  border-top-color: rgba(255, 255, 255, 0.06);
+}
+
+// Activity blink for a rack card whose APDU exchange is running. The readers
+// block has the same animation, but its <style> is `scoped`, so the rule does
+// not reach this component — hence the shared copy here.
+.rack-cards .blinking-icon {
+  animation: rack-card-blink 1300ms infinite;
+}
+
+@keyframes rack-card-blink {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.37;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+// A card mid-authentication must still be readable without motion.
+@media (prefers-reduced-motion: reduce) {
+  .rack-cards .blinking-icon {
+    animation: none;
+  }
+}
+
 // Rack scan bar: a calmer take on Quasar's indeterminate animation.
 // The default runs two overlapping dashes on a 2.1s cycle with a sharp
 // cubic-bezier — reads as urgent foreground work and is tiring to sit next to.

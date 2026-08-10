@@ -1067,8 +1067,40 @@ fn update_rack_card_ui(slot: u16, iccid: &str, card_number: Option<String>) {
             iccid: Some(iccid.to_string()),
             card_number,
             name,
+            // A freshly discovered card has no session yet; `set_rack_card_state`
+            // fills these in once its MQTT loop connects and starts exchanging.
+            online: None,
+            authentication: None,
         });
         ui.sort_by_key(|c| c.slot);
+        ui.clone()
+    };
+    rack_update_cards(cards);
+}
+
+/// Updates the live session state of one rack card (looked up by the ICCID it
+/// was spawned with) and re-emits the rack state so the UI can show activity.
+///
+/// A no-op when the card is not in the list — it may have been removed from the
+/// rack while its session task was still winding down, and resurrecting a row
+/// for a card that is physically gone would be worse than losing one blink.
+fn set_rack_card_state(iccid: &str, online: Option<bool>, authentication: Option<bool>) {
+    let cards = {
+        let mut ui = match RACK_CARDS_UI.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(card) = ui.iter_mut().find(|c| c.iccid.as_deref() == Some(iccid)) else {
+            return;
+        };
+        // Skip the emit when nothing actually changed: the activity setter is
+        // called on every single request, and re-emitting an identical state
+        // would push a rack-state event per APDU to the webview.
+        if card.online == online && card.authentication == authentication {
+            return;
+        }
+        card.online = online;
+        card.authentication = authentication;
         ui.clone()
     };
     rack_update_cards(cards);
@@ -1282,6 +1314,8 @@ async fn rack_card_mqtt_loop(
                         // new MQTT session: the server-side request_id counter restarts at 1
                         last_request_id = None;
                         last_response_payload = None;
+                        // Session is up: show the card as served and idle.
+                        set_rack_card_state(&iccid, Some(true), Some(false));
                         // rack link report: must be the first publish of the session
                         let report =
                             serde_json::json!({ "iccid": iccid, "slot": slot }).to_string();
@@ -1317,6 +1351,10 @@ async fn rack_card_mqtt_loop(
                             log_header,
                             String::from_utf8_lossy(&publish.payload)
                         );
+                        // Blink for the duration of the exchange: the rack is
+                        // Master/Slave, so a request occupies the card until its
+                        // reply comes back.
+                        set_rack_card_state(&iccid, Some(true), Some(true));
                         handle_serial_request(
                             &mqtt_client,
                             &topic,
@@ -1327,6 +1365,7 @@ async fn rack_card_mqtt_loop(
                             &mut last_response_payload,
                         )
                         .await;
+                        set_rack_card_state(&iccid, Some(true), Some(false));
                     }
                     other => {
                         log::debug!("{} [MQTT] event=other detail={:?}", log_header, other);
@@ -1340,6 +1379,9 @@ async fn rack_card_mqtt_loop(
                     "OFFLINE"
                 };
                 is_online = false;
+                // Connection lost: the card is present in its slot but no
+                // longer served, so it must stop looking active.
+                set_rack_card_state(&iccid, Some(false), Some(false));
                 crate::mqtt::log_connection_failure(
                     &log_header,
                     "MQTT",

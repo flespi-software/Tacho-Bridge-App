@@ -34,33 +34,14 @@
          progress bar: the server sends no total, so there is no honest
          percentage to display (see `scanning` below). -->
     <div class="rack-cards">
-      <div v-if="rack.cards.length === 0" class="rack-cards-empty text-grey-6">
-        <template v-if="!rack.connected">
-          <q-icon name="mdi-card-search-outline" size="xs" class="q-mr-xs" />
-          Rack disconnected
-        </template>
-        <!-- Scan in flight: no card reported yet, and the window has not
-             elapsed. Indeterminate on purpose — a percentage here would be
-             invented, since nothing tells us how many slots are being read. -->
-        <template v-else-if="scanning">
-          <div class="row items-center no-wrap q-mb-xs">
-            <q-spinner size="xs" class="q-mr-xs" />
-            <span>Scanning rack slots…</span>
-          </div>
-          <q-linear-progress
-            indeterminate
-            rounded
-            size="4px"
-            color="primary"
-            class="rack-scan-bar"
-          />
-        </template>
-        <!-- Window elapsed with nothing reported: the rack really is empty.
-             Keeping the bar running here would imply work that has finished. -->
-        <template v-else>
-          <q-icon name="mdi-card-search-outline" size="xs" class="q-mr-xs" />
-          No cards in the rack
-        </template>
+      <!-- Only the two terminal states live here; the scan indicator sits BELOW
+           the card list (see after the v-for), because on a large rack the
+           cards arrive one `connect` at a time and the scan keeps running long
+           after the first one lands. -->
+      <div v-if="rack.cards.length === 0 && !scanning" class="rack-cards-empty text-grey-6">
+        <q-icon name="mdi-card-search-outline" size="xs" class="q-mr-xs" />
+        <template v-if="rack.connected">No cards in the rack</template>
+        <template v-else>Rack disconnected</template>
       </div>
 
       <div
@@ -71,6 +52,10 @@
         <q-chip dense size="sm" color="blue-grey-2" text-color="blue-grey-9" class="text-bold">
           slot {{ card.slot }}
         </q-chip>
+        <!-- Card state, mirroring the icon language of a plain reader row:
+             green while the session is online, blinking during an active APDU
+             exchange, outline when the card is present but not served. -->
+        <q-icon v-bind="rackCardStatus(card)" class="q-ml-xs" />
         <div class="col q-ml-sm">
           <!-- configured card: name + number, like a card in a plain reader -->
           <template v-if="card.card_number">
@@ -97,13 +82,26 @@
           <q-btn size="12px" flat dense round icon="mdi-link" @click="emit('link', card.iccid)" />
         </div>
       </div>
+
+      <!-- Scan still in flight. Deliberately OUTSIDE the "list is empty" branch:
+           a large rack reports its slots one `connect` at a time, so the bar has
+           to survive the arrival of the first card and keep running underneath
+           the rows that are already listed. Indeterminate because the server
+           sends no total — there is no honest percentage to show. -->
+      <div v-if="scanning" class="rack-scan text-grey-6">
+        <div class="row items-center no-wrap q-mb-xs">
+          <q-spinner size="xs" class="q-mr-xs" />
+          <span>Scanning rack slots…</span>
+        </div>
+        <q-linear-progress indeterminate rounded size="4px" color="primary" class="rack-scan-bar" />
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, watch, onUnmounted } from 'vue'
-import type { RackState } from './models'
+import type { RackCard, RackState } from './models'
 
 const props = defineProps<{
   rack: RackState | null
@@ -113,8 +111,16 @@ const emit = defineEmits<{
   (e: 'link', iccid: string): void
 }>()
 
-/** How long a connected rack may stay silent before we call it empty. */
-const SCAN_WINDOW_MS = 12000
+/**
+ * How long the rack may stay silent before we consider the scan finished.
+ *
+ * Generous on purpose: a populated multi-block rack reports its slots one
+ * `connect` at a time and can pause noticeably between blocks, so a tight
+ * window ended the animation while slots were still arriving. The window is
+ * re-armed on every change to the card list, so this only ever bounds the gap
+ * between two reports, never the whole scan.
+ */
+const SCAN_WINDOW_MS = 30000
 
 // True while we still expect `connect` messages for this rack. The server
 // reports discovered cards one at a time and never says "scan finished", so
@@ -141,25 +147,53 @@ function armScanWindow(): void {
 }
 
 // Drive the window off the two things that mean "the rack is still working":
-// a fresh connection, and each newly reported card. Re-arming on every card
-// keeps a slow trickle of `connect` messages from being cut off mid-scan, which
-// a single fixed timeout from connect time would do on a full rack.
+// a fresh connection, and any change to the reported card list. Re-arming on
+// every change keeps a slow trickle of `connect` messages from being cut off
+// mid-scan, which a single fixed timeout from connect time would do on a full
+// rack. The list is fingerprinted by slot+iccid rather than just counted: a
+// slot being reassigned (card swapped) leaves the count identical but still
+// means the rack is actively reporting.
 watch(
-  () => [props.rack?.connected ?? false, props.rack?.cards.length ?? 0] as const,
-  ([connected, cardCount], previous) => {
+  () =>
+    [
+      props.rack?.connected ?? false,
+      (props.rack?.cards ?? []).map((c) => `${c.slot}:${c.iccid ?? ''}`).join(','),
+    ] as const,
+  ([connected, fingerprint], previous) => {
     if (!connected) {
       // Disconnected racks show their own message; no scan is in flight.
       stopScanTimer()
       scanning.value = false
       return
     }
-    const [wasConnected, previousCount] = previous ?? [false, 0]
-    if (!wasConnected || cardCount !== previousCount) {
+    const [wasConnected, previousFingerprint] = previous ?? [false, '']
+    if (!wasConnected || fingerprint !== previousFingerprint) {
       armScanWindow()
     }
   },
   { immediate: true },
 )
+
+/**
+ * Icon spec for one rack card, mirroring `cardConnectedStatus` in the readers
+ * block so both lists speak the same visual language:
+ *   blinking green — an APDU exchange is in progress on this card
+ *   solid green    — session is up and idle
+ *   grey outline   — card present and configured, but no session yet
+ *   orange plus    — card present but not linked to a card number
+ */
+function rackCardStatus(card: RackCard) {
+  if (!card.card_number) {
+    return { name: 'mdi-card-plus-outline', color: 'orange', size: '22px' }
+  }
+  if (card.online && card.authentication) {
+    return { name: 'mdi-smart-card', color: 'green', size: '22px', class: 'blinking-icon' }
+  }
+  if (card.online) {
+    return { name: 'mdi-smart-card', color: 'green', size: '22px' }
+  }
+  return { name: 'mdi-smart-card-outline', color: 'grey', size: '22px' }
+}
 
 // The timer outlives the component otherwise, and would write to a ref that no
 // longer renders anything.

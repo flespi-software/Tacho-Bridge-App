@@ -152,6 +152,13 @@ pub struct RackCard {
     pub iccid: Option<String>,
     pub card_number: Option<String>,
     pub name: Option<String>,
+    /// True once this card's rack-backed MQTT session is connected. `None` for
+    /// a card the rack reports but TBA does not serve (unknown ICCID).
+    pub online: Option<bool>,
+    /// True while an APDU exchange is actually running on this card — drives
+    /// the blinking activity icon, same as `Reader.authentication` does for a
+    /// card in a plain PC/SC reader.
+    pub authentication: Option<bool>,
 }
 
 /// State of the connected card rack, pushed to the frontend. Carries only
