@@ -7,7 +7,7 @@
 //! `logs/<request_id>/done` — either `{"name":...,"size":...,"chunks":...}`
 //! or `{"error":...}` when the slice could not be collected.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -17,7 +17,7 @@ use rumqttc::v5::AsyncClient;
 use serde_json::{json, Value};
 use tauri::async_runtime;
 
-use crate::logger::{log_file_paths, zip_log_entry, LOG_LINE_TS_FORMAT, LOG_LINE_TS_LEN};
+use crate::logger::{log_file_paths, LOG_LINE_TS_FORMAT, LOG_LINE_TS_LEN};
 
 /// Upload chunk size. Large enough to move a multi-megabyte zip in a handful
 /// of publishes, small enough to keep memory and re-send costs sane.
@@ -265,18 +265,25 @@ fn collect_zipped_logs(days: i64, period: &str) -> Result<(String, Vec<u8>), Str
     };
     let archive_needed = first_ts.is_none_or(|ts| ts > cutoff);
 
-    let mut data = Vec::new();
+    // Compress while filtering instead of collecting the whole plaintext slice
+    // first: the uncompressed window can be up to MAX_SLICE_BYTES, and holding
+    // it alongside the finished zip put roughly twice that in RAM at the peak.
+    // Deflating as we go keeps only the zip (log text compresses ~10-20x) plus
+    // one line of scratch.
+    let mut writer = start_zip().map_err(|e| format!("cannot start zip: {}", e))?;
+    let mut written = 0usize;
+
     if archive_needed {
         if let Some(file) = archived_file {
-            filter_log_lines(BufReader::new(file), cutoff, &mut data)
+            written += filter_log_lines(BufReader::new(file), cutoff, &mut writer, written)
                 .map_err(|e| format!("cannot read archived log file: {}", e))?;
         }
     }
     if let Some(file) = current_file {
-        filter_log_lines(BufReader::new(file), cutoff, &mut data)
+        written += filter_log_lines(BufReader::new(file), cutoff, &mut writer, written)
             .map_err(|e| format!("cannot read log file: {}", e))?;
     }
-    if data.is_empty() {
+    if written == 0 {
         return Err(format!("no log entries for the last {} day(s)", days));
     }
 
@@ -285,7 +292,7 @@ fn collect_zipped_logs(days: i64, period: &str) -> Result<(String, Vec<u8>), Str
         Local::now().format("%Y%m%d_%H%M"),
         period
     );
-    let zipped = zip_log(&data).map_err(|e| format!("cannot zip log data: {}", e))?;
+    let zipped = finish_zip(writer).map_err(|e| format!("cannot zip log data: {}", e))?;
     Ok((name, zipped))
 }
 
@@ -310,26 +317,34 @@ fn first_entry_timestamp<R: BufRead>(reader: R) -> std::io::Result<Option<NaiveD
     Ok(None)
 }
 
-fn filter_log_lines<R: BufRead>(
-    reader: R,
+/// Writes the log lines at or after `cutoff` into `out`, returning how many
+/// uncompressed bytes were written. `already_written` carries the running total
+/// across both log generations so the size cap still bounds the whole slice —
+/// the cap counts plaintext, which is what a runaway debug log actually
+/// produces, not the deflated result.
+fn filter_log_lines<W: Write>(
+    reader: impl BufRead,
     cutoff: NaiveDateTime,
-    out: &mut Vec<u8>,
-) -> std::io::Result<()> {
+    out: &mut W,
+    already_written: usize,
+) -> std::io::Result<usize> {
     let mut include = false;
+    let mut written = 0usize;
     for line in reader.lines() {
         let line = line?;
         if let Some(ts) = line_timestamp(&line) {
             include = ts >= cutoff;
         }
         if include {
-            if out.len() + line.len() + 1 > MAX_SLICE_BYTES {
+            if already_written + written + line.len() + 1 > MAX_SLICE_BYTES {
                 return Err(std::io::Error::other("log slice is too big"));
             }
-            out.extend_from_slice(line.as_bytes());
-            out.push(b'\n');
+            out.write_all(line.as_bytes())?;
+            out.write_all(b"\n")?;
+            written += line.len() + 1;
         }
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Parses the timestamp prefix of a log line, None for continuation lines.
@@ -338,13 +353,23 @@ fn line_timestamp(line: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(prefix, LOG_LINE_TS_FORMAT).ok()
 }
 
-/// Packs the collected log slice into a single-entry zip archive.
-fn zip_log(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    Ok(zip_log_entry(
-        &mut std::io::Cursor::new(data),
-        std::io::Cursor::new(Vec::new()),
-    )?
-    .into_inner())
+/// Opens an in-memory single-entry zip and positions it at the `log.txt` entry,
+/// ready to be written line by line. Split from `finish_zip` so the caller can
+/// stream into it instead of handing over a fully-materialised slice — see
+/// `collect_zipped_logs`.
+fn start_zip() -> std::io::Result<zip::ZipWriter<std::io::Cursor<Vec<u8>>>> {
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .start_file("log.txt", options)
+        .map_err(std::io::Error::other)?;
+    Ok(writer)
+}
+
+/// Closes the entry and returns the finished archive bytes.
+fn finish_zip(writer: zip::ZipWriter<std::io::Cursor<Vec<u8>>>) -> std::io::Result<Vec<u8>> {
+    Ok(writer.finish().map_err(std::io::Error::other)?.into_inner())
 }
 
 #[cfg(test)]
@@ -388,7 +413,13 @@ mod tests {
 2026-07-03 10:00:00.000 INFO  [a] newer entry
 ";
         let mut out = Vec::new();
-        filter_log_lines(Cursor::new(log), ts("2026-07-02 00:00:00.000"), &mut out).unwrap();
+        let written =
+            filter_log_lines(Cursor::new(log), ts("2026-07-02 00:00:00.000"), &mut out, 0).unwrap();
+        assert_eq!(
+            written,
+            out.len(),
+            "reported count must match what was written"
+        );
         let out = String::from_utf8(out).unwrap();
         assert!(!out.contains("old entry"));
         assert!(!out.contains("old continuation"));
@@ -401,15 +432,56 @@ mod tests {
     fn filter_drops_leading_continuations_without_timestamp() {
         let log = "orphan continuation\n2026-07-02 10:00:00.000 INFO  [a] entry\n";
         let mut out = Vec::new();
-        filter_log_lines(Cursor::new(log), ts("2026-07-01 00:00:00.000"), &mut out).unwrap();
+        filter_log_lines(Cursor::new(log), ts("2026-07-01 00:00:00.000"), &mut out, 0).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(!out.contains("orphan"));
         assert!(out.contains("entry"));
     }
 
     #[test]
-    fn zip_log_produces_zip_magic() {
-        let zipped = zip_log(b"2026-07-02 10:00:00.000 INFO  [a] entry\n").unwrap();
+    fn streamed_zip_produces_a_readable_archive() {
+        // End-to-end of the streaming path: filter straight into the zip, then
+        // read the entry back out to prove the archive is well-formed and holds
+        // exactly the filtered lines.
+        let log = "\
+2026-07-01 10:00:00.000 INFO  [a] old entry
+2026-07-03 10:00:00.000 INFO  [a] kept entry
+";
+        let mut writer = start_zip().unwrap();
+        let written = filter_log_lines(
+            Cursor::new(log),
+            ts("2026-07-02 00:00:00.000"),
+            &mut writer,
+            0,
+        )
+        .unwrap();
+        assert!(written > 0);
+        let zipped = finish_zip(writer).unwrap();
+
         assert_eq!(&zipped[..4], b"PK\x03\x04");
+
+        let mut archive = zip::ZipArchive::new(Cursor::new(zipped)).expect("valid zip");
+        let mut entry = archive.by_name("log.txt").expect("log.txt entry");
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut content).unwrap();
+        assert!(content.contains("kept entry"));
+        assert!(!content.contains("old entry"));
+        assert_eq!(content.len(), written, "entry must hold every counted byte");
+    }
+
+    #[test]
+    fn slice_cap_counts_across_both_generations() {
+        // The cap bounds the whole slice, not each generation: a second call
+        // carrying the running total must refuse to exceed MAX_SLICE_BYTES.
+        let log = "2026-07-03 10:00:00.000 INFO  [a] entry\n";
+        let mut out = Vec::new();
+        let err = filter_log_lines(
+            Cursor::new(log),
+            ts("2026-07-01 00:00:00.000"),
+            &mut out,
+            MAX_SLICE_BYTES,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("too big"));
     }
 }
