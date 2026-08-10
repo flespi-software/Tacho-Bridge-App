@@ -507,6 +507,12 @@ pub async fn remove_card_from_config(
         remove_connections(vec![card_number.to_string()]).await;
         log::debug!("Removed connection for card {}", card_number);
 
+        // Reader-backed sessions live in TASK_POOL and are covered above; a
+        // rack-backed session for the same number lives in the rack module's
+        // own map and must be closed explicitly, or it keeps running with the
+        // removed card's MQTT client_id.
+        crate::com_port::disconnect_rack_card(card_number);
+
         emit_card_config_event("global-card-config-updated", card_number.to_string(), None);
 
         #[cfg(target_os = "linux")]
@@ -754,19 +760,21 @@ pub fn record_auth_result(card_number: &str, success: bool) {
     }
 }
 
-/// Async-safe variant of `record_auth_result`.
-/// Offloads the blocking config write (disk I/O + sync mutexes) to a dedicated
-/// blocking thread so the caller's tokio worker is not stalled. Use this from
-/// async contexts such as the MQTT eventloop tasks.
-pub async fn record_auth_result_async(card_number: &str, success: bool) {
+/// Fire-and-forget variant of `record_auth_result` for async contexts (the MQTT
+/// eventloop tasks).
+///
+/// Deliberately does NOT await the write. `record_auth_result` takes the global
+/// config lock and fsyncs the file; awaiting it on the card's MQTT task would
+/// park the APDU bridge on disk I/O at the worst possible moment — right
+/// between the VU's `finish` and our reply — and a slow disk (antivirus scan on
+/// Windows, network home directory) would push the server past its command
+/// timeout. The timestamp is UI-only state, so nothing downstream needs it to
+/// have landed before the reply goes out.
+pub fn record_auth_result_detached(card_number: &str, success: bool) {
     let card_number = card_number.to_string();
-    if let Err(e) = tokio::task::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         record_auth_result(&card_number, success);
-    })
-    .await
-    {
-        log::error!("record_auth_result_async: spawn_blocking failed: {:?}", e);
-    }
+    });
 }
 
 /// Retrieves a value from the cache by key.

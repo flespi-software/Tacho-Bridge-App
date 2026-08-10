@@ -136,6 +136,48 @@
   font-size: 13px;
 }
 
+// Rack scan bar: a calmer take on Quasar's indeterminate animation.
+// The default runs two overlapping dashes on a 2.1s cycle with a sharp
+// cubic-bezier — reads as urgent foreground work and is tiring to sit next to.
+// This is a passive background status, so we slow the sweep down, ease it
+// symmetrically, and drop the second dash entirely (`:after`).
+// The animation lives on the inner `__model` element, not on the root the
+// class is applied to — the root only ever carries `q-linear-progress`.
+.rack-scan-bar {
+  opacity: 0.75;
+
+  .q-linear-progress__model--indeterminate {
+    &:before {
+      animation-duration: 3.6s;
+      animation-timing-function: ease-in-out;
+    }
+
+    // The trailing dash is what makes the default feel busy — one travelling
+    // bar is enough to say "working".
+    &:after {
+      animation: none;
+      opacity: 0;
+    }
+  }
+}
+
+// Respect a user's reduced-motion preference: no sweep at all, just a static
+// muted track so the state is still visible without movement.
+@media (prefers-reduced-motion: reduce) {
+  .rack-scan-bar .q-linear-progress__model--indeterminate {
+    &:before {
+      animation: none;
+      transform: none;
+      opacity: 0.5;
+    }
+
+    &:after {
+      animation: none;
+      opacity: 0;
+    }
+  }
+}
+
 .rack-card-row {
   padding: 4px 0;
   border-bottom: 1px solid rgba(0, 0, 0, 0.06);

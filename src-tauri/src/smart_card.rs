@@ -25,7 +25,10 @@ use crate::mqtt::{ensure_connection, remove_connections_all};
 // ───── Constants ─────
 const READERS_BUFFER_SIZE: usize = 2048;
 const MANUAL_SYNC_TIMEOUT_SECS: u64 = 1;
-const SW_TECHNICAL_PROBLEM: &str = "6F00";
+/// Status word substituted when the APDU could not be run against the card at
+/// all. `mqtt.rs` compares against it to keep such a non-reply out of the
+/// idempotency cache.
+pub(crate) const SW_TECHNICAL_PROBLEM: &str = "6F00";
 /// Upper bound for one `get_status_change` wait in the monitor loop. A bounded
 /// wait (instead of an infinite one) lets the loop notice a rescan request
 /// even if the `cancel()` in `request_rescan` raced past a non-blocked monitor.

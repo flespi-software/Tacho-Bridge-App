@@ -1530,6 +1530,64 @@ fn handle_card_disconnect(payload: &[u8], log_header: &str) {
     }
 }
 
+/// Closes the rack-backed session of one card number, if the rack currently
+/// serves it. Called when the card is removed from the config: `TASK_POOL` only
+/// holds reader-backed sessions, so without this the rack session would keep
+/// running with the removed card's MQTT client_id — leaking the task until the
+/// rack is unplugged, and colliding with the server's ident check if the same
+/// number is re-added later.
+///
+/// The card stays physically in its slot, so it is kept in the rack UI with its
+/// number cleared: it reappears as an unknown card, ready to be assigned again
+/// (which is what `connect_pending_rack_cards` then retries).
+pub fn disconnect_rack_card(card_number: &str) {
+    // Sessions are keyed by ICCID (stable across config edits), so the lookup
+    // is by the number captured at spawn time.
+    let aborted: Vec<String> = {
+        let mut tasks = match RACK_CARD_TASKS.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let matching: Vec<String> = tasks
+            .iter()
+            .filter(|(_, (number, _, _))| number == card_number)
+            .map(|(iccid, _)| iccid.clone())
+            .collect();
+        for iccid in &matching {
+            if let Some((number, slot, handle)) = tasks.remove(iccid) {
+                handle.abort();
+                log::info!(
+                    "RACK | [SPAWN] card={} slot={} status=aborted reason=card_removed_from_config",
+                    number,
+                    slot
+                );
+            }
+        }
+        matching
+    };
+
+    if aborted.is_empty() {
+        return;
+    }
+
+    // Keep the card visible in the rack section, but unassigned — the physical
+    // card did not move, only its config entry is gone.
+    let cards = {
+        let mut ui = match RACK_CARDS_UI.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for card in ui.iter_mut() {
+            if card.card_number.as_deref() == Some(card_number) {
+                card.card_number = None;
+                card.name = None;
+            }
+        }
+        ui.clone()
+    };
+    rack_update_cards(cards);
+}
+
 /// Aborts all rack-backed card sessions and clears the UI card list. Called when the rack
 /// disconnects or its MQTT/serial stack is restarted — without the rack there is no transport.
 fn stop_rack_cards() {

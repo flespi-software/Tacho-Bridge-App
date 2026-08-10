@@ -26,7 +26,7 @@ use crate::config::split_host_to_parts; // Function to split the host into parts
 use crate::config::CacheSection; // Enum for cache sections for getting data from cache.
 use crate::global_app_handle::card_emit_event; // Sends events to the frontend via global app handle.
 use crate::smart_card::ProcessingCard;
-use crate::smart_card::{ManagedCard, TASK_POOL}; // Managed card object and global task pool for MQTT handling.
+use crate::smart_card::{ManagedCard, SW_TECHNICAL_PROBLEM, TASK_POOL}; // Managed card object, global task pool, and the "card unreachable" status word.
 
 /// Initial delay (in seconds) before the first reconnect attempt after a
 /// connection failure. Subsequent failures back off exponentially up to
@@ -448,6 +448,11 @@ pub async fn ensure_connection(
                                     log::debug!("Parsed JSON payload: {:?}", json_payload);
 
                                     let mut payload_ack = String::new();
+                                    // Set when the card exchange itself failed (send_apdu could
+                                    // not reach the card and substituted SW_TECHNICAL_PROBLEM).
+                                    // Such a reply must never be cached for idempotency — see
+                                    // the caching block below.
+                                    let mut exchange_failed = false;
 
                                     // Server-requested T protocol for this session. Applied only on session
                                     // start (empty payload) below: switching is a physical card reset, so
@@ -493,12 +498,13 @@ pub async fn ensure_connection(
                                                 log_header
                                             );
 
-                                            // Persist successful auth timestamp (offloaded to blocking thread).
-                                            crate::config::record_auth_result_async(
+                                            // Persist successful auth timestamp (detached: the
+                                            // config write must not park the bridge on disk I/O
+                                            // between `finish` and our reply).
+                                            crate::config::record_auth_result_detached(
                                                 &client_id_cloned,
                                                 true,
-                                            )
-                                            .await;
+                                            );
 
                                             // Reset the card to its original state
                                             managed_card.reconnect().await;
@@ -535,12 +541,12 @@ pub async fn ensure_connection(
                                                             "{} Empty payload received while auth in progress. Reconnecting card.",
                                                             log_header
                                                         );
-                                                        // Persist failed auth timestamp (aborted mid-flow, offloaded to blocking thread).
-                                                        crate::config::record_auth_result_async(
+                                                        // Persist failed auth timestamp (aborted
+                                                        // mid-flow; detached, same reason as above).
+                                                        crate::config::record_auth_result_detached(
                                                             &client_id_cloned,
                                                             false,
-                                                        )
-                                                        .await;
+                                                        );
                                                         // Reset the card to its original state
                                                         managed_card.reconnect().await;
                                                     }
@@ -599,6 +605,7 @@ pub async fn ensure_connection(
                                                     let rapdu = managed_card
                                                         .send_apdu(hex_value, &client_id_cloned)
                                                         .await;
+                                                    exchange_failed = rapdu == SW_TECHNICAL_PROBLEM;
 
                                                     // Passive sniffer: extract plaintext EF data from SM'd responses
                                                     crate::apdu_sniffer::sniff(
@@ -649,11 +656,20 @@ pub async fn ensure_connection(
 
                                         // Cache this reply so a re-sent request with the same id is
                                         // answered from cache without re-running the card exchange.
-                                        // Only real card replies are cached: a malformed request
-                                        // leaves payload_ack empty, and pinning that against the id
-                                        // would answer the server's corrected retry from cache
-                                        // without ever touching the card.
-                                        if req_id.is_some() && !payload_ack.is_empty() {
+                                        // Only real card replies are cached:
+                                        //  * a malformed request leaves payload_ack empty, and
+                                        //    pinning that against the id would answer the server's
+                                        //    corrected retry from cache without touching the card;
+                                        //  * a failed exchange (SW_TECHNICAL_PROBLEM, the card was
+                                        //    never reached) must be retried on the card when the
+                                        //    server re-sends — caching it would pin the failure to
+                                        //    the id and deny the retry that the recreate path just
+                                        //    made possible. Same rule the rack path applies via
+                                        //    SerialExchange::is_ok().
+                                        if req_id.is_some()
+                                            && !payload_ack.is_empty()
+                                            && !exchange_failed
+                                        {
                                             last_request_id = req_id;
                                             last_response_payload = Some(payload_ack.clone());
                                         }
