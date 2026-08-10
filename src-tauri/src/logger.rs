@@ -4,16 +4,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
-use tauri::async_runtime;
-
 use crate::global_app_handle::emit_notification_event;
 use crate::global_app_handle::NotificationPayload;
-
-#[derive(Deserialize, Debug)]
-struct Release {
-    tag_name: String,
-}
 
 /// Rotate when the log grows to this size. Rotation happens at runtime (the
 /// app is a server-style solution and can run for months without a restart):
@@ -470,12 +462,12 @@ pub fn setup_logging() {
         level_spec
     );
 
-    // Check for the latest version asynchronously
-    async_runtime::spawn(async {
-        if let Err(e) = check_latest_version().await {
-            log::error!("Error checking latest version: {}", e);
-        }
-    });
+    // NOTE: the update check lives in `updater.rs` (tauri-plugin-updater), which
+    // runs at startup from lib.rs and understands pre-release versions. The
+    // hand-rolled GitHub-API check that used to run here was removed: its
+    // numeric comparison dropped the channel suffix, so `0.8.0-beta.8` collapsed
+    // to `8` and every beta build reported itself as outdated against any
+    // stable release — a false "new version available" popup on each launch.
 
     // Log system information
     log_system_info();
@@ -502,72 +494,6 @@ fn log_system_info() {
         cpu_speed,
         mem_info
     );
-}
-
-async fn check_latest_version() -> Result<(), reqwest::Error> {
-    let url = "https://api.github.com/repos/flespi-software/Tacho-Bridge-App/releases/latest";
-    let client = reqwest::Client::new();
-    let response = client
-        .get(url)
-        .header("User-Agent", "reqwest")
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        let release: Release = response.json().await?;
-        // log::info!("Latest release info: {:?}", release);
-
-        let latest_version = release.tag_name;
-        let current_version = env!("CARGO_PKG_VERSION");
-
-        let latest_version_num = version_to_number(&latest_version);
-        let current_version_num = version_to_number(current_version);
-
-        if current_version_num > latest_version_num {
-            log::info!(
-                "Version (current: {}, latest: {})",
-                current_version,
-                latest_version
-            );
-        } else if current_version_num < latest_version_num {
-            log::info!(
-                "Version (current: {}, latest: {}). New one is available, use the link to download: {}",
-                current_version,
-                latest_version,
-                url
-            );
-
-            let payload = NotificationPayload {
-                notification_type: "version".to_string(),
-                message: format!(
-                    "New version {} is available, use the link to download: {}",
-                    latest_version, url
-                ),
-            };
-            emit_notification_event("global-notification", payload);
-        } else {
-            log::info!(
-                "Version (current: {}, latest: {}). You are using the latest version.",
-                current_version,
-                latest_version
-            );
-        }
-    } else {
-        log::warn!(
-            "Version. Failed to fetch the latest release info: {}",
-            response.status()
-        );
-    }
-
-    Ok(())
-}
-
-fn version_to_number(version: &str) -> u32 {
-    version
-        .trim_start_matches('v')
-        .split('.')
-        .filter_map(|s| s.parse::<u32>().ok())
-        .fold(0, |acc, num| acc * 100 + num)
 }
 
 #[cfg(test)]
@@ -693,26 +619,5 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn version_to_number_strips_v_prefix_and_packs_components() {
-        // 0.7.2 → 0*10000 + 7*100 + 2 = 702
-        assert_eq!(version_to_number("0.7.2"), 702);
-        assert_eq!(version_to_number("v0.7.2"), 702);
-        assert_eq!(version_to_number("1.0.0"), 10000);
-    }
-
-    #[test]
-    fn version_to_number_orders_versions_correctly() {
-        assert!(version_to_number("v0.7.3") > version_to_number("v0.7.2"));
-        assert!(version_to_number("v0.8.0") > version_to_number("v0.7.99"));
-        assert!(version_to_number("v1.0.0") > version_to_number("v0.99.99"));
-    }
-
-    #[test]
-    fn version_to_number_handles_garbage_components() {
-        // Non-numeric chunks are skipped silently.
-        assert_eq!(version_to_number("v1.x.3"), 103);
     }
 }

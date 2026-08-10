@@ -406,7 +406,15 @@ impl ChangeGuard {
 
     /// Store `value` and report whether it differs from the previous one.
     fn changed(&self, value: &str) -> bool {
-        let mut last = self.0.lock().unwrap();
+        // Poison-recovering like every other lock in the backend: this guard is
+        // touched from the discovery loop on the blocking pool, and a panic in
+        // any holder would otherwise poison it permanently — killing rack
+        // discovery for the rest of the process. The stored value is a plain
+        // String replaced in one assignment, so it is never half-updated.
+        let mut last = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if *last == value {
             false
         } else {
@@ -417,7 +425,11 @@ impl ChangeGuard {
 
     /// Forget the stored value so the next `changed` reports true again.
     fn reset(&self) {
-        self.0.lock().unwrap().clear();
+        let mut last = match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        last.clear();
     }
 }
 
