@@ -1088,6 +1088,61 @@ fn update_rack_card_ui(slot: u16, iccid: &str, card_number: Option<String>) {
     rack_update_cards(cards);
 }
 
+/// How long a card keeps its "authenticating" mark after its last exchange.
+///
+/// The rack envelope is opaque — unlike the PC/SC path there is no `finish`
+/// flag telling us an authentication ended — so the end of a session can only
+/// be inferred from the traffic stopping. This must comfortably exceed the gap
+/// between two commands of one authentication, otherwise the mark drops between
+/// them and the activity icon restarts its animation on every command.
+const RACK_AUTH_IDLE_HOLD: Duration = Duration::from_secs(3);
+
+/// Marks a card as actively authenticating and (re)arms the idle timer that
+/// clears the mark once its traffic stops.
+///
+/// Deliberately does NOT clear the flag between commands: an authentication is
+/// a burst of many exchanges, and toggling the flag per command made the icon
+/// re-mount and restart its CSS animation each time, which reads as jitter. The
+/// mark goes up on the first command and stays up until the burst ends.
+fn touch_rack_card_activity(iccid: &str) {
+    set_rack_card_state(iccid, Some(true), Some(true));
+
+    let iccid = iccid.to_string();
+    let mut guard = match RACK_AUTH_TIMERS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Replacing the handle aborts the previous countdown, so the hold window is
+    // measured from the most recent command rather than the first one.
+    if let Some(previous) = guard.insert(
+        iccid.clone(),
+        async_runtime::spawn(async move {
+            tokio::time::sleep(RACK_AUTH_IDLE_HOLD).await;
+            set_rack_card_state(&iccid, Some(true), Some(false));
+            let mut guard = match RACK_AUTH_TIMERS.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.remove(&iccid);
+        }),
+    ) {
+        previous.abort();
+    }
+}
+
+/// Cancels a card's pending "authentication finished" timer, so a session that
+/// ends for another reason (disconnect, card removed) does not get its flag
+/// flipped later by a timer that outlived it.
+fn cancel_rack_auth_timer(iccid: &str) {
+    let mut guard = match RACK_AUTH_TIMERS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(handle) = guard.remove(iccid) {
+        handle.abort();
+    }
+}
+
 /// Updates the live session state of one rack card (looked up by the ICCID it
 /// was spawned with) and re-emits the rack state so the UI can show activity.
 ///
@@ -1135,6 +1190,13 @@ lazy_static::lazy_static! {
 
     /// Cards currently exposed by the rack, as shown in the UI (RackState.cards).
     static ref RACK_CARDS_UI: std::sync::Mutex<Vec<RackCard>> = std::sync::Mutex::new(Vec::new());
+
+    /// Pending "authentication finished" timers, keyed by card ICCID. Each one
+    /// clears the card's activity mark once its traffic has been quiet for
+    /// `RACK_AUTH_IDLE_HOLD`; a new command replaces (and aborts) the previous
+    /// timer so the mark spans the whole burst instead of one command.
+    static ref RACK_AUTH_TIMERS: std::sync::Mutex<std::collections::HashMap<String, JoinHandle<()>>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
 }
 
 /// Opens rack-backed sessions for discovered cards that became resolvable after
@@ -1361,10 +1423,12 @@ async fn rack_card_mqtt_loop(
                             log_header,
                             String::from_utf8_lossy(&publish.payload)
                         );
-                        // Blink for the duration of the exchange: the rack is
-                        // Master/Slave, so a request occupies the card until its
-                        // reply comes back.
-                        set_rack_card_state(&iccid, Some(true), Some(true));
+                        // Mark the card active and let the idle timer clear it
+                        // once the burst ends. Clearing it right after this one
+                        // exchange would restart the icon animation on every
+                        // command, which looks like jitter during the rapid
+                        // command sequence of an authentication.
+                        touch_rack_card_activity(&iccid);
                         handle_serial_request(
                             &mqtt_client,
                             &topic,
@@ -1375,7 +1439,6 @@ async fn rack_card_mqtt_loop(
                             &mut last_response_payload,
                         )
                         .await;
-                        set_rack_card_state(&iccid, Some(true), Some(false));
                     }
                     other => {
                         log::debug!("{} [MQTT] event=other detail={:?}", log_header, other);
@@ -1390,7 +1453,10 @@ async fn rack_card_mqtt_loop(
                 };
                 is_online = false;
                 // Connection lost: the card is present in its slot but no
-                // longer served, so it must stop looking active.
+                // longer served, so it must stop looking active. Drop the idle
+                // timer too — it would otherwise fire later and mark a card
+                // "online, idle" on a connection that is already down.
+                cancel_rack_auth_timer(&iccid);
                 set_rack_card_state(&iccid, Some(false), Some(false));
                 crate::mqtt::log_connection_failure(
                     &log_header,
@@ -1586,6 +1652,9 @@ fn handle_card_disconnect(payload: &[u8], log_header: &str) {
     };
     if let Some((card_number, _slot, handle)) = tasks.remove(iccid) {
         handle.abort();
+        // The card's row is gone from the UI; its pending activity timer must
+        // not outlive it (it would fire into an empty list, and leak an entry).
+        cancel_rack_auth_timer(iccid);
         log::info!(
             "{} [SPAWN] card={} status=aborted reason=card_removed",
             log_header,
@@ -1659,8 +1728,10 @@ fn stop_rack_cards() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    for (_iccid, (card_number, _slot, handle)) in tasks.drain() {
+    for (iccid, (card_number, _slot, handle)) in tasks.drain() {
         handle.abort();
+        // Same reasoning as the single-card path: no session, no timer.
+        cancel_rack_auth_timer(&iccid);
         log::info!(
             "RACK | [SPAWN] card={} status=aborted reason=rack_gone",
             card_number
