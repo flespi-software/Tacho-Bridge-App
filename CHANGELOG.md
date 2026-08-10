@@ -333,3 +333,16 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Reduced memory use when uploading logs to the server: the log slice is now compressed as it is read instead of being held in memory in full beforehand.
+
+### [0.8.0-beta.10] - 2026-08-10
+
+🛠 Fixes
+
+- Fixed the rack scan indicator disappearing as soon as the first card was found instead of running until the whole rack is listed, and added a live activity indicator to every card in a rack slot.
+- Fixed the rack scan indicator staying on screen after all cards were listed: the application now ends it when the server reports the rack scan as finished, instead of waiting out a fixed timeout.
+- Fixed the card activity indicator flickering during authentication: the icon now blinks steadily from the start of the exchange until it ends, instead of restarting its animation on every command.
+- Fixed the card activity indicator misreading pauses during authentication as its end: the application now takes the start and end of an authentication from the server instead of guessing from the traffic, so the icon blinks steadily through the wait while the tracker responds.
+
+🆕 Features / Improvements
+
+- Updated frontend dependencies to close known security advisories, including a prototype pollution issue in the UI framework.
