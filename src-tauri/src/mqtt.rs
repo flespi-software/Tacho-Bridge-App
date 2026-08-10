@@ -159,7 +159,8 @@ pub(crate) fn log_connection_failure(
 /// Rewrites a `request/...` topic to its matching `response/...` topic.
 /// Replaces only the leading segment so substrings deeper in the topic
 /// (in client_id, parcel id, etc.) cannot be accidentally mangled.
-fn request_to_response_topic(topic: &str) -> String {
+/// Shared with the rack path in `com_port.rs` — one wire contract, one parser.
+pub(crate) fn request_to_response_topic(topic: &str) -> String {
     if let Some(rest) = topic.strip_prefix("request/") {
         format!("response/{}", rest)
     } else {

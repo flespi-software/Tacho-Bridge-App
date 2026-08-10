@@ -131,21 +131,9 @@
 </template>
 
 <style scoped>
-.blinking-icon {
-  animation: blink 1300ms infinite;
-}
-
-@keyframes blink {
-  0% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.37;
-  }
-  100% {
-    opacity: 1;
-  }
-}
+/* `.blinking-icon` and its @keyframes live in src/css/app.scss: the rack list
+   needs the same animation, and a scoped copy cannot be shared (Vue rewrites
+   keyframe names per component). */
 .toolbar-block {
   margin-bottom: 8px;
 }
@@ -170,7 +158,13 @@
 import SmartCardList from './SmartCardList.vue'
 import RackList from './RackList.vue'
 import type { SmartCard, Reader, RackState } from './models'
-import { formatStructureVersion, formatExpire, isExpired, formatAuthDate } from './cardFormatters'
+import {
+  formatStructureVersion,
+  formatExpire,
+  isExpired,
+  formatAuthDate,
+  cardStatusIcon,
+} from './cardFormatters'
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, emit, type UnlistenFn } from '@tauri-apps/api/event'
@@ -329,53 +323,15 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
   }
 }
 
-// Function to change the color of the icon depending on the card status
-const cardConnectedStatus = (reader: Reader) => {
-  if (reader.iccid && reader.online) {
-    // If the card is connected and online
-
-    if (reader.authentication) {
-      // If the card is in the authentication process
-      return {
-        name: 'mdi-smart-card',
-        color: 'green',
-        size: '25px',
-        class: 'blinking-icon',
-      }
-    } else {
-      // If the card is not in the authentication process
-      return {
-        name: 'mdi-smart-card',
-        color: 'green',
-        size: '25px',
-      }
-    }
-  } else if (reader.iccid) {
-    // If the card is connected to the app but not online
-    if (reader.card_number) {
-      // Known card
-      return {
-        name: 'mdi-smart-card-outline',
-        color: 'grey',
-        size: '25px',
-      }
-    } else {
-      // unknown card
-      return {
-        name: 'mdi-card-plus-outline',
-        color: 'orange',
-        size: '25px',
-      }
-    }
-  } else {
-    // If the card is disconnected
-    return {
-      name: 'mdi-smart-card-off-outline',
-      color: 'grey',
-      size: '25px',
-    }
-  }
-}
+// Status icon for a card in a reader, from the shared vocabulary the rack list
+// uses too. `iccid` present means a card is physically in the reader.
+const cardConnectedStatus = (reader: Reader) =>
+  cardStatusIcon({
+    present: !!reader.iccid,
+    linked: !!reader.card_number,
+    online: reader.online,
+    authentication: reader.authentication,
+  })
 
 // SmartCardList handlers
 function linkMode(iccid: string) {

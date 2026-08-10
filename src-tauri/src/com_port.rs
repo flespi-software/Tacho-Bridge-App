@@ -38,6 +38,7 @@ use crate::global_app_handle::{
     emit_notification_event, rack_emit_event, rack_update_cards, NotificationPayload, RackCard,
     RackState,
 };
+use crate::mqtt::{request_id_from_topic, request_to_response_topic};
 use crate::smart_card::TASK_POOL;
 
 /// The open serial port to the rack, shared between the monitor (which opens it)
@@ -972,26 +973,22 @@ async fn handle_serial_request(
     let exchange = match parsed {
         Ok(envelope) => {
             // Authentication boundaries come from the server's `finish` flag —
-            // the same contract the PC/SC path uses. This replaces guessing the
-            // end of a session from the traffic going quiet, which misfired on
-            // the long pause while the tracker thinks after the ATR read.
+            // the same contract the PC/SC path uses (see `auth_process` in
+            // mqtt.rs). Nothing is inferred from the traffic itself: the pause
+            // while the tracker thinks after the ATR read is indistinguishable
+            // from the end of a session, so guessing got it wrong either way.
+            //
+            // Every other way a session can end already clears the state at its
+            // own site — connection lost, card pulled from the slot, rack
+            // unplugged — so this needs no timeout of its own.
             if let Some(iccid) = card_iccid {
-                match envelope.finish {
-                    // Session over: stop the activity indicator now, whatever
-                    // the idle timer was about to do.
-                    Some(true) => {
-                        cancel_rack_auth_timer(iccid);
-                        set_rack_card_state(iccid, Some(true), Some(false));
-                        log::info!("{} [MQTT] status=auth_finished", log_header);
-                    }
-                    // A command of an ongoing session: hold the indicator lit.
-                    // The idle timer is still armed as a backstop in case the
-                    // closing `finish: true` never arrives (dropped connection,
-                    // aborted session), so the icon cannot blink forever.
-                    Some(false) => touch_rack_card_activity(iccid),
-                    // Older server that does not send the flag: fall back to the
-                    // pure idle-timeout behaviour.
-                    None => touch_rack_card_activity(iccid),
+                if envelope.finish == Some(true) {
+                    set_rack_card_state(iccid, true, false);
+                    log::info!("{} [MQTT] status=auth_finished", log_header);
+                } else {
+                    // `finish: false`, or a server that omits the flag: either
+                    // way a command is in flight, so the card is busy.
+                    set_rack_card_state(iccid, true, true);
                 }
             }
 
@@ -1150,73 +1147,13 @@ fn update_rack_card_ui(slot: u16, iccid: &str, card_number: Option<String>) {
     rack_update_cards(cards);
 }
 
-/// Backstop only: how long a card keeps its "authenticating" mark with no
-/// traffic at all.
-///
-/// The authoritative end-of-session signal is the server's `finish: true`
-/// envelope. This timer exists purely so the indicator cannot blink forever if
-/// that message never arrives — a dropped connection, an aborted session, or a
-/// server version that does not send the flag.
-///
-/// Generous on purpose: the server reads the ATR, hands it to the tracker, and
-/// then the line goes quiet while the tracker thinks. That pause is part of one
-/// authentication, and a short window would end the blink in the middle of it —
-/// exactly the flicker this replaced.
-const RACK_AUTH_IDLE_HOLD: Duration = Duration::from_secs(120);
-
-/// Marks a card as actively authenticating and (re)arms the idle timer that
-/// clears the mark once its traffic stops.
-///
-/// Deliberately does NOT clear the flag between commands: an authentication is
-/// a burst of many exchanges, and toggling the flag per command made the icon
-/// re-mount and restart its CSS animation each time, which reads as jitter. The
-/// mark goes up on the first command and stays up until the burst ends.
-fn touch_rack_card_activity(iccid: &str) {
-    set_rack_card_state(iccid, Some(true), Some(true));
-
-    let iccid = iccid.to_string();
-    let mut guard = match RACK_AUTH_TIMERS.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    // Replacing the handle aborts the previous countdown, so the hold window is
-    // measured from the most recent command rather than the first one.
-    if let Some(previous) = guard.insert(
-        iccid.clone(),
-        async_runtime::spawn(async move {
-            tokio::time::sleep(RACK_AUTH_IDLE_HOLD).await;
-            set_rack_card_state(&iccid, Some(true), Some(false));
-            let mut guard = match RACK_AUTH_TIMERS.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.remove(&iccid);
-        }),
-    ) {
-        previous.abort();
-    }
-}
-
-/// Cancels a card's pending "authentication finished" timer, so a session that
-/// ends for another reason (disconnect, card removed) does not get its flag
-/// flipped later by a timer that outlived it.
-fn cancel_rack_auth_timer(iccid: &str) {
-    let mut guard = match RACK_AUTH_TIMERS.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if let Some(handle) = guard.remove(iccid) {
-        handle.abort();
-    }
-}
-
 /// Updates the live session state of one rack card (looked up by the ICCID it
 /// was spawned with) and re-emits the rack state so the UI can show activity.
 ///
 /// A no-op when the card is not in the list — it may have been removed from the
 /// rack while its session task was still winding down, and resurrecting a row
 /// for a card that is physically gone would be worse than losing one blink.
-fn set_rack_card_state(iccid: &str, online: Option<bool>, authentication: Option<bool>) {
+fn set_rack_card_state(iccid: &str, online: bool, authentication: bool) {
     let cards = {
         let mut ui = match RACK_CARDS_UI.lock() {
             Ok(g) => g,
@@ -1226,13 +1163,15 @@ fn set_rack_card_state(iccid: &str, online: Option<bool>, authentication: Option
             return;
         };
         // Skip the emit when nothing actually changed: the activity setter is
-        // called on every single request, and re-emitting an identical state
-        // would push a rack-state event per APDU to the webview.
-        if card.online == online && card.authentication == authentication {
+        // called on every request of an authentication burst, and re-emitting an
+        // identical state would push a rack-state event per APDU to the webview.
+        // This early return is what keeps the indicator steady through a burst —
+        // the icon is never re-rendered, so its animation never restarts.
+        if card.online == Some(online) && card.authentication == Some(authentication) {
             return;
         }
-        card.online = online;
-        card.authentication = authentication;
+        card.online = Some(online);
+        card.authentication = Some(authentication);
         ui.clone()
     };
     rack_update_cards(cards);
@@ -1257,13 +1196,6 @@ lazy_static::lazy_static! {
 
     /// Cards currently exposed by the rack, as shown in the UI (RackState.cards).
     static ref RACK_CARDS_UI: std::sync::Mutex<Vec<RackCard>> = std::sync::Mutex::new(Vec::new());
-
-    /// Pending "authentication finished" timers, keyed by card ICCID. Each one
-    /// clears the card's activity mark once its traffic has been quiet for
-    /// `RACK_AUTH_IDLE_HOLD`; a new command replaces (and aborts) the previous
-    /// timer so the mark spans the whole burst instead of one command.
-    static ref RACK_AUTH_TIMERS: std::sync::Mutex<std::collections::HashMap<String, JoinHandle<()>>> =
-        std::sync::Mutex::new(std::collections::HashMap::new());
 }
 
 /// Opens rack-backed sessions for discovered cards that became resolvable after
@@ -1452,7 +1384,7 @@ async fn rack_card_mqtt_loop(
                         // new MQTT session: the server-side request_id counter restarts at 1
                         idempotency.reset();
                         // Session is up: show the card as served and idle.
-                        set_rack_card_state(&iccid, Some(true), Some(false));
+                        set_rack_card_state(&iccid, true, false);
                         // rack link report: must be the first publish of the session
                         let report =
                             serde_json::json!({ "iccid": iccid, "slot": slot }).to_string();
@@ -1515,11 +1447,8 @@ async fn rack_card_mqtt_loop(
                 };
                 is_online = false;
                 // Connection lost: the card is present in its slot but no
-                // longer served, so it must stop looking active. Drop the idle
-                // timer too — it would otherwise fire later and mark a card
-                // "online, idle" on a connection that is already down.
-                cancel_rack_auth_timer(&iccid);
-                set_rack_card_state(&iccid, Some(false), Some(false));
+                // longer served, so it must stop looking active.
+                set_rack_card_state(&iccid, false, false);
                 crate::mqtt::log_connection_failure(
                     &log_header,
                     "MQTT",
@@ -1716,9 +1645,6 @@ fn handle_card_disconnect(payload: &[u8], log_header: &str) {
     };
     if let Some((card_number, _slot, handle)) = tasks.remove(iccid) {
         handle.abort();
-        // The card's row is gone from the UI; its pending activity timer must
-        // not outlive it (it would fire into an empty list, and leak an entry).
-        cancel_rack_auth_timer(iccid);
         log::info!(
             "{} [SPAWN] card={} status=aborted reason=card_removed",
             log_header,
@@ -1792,10 +1718,8 @@ fn stop_rack_cards() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    for (iccid, (card_number, _slot, handle)) in tasks.drain() {
+    for (_iccid, (card_number, _slot, handle)) in tasks.drain() {
         handle.abort();
-        // Same reasoning as the single-card path: no session, no timer.
-        cancel_rack_auth_timer(&iccid);
         log::info!(
             "RACK | [SPAWN] card={} status=aborted reason=rack_gone",
             card_number
@@ -1809,25 +1733,6 @@ fn stop_rack_cards() {
         ui.clear();
         rack_update_cards(Vec::new());
     }
-}
-
-/// Rewrites a leading `request/` topic segment to `response/` for replies.
-/// Returns the topic unchanged if it has no `request/` prefix.
-fn request_to_response_topic(topic: &str) -> String {
-    match topic.strip_prefix("request/") {
-        Some(rest) => format!("response/{}", rest),
-        None => topic.to_string(),
-    }
-}
-
-/// Extracts the request id (first segment after `request/`) from a topic of the
-/// form `request/<id>/<sender>`. Used for idempotent handling of repeated requests:
-/// the server re-sends the same id when it does not get a timely reply.
-fn request_id_from_topic(topic: &str) -> Option<u64> {
-    topic
-        .strip_prefix("request/")
-        .and_then(|rest| rest.split('/').next())
-        .and_then(|id| id.parse::<u64>().ok())
 }
 
 /// Bytes sitting in the driver's input buffer right now, taken without waiting.
@@ -2535,26 +2440,6 @@ mod tests {
         assert_eq!(windows_id, macos_id);
         assert_eq!(windows_id, "LISLE00000SC1799");
         assert!(matches_server_contract(&windows_id));
-    }
-
-    #[test]
-    fn response_topic_swaps_request_prefix_only() {
-        assert_eq!(request_to_response_topic("request/0"), "response/0");
-        assert_eq!(request_to_response_topic("request/1/ABC"), "response/1/ABC");
-        // No request/ prefix → unchanged.
-        assert_eq!(request_to_response_topic("status/x"), "status/x");
-    }
-
-    #[test]
-    fn request_id_from_topic_parses_first_segment_only() {
-        assert_eq!(
-            request_id_from_topic("request/42/RACK0000000000AB"),
-            Some(42)
-        );
-        assert_eq!(request_id_from_topic("request/0"), Some(0));
-        // Non-numeric id or wrong prefix → None.
-        assert_eq!(request_id_from_topic("request/abc/X"), None);
-        assert_eq!(request_id_from_topic("status/1/X"), None);
     }
 
     // The server contract: client_id must match ^[0-9A-Z]{16}$.

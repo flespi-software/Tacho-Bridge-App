@@ -149,14 +149,15 @@
   border-top-color: rgba(255, 255, 255, 0.06);
 }
 
-// Activity blink for a rack card whose APDU exchange is running. The readers
-// block has the same animation, but its <style> is `scoped`, so the rule does
-// not reach this component — hence the shared copy here.
-.rack-cards .blinking-icon {
-  animation: rack-card-blink 1300ms infinite;
+// Activity blink for a card mid-authentication, shared by the readers list and
+// the rack list. Global on purpose: a `<style scoped>` block cannot serve both,
+// because Vue rewrites @keyframes names per component (`blink` becomes
+// `blink-<hash>`), so a scoped copy is invisible to every other component.
+.blinking-icon {
+  animation: blink 1300ms infinite;
 }
 
-@keyframes rack-card-blink {
+@keyframes blink {
   0% {
     opacity: 1;
   }
@@ -170,7 +171,7 @@
 
 // A card mid-authentication must still be readable without motion.
 @media (prefers-reduced-motion: reduce) {
-  .rack-cards .blinking-icon {
+  .blinking-icon {
     animation: none;
   }
 }

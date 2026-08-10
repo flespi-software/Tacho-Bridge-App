@@ -35,9 +35,9 @@
          percentage to display (see `scanning` below). -->
     <div class="rack-cards">
       <!-- Only the two terminal states live here; the scan indicator sits BELOW
-           the card list (see after the v-for), because on a large rack the
-           cards arrive one `connect` at a time and the scan keeps running long
-           after the first one lands. -->
+           the card list (see after the v-for), because the rack reports its
+           slots one `connect` at a time and the scan keeps running long after
+           the first card lands. -->
       <div v-if="rack.cards.length === 0 && !scanning" class="rack-cards-empty text-grey-6">
         <q-icon name="mdi-card-search-outline" size="xs" class="q-mr-xs" />
         <template v-if="rack.connected">No cards in the rack</template>
@@ -100,8 +100,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onUnmounted } from 'vue'
+import { computed } from 'vue'
 import type { RackCard, RackState } from './models'
+import { cardStatusIcon } from './cardFormatters'
 
 const props = defineProps<{
   rack: RackState | null
@@ -112,102 +113,37 @@ const emit = defineEmits<{
 }>()
 
 /**
- * Fallback only: how long the rack may stay silent before we give up waiting.
+ * The rack is still being enumerated: connected, and the backend has not yet
+ * reported the scan as finished.
  *
- * The scan normally ends on the backend's `scan_complete` flag, which the
- * server raises when it finishes enumerating the rack. This timeout exists for
- * the case where that signal never arrives (older server that does not arm the
- * presence watch), so the indicator cannot spin forever. It is re-armed on
- * every change to the card list, so it only ever bounds the gap between two
- * reports, never the whole scan.
+ * Derived rather than tracked. An earlier version inferred the end of the scan
+ * from a silence timeout, which could only ever be wrong in one direction or
+ * the other — too short cut the indicator off mid-scan, too long left it
+ * spinning after the last card. `scan_complete` is the real signal (the backend
+ * raises it when the server arms the rack's presence watch, which happens once
+ * discovery has walked the rack), so there is nothing left to time out.
  */
-const SCAN_WINDOW_MS = 30000
-
-// True while we still expect `connect` messages for this rack. The server
-// reports discovered cards one at a time and never says "scan finished", so
-// this is a time window rather than a real completion signal: it opens when the
-// rack connects and closes once the rack has been quiet for SCAN_WINDOW_MS.
-const scanning = ref(false)
-let scanTimer: ReturnType<typeof setTimeout> | undefined
-
-function stopScanTimer(): void {
-  if (scanTimer !== undefined) {
-    clearTimeout(scanTimer)
-    scanTimer = undefined
-  }
-}
-
-/** (Re)opens the scan window — the rack is connected and something may still arrive. */
-function armScanWindow(): void {
-  stopScanTimer()
-  scanning.value = true
-  scanTimer = setTimeout(() => {
-    scanning.value = false
-    scanTimer = undefined
-  }, SCAN_WINDOW_MS)
-}
-
-// Drive the window off the two things that mean "the rack is still working":
-// a fresh connection, and any change to the reported card list. Re-arming on
-// every change keeps a slow trickle of `connect` messages from being cut off
-// mid-scan, which a single fixed timeout from connect time would do on a full
-// rack. The list is fingerprinted by slot+iccid rather than just counted: a
-// slot being reassigned (card swapped) leaves the count identical but still
-// means the rack is actively reporting.
-watch(
-  () =>
-    [
-      props.rack?.connected ?? false,
-      props.rack?.scan_complete ?? false,
-      (props.rack?.cards ?? []).map((c) => `${c.slot}:${c.iccid ?? ''}`).join(','),
-    ] as const,
-  ([connected, scanComplete, fingerprint], previous) => {
-    if (!connected) {
-      // Disconnected racks show their own message; no scan is in flight.
-      stopScanTimer()
-      scanning.value = false
-      return
-    }
-    // The backend says enumeration is over — end the indicator at once instead
-    // of waiting out the fallback window. This is what stops the bar from
-    // lingering for half a minute after every card is already on screen.
-    if (scanComplete) {
-      stopScanTimer()
-      scanning.value = false
-      return
-    }
-    const [wasConnected, , previousFingerprint] = previous ?? [false, false, '']
-    if (!wasConnected || fingerprint !== previousFingerprint) {
-      armScanWindow()
-    }
-  },
-  { immediate: true },
-)
+const scanning = computed(() => {
+  const rack = props.rack
+  return rack !== null && rack.connected && !rack.scan_complete
+})
 
 /**
- * Icon spec for one rack card, mirroring `cardConnectedStatus` in the readers
- * block so both lists speak the same visual language:
- *   blinking green — an APDU exchange is in progress on this card
- *   solid green    — session is up and idle
- *   grey outline   — card present and configured, but no session yet
- *   orange plus    — card present but not linked to a card number
+ * Status icon for a rack card, from the shared vocabulary the readers list uses.
+ * A card reported by the rack is always physically present, so `present` is
+ * fixed — the rack has no "empty slot" row.
  */
 function rackCardStatus(card: RackCard) {
-  if (!card.card_number) {
-    return { name: 'mdi-card-plus-outline', color: 'orange', size: '22px' }
-  }
-  if (card.online && card.authentication) {
-    return { name: 'mdi-smart-card', color: 'green', size: '22px', class: 'blinking-icon' }
-  }
-  if (card.online) {
-    return { name: 'mdi-smart-card', color: 'green', size: '22px' }
-  }
-  return { name: 'mdi-smart-card-outline', color: 'grey', size: '22px' }
+  return cardStatusIcon(
+    {
+      present: true,
+      linked: !!card.card_number,
+      online: card.online,
+      authentication: card.authentication,
+    },
+    '22px',
+  )
 }
-
-// The timer outlives the component otherwise, and would write to a ref that no
-// longer renders anything.
-onUnmounted(stopScanTimer)
 </script>
 
 <!-- Styles live in src/css/app.scss alongside the readers block so the rack
