@@ -157,6 +157,12 @@ struct SerialEnvelope {
     /// Hard bound of the read phase of one exchange, first reply byte included.
     deadline: Duration,
     poll: Option<PollSpec>,
+    /// End-of-authentication marker, same semantics as the `finish` flag of the
+    /// PC/SC path: `false` on every command of an ongoing session, `true` on the
+    /// closing message the server sends (with an empty `serial_cmd`) once the
+    /// tracker reports the authentication finished. Absent on older servers,
+    /// which is why it is an Option — see `handle_serial_request`.
+    finish: Option<bool>,
 }
 
 /// Validates and uppercases a hex string; the error is the wire contract code.
@@ -222,6 +228,7 @@ fn parse_envelope_fields(
             .map(Duration::from_millis)
             .unwrap_or(SERIAL_READ_DEADLINE),
         poll,
+        finish: json.get("finish").and_then(|v| v.as_bool()),
     })
 }
 
@@ -774,8 +781,7 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
     // same id when it does not get a timely reply. Remember the last id we answered and its reply
     // so a repeat re-sends the cached response instead of re-forwarding to the rack. Reset on every
     // CONNACK, because a new MQTT session restarts the server-side request_id counter at 1.
-    let mut last_request_id: Option<u64> = None;
-    let mut last_response_payload: Option<String> = None;
+    let mut idempotency = IdempotencySlot::default();
 
     loop {
         match eventloop.poll().await {
@@ -792,8 +798,7 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                 match notification {
                     Event::Incoming(Incoming::ConnAck(..)) => {
                         // New MQTT session: server restarts request_id at 1, drop the idempotency slot.
-                        last_request_id = None;
-                        last_response_payload = None;
+                        idempotency.reset();
                         log::debug!("{} [MQTT] event=CONNACK status=received", log_header);
                     }
                     Event::Incoming(Incoming::Publish(publish)) => {
@@ -842,8 +847,9 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                                 &publish.payload,
                                 &serial_port,
                                 &log_header,
-                                &mut last_request_id,
-                                &mut last_response_payload,
+                                &mut idempotency,
+                                // the rack's own connection serves no single card
+                                None,
                             )
                             .await;
                         }
@@ -883,14 +889,36 @@ async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
 /// rack-backed card's): idempotency, envelope parsing, serial execution, and the always-reply
 /// response publish — the app is the server's only feedback channel, so a silent rack must be
 /// reported, not swallowed.
+/// Per-connection idempotency slot: the last request id answered and the reply
+/// sent for it. The server re-sends a request with the same id when it does not
+/// get a timely response; kept together so it can be threaded through as one
+/// argument and reset as one unit on CONNACK.
+#[derive(Default)]
+struct IdempotencySlot {
+    last_request_id: Option<u64>,
+    last_response_payload: Option<String>,
+}
+
+impl IdempotencySlot {
+    /// Forgets the cached reply — called on a new MQTT session, where the
+    /// server-side request_id counter restarts at 1.
+    fn reset(&mut self) {
+        self.last_request_id = None;
+        self.last_response_payload = None;
+    }
+}
+
 async fn handle_serial_request(
     mqtt_client: &AsyncClient,
     topic: &str,
     payload: &[u8],
     serial_port: &SharedPort,
     log_header: &str,
-    last_request_id: &mut Option<u64>,
-    last_response_payload: &mut Option<String>,
+    idempotency: &mut IdempotencySlot,
+    // ICCID of the card this connection serves, when the caller is a card
+    // session. `None` for the rack's own connection, which has no single card
+    // and therefore no authentication state to track.
+    card_iccid: Option<&str>,
 ) {
     // A server-driven rack exchange counts as card activity: the auto-updater
     // must not restart the app in the middle of a rack card operation. The
@@ -900,8 +928,8 @@ async fn handle_serial_request(
     // answered this id, re-send the cached response without touching the port again; if it is
     // still in flight, drop the duplicate.
     let req_id = request_id_from_topic(topic);
-    if req_id.is_some() && req_id == *last_request_id {
-        match last_response_payload {
+    if req_id.is_some() && req_id == idempotency.last_request_id {
+        match &idempotency.last_response_payload {
             Some(cached) => {
                 log::warn!(
                     "{} [MQTT] status=duplicate_request request_id={:?} action=resend_cached",
@@ -942,7 +970,41 @@ async fn handle_serial_request(
     };
 
     let exchange = match parsed {
-        Ok(envelope) => execute_envelope(serial_port, envelope, log_header, true).await,
+        Ok(envelope) => {
+            // Authentication boundaries come from the server's `finish` flag —
+            // the same contract the PC/SC path uses. This replaces guessing the
+            // end of a session from the traffic going quiet, which misfired on
+            // the long pause while the tracker thinks after the ATR read.
+            if let Some(iccid) = card_iccid {
+                match envelope.finish {
+                    // Session over: stop the activity indicator now, whatever
+                    // the idle timer was about to do.
+                    Some(true) => {
+                        cancel_rack_auth_timer(iccid);
+                        set_rack_card_state(iccid, Some(true), Some(false));
+                        log::info!("{} [MQTT] status=auth_finished", log_header);
+                    }
+                    // A command of an ongoing session: hold the indicator lit.
+                    // The idle timer is still armed as a backstop in case the
+                    // closing `finish: true` never arrives (dropped connection,
+                    // aborted session), so the icon cannot blink forever.
+                    Some(false) => touch_rack_card_activity(iccid),
+                    // Older server that does not send the flag: fall back to the
+                    // pure idle-timeout behaviour.
+                    None => touch_rack_card_activity(iccid),
+                }
+            }
+
+            // The closing message carries no command (`serial_cmd` empty) — it
+            // exists only to mark the end of the session, so there is nothing to
+            // put on the wire. Running it as an exchange would write a zero-byte
+            // frame to the rack and come back `no_reply`.
+            if envelope.cmd_hex.is_empty() {
+                SerialExchange::ok(String::new())
+            } else {
+                execute_envelope(serial_port, envelope, log_header, true).await
+            }
+        }
         Err(code) => SerialExchange::error(code),
     };
 
@@ -952,8 +1014,8 @@ async fn handle_serial_request(
     // must retry the rack (the device may have recovered), a repeat after success is answered
     // from cache without touching the port again.
     if exchange.is_ok() && req_id.is_some() {
-        *last_request_id = req_id;
-        *last_response_payload = Some(resp_payload.clone());
+        idempotency.last_request_id = req_id;
+        idempotency.last_response_payload = Some(resp_payload.clone());
     }
     if let Err(e) = mqtt_client
         .publish(resp_topic, QoS::AtLeastOnce, false, resp_payload)
@@ -1088,14 +1150,19 @@ fn update_rack_card_ui(slot: u16, iccid: &str, card_number: Option<String>) {
     rack_update_cards(cards);
 }
 
-/// How long a card keeps its "authenticating" mark after its last exchange.
+/// Backstop only: how long a card keeps its "authenticating" mark with no
+/// traffic at all.
 ///
-/// The rack envelope is opaque — unlike the PC/SC path there is no `finish`
-/// flag telling us an authentication ended — so the end of a session can only
-/// be inferred from the traffic stopping. This must comfortably exceed the gap
-/// between two commands of one authentication, otherwise the mark drops between
-/// them and the activity icon restarts its animation on every command.
-const RACK_AUTH_IDLE_HOLD: Duration = Duration::from_secs(3);
+/// The authoritative end-of-session signal is the server's `finish: true`
+/// envelope. This timer exists purely so the indicator cannot blink forever if
+/// that message never arrives — a dropped connection, an aborted session, or a
+/// server version that does not send the flag.
+///
+/// Generous on purpose: the server reads the ATR, hands it to the tracker, and
+/// then the line goes quiet while the tracker thinks. That pause is part of one
+/// authentication, and a short window would end the blink in the middle of it —
+/// exactly the flicker this replaced.
+const RACK_AUTH_IDLE_HOLD: Duration = Duration::from_secs(120);
 
 /// Marks a card as actively authenticating and (re)arms the idle timer that
 /// clears the mark once its traffic stops.
@@ -1366,8 +1433,7 @@ async fn rack_card_mqtt_loop(
 
     let mut is_online = false;
     let mut reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
-    let mut last_request_id: Option<u64> = None;
-    let mut last_response_payload: Option<String> = None;
+    let mut idempotency = IdempotencySlot::default();
 
     loop {
         match eventloop.poll().await {
@@ -1384,8 +1450,7 @@ async fn rack_card_mqtt_loop(
                 match notification {
                     Event::Incoming(Incoming::ConnAck(..)) => {
                         // new MQTT session: the server-side request_id counter restarts at 1
-                        last_request_id = None;
-                        last_response_payload = None;
+                        idempotency.reset();
                         // Session is up: show the card as served and idle.
                         set_rack_card_state(&iccid, Some(true), Some(false));
                         // rack link report: must be the first publish of the session
@@ -1423,20 +1488,17 @@ async fn rack_card_mqtt_loop(
                             log_header,
                             String::from_utf8_lossy(&publish.payload)
                         );
-                        // Mark the card active and let the idle timer clear it
-                        // once the burst ends. Clearing it right after this one
-                        // exchange would restart the icon animation on every
-                        // command, which looks like jitter during the rapid
-                        // command sequence of an authentication.
-                        touch_rack_card_activity(&iccid);
+                        // Activity marking now happens inside, driven by the
+                        // envelope's `finish` flag rather than by the mere
+                        // arrival of a command.
                         handle_serial_request(
                             &mqtt_client,
                             &topic,
                             &publish.payload,
                             &serial_port,
                             &log_header,
-                            &mut last_request_id,
-                            &mut last_response_payload,
+                            &mut idempotency,
+                            Some(&iccid),
                         )
                         .await;
                     }
@@ -1545,6 +1607,8 @@ fn start_rack_watch(
                 idle,
                 deadline,
                 poll: None,
+                // presence polling is not part of any authentication session
+                finish: None,
             };
             let exchange = execute_envelope(&serial_port, envelope, &log_header, false).await;
             if !exchange.is_ok() {
@@ -2666,6 +2730,53 @@ mod tests {
     }
 
     #[test]
+    fn envelope_reads_finish_flag_from_a_real_server_payload() {
+        // Verbatim envelope captured from the server during an authentication.
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"deadline_ms":500,"expect":"5501006644","finish":false,"idle_ms":50,"poll":{"cmd":"55010000AA","deadline_ms":5000,"interval_ms":20,"while":"55010004A6"},"serial_cmd":"550100604A"}"#,
+        )
+        .unwrap();
+        let env = parse_envelope(&json)
+            .expect("is an envelope")
+            .expect("parses");
+        assert_eq!(
+            env.finish,
+            Some(false),
+            "an in-session command carries finish:false"
+        );
+        assert_eq!(env.cmd_hex, "550100604A");
+        assert_eq!(env.expect_hex.as_deref(), Some("5501006644"));
+        assert_eq!(env.idle, Duration::from_millis(50));
+        assert!(env.poll.is_some());
+    }
+
+    #[test]
+    fn closing_envelope_carries_finish_true_and_no_command() {
+        // End of the session: same shape, empty APDU, finish:true.
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"serial_cmd":"","finish":true}"#).unwrap();
+        let env = parse_envelope(&json)
+            .expect("is an envelope")
+            .expect("parses");
+        assert_eq!(env.finish, Some(true));
+        assert!(
+            env.cmd_hex.is_empty(),
+            "nothing to put on the wire for the closing message"
+        );
+    }
+
+    #[test]
+    fn envelope_without_finish_is_backward_compatible() {
+        // Older server: no flag at all — the idle-timer fallback takes over.
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"serial_cmd":"550100604A"}"#).unwrap();
+        let env = parse_envelope(&json)
+            .expect("is an envelope")
+            .expect("parses");
+        assert_eq!(env.finish, None);
+    }
+
+    #[test]
     fn envelope_bad_hex_reports_contract_code() {
         let json: serde_json::Value = serde_json::from_str(r#"{"serial_cmd":"ZZ"}"#).unwrap();
         assert_eq!(
@@ -2946,6 +3057,7 @@ mod tests {
             expect_hex: Some(ACCEPTED.into()),
             idle: T_IDLE,
             deadline: T_DEADLINE,
+            finish: None,
             poll: Some(PollSpec {
                 cmd_hex: POLL_CMD.into(),
                 while_hex: BUSY.into(),
@@ -3065,6 +3177,7 @@ mod tests {
             idle: T_IDLE,
             deadline: T_DEADLINE,
             poll: None,
+            finish: None,
         };
         let (outcome, polls, pushes) = run_envelope(&mut port, &env, "TEST |");
 
