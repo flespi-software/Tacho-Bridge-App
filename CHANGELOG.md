@@ -319,3 +319,17 @@ All notable changes to this project will be documented in this file.
 
 - Added automatic update installation: an opt-in setting makes the app check hourly and install new versions on its own, waiting for a pause in card activity so an authentication is never interrupted.
 - Added launch at system startup: a new System setting registers the app to start on login, minimized to the tray.
+
+### [0.8.0-beta.9] - 2026-08-10
+
+🛠 Fixes
+
+- Fixed card-session defects and added a rack scan indicator: a removed card now also disconnects from the rack, the authentication result no longer pauses the card link, a failed exchange is retried rather than cached, and the rack shows scan progress instead of waiting forever.
+- Fixed a truncated card ATR silently locking the wrong communication protocol into the configuration: an incomplete ATR is now recognised as inconclusive and used only for the current connection instead of being saved.
+- Fixed a false update notification on every launch of a pre-release build, and made card rack discovery survive an internal error instead of stopping until restart.
+- Fixed a repeated authentication request being answered from a stale cache after the card was reset, and a card that failed to report its serial number staying marked as busy until it was reinserted.
+- Fixed a pending update being lost when the application closed while it was downloading, and prevented a manual install from clashing with the automatic one.
+
+🆕 Features / Improvements
+
+- Reduced memory use when uploading logs to the server: the log slice is now compressed as it is read instead of being held in memory in full beforehand.
