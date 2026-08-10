@@ -15,6 +15,30 @@ use crate::global_app_handle::{emit_notification_event, NotificationPayload};
 /// The update found by the last check, waiting for the user to accept it.
 static PENDING_UPDATE: Mutex<Option<tauri_plugin_updater::Update>> = Mutex::const_new(None);
 
+/// Set while a download+install is in flight, so only one can run at a time.
+///
+/// Two callers can reach `install_update` concurrently: the unattended loop and
+/// the user clicking "Install" on the notification. Without this guard the
+/// second one finds an empty `PENDING_UPDATE` (the first `take()`s it) and
+/// reports a spurious "no pending update" error, and a failure of the first
+/// would then restore an update the second already gave up on. Guarding is also
+/// what makes the restore-on-failure below safe to reason about: at most one
+/// task ever owns the taken update.
+static INSTALL_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Clears `INSTALL_IN_PROGRESS` on every exit path, including a panic or the
+/// task being aborted mid-install (the auto-update loop can be torn down at
+/// shutdown). A plain assignment at the end of `install_update` would leak the
+/// flag on those paths and block every later install attempt until a restart.
+struct InstallGuard;
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        INSTALL_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Log tag prefix, mirrors the `[RACK]`/`[CONN]` style used elsewhere.
 const TAG: &str = "[UPDATER]";
 
@@ -160,7 +184,13 @@ pub async fn auto_update_loop(app: AppHandle) {
             let _ = perform_check(&app, None).await;
         }
 
-        // Install the parked update once the card link is quiet.
+        // Install the parked update once the card link is quiet. Skip the tick
+        // while an install is already running — the user may have clicked
+        // "Install" on the notification — so we never start a second download
+        // of the same update alongside it.
+        if INSTALL_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
         let (pending, version) = {
             let guard = PENDING_UPDATE.lock().await;
             match guard.as_ref() {
@@ -221,11 +251,30 @@ pub fn get_changelog() -> &'static str {
 /// Invoked from the frontend when the user accepts the update notification.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
-    let update = PENDING_UPDATE
-        .lock()
-        .await
-        .take()
-        .ok_or_else(|| "no pending update".to_string())?;
+    // Claim the install slot before touching PENDING_UPDATE, so a concurrent
+    // caller (auto-loop vs. the user's "Install" click) backs off instead of
+    // racing us for the taken update.
+    if INSTALL_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        log::info!("{TAG} phase=install status=skipped reason=already_in_progress");
+        return Err("an update install is already in progress".to_string());
+    }
+    let _install_guard = InstallGuard;
+
+    // Clone the parked update instead of taking it. `Update` is a descriptor
+    // (version + download URL + signature), not the payload, so a clone is
+    // cheap — and leaving the original in place means an install that never
+    // reaches its error branch cannot lose it. The previous `take()` dropped
+    // the update on the floor whenever this task was aborted mid-download (app
+    // shutdown, auto-loop teardown): the slot stayed empty and the update could
+    // only reappear after a fresh network check. The slot is cleared explicitly
+    // on success, just before the restart.
+    let update = {
+        let guard = PENDING_UPDATE.lock().await;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "no pending update".to_string())?
+    };
 
     log::info!(
         "{TAG} phase=install status=downloading version={}",
@@ -252,12 +301,15 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
         .await
     {
         log::error!("{TAG} phase=install status=failed err={e}");
-        // Put the update back: the slot was take()n above, and without this a
-        // transient download failure would consume it — the user could never
-        // retry the install until a fresh update check found it again.
-        *PENDING_UPDATE.lock().await = Some(update);
+        // The update stays parked (we only cloned it), so a transient download
+        // failure leaves it available: the user can retry from the notification
+        // and the auto-loop picks it up on its next tick.
         return Err(e.to_string());
     }
+
+    // Installed successfully — drop it so the restarted app does not find a
+    // stale entry for the version it is now running.
+    *PENDING_UPDATE.lock().await = None;
 
     log::info!("{TAG} phase=install status=installed action=restart");
     // Release the rack's serial port before the restart, same as window close.
