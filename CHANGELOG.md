@@ -346,3 +346,13 @@ All notable changes to this project will be documented in this file.
 
 - Added a live activity indicator to every card in a rack slot: the icon blinks steadily for the whole authentication, including the wait while the tracker responds.
 - Updated frontend dependencies to close known security advisories, including a prototype pollution issue in the UI framework.
+
+### [0.8.0-beta.11] - 2026-08-10
+
+🛠 Fixes
+
+- fix changelog.
+
+🆕 Features / Improvements
+
+- Internal cleanup of the rack card indicators: removed the timers and fallbacks that the server-driven signals made redundant, and unified the card status icons and topic parsing shared with the reader path.
