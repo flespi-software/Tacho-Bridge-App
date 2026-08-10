@@ -324,11 +324,13 @@ All notable changes to this project will be documented in this file.
 
 🛠 Fixes
 
-- Fixed card-session defects and added a rack scan indicator: a removed card now also disconnects from the rack, the authentication result no longer pauses the card link, a failed exchange is retried rather than cached, and the rack shows scan progress instead of waiting forever.
-- Fixed a truncated card ATR silently locking the wrong communication protocol into the configuration: an incomplete ATR is now recognised as inconclusive and used only for the current connection instead of being saved.
-- Fixed a false update notification on every launch of a pre-release build, and made card rack discovery survive an internal error instead of stopping until restart.
-- Fixed a repeated authentication request being answered from a stale cache after the card was reset, and a card that failed to report its serial number staying marked as busy until it was reinserted.
+- Fixed a card removed from the configuration keeping its session in the rack, which could later clash with the same card number being added again.
+- Fixed a truncated card ATR silently locking the wrong communication protocol into the configuration: an incomplete ATR is now used only for the current connection instead of being saved.
+- Fixed a repeated authentication request being answered from a stale cache after the card was reset, and a failed card exchange being retried instead of returning the cached failure.
+- Fixed a card that failed to report its serial number staying marked as busy until it was reinserted.
 - Fixed a pending update being lost when the application closed while it was downloading, and prevented a manual install from clashing with the automatic one.
+- Fixed a false update notification on every launch of a pre-release build.
+- Fixed saving the authentication result briefly pausing the card link, and made card rack discovery survive an internal error instead of stopping until restart.
 
 🆕 Features / Improvements
 
@@ -338,11 +340,9 @@ All notable changes to this project will be documented in this file.
 
 🛠 Fixes
 
-- Fixed the rack scan indicator disappearing as soon as the first card was found instead of running until the whole rack is listed, and added a live activity indicator to every card in a rack slot.
-- Fixed the rack scan indicator staying on screen after all cards were listed: the application now ends it when the server reports the rack scan as finished, instead of waiting out a fixed timeout.
-- Fixed the card activity indicator flickering during authentication: the icon now blinks steadily from the start of the exchange until it ends, instead of restarting its animation on every command.
-- Fixed the card activity indicator misreading pauses during authentication as its end: the application now takes the start and end of an authentication from the server instead of guessing from the traffic, so the icon blinks steadily through the wait while the tracker responds.
+- Fixed the card rack scan indicator: it now runs for as long as the rack is being read and ends when the server reports the scan as finished, instead of stopping at the first card found or lingering after the last one.
 
 🆕 Features / Improvements
 
+- Added a live activity indicator to every card in a rack slot: the icon blinks steadily for the whole authentication, including the wait while the tracker responds.
 - Updated frontend dependencies to close known security advisories, including a prototype pollution issue in the UI framework.
