@@ -33,11 +33,11 @@ pub(crate) const SW_TECHNICAL_PROBLEM: &str = "6F00";
 /// wait (instead of an infinite one) lets the loop notice a rescan request
 /// even if the `cancel()` in `request_rescan` raced past a non-blocked monitor.
 const MONITOR_POLL_TIMEOUT_SECS: u64 = 30;
-/// Backoff bounds for retrying `Context::establish` in the monitor loop: the
-/// delay starts at the minimum and doubles per consecutive failure up to the
-/// maximum, resetting once a context is established.
-const ESTABLISH_RETRY_MIN: Duration = Duration::from_secs(5);
-const ESTABLISH_RETRY_MAX: Duration = Duration::from_secs(60);
+/// Backoff bounds for failed monitor passes (context establish errors or
+/// panics): the delay starts at the minimum and doubles per consecutive
+/// failure up to the maximum, resetting after a successful pass.
+const MONITOR_RETRY_MIN: Duration = Duration::from_secs(5);
+const MONITOR_RETRY_MAX: Duration = Duration::from_secs(60);
 
 type DynError = Box<dyn StdError + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
@@ -87,6 +87,16 @@ lazy_static! {
 /// Set when someone asked the monitor for a full rescan (see `request_rescan`).
 static RESCAN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Publishes (Some) or clears (None) the context slot used by `request_rescan`
+/// to cancel a blocked `get_status_change` from another thread.
+fn set_monitor_ctx(ctx: Option<Context>) {
+    let mut slot = match MONITOR_CTX.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = ctx;
+}
+
 /// Asks the reader monitor to drop its current PCSC view and rescan from
 /// scratch: the context and reader states are rebuilt from UNAWARE, so every
 /// still-inserted card is re-reported and re-registered through the normal
@@ -110,45 +120,6 @@ pub fn request_rescan() {
             ),
         },
         None => log::warn!("Rescan requested, but the monitor context is not available yet"),
-    }
-}
-
-/// Represents errors that can occur while interacting with smart card readers.
-#[derive(Debug)] // Enables use of `{:?}` for logging and debugging
-pub enum SmartCardError {
-    /// Error indicating that the specified reader is no longer available or not recognized.
-    UnknownReader,
-
-    /// A catch-all for other types of errors, represented as a string message.
-    Other(String),
-}
-
-impl std::fmt::Display for SmartCardError {
-    /// Provides a user-friendly string representation of the error.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SmartCardError::UnknownReader => write!(f, "UnknownReader"),
-            SmartCardError::Other(s) => write!(f, "Other: {}", s),
-        }
-    }
-}
-
-impl std::error::Error for SmartCardError {
-    // This enables interoperability with other error-handling APIs,
-    // such as `?` operator, logging, and integration with `anyhow` or `thiserror`.
-}
-
-impl From<pcsc::Error> for SmartCardError {
-    /// Converts a `pcsc::Error` into a `SmartCardError`.
-    ///
-    /// Attempts to classify `UnknownReader` errors specifically,
-    /// all other errors are wrapped in `SmartCardError::Other`.
-    fn from(err: pcsc::Error) -> Self {
-        if err.to_string().contains("UnknownReader") {
-            SmartCardError::UnknownReader
-        } else {
-            SmartCardError::Other(err.to_string())
-        }
     }
 }
 
@@ -195,7 +166,9 @@ fn setup_reader_states(
     Ok(())
 }
 
-async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), SmartCardError> {
+// Every failure here is per-card and non-fatal: it is logged and the loop
+// moves on to the next reader, so there is nothing to propagate to the caller.
+async fn process_reader_states(reader_states: &mut [ReaderState]) {
     for rs in reader_states {
         if rs.name() == PNP_NOTIFICATION() {
             continue;
@@ -292,8 +265,6 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) -> Result<(), 
             );
         }
     }
-
-    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -385,52 +356,27 @@ pub fn sc_monitor() {
         return;
     }
 
-    // Consecutive context establish failures back off 5s -> 60s so a
-    // persistently unavailable PCSC service does not flood the log.
-    let mut establish_retry = ESTABLISH_RETRY_MIN;
+    // Consecutive failed passes back off 5s -> 60s so a persistently broken
+    // PCSC stack (unavailable daemon, polkit denial, panicking FFI) does not
+    // flood the log; a pass that ran normally resets the delay.
+    let mut retry_delay = MONITOR_RETRY_MIN;
     loop {
         // One full context lifecycle per pass. A panic anywhere inside (PCSC
         // FFI, event emission, config I/O) must not silently kill card
         // detection for the rest of the process — nothing ever respawns this
         // monitor. Catch it, log it, start a fresh pass.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            monitor_pass(establish_retry)
-        })) {
-            Ok(true) => establish_retry = ESTABLISH_RETRY_MIN,
-            Ok(false) => establish_retry = (establish_retry * 2).min(ESTABLISH_RETRY_MAX),
-            Err(panic) => {
-                let msg = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "non-string panic payload".to_string());
-                log::error!(
-                    "sc_monitor pass panicked: {}. Restarting in 5 seconds...",
-                    msg
-                );
-                std::thread::sleep(Duration::from_secs(5));
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(monitor_pass)) {
+            Ok(Ok(())) => {
+                // Healthy pass ended (rescan or transient error inside the
+                // monitored window): re-establish immediately, no backoff.
+                retry_delay = MONITOR_RETRY_MIN;
+                continue;
             }
-        }
-    }
-}
-
-/// One pass of the reader monitor: establish a PCSC context, watch reader
-/// state changes until the context needs re-establishing, then return.
-/// Returns whether the context was established; on failure sleeps for
-/// `establish_retry` before returning so the caller can grow the backoff.
-fn monitor_pass(establish_retry: Duration) -> bool {
-    {
-        log::debug!("Starting the outer loop to establish context...");
-        let ctx = match Context::establish(Scope::User) {
-            Ok(ctx) => {
-                log::debug!("Successfully established context.");
-                ctx
-            }
-            Err(e) => {
+            Ok(Err(e)) => {
                 log::error!(
                     "Failed to establish context: {:?}. Retrying in {} seconds...",
                     e,
-                    establish_retry.as_secs()
+                    retry_delay.as_secs()
                 );
                 if e == pcsc::Error::SecurityViolation {
                     log::error!(
@@ -441,117 +387,125 @@ fn monitor_pass(establish_retry: Duration) -> bool {
                          local session, or add a polkit rule / start pcscd with --disable-polkit."
                     );
                 }
-                std::thread::sleep(establish_retry);
-                return false;
             }
-        };
-
-        // Publish the context so request_rescan() can cancel a blocked
-        // get_status_change from another thread.
-        {
-            let mut slot = match MONITOR_CTX.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *slot = Some(ctx.clone());
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                log::error!(
+                    "sc_monitor pass panicked: {}. Restarting in {} seconds...",
+                    msg,
+                    retry_delay.as_secs()
+                );
+                // The panic skipped the normal end-of-pass cleanup: drop the
+                // published context so request_rescan() does not cancel a dead
+                // handle while the monitor sleeps.
+                set_monitor_ctx(None);
+            }
         }
+        std::thread::sleep(retry_delay);
+        retry_delay = (retry_delay * 2).min(MONITOR_RETRY_MAX);
+    }
+}
 
-        let mut readers_buf = [0; READERS_BUFFER_SIZE];
-        let mut reader_states: Vec<ReaderState> = vec![
-            // Listen for reader insertions/removals, if supported.
-            ReaderState::new(PNP_NOTIFICATION(), PcscState::UNAWARE),
-        ];
+/// One pass of the reader monitor: establish a PCSC context, watch reader
+/// state changes until the context needs re-establishing, then return.
+/// Returns the PCSC error when the context could not be established; all retry
+/// pacing (sleep, backoff) is the caller's job.
+fn monitor_pass() -> Result<(), pcsc::Error> {
+    log::debug!("Establishing PCSC context...");
+    let ctx = Context::establish(Scope::User)?;
+    log::debug!("Successfully established context.");
 
-        log::debug!("Initialized readers buffer and reader states.");
+    // A fresh pass re-reports every reader and card from UNAWARE, so a rescan
+    // requested while no context was alive (establish backoff, panic restart)
+    // is satisfied by this pass anyway: clear the leftover flag so it does not
+    // trigger a pointless context re-establish on the first poll timeout.
+    RESCAN_REQUESTED.store(false, Ordering::SeqCst);
 
-        loop {
-            // These repeat every poll timeout (30s), so they live at trace to
-            // keep debug output focused on actual card events.
-            log::trace!("Starting the inner loop to monitor reader states...");
-            if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
-                log::error!("Failed to setup_reader_states: {:?}", e);
-                break; // Exit the inner loop to re-establish context
-            }
-            log::trace!(
-                "Reader states: {:?}",
-                reader_states
-                    .iter()
-                    .map(|rs| rs.name().to_string_lossy())
-                    .collect::<Vec<_>>()
-            );
+    // Publish the context so request_rescan() can cancel a blocked
+    // get_status_change from another thread.
+    set_monitor_ctx(Some(ctx.clone()));
 
-            match ctx.get_status_change(
-                Some(Duration::from_secs(MONITOR_POLL_TIMEOUT_SECS)),
-                &mut reader_states[..],
-            ) {
-                Ok(()) => {}
-                Err(pcsc::Error::Timeout) => {
-                    // Nothing changed within the poll window — check for a
-                    // rescan request that missed the cancel(), keep waiting.
-                    if RESCAN_REQUESTED.swap(false, Ordering::SeqCst) {
-                        log::info!("Rescan requested (picked up on poll timeout). Re-establishing context...");
-                        break;
-                    }
-                    continue;
-                }
-                Err(pcsc::Error::Cancelled) => {
-                    // request_rescan() cancelled the wait. Break to the outer
-                    // loop: fresh context + UNAWARE reader states make PCSC
-                    // re-report every inserted card, and process_reader_states
-                    // re-registers them against the (now empty) task pool.
-                    RESCAN_REQUESTED.store(false, Ordering::SeqCst);
-                    log::info!("Rescan requested (get_status_change cancelled). Re-establishing context...");
+    let mut readers_buf = [0; READERS_BUFFER_SIZE];
+    let mut reader_states: Vec<ReaderState> = vec![
+        // Listen for reader insertions/removals, if supported.
+        ReaderState::new(PNP_NOTIFICATION(), PcscState::UNAWARE),
+    ];
+
+    log::debug!("Initialized readers buffer and reader states.");
+
+    loop {
+        // These repeat every poll timeout (30s), so they live at trace to
+        // keep debug output focused on actual card events.
+        log::trace!("Starting the inner loop to monitor reader states...");
+        if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
+            log::error!("Failed to setup_reader_states: {:?}", e);
+            break; // Exit the inner loop to re-establish context
+        }
+        log::trace!(
+            "Reader states: {:?}",
+            reader_states
+                .iter()
+                .map(|rs| rs.name().to_string_lossy())
+                .collect::<Vec<_>>()
+        );
+
+        match ctx.get_status_change(
+            Some(Duration::from_secs(MONITOR_POLL_TIMEOUT_SECS)),
+            &mut reader_states[..],
+        ) {
+            Ok(()) => {}
+            Err(pcsc::Error::Timeout) => {
+                // Nothing changed within the poll window — check for a
+                // rescan request that missed the cancel(), keep waiting.
+                if RESCAN_REQUESTED.swap(false, Ordering::SeqCst) {
+                    log::info!(
+                        "Rescan requested (picked up on poll timeout). Re-establishing context..."
+                    );
                     break;
                 }
-                Err(e) => {
-                    log::error!("get_status_change failed: {:?}", e);
-                    // Small backoff prevents a tight reconnect loop if the PCSC
-                    // service is repeatedly returning errors (e.g. daemon down).
-                    std::thread::sleep(Duration::from_secs(1));
-                    break;
-                }
+                continue;
             }
-
-            // Bridge back into the async runtime: registration locks the tokio
-            // TASK_POOL mutex and spawns per-card MQTT tasks. Those futures run
-            // on the async workers; this thread just waits for the result.
-            if let Err(e) = block_on(process_reader_states(&mut reader_states)) {
-                match e {
-                    SmartCardError::UnknownReader => {
-                        log::warn!("Detected UnknownReader. Sleeping 3s to avoid busy loop!");
-                        std::thread::sleep(Duration::from_secs(3));
-                    }
-                    SmartCardError::Other(msg) => {
-                        log::error!("SmartCard error: {}", msg);
-                        // Without a small backoff this branch could spin the
-                        // outer reconnect loop very quickly under persistent
-                        // PCSC failures.
-                        std::thread::sleep(Duration::from_secs(1));
-                    }
-                }
-
+            Err(pcsc::Error::Cancelled) => {
+                // request_rescan() cancelled the wait. Break to the outer
+                // loop: fresh context + UNAWARE reader states make PCSC
+                // re-report every inserted card, and process_reader_states
+                // re-registers them against the (now empty) task pool.
+                RESCAN_REQUESTED.store(false, Ordering::SeqCst);
+                log::info!(
+                    "Rescan requested (get_status_change cancelled). Re-establishing context..."
+                );
                 break;
             }
-
-            log::debug!("Waiting for the next status change...");
+            Err(e) => {
+                log::error!("get_status_change failed: {:?}", e);
+                // Small backoff prevents a tight reconnect loop if the PCSC
+                // service is repeatedly returning errors (e.g. daemon down).
+                std::thread::sleep(Duration::from_secs(1));
+                break;
+            }
         }
 
-        // The context is about to be dropped: clear the published clone so
-        // request_rescan() cannot cancel a dead handle (a useless cancel that
-        // would delay the rescan by a full poll window) — with the slot empty
-        // it falls back to the RESCAN_REQUESTED flag, which the fresh pass
-        // picks up on its bounded wait.
-        {
-            let mut slot = match MONITOR_CTX.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *slot = None;
-        }
+        // Bridge back into the async runtime: registration locks the tokio
+        // TASK_POOL mutex and spawns per-card MQTT tasks. Those futures run
+        // on the async workers; this thread just waits for the result.
+        block_on(process_reader_states(&mut reader_states));
 
-        log::debug!("Re-establishing context...");
+        log::debug!("Waiting for the next status change...");
     }
-    true
+
+    // The context is about to be dropped: clear the published clone so
+    // request_rescan() cannot cancel a dead handle (a useless cancel that
+    // would delay the rescan by a full poll window) — with the slot empty
+    // it falls back to the RESCAN_REQUESTED flag, which the fresh pass
+    // picks up on its bounded wait.
+    set_monitor_ctx(None);
+
+    log::debug!("Re-establishing context...");
+    Ok(())
 }
 
 /// Renders a PCSC protocol as the config string form ("T0"/"T1").
@@ -830,8 +784,8 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
         )
         .map_err(|e| format!("failed to get status change: {e}"))?;
 
-        block_on(process_reader_states(&mut reader_states))
-            .map_err(|e| format!("Processing failed: {}", e))
+        block_on(process_reader_states(&mut reader_states));
+        Ok(())
     })
     .await
     .map_err(|e| format!("manual_sync_cards: blocking task failed: {e}"))?
