@@ -77,7 +77,14 @@ export default defineConfig((/* ctx */) => {
           {
             vueTsc: true,
             eslint: {
-              lintCommand: 'eslint -c ./eslint.config.js "./src*/**/*.{ts,js,mjs,cjs,vue}"',
+              // "./src/**", NOT "./src*/**": the checker worker feeds this glob
+              // straight into its own chokidar watcher (its only built-in ignore
+              // is node_modules), and `src*` would pull in src-tauri/target —
+              // tens of thousands of cargo artifacts rewritten on every rebuild,
+              // which balloons the worker until it dies with
+              // ERR_WORKER_OUT_OF_MEMORY. There is no lintable JS/TS in
+              // src-tauri anyway.
+              lintCommand: 'eslint -c ./eslint.config.js "./src/**/*.{ts,js,mjs,cjs,vue}"',
               useFlatConfig: true,
             },
           },
