@@ -33,6 +33,11 @@ pub(crate) const SW_TECHNICAL_PROBLEM: &str = "6F00";
 /// wait (instead of an infinite one) lets the loop notice a rescan request
 /// even if the `cancel()` in `request_rescan` raced past a non-blocked monitor.
 const MONITOR_POLL_TIMEOUT_SECS: u64 = 30;
+/// Backoff bounds for retrying `Context::establish` in the monitor loop: the
+/// delay starts at the minimum and doubles per consecutive failure up to the
+/// maximum, resetting once a context is established.
+const ESTABLISH_RETRY_MIN: Duration = Duration::from_secs(5);
+const ESTABLISH_RETRY_MAX: Duration = Duration::from_secs(60);
 
 type DynError = Box<dyn StdError + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
@@ -380,29 +385,40 @@ pub fn sc_monitor() {
         return;
     }
 
+    // Consecutive context establish failures back off 5s -> 60s so a
+    // persistently unavailable PCSC service does not flood the log.
+    let mut establish_retry = ESTABLISH_RETRY_MIN;
     loop {
         // One full context lifecycle per pass. A panic anywhere inside (PCSC
         // FFI, event emission, config I/O) must not silently kill card
         // detection for the rest of the process — nothing ever respawns this
         // monitor. Catch it, log it, start a fresh pass.
-        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(monitor_pass)) {
-            let msg = panic
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string());
-            log::error!(
-                "sc_monitor pass panicked: {}. Restarting in 5 seconds...",
-                msg
-            );
-            std::thread::sleep(Duration::from_secs(5));
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            monitor_pass(establish_retry)
+        })) {
+            Ok(true) => establish_retry = ESTABLISH_RETRY_MIN,
+            Ok(false) => establish_retry = (establish_retry * 2).min(ESTABLISH_RETRY_MAX),
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                log::error!(
+                    "sc_monitor pass panicked: {}. Restarting in 5 seconds...",
+                    msg
+                );
+                std::thread::sleep(Duration::from_secs(5));
+            }
         }
     }
 }
 
 /// One pass of the reader monitor: establish a PCSC context, watch reader
 /// state changes until the context needs re-establishing, then return.
-fn monitor_pass() {
+/// Returns whether the context was established; on failure sleeps for
+/// `establish_retry` before returning so the caller can grow the backoff.
+fn monitor_pass(establish_retry: Duration) -> bool {
     {
         log::debug!("Starting the outer loop to establish context...");
         let ctx = match Context::establish(Scope::User) {
@@ -412,11 +428,21 @@ fn monitor_pass() {
             }
             Err(e) => {
                 log::error!(
-                    "Failed to establish context: {:?}. Retrying in 5 seconds...",
-                    e
+                    "Failed to establish context: {:?}. Retrying in {} seconds...",
+                    e,
+                    establish_retry.as_secs()
                 );
-                std::thread::sleep(Duration::from_secs(5));
-                return;
+                if e == pcsc::Error::SecurityViolation {
+                    log::error!(
+                        "SecurityViolation means the PC/SC daemon denied this process access. \
+                         On Linux pcscd is usually guarded by polkit, which only allows clients \
+                         from an active local desktop session - processes started inside a \
+                         container, over SSH or as a service are rejected. Run the app from a \
+                         local session, or add a polkit rule / start pcscd with --disable-polkit."
+                    );
+                }
+                std::thread::sleep(establish_retry);
+                return false;
             }
         };
 
@@ -525,6 +551,7 @@ fn monitor_pass() {
 
         log::debug!("Re-establishing context...");
     }
+    true
 }
 
 /// Renders a PCSC protocol as the config string form ("T0"/"T1").
