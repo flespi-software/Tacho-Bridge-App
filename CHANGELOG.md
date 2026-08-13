@@ -356,3 +356,10 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Internal cleanup of the rack card indicators: removed the timers and fallbacks that the server-driven signals made redundant, and unified the card status icons and topic parsing shared with the reader path.
+
+### [0.8.0-beta.12] - 2026-08-13
+
+🆕 Features / Improvements
+
+- Resize default window size.
+- Internal refactoring: split the card rack module into separate units for device discovery, serial transport, the rack connection, card sessions and interface state.
