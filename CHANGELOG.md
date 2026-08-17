@@ -363,3 +363,10 @@ All notable changes to this project will be documented in this file.
 
 - Resize default window size.
 - Internal refactoring: split the card rack module into separate units for device discovery, serial transport, the rack connection, card sessions and interface state.
+
+### [0.8.0-beta.13] - 2026-08-17
+
+🆕 Features / Improvements
+
+- Added support for multiple card racks connected to one application instance.
+- Internal hardening of the multi-rack support: fixed stale card rows and session rebinding when a card moves between racks, and deduplicated the rack state handling.
