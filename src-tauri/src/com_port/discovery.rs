@@ -1,10 +1,16 @@
-//! Rack device discovery: finding the Lisle rack on the USB-serial bus and
-//! opening its port.
+//! Device discovery: finding supported COM devices (currently the Lisle rack)
+//! on the USB-serial bus and opening their ports.
 //!
 //! Matching is by the device's own descriptor strings where the OS exposes them
 //! (macOS/Linux), by the parent USB node on Windows (where the COM node only
 //! carries the driver's strings), and by chip identity + serial scheme as a last
 //! resort. vid/pid are logged but never used as the primary match.
+//!
+//! What identifies a device type lives in a [`DeviceProfile`]; the scan itself
+//! is profile-driven, so a future device type is a new profile entry plus its
+//! own server-instruction handler — the scan and the transport need no changes.
+//! Every matching device is returned: several racks on separate USB ports are
+//! all served, each through its own connection (see `rack_connection`).
 
 use std::time::Duration;
 
@@ -14,21 +20,58 @@ use super::transport::SERIAL_REPLY_TIMEOUT;
 
 use crate::global_app_handle::{emit_notification_event, NotificationPayload, RackState};
 
-/// USB product string the rack advertises. Combined with the brand marker in
-/// the manufacturer string (see `RACK_BRAND_MARKER`), this identifies a
-/// supported rack. We deliberately do NOT match on USB vid/pid — those belong to
-/// the underlying USB-serial chip (shared across many unrelated adapters and
-/// liable to change between hardware revisions). vid/pid are only read and
-/// logged, to collect data for now.
-const RACK_PRODUCT: &str = "Smart Card Rack";
+/// Declarative identity of one supported COM-device type: how to recognise it
+/// on the bus and how its serial link is configured. All Lisle-rack matching
+/// knowledge lives in [`LISLE_RACK`]; the wire protocol itself stays on the
+/// server either way (the client is a dumb pipe — see `transport`).
+#[derive(Debug)]
+pub(super) struct DeviceProfile {
+    /// USB product string the device advertises via its own descriptors.
+    /// Combined with `brand_marker`, this identifies a supported device. We
+    /// deliberately do NOT match on USB vid/pid — those belong to the
+    /// underlying USB-serial chip (shared across many unrelated adapters and
+    /// liable to change between hardware revisions). vid/pid are only read and
+    /// logged, to collect data for now.
+    product: &'static str,
+    /// Substring (case-insensitive) the manufacturer string must contain for
+    /// the device to be treated as supported.
+    brand_marker: &'static str,
+    /// Chip identity for platforms where the OS reports the *driver's* strings
+    /// instead of the device's USB descriptors (Windows: manufacturer="FTDI",
+    /// product="USB Serial Port (COMx)"), so the string match can never succeed
+    /// there. Together with `serial_scheme` this identifies the device as a
+    /// last resort.
+    fallback_vid: u16,
+    fallback_pid: u16,
+    /// Canonical manufacturer substituted when the OS hides the device's own
+    /// strings, so the client_id and UI match the platforms where the same
+    /// hardware reports them via its descriptors.
+    fallback_manufacturer: &'static str,
+    /// Validates a reported serial against the vendor's scheme and normalizes
+    /// it to the descriptor form (e.g. "SC1799A" -> "SC1799").
+    serial_scheme: fn(&str) -> Option<String>,
+    /// Serial line speed (8N1 framing is common to all supported devices).
+    baud: u32,
+}
 
-/// Serial line settings for the rack link.
-const BAUD: u32 = 115_200;
+/// The Lisle Design "Smart Card Rack" — the only supported device type so far.
+pub(super) static LISLE_RACK: DeviceProfile = DeviceProfile {
+    product: "Smart Card Rack",
+    brand_marker: "lisle",
+    fallback_vid: 0x0403,
+    fallback_pid: 0x6015,
+    fallback_manufacturer: "Lisle Design Ltd",
+    serial_scheme: lisle_serial,
+    baud: 115_200,
+};
 
-/// How often the monitor scans the bus for the rack appearing/disappearing.
+/// Every device type the discovery scan looks for.
+static PROFILES: &[&DeviceProfile] = &[&LISLE_RACK];
+
+/// How often the monitor scans the bus for devices appearing/disappearing.
 pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// MQTT client_id construction for the rack connection.
+/// MQTT client_id construction for a device connection.
 ///
 /// The id must match the server's `^[0-9A-Z]{16}$` (exactly 16 uppercase
 /// alphanumerics). Layout is `BRAND` + filler zeros + `SERIAL`: the brand comes
@@ -37,21 +80,6 @@ pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const RACK_ID_LEN: usize = 16; // server contract: exactly 16 chars
 const RACK_ID_BRAND_LEN: usize = 5; // chars of the brand kept in the id
 const RACK_ID_PAD: char = '0'; // filler placed between brand and serial
-
-/// Substring (case-insensitive) the manufacturer must contain for the device to
-/// be treated as a supported rack.
-const RACK_BRAND_MARKER: &str = "lisle";
-
-/// Fallback identity for platforms where the OS reports the *driver's* strings
-/// instead of the device's USB descriptors (Windows: manufacturer="FTDI",
-/// product="USB Serial Port (COMx)"), so the string match above can never
-/// succeed. The rack is an FTDI FT-X (vid/pid below) whose EEPROM serial
-/// follows the Lisle scheme `SC<digits>`; together these identify it. The
-/// canonical strings are substituted so the client_id and UI match the other
-/// platforms, where the same hardware reports them via its own descriptors.
-const RACK_FALLBACK_VID: u16 = 0x0403;
-const RACK_FALLBACK_PID: u16 = 0x6015;
-const RACK_FALLBACK_MANUFACTURER: &str = "Lisle Design Ltd";
 
 /// Extracts the brand prefix for the client_id from the manufacturer string:
 /// the first whitespace-separated word, kept to `[0-9A-Z]`, uppercased, and
@@ -68,7 +96,7 @@ fn brand_prefix(manufacturer: &str) -> String {
         .collect()
 }
 
-/// Builds the rack's MQTT client_id as `<brand>` + zero filler + sanitised
+/// Builds the device's MQTT client_id as `<brand>` + zero filler + sanitised
 /// serial, uppercased, kept to `[0-9A-Z]`, exactly 16 chars. The serial sits
 /// flush at the end; if brand + serial would exceed 16, the serial is truncated
 /// to its trailing chars (no filler).
@@ -106,7 +134,7 @@ fn build_client_id(manufacturer: &str, serial: Option<&str>) -> String {
 
 /// Details of a discovered rack device, for logging and later use. `vid`/`pid`
 /// are kept only for logging/data collection — they are not used for matching.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct RackInfo {
     pub(super) port_name: String,
     pub(super) serial: Option<String>,
@@ -114,20 +142,45 @@ pub(super) struct RackInfo {
     pub(super) product: Option<String>,
     pub(super) vid: u16,
     pub(super) pid: u16,
+    /// Which discovery pass matched this device — diagnostic only.
+    matched_by: &'static str,
+    /// The device type this hardware matched.
+    profile: &'static DeviceProfile,
 }
 
+/// `matched_by` is deliberately excluded from equality: the pass that finds a
+/// device can vary between poll ticks (e.g. a transient USB enumeration
+/// failure downgrades the Windows match to chip identity) and must not read as
+/// a device swap — that would tear down and rebuild a healthy connection.
+/// `profile` is compared by address: profiles are statics.
+impl PartialEq for RackInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.port_name == other.port_name
+            && self.serial == other.serial
+            && self.manufacturer == other.manufacturer
+            && self.product == other.product
+            && self.vid == other.vid
+            && self.pid == other.pid
+            && std::ptr::eq(self.profile, other.profile)
+    }
+}
+
+impl Eq for RackInfo {}
+
 impl RackInfo {
-    /// True if the device manufacturer string marks it as a supported rack
-    /// (contains the brand marker, case-insensitive).
+    /// True if the device manufacturer string marks it as a supported device
+    /// (contains the profile's brand marker, case-insensitive).
     pub(super) fn is_supported(&self) -> bool {
         self.manufacturer
             .as_deref()
-            .map(|m| m.to_ascii_lowercase().contains(RACK_BRAND_MARKER))
+            .map(|m| m.to_ascii_lowercase().contains(self.profile.brand_marker))
             .unwrap_or(false)
     }
 
-    /// The MQTT client_id the server uses to address this rack. The brand prefix
-    /// is derived from the device's own manufacturer string.
+    /// The MQTT client_id the server uses to address this device. The brand
+    /// prefix is derived from the device's own manufacturer string. Also the
+    /// key of every per-rack structure in the app (connections, card sessions,
+    /// UI state).
     pub(super) fn client_id(&self) -> String {
         build_client_id(
             self.manufacturer.as_deref().unwrap_or(""),
@@ -139,6 +192,7 @@ impl RackInfo {
     /// it will be filled once the server reports the cards in the rack's slots.
     pub(super) fn to_state(&self, connected: bool) -> RackState {
         RackState {
+            client_id: self.client_id(),
             connected,
             name: self
                 .product
@@ -185,30 +239,29 @@ impl ChangeGuard {
             true
         }
     }
-
-    /// Forget the stored value so the next `changed` reports true again.
-    fn reset(&self) {
-        let mut last = match self.0.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        last.clear();
-    }
 }
 
 /// Last logged port-inventory snapshot.
 static PORT_INVENTORY: ChangeGuard = ChangeGuard::new();
 
-/// Last logged discovery-match outcome.
+/// Last logged discovery-match outcome (the whole matched set).
 static DISCOVERY_MATCH: ChangeGuard = ChangeGuard::new();
 
-/// Port for which the "COM port busy" UI notification has already been shown.
-/// Reset when the port opens or the rack disappears, so a new busy episode
-/// (e.g. after replug) notifies again.
-static BUSY_PORT_NOTICE: ChangeGuard = ChangeGuard::new();
+/// Ports for which the "COM port busy" UI notification has been shown. An
+/// entry is dropped when its port opens or its device leaves the bus, so a new
+/// busy episode (e.g. after replug) notifies again. A plain Vec: the set is as
+/// small as the number of connected devices.
+static BUSY_PORT_NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn lock_busy_notices() -> std::sync::MutexGuard<'static, Vec<String>> {
+    match BUSY_PORT_NOTICES.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 /// One-line description of an enumerated port for the inventory log. USB ports
-/// carry the metadata `find_rack` matches on; other transports just get their
+/// carry the metadata discovery matches on; other transports just get their
 /// kind, so field reports show why a device was not considered a rack.
 fn describe_port(p: &serialport::SerialPortInfo) -> String {
     match &p.port_type {
@@ -227,10 +280,11 @@ fn describe_port(p: &serialport::SerialPortInfo) -> String {
     }
 }
 
-/// Find a candidate rack: a USB device whose product matches and whose
-/// manufacturer contains the brand marker (case-insensitive). vid/pid are
-/// recorded for logging but never used as match criteria.
-pub(super) fn find_rack() -> Option<RackInfo> {
+/// Find every supported device on the bus. Runs all matching passes for every
+/// profile, then orders the result deterministically (serial, then port name)
+/// and drops client_id duplicates — so which device is "first" never depends
+/// on OS enumeration order, which can change across reboots.
+pub(super) fn find_racks() -> Vec<RackInfo> {
     let ports = match serialport::available_ports() {
         Ok(ports) => ports,
         Err(e) => {
@@ -238,7 +292,7 @@ pub(super) fn find_rack() -> Option<RackInfo> {
             if PORT_INVENTORY.changed(&snapshot) {
                 log::error!("RACK | phase=discovery status=enumeration_failed err={e}");
             }
-            return None;
+            return Vec::new();
         }
     };
 
@@ -262,94 +316,140 @@ pub(super) fn find_rack() -> Option<RackInfo> {
         }
     }
 
-    // First pass: match by the device's own descriptor strings (macOS/Linux).
-    for p in &ports {
+    let mut racks: Vec<RackInfo> = Vec::new();
+    for profile in PROFILES {
+        // First pass: match by the device's own descriptor strings (macOS/Linux).
+        collect_by_descriptor(profile, &ports, &mut racks);
+        // Second pass (Windows): the COM node carries the driver's strings, but
+        // the parent USB node still holds the device's real iProduct and clean
+        // EEPROM serial — match by those.
+        #[cfg(windows)]
+        collect_by_usb_descriptor(profile, &ports, &mut racks);
+        // Last resort: no descriptor strings anywhere — match by chip identity
+        // plus the vendor's serial scheme, and substitute the canonical strings
+        // so client_id/UI stay identical across platforms.
+        collect_by_chip_identity(profile, &ports, &mut racks);
+    }
+
+    sort_racks(&mut racks);
+    dedupe_by_client_id(&mut racks);
+
+    // One log line per change of the matched set, covering every pass.
+    let snapshot = if racks.is_empty() {
+        "none".to_string()
+    } else {
+        racks
+            .iter()
+            .map(|r| {
+                format!(
+                    "{{{}:{} serial={}}}",
+                    r.matched_by,
+                    r.port_name,
+                    r.serial.as_deref().unwrap_or("-")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if DISCOVERY_MATCH.changed(&snapshot) && !racks.is_empty() {
+        log::info!(
+            "RACK | phase=discovery status=match count={} list=[{}]",
+            racks.len(),
+            snapshot
+        );
+    }
+
+    // Busy notices only survive for ports still matched: a device that left
+    // the bus notifies again on its next busy episode.
+    lock_busy_notices().retain(|p| racks.iter().any(|r| r.port_name == *p));
+
+    racks
+}
+
+/// Deterministic ordering: by serial, then port name.
+fn sort_racks(racks: &mut [RackInfo]) {
+    racks.sort_by(|a, b| {
+        (a.serial.as_deref(), a.port_name.as_str())
+            .cmp(&(b.serial.as_deref(), b.port_name.as_str()))
+    });
+}
+
+/// Two devices that build the same client_id are one MQTT identity — only the
+/// first (in the deterministic order) can be served, the rest are dropped with
+/// a warning. Realistically this takes two racks with no serial at all.
+fn dedupe_by_client_id(racks: &mut Vec<RackInfo>) {
+    let mut seen = std::collections::HashSet::new();
+    racks.retain(|r| {
+        let id = r.client_id();
+        if seen.insert(id.clone()) {
+            true
+        } else {
+            log::warn!(
+                "RACK | phase=discovery status=ignored reason=duplicate_client_id client_id={} port={}",
+                id,
+                r.port_name
+            );
+            false
+        }
+    });
+}
+
+/// First pass: the device's own descriptor strings (macOS/Linux).
+fn collect_by_descriptor(
+    profile: &'static DeviceProfile,
+    ports: &[serialport::SerialPortInfo],
+    out: &mut Vec<RackInfo>,
+) {
+    for p in ports {
+        if out.iter().any(|r| r.port_name == p.port_name) {
+            continue;
+        }
         if let SerialPortType::UsbPort(info) = &p.port_type {
             let manufacturer_ok = info
                 .manufacturer
                 .as_deref()
-                .map(|m| m.to_ascii_lowercase().contains(RACK_BRAND_MARKER))
+                .map(|m| m.to_ascii_lowercase().contains(profile.brand_marker))
                 .unwrap_or(false);
-            if manufacturer_ok && info.product.as_deref() == Some(RACK_PRODUCT) {
-                DISCOVERY_MATCH.changed(&format!("descriptor:{}", p.port_name));
-                return Some(RackInfo {
+            if manufacturer_ok && info.product.as_deref() == Some(profile.product) {
+                out.push(RackInfo {
                     port_name: p.port_name.clone(),
                     serial: info.serial_number.clone(),
                     manufacturer: info.manufacturer.clone(),
                     product: info.product.clone(),
                     vid: info.vid,
                     pid: info.pid,
+                    matched_by: "descriptor",
+                    profile,
                 });
             }
         }
     }
-
-    // Second pass (Windows): the COM node carries the driver's strings, but
-    // the parent USB node still holds the device's real iProduct and clean
-    // EEPROM serial — match by those.
-    #[cfg(windows)]
-    if let Some(rack) = find_rack_by_usb_descriptor(&ports) {
-        return Some(rack);
-    }
-
-    // Last resort: no descriptor strings anywhere — match by the rack's chip
-    // identity plus the Lisle serial scheme, and substitute the canonical
-    // strings so client_id/UI stay identical across platforms.
-    for p in &ports {
-        if let SerialPortType::UsbPort(info) = &p.port_type {
-            if info.vid != RACK_FALLBACK_VID || info.pid != RACK_FALLBACK_PID {
-                continue;
-            }
-            let Some(serial) = info.serial_number.as_deref().and_then(lisle_serial) else {
-                continue;
-            };
-            if DISCOVERY_MATCH.changed(&format!("chip:{}:{}", p.port_name, serial)) {
-                log::info!(
-                    "RACK | phase=discovery status=fallback_match port={} serial={} reported_serial={:?} \
-                     reported_manufacturer={:?} reason=os_reports_driver_strings",
-                    p.port_name,
-                    serial,
-                    info.serial_number.as_deref().unwrap_or("-"),
-                    info.manufacturer.as_deref().unwrap_or("-"),
-                );
-            }
-            return Some(RackInfo {
-                port_name: p.port_name.clone(),
-                serial: Some(serial),
-                manufacturer: Some(RACK_FALLBACK_MANUFACTURER.to_string()),
-                product: Some(RACK_PRODUCT.to_string()),
-                vid: info.vid,
-                pid: info.pid,
-            });
-        }
-    }
-    // Reset the change guards so the next appearance of a rack is logged and,
-    // if its port is still busy, re-notifies the user.
-    DISCOVERY_MATCH.changed("none");
-    BUSY_PORT_NOTICE.reset();
-    None
 }
 
-/// Windows: locate the rack via the parent USB node. The COM node only shows
+/// Windows: locate devices via the parent USB node. The COM node only shows
 /// the FTDI driver's strings ("FTDI" / "USB Serial Port (COMx)"), but Windows
 /// caches the device's own iProduct on the USB node (`BusReportedDeviceDesc`,
 /// surfaced by nusb as `product_string`) along with the clean EEPROM serial —
 /// the same values macOS/Linux read from the descriptors directly, so the
 /// resulting client_id matches across platforms. The device is never opened.
 #[cfg(windows)]
-fn find_rack_by_usb_descriptor(ports: &[serialport::SerialPortInfo]) -> Option<RackInfo> {
+fn collect_by_usb_descriptor(
+    profile: &'static DeviceProfile,
+    ports: &[serialport::SerialPortInfo],
+    out: &mut Vec<RackInfo>,
+) {
     use nusb::MaybeFuture;
 
     let devices = match nusb::list_devices().wait() {
         Ok(devices) => devices,
         Err(e) => {
             log::warn!("RACK | phase=discovery status=usb_enum_failed err={e}");
-            return None;
+            return;
         }
     };
 
     for dev in devices {
-        if dev.product_string() != Some(RACK_PRODUCT) {
+        if dev.product_string() != Some(profile.product) {
             continue;
         }
         let Some(dev_serial) = dev.serial_number() else {
@@ -359,6 +459,9 @@ fn find_rack_by_usb_descriptor(ports: &[serialport::SerialPortInfo]) -> Option<R
         // port serial is the device serial plus an optional channel letter
         // appended by the driver ("SC1799" -> "SC1799A").
         for p in ports {
+            if out.iter().any(|r| r.port_name == p.port_name) {
+                continue;
+            }
             let SerialPortType::UsbPort(info) = &p.port_type else {
                 continue;
             };
@@ -370,31 +473,60 @@ fn find_rack_by_usb_descriptor(ports: &[serialport::SerialPortInfo]) -> Option<R
             if info.vid != dev.vendor_id() || info.pid != dev.product_id() || !serial_ok {
                 continue;
             }
-            if DISCOVERY_MATCH.changed(&format!("usb:{}:{dev_serial}", p.port_name)) {
-                log::info!(
-                    "RACK | phase=discovery status=usb_descriptor_match port={} serial={} \
-                     product={:?} vid={:#06x} pid={:#06x}",
-                    p.port_name,
-                    dev_serial,
-                    RACK_PRODUCT,
-                    info.vid,
-                    info.pid,
-                );
-            }
-            return Some(RackInfo {
+            out.push(RackInfo {
                 port_name: p.port_name.clone(),
                 serial: Some(dev_serial.to_string()),
                 // iManufacturer is not reachable on Windows without opening
-                // the device; the product string is Lisle's own EEPROM value,
-                // so the canonical manufacturer is substituted for branding.
-                manufacturer: Some(RACK_FALLBACK_MANUFACTURER.to_string()),
-                product: Some(RACK_PRODUCT.to_string()),
+                // the device; the product string is the vendor's own EEPROM
+                // value, so the canonical manufacturer is substituted.
+                manufacturer: Some(profile.fallback_manufacturer.to_string()),
+                product: Some(profile.product.to_string()),
                 vid: info.vid,
                 pid: info.pid,
+                matched_by: "usb",
+                profile,
             });
+            break; // this USB device is linked to its port — next device
         }
     }
-    None
+}
+
+/// Last resort: no descriptor strings anywhere — match by the profile's chip
+/// identity plus its serial scheme, substituting the canonical strings so the
+/// client_id and UI stay identical across platforms.
+fn collect_by_chip_identity(
+    profile: &'static DeviceProfile,
+    ports: &[serialport::SerialPortInfo],
+    out: &mut Vec<RackInfo>,
+) {
+    for p in ports {
+        if out.iter().any(|r| r.port_name == p.port_name) {
+            continue;
+        }
+        let SerialPortType::UsbPort(info) = &p.port_type else {
+            continue;
+        };
+        if info.vid != profile.fallback_vid || info.pid != profile.fallback_pid {
+            continue;
+        }
+        let Some(serial) = info
+            .serial_number
+            .as_deref()
+            .and_then(profile.serial_scheme)
+        else {
+            continue;
+        };
+        out.push(RackInfo {
+            port_name: p.port_name.clone(),
+            serial: Some(serial),
+            manufacturer: Some(profile.fallback_manufacturer.to_string()),
+            product: Some(profile.product.to_string()),
+            vid: info.vid,
+            pid: info.pid,
+            matched_by: "chip",
+            profile,
+        });
+    }
 }
 
 /// True if a COM port's serial belongs to the USB device with `dev_serial`:
@@ -422,9 +554,9 @@ fn lisle_serial(serial: &str) -> Option<String> {
     (!body.is_empty() && body.bytes().all(|b| b.is_ascii_digit())).then(|| format!("SC{body}"))
 }
 
-/// Try to open the rack's serial port (8N1). Logs success/failure.
+/// Try to open the device's serial port (8N1). Logs success/failure.
 pub(super) fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPort>> {
-    match serialport::new(&rack.port_name, BAUD)
+    match serialport::new(&rack.port_name, rack.profile.baud)
         .data_bits(serialport::DataBits::Eight)
         .stop_bits(serialport::StopBits::One)
         .parity(serialport::Parity::None)
@@ -435,9 +567,10 @@ pub(super) fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPor
             log::info!(
                 "RACK | phase=open status=ok port={} baud={} format=8N1",
                 rack.port_name,
-                BAUD
+                rack.profile.baud
             );
-            BUSY_PORT_NOTICE.reset();
+            // The busy episode of this port (if any) is over.
+            lock_busy_notices().retain(|p| p != &rack.port_name);
             Some(port)
         }
         Err(e) => {
@@ -467,10 +600,14 @@ pub(super) fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPor
     }
 }
 
-/// Emits the "COM port busy" UI notification once per busy episode.
+/// Emits the "COM port busy" UI notification once per busy episode of a port.
 fn notify_port_busy(port_name: &str) {
-    if !BUSY_PORT_NOTICE.changed(port_name) {
-        return;
+    {
+        let mut notified = lock_busy_notices();
+        if notified.iter().any(|p| p == port_name) {
+            return;
+        }
+        notified.push(port_name.to_string());
     }
     emit_notification_event(
         "global-notification",
@@ -491,10 +628,25 @@ mod tests {
 
     const MFR: &str = "Lisle Design Ltd"; // sample manufacturer string
 
+    /// Test RackInfo with the fields the discovery invariants care about.
+    fn info(port: &str, serial: Option<&str>) -> RackInfo {
+        RackInfo {
+            port_name: port.into(),
+            serial: serial.map(str::to_string),
+            manufacturer: Some(MFR.into()),
+            product: None,
+            vid: 0,
+            pid: 0,
+            matched_by: "descriptor",
+            profile: &LISLE_RACK,
+        }
+    }
+
     #[test]
-    fn rack_product_string_is_set() {
-        assert!(!RACK_PRODUCT.is_empty());
-        assert!(!RACK_BRAND_MARKER.is_empty());
+    fn lisle_profile_is_set() {
+        assert!(!LISLE_RACK.product.is_empty());
+        assert!(!LISLE_RACK.brand_marker.is_empty());
+        assert!(!LISLE_RACK.fallback_manufacturer.is_empty());
     }
 
     #[test]
@@ -529,7 +681,7 @@ mod tests {
         // The same physical rack: macOS reports the descriptors, Windows the
         // driver strings + suffixed serial. Both must yield one client_id.
         let windows_id = build_client_id(
-            RACK_FALLBACK_MANUFACTURER,
+            LISLE_RACK.fallback_manufacturer,
             lisle_serial("SC1799A").as_deref(),
         );
         let macos_id = build_client_id("Lisle Design Ltd", Some("SC1799"));
@@ -609,14 +761,7 @@ mod tests {
 
     #[test]
     fn is_supported_checks_manufacturer_marker() {
-        let base = RackInfo {
-            port_name: "/dev/x".into(),
-            serial: Some("SC1".into()),
-            manufacturer: Some("Lisle Design Ltd".into()),
-            product: None,
-            vid: 0,
-            pid: 0,
-        };
+        let base = info("/dev/x", Some("SC1"));
         assert!(base.is_supported());
         assert!(RackInfo {
             manufacturer: Some("LISLE DESIGN".into()),
@@ -637,19 +782,54 @@ mod tests {
 
     #[test]
     fn rack_info_equality_detects_swap() {
-        let a = RackInfo {
-            port_name: "/dev/x".into(),
-            serial: Some("SC1".into()),
-            manufacturer: None,
-            product: None,
-            vid: 0,
-            pid: 0,
-        };
+        let a = info("/dev/x", Some("SC1"));
         let b = RackInfo {
             serial: Some("SC2".into()),
             ..a.clone()
         };
         assert_ne!(a, b); // different serial => treated as a different device
         assert_eq!(a, a.clone());
+    }
+
+    #[test]
+    fn rack_info_equality_ignores_the_discovery_pass() {
+        // Which pass matched can vary between ticks (transient nusb failure
+        // falls back to chip identity) — must not read as a device swap.
+        let a = info("/dev/x", Some("SC1"));
+        let b = RackInfo {
+            matched_by: "chip",
+            ..a.clone()
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn racks_sorted_by_serial_not_enumeration_order() {
+        // The client's field case: COM4/SC5465 enumerated before COM3/SC4953.
+        let mut racks = vec![info("COM4", Some("SC5465")), info("COM3", Some("SC4953"))];
+        sort_racks(&mut racks);
+        assert_eq!(racks[0].serial.as_deref(), Some("SC4953"));
+        // Same result whatever the initial order.
+        let mut racks = vec![info("COM3", Some("SC4953")), info("COM4", Some("SC5465"))];
+        sort_racks(&mut racks);
+        assert_eq!(racks[0].serial.as_deref(), Some("SC4953"));
+    }
+
+    #[test]
+    fn distinct_serials_are_all_kept() {
+        let mut racks = vec![info("COM3", Some("SC4953")), info("COM4", Some("SC5465"))];
+        dedupe_by_client_id(&mut racks);
+        assert_eq!(racks.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_client_ids_keep_only_the_first() {
+        // No serial at all → both devices build "LISLE00000000000": one MQTT
+        // identity, so only the first (deterministic order) survives.
+        let mut racks = vec![info("COM4", None), info("COM3", None)];
+        sort_racks(&mut racks);
+        dedupe_by_client_id(&mut racks);
+        assert_eq!(racks.len(), 1);
+        assert_eq!(racks[0].port_name, "COM3");
     }
 }

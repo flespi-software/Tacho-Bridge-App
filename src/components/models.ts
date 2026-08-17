@@ -36,9 +36,13 @@ export interface RackCard {
   authentication?: boolean | null
 }
 
-// State of the connected card rack, pushed from the backend via `rack-state`.
-// Unlike a plain reader, one rack holds many cards.
+// State of one connected card rack. The backend pushes the full rack list as
+// an array via `rack-state` — several racks can be connected at once, each on
+// its own USB port. Unlike a plain reader, one rack holds many cards.
 export interface RackState {
+  // Stable identity of the rack (its MQTT client_id, derived from the device
+  // serial); keys the rack rows in the UI.
+  client_id: string
   connected: boolean
   name: string
   serial?: string | null

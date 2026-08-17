@@ -97,11 +97,19 @@ pub(super) async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
 
                         if topic == "connect" {
                             // spawn instruction: the server discovered a card in a rack slot
-                            handle_connect_spawn(&publish.payload, &serial_port, &log_header).await;
+                            handle_connect_spawn(
+                                &publish.payload,
+                                &client_id,
+                                &serial_port,
+                                &log_header,
+                            )
+                            .await;
                         } else if topic == "watch" {
-                            // arm/re-arm the card presence watch with the server-supplied bytes
+                            // arm/re-arm this rack's card presence watch with the
+                            // server-supplied bytes
                             start_rack_watch(
                                 &publish.payload,
+                                &client_id,
                                 &serial_port,
                                 &mqtt_client,
                                 &log_header,
@@ -112,10 +120,11 @@ pub(super) async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                             // showing a scan in progress. Treated as a hint, not a
                             // contract: the frontend still has its own timeout in
                             // case a server version never sends `watch`.
-                            crate::global_app_handle::rack_mark_scan_complete();
+                            crate::global_app_handle::rack_mark_scan_complete(&client_id);
                         } else if topic == "disconnect" {
-                            // a card left its slot: close the session, drop it from the UI
-                            handle_card_disconnect(&publish.payload, &log_header);
+                            // a card left its slot: close the session (if this rack
+                            // owns it), drop it from this rack's UI section
+                            handle_card_disconnect(&publish.payload, &client_id, &log_header);
                         } else {
                             handle_serial_request(
                                 &mqtt_client,
