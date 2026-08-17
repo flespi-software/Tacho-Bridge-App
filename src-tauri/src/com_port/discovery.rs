@@ -223,15 +223,13 @@ impl ChangeGuard {
 
     /// Store `value` and report whether it differs from the previous one.
     fn changed(&self, value: &str) -> bool {
-        // Poison-recovering like every other lock in the backend: this guard is
-        // touched from the discovery loop on the blocking pool, and a panic in
-        // any holder would otherwise poison it permanently — killing rack
-        // discovery for the rest of the process. The stored value is a plain
-        // String replaced in one assignment, so it is never half-updated.
-        let mut last = match self.0.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        // Poison-recovering like every other lock in the backend (see
+        // `super::lock`; this one is inline because the mutex lives inside
+        // `self`, not in a static).
+        let mut last = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *last == value {
             false
         } else {
@@ -247,18 +245,18 @@ static PORT_INVENTORY: ChangeGuard = ChangeGuard::new();
 /// Last logged discovery-match outcome (the whole matched set).
 static DISCOVERY_MATCH: ChangeGuard = ChangeGuard::new();
 
+/// Last logged set of client_id duplicates dropped by `dedupe_by_client_id`.
+/// Must be change-gated like every other discovery log: on macOS every USB
+/// serial device enumerates as BOTH its /dev/cu.* and /dev/tty.* node with
+/// identical metadata, so duplicates are the NORMAL state there and an
+/// unguarded warn would fire on every 2s poll tick.
+static DISCOVERY_DUPLICATES: ChangeGuard = ChangeGuard::new();
+
 /// Ports for which the "COM port busy" UI notification has been shown. An
 /// entry is dropped when its port opens or its device leaves the bus, so a new
 /// busy episode (e.g. after replug) notifies again. A plain Vec: the set is as
 /// small as the number of connected devices.
 static BUSY_PORT_NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-fn lock_busy_notices() -> std::sync::MutexGuard<'static, Vec<String>> {
-    match BUSY_PORT_NOTICES.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
 
 /// One-line description of an enumerated port for the inventory log. USB ports
 /// carry the metadata discovery matches on; other transports just get their
@@ -361,7 +359,7 @@ pub(super) fn find_racks() -> Vec<RackInfo> {
 
     // Busy notices only survive for ports still matched: a device that left
     // the bus notifies again on its next busy episode.
-    lock_busy_notices().retain(|p| racks.iter().any(|r| r.port_name == *p));
+    super::lock(&BUSY_PORT_NOTICES).retain(|p| racks.iter().any(|r| r.port_name == *p));
 
     racks
 }
@@ -374,24 +372,35 @@ fn sort_racks(racks: &mut [RackInfo]) {
     });
 }
 
-/// Two devices that build the same client_id are one MQTT identity — only the
-/// first (in the deterministic order) can be served, the rest are dropped with
-/// a warning. Realistically this takes two racks with no serial at all.
+/// Two entries that build the same client_id are one MQTT identity — only the
+/// first (in the deterministic order) can be served, the rest are dropped.
+/// This is the NORMAL state on macOS, where every USB serial device enumerates
+/// as both its /dev/cu.* and /dev/tty.* node with identical metadata (the sort
+/// keeps /dev/cu.*, the callout node, first). Logged once per change of the
+/// dropped set, at info — it is expected housekeeping, not a fault.
 fn dedupe_by_client_id(racks: &mut Vec<RackInfo>) {
     let mut seen = std::collections::HashSet::new();
+    let mut dropped: Vec<String> = Vec::new();
     racks.retain(|r| {
         let id = r.client_id();
         if seen.insert(id.clone()) {
             true
         } else {
-            log::warn!(
-                "RACK | phase=discovery status=ignored reason=duplicate_client_id client_id={} port={}",
-                id,
-                r.port_name
-            );
+            dropped.push(format!("{}:{}", id, r.port_name));
             false
         }
     });
+    let snapshot = if dropped.is_empty() {
+        "none".to_string()
+    } else {
+        dropped.join(" ")
+    };
+    if DISCOVERY_DUPLICATES.changed(&snapshot) && !dropped.is_empty() {
+        log::info!(
+            "RACK | phase=discovery status=duplicate_client_id_dropped list=[{}]",
+            snapshot
+        );
+    }
 }
 
 /// First pass: the device's own descriptor strings (macOS/Linux).
@@ -405,22 +414,23 @@ fn collect_by_descriptor(
             continue;
         }
         if let SerialPortType::UsbPort(info) = &p.port_type {
-            let manufacturer_ok = info
-                .manufacturer
-                .as_deref()
-                .map(|m| m.to_ascii_lowercase().contains(profile.brand_marker))
-                .unwrap_or(false);
-            if manufacturer_ok && info.product.as_deref() == Some(profile.product) {
-                out.push(RackInfo {
-                    port_name: p.port_name.clone(),
-                    serial: info.serial_number.clone(),
-                    manufacturer: info.manufacturer.clone(),
-                    product: info.product.clone(),
-                    vid: info.vid,
-                    pid: info.pid,
-                    matched_by: "descriptor",
-                    profile,
-                });
+            if info.product.as_deref() != Some(profile.product) {
+                continue;
+            }
+            let candidate = RackInfo {
+                port_name: p.port_name.clone(),
+                serial: info.serial_number.clone(),
+                manufacturer: info.manufacturer.clone(),
+                product: info.product.clone(),
+                vid: info.vid,
+                pid: info.pid,
+                matched_by: "descriptor",
+                profile,
+            };
+            // The brand check lives in is_supported() only — one predicate for
+            // both the discovery pass and the connect-time gate.
+            if candidate.is_supported() {
+                out.push(candidate);
             }
         }
     }
@@ -570,7 +580,7 @@ pub(super) fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPor
                 rack.profile.baud
             );
             // The busy episode of this port (if any) is over.
-            lock_busy_notices().retain(|p| p != &rack.port_name);
+            super::lock(&BUSY_PORT_NOTICES).retain(|p| p != &rack.port_name);
             Some(port)
         }
         Err(e) => {
@@ -603,7 +613,7 @@ pub(super) fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPor
 /// Emits the "COM port busy" UI notification once per busy episode of a port.
 fn notify_port_busy(port_name: &str) {
     {
-        let mut notified = lock_busy_notices();
+        let mut notified = super::lock(&BUSY_PORT_NOTICES);
         if notified.iter().any(|p| p == port_name) {
             return;
         }

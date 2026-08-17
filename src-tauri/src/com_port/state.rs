@@ -5,10 +5,17 @@
 use crate::global_app_handle::{rack_update_cards, RackCard};
 
 use super::cards::RACK_CARDS_UI;
+use super::lock;
 
 /// Puts one discovered rack card into that rack's UI card list (keyed by slot)
 /// and re-emits the rack state. Cards without a local config entry are shown
 /// too — with no card number.
+///
+/// Also enforces one row per ICCID across ALL racks: a physical card sits in
+/// exactly one slot, so its appearance here removes any stale row another rack
+/// still shows (e.g. the old rack's `disconnect` was lost while its connection
+/// was down). Without the purge the card would be displayed in two rack blocks,
+/// and the stale row would feed `connect_pending_rack_cards` a wrong location.
 pub(super) fn update_rack_card_ui(
     rack_id: &str,
     slot: u16,
@@ -18,11 +25,25 @@ pub(super) fn update_rack_card_ui(
     let name = card_number
         .as_deref()
         .and_then(|number| crate::config::get_card_config_from_cache(number).and_then(|c| c.name));
-    let cards = {
-        let mut ui = match RACK_CARDS_UI.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+    let updates: Vec<(String, Vec<RackCard>)> = {
+        let mut ui = lock(&RACK_CARDS_UI);
+        let mut updates = Vec::new();
+        for (other_id, list) in ui.iter_mut() {
+            if other_id == rack_id {
+                continue;
+            }
+            let before = list.len();
+            list.retain(|c| c.iccid.as_deref() != Some(iccid));
+            if list.len() != before {
+                log::info!(
+                    "RACK {} | [SPAWN] status=stale_row_purged iccid={} now_in_rack={}",
+                    other_id,
+                    iccid,
+                    rack_id
+                );
+                updates.push((other_id.clone(), list.clone()));
+            }
+        }
         let list = ui.entry(rack_id.to_string()).or_default();
         list.retain(|c| c.slot != slot);
         list.push(RackCard {
@@ -36,13 +57,16 @@ pub(super) fn update_rack_card_ui(
             authentication: None,
         });
         list.sort_by_key(|c| c.slot);
-        list.clone()
+        updates.push((rack_id.to_string(), list.clone()));
+        updates
     };
-    rack_update_cards(rack_id, cards);
+    for (id, cards) in updates {
+        rack_update_cards(&id, cards);
+    }
 }
 
 /// Updates the live session state of one rack card (looked up by the ICCID it
-/// was spawned with — unique across racks, a physical card sits in one slot)
+/// was spawned with — `update_rack_card_ui` keeps ICCIDs unique across racks)
 /// and re-emits the rack state so the UI can show activity.
 ///
 /// A no-op when the card is not in any list — it may have been removed from
@@ -50,12 +74,9 @@ pub(super) fn update_rack_card_ui(
 /// row for a card that is physically gone would be worse than losing one blink.
 pub(super) fn set_rack_card_state(iccid: &str, online: bool, authentication: bool) {
     let update = {
-        let mut ui = match RACK_CARDS_UI.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut ui = lock(&RACK_CARDS_UI);
         let mut update = None;
-        'racks: for (rack_id, list) in ui.iter_mut() {
+        for (rack_id, list) in ui.iter_mut() {
             let Some(card) = list.iter_mut().find(|c| c.iccid.as_deref() == Some(iccid)) else {
                 continue;
             };
@@ -70,7 +91,7 @@ pub(super) fn set_rack_card_state(iccid: &str, online: bool, authentication: boo
             card.online = Some(online);
             card.authentication = Some(authentication);
             update = Some((rack_id.clone(), list.clone()));
-            break 'racks;
+            break;
         }
         update
     };

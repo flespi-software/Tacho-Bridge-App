@@ -75,17 +75,17 @@ lazy_static::lazy_static! {
         std::sync::Mutex::new(HashMap::new());
 }
 
-fn lock_rack_tasks() -> std::sync::MutexGuard<'static, HashMap<String, (JoinHandle<()>, SharedPort)>>
-{
-    match RACK_TASKS.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+/// Locks a mutex, recovering from poisoning: a panic in any holder must not
+/// permanently kill the rack stack. Every guarded value in this module is safe
+/// to reuse after a panic — plain collections replaced in whole assignments,
+/// never left half-updated. Shared by all `com_port` submodules.
+fn lock<T>(m: &'static std::sync::Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// True while the MQTT task of this rack is running; reaps a finished entry.
 fn rack_mqtt_running(client_id: &str) -> bool {
-    let mut guard = lock_rack_tasks();
+    let mut guard = lock(&RACK_TASKS);
     match guard.get(client_id) {
         Some((handle, _)) if handle.inner().is_finished() => {
             log::warn!(
@@ -109,7 +109,7 @@ fn start_rack_mqtt(client_id: String, port: SharedPort) {
         );
         return;
     }
-    let mut guard = lock_rack_tasks();
+    let mut guard = lock(&RACK_TASKS);
     log::info!("RACK | [MQTT] phase=start client_id={}", client_id);
     let handle = async_runtime::spawn(rack_mqtt_loop(client_id.clone(), port.clone()));
     guard.insert(client_id, (handle, port));
@@ -120,7 +120,7 @@ fn start_rack_mqtt(client_id: String, port: SharedPort) {
 /// host once at start, so a server-host change must go through a full restart;
 /// the server re-issues `connect`/`watch` after each rack reconnects.
 pub fn restart_rack_mqtt(reason: &str) {
-    let ids: Vec<String> = lock_rack_tasks().keys().cloned().collect();
+    let ids: Vec<String> = lock(&RACK_TASKS).keys().cloned().collect();
     if ids.is_empty() {
         return;
     }
@@ -149,7 +149,7 @@ pub fn shutdown() {
 /// map is what closes the COM handle once the tasks release their clones.
 fn stop_rack(client_id: &str) {
     {
-        let mut guard = lock_rack_tasks();
+        let mut guard = lock(&RACK_TASKS);
         if let Some((handle, _)) = guard.remove(client_id) {
             handle.abort();
             log::info!("RACK {} | [MQTT] phase=stop status=aborted", client_id);
@@ -163,7 +163,7 @@ fn stop_rack(client_id: &str) {
 /// card sessions whose rack entry was already reaped (e.g. a task that died
 /// and was cleared before its siblings were stopped).
 fn stop_all_racks() {
-    let ids: Vec<String> = lock_rack_tasks().keys().cloned().collect();
+    let ids: Vec<String> = lock(&RACK_TASKS).keys().cloned().collect();
     for id in &ids {
         stop_rack(id);
     }
