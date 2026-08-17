@@ -1,8 +1,8 @@
 <template>
-  <!-- Card rack block. Shown only when a rack has ever been reported by the
-       backend. Unlike a single reader, a rack is a horizontal block: a header
-       with the rack name on top, and the list of its cards below. -->
-  <div v-if="rack" class="rack-block">
+  <!-- One card rack block; the parent renders one per reported rack. Unlike a
+       single reader, a rack is a horizontal block: a header with the rack name
+       on top, and the list of its cards below. -->
+  <div class="rack-block">
     <!-- Header: rack identity + connection state -->
     <div class="rack-header row items-center no-wrap">
       <q-icon
@@ -105,7 +105,7 @@ import type { RackCard, RackState } from './models'
 import { cardStatusIcon } from './cardFormatters'
 
 const props = defineProps<{
-  rack: RackState | null
+  rack: RackState
 }>()
 
 const emit = defineEmits<{
@@ -123,10 +123,7 @@ const emit = defineEmits<{
  * raises it when the server arms the rack's presence watch, which happens once
  * discovery has walked the rack), so there is nothing left to time out.
  */
-const scanning = computed(() => {
-  const rack = props.rack
-  return rack !== null && rack.connected && !rack.scan_complete
-})
+const scanning = computed(() => props.rack.connected && !props.rack.scan_complete)
 
 /**
  * Status icon for a rack card, from the shared vocabulary the readers list uses.

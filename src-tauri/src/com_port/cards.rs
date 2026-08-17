@@ -2,11 +2,13 @@
 //!
 //! The server discovers cards by ICCID and tells us to open a session per card
 //! (`connect`); each session is an MQTT connection under the card's own number,
-//! funnelling its envelopes into the shared serial port. Also hosts the card
-//! presence watch, which the server arms once discovery has walked the rack.
+//! funnelling its envelopes into the serial port of the rack that holds the
+//! card. Also hosts the card presence watches, one per connected rack, armed by
+//! the server once its discovery has walked that rack.
 
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::async_runtime::{self, JoinHandle};
@@ -21,25 +23,37 @@ use super::transport::{
     execute_envelope, normalize_hex, SerialEnvelope, SharedPort, SERIAL_MS_MAX, SERIAL_MS_MIN,
     SERIAL_READ_DEADLINE, SERIAL_REPLY_TIMEOUT,
 };
-use super::{next_reconnect_delay, RACK_MQTT_TASK, RECONNECT_DELAY_INITIAL_SECS};
+use super::{lock, next_reconnect_delay, RACK_TASKS, RECONNECT_DELAY_INITIAL_SECS};
 
-type RackCardTask = (String, u16, JoinHandle<()>);
+/// One rack-backed card session: the running task plus the identity it was
+/// spawned with. `rack_id` is the client_id of the rack whose serial port the
+/// session writes to — server messages of one rack must never touch sessions
+/// that belong to another.
+struct RackCardTask {
+    card_number: String,
+    slot: u16,
+    rack_id: String,
+    handle: JoinHandle<()>,
+}
 
 lazy_static::lazy_static! {
-    /// Rack-backed per-card MQTT tasks, keyed by ICCID (the rack's stable card
-    /// identifier) with the spawn-time card number and slot kept alongside.
+    /// Rack-backed per-card MQTT tasks, keyed by ICCID (the stable card
+    /// identifier — a physical card sits in exactly one slot of one rack).
     /// Keying by the config-resolved card number would leak the session if the
     /// config entry is deleted or edited while the card sits in the rack — the
-    /// disconnect lookup would then miss the running task. The slot is kept so
-    /// a `connect` for the same slot with a different ICCID (card swapped
-    /// without an explicit `disconnect`) evicts the stale session instead of
-    /// leaking it. All aborted when the rack disconnects — without the rack
-    /// there is no transport to those cards.
-    static ref RACK_CARD_TASKS: std::sync::Mutex<std::collections::HashMap<String, RackCardTask>> =
-        std::sync::Mutex::new(std::collections::HashMap::new());
+    /// disconnect lookup would then miss the running task. The (rack, slot) the
+    /// session was spawned for is kept so a `connect` for the same slot with a
+    /// different ICCID (card swapped without an explicit `disconnect`) evicts
+    /// the stale session, and so a `connect` from another rack (card moved
+    /// while the old rack's `disconnect` is delayed) replaces the session
+    /// instead of being skipped.
+    static ref RACK_CARD_TASKS: std::sync::Mutex<HashMap<String, RackCardTask>> =
+        std::sync::Mutex::new(HashMap::new());
 
-    /// Cards currently exposed by the rack, as shown in the UI (RackState.cards).
-    pub(super) static ref RACK_CARDS_UI: std::sync::Mutex<Vec<RackCard>> = std::sync::Mutex::new(Vec::new());
+    /// Cards currently exposed by each rack (RackState.cards), keyed by the
+    /// rack's client_id.
+    pub(super) static ref RACK_CARDS_UI: std::sync::Mutex<HashMap<String, Vec<RackCard>>> =
+        std::sync::Mutex::new(HashMap::new());
 }
 
 /// Opens rack-backed sessions for discovered cards that became resolvable after
@@ -47,113 +61,186 @@ lazy_static::lazy_static! {
 /// skipped at discovery time, and the server does not repeat it until the rack
 /// content changes — so assigning the number in the UI must retry it locally.
 pub async fn connect_pending_rack_cards() {
-    let port = {
-        let guard = match RACK_MQTT_TASK.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.as_ref().map(|(_, port)| port.clone())
+    // Live racks and their serial ports.
+    let ports: Vec<(String, SharedPort)> = {
+        let guard = lock(&RACK_TASKS);
+        guard
+            .iter()
+            .map(|(rack_id, (_, port))| (rack_id.clone(), port.clone()))
+            .collect()
     };
-    let Some(port) = port else {
+    if ports.is_empty() {
         return; // no rack connected
-    };
+    }
 
-    let pending: Vec<(u16, String)> = {
-        let ui = match RACK_CARDS_UI.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+    let pending: Vec<(String, u16, String)> = {
+        let ui = lock(&RACK_CARDS_UI);
         ui.iter()
-            .filter(|card| card.card_number.is_none())
-            .filter_map(|card| card.iccid.clone().map(|iccid| (card.slot, iccid)))
+            .flat_map(|(rack_id, cards)| {
+                cards
+                    .iter()
+                    .filter(|card| card.card_number.is_none())
+                    .filter_map(|card| {
+                        card.iccid
+                            .clone()
+                            .map(|iccid| (rack_id.clone(), card.slot, iccid))
+                    })
+            })
             .collect()
     };
 
-    for (slot, iccid) in pending {
+    for (rack_id, slot, iccid) in pending {
         let Some(card_number) = crate::config::find_card_number_by_iccid(&iccid) else {
             continue; // still unassigned
         };
+        let Some((_, port)) = ports.iter().find(|(id, _)| *id == rack_id) else {
+            continue; // that rack is gone
+        };
         log::info!(
-            "RACK | [SPAWN] status=pending_card_resolved slot={} iccid={} card={}",
+            "RACK | [SPAWN] status=pending_card_resolved rack={} slot={} iccid={} card={}",
+            rack_id,
             slot,
             iccid,
             card_number
         );
-        update_rack_card_ui(slot, &iccid, Some(card_number.clone()));
-        spawn_rack_card_checked(card_number, iccid, slot, port.clone(), "RACK |").await;
+        update_rack_card_ui(&rack_id, slot, &iccid, Some(card_number.clone()));
+        spawn_rack_card_checked(
+            card_number,
+            iccid,
+            slot,
+            rack_id.clone(),
+            port.clone(),
+            "RACK |",
+            // a replay of cached UI rows: must not displace a live session
+            false,
+        )
+        .await;
     }
 }
 
 /// Starts the rack-backed MQTT session of one card, deduplicating by ICCID and
 /// by card number (two slots mapped to the same number in the config must not
 /// open two MQTT connections with the same client_id).
-fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: SharedPort) {
+///
+/// `from_server` tells whether this spawn is driven by a fresh server `connect`
+/// (the server just read the card's ICCID in that slot — ground truth) or by a
+/// local replay of cached UI rows (`connect_pending_rack_cards`). Only the
+/// former may relocate a live session to another rack/slot: a replayed row can
+/// be stale, and rebinding a working session to it would funnel the card's
+/// APDUs into a port where the card no longer sits.
+fn spawn_rack_card(
+    card_number: String,
+    iccid: String,
+    slot: u16,
+    rack_id: String,
+    serial_port: SharedPort,
+    from_server: bool,
+) {
     // The rack may have been torn down while the caller was awaiting between
     // its dedup check and this spawn (config-change path racing the monitor).
     // A session installed after the teardown would hold the stale serial port
     // and an MQTT client_id forever — verify the port is still the live one.
     let port_is_live = {
-        let guard = match RACK_MQTT_TASK.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let guard = lock(&RACK_TASKS);
         guard
-            .as_ref()
+            .get(&rack_id)
             .map(|(_, live)| Arc::ptr_eq(live, &serial_port))
             .unwrap_or(false)
     };
     if !port_is_live {
         log::warn!(
-            "RACK | [SPAWN] card={} slot={} status=skipped reason=rack_gone",
+            "RACK | [SPAWN] card={} rack={} slot={} status=skipped reason=rack_gone",
             card_number,
+            rack_id,
             slot
         );
         return;
     }
 
-    let mut tasks = match RACK_CARD_TASKS.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    // A different card now occupies this slot: the previous occupant's session
-    // is dead weight (its card is gone) — evict it even without a `disconnect`.
+    let mut tasks = lock(&RACK_CARD_TASKS);
+    // A different card now occupies this slot of this rack: the previous
+    // occupant's session is dead weight (its card is gone) — evict it even
+    // without a `disconnect`. Scoped to the rack: slot numbers repeat across
+    // racks (every rack has a slot 1).
     let stale: Vec<String> = tasks
         .iter()
-        .filter(|(other_iccid, (_, other_slot, _))| **other_iccid != iccid && *other_slot == slot)
+        .filter(|(other_iccid, task)| {
+            **other_iccid != iccid && task.rack_id == rack_id && task.slot == slot
+        })
         .map(|(other_iccid, _)| other_iccid.clone())
         .collect();
     for old_iccid in stale {
-        if let Some((old_number, _, handle)) = tasks.remove(&old_iccid) {
-            handle.abort();
+        if let Some(old) = tasks.remove(&old_iccid) {
+            old.handle.abort();
             log::info!(
-                "RACK | [SPAWN] card={} slot={} status=aborted reason=slot_reassigned",
-                old_number,
+                "RACK | [SPAWN] card={} rack={} slot={} status=aborted reason=slot_reassigned",
+                old.card_number,
+                rack_id,
                 slot
             );
         }
     }
-    if let Some((_, _, handle)) = tasks.get(&iccid) {
-        if !handle.inner().is_finished() {
-            log::debug!(
-                "RACK | [SPAWN] card={} status=skipped reason=already_running",
-                card_number
+    // Same ICCID: a repeat `connect` for the same place is a no-op, but the
+    // same card reported from another rack or slot means it physically moved
+    // while the old session was still alive — e.g. the old rack's connection
+    // was offline, so its `disconnect` is delayed or lost. The newest `connect`
+    // is ground truth (the server just read this ICCID in that slot): replace
+    // the session so the card is served where it actually is.
+    let moved = match tasks.get(&iccid) {
+        Some(existing) if !existing.handle.inner().is_finished() => {
+            if existing.rack_id == rack_id && existing.slot == slot {
+                log::debug!(
+                    "RACK | [SPAWN] card={} status=skipped reason=already_running",
+                    card_number
+                );
+                return;
+            }
+            // A live session elsewhere, but this spawn is a local replay of a
+            // cached UI row — that row may be the stale duplicate, so it must
+            // not displace a working session (see `from_server` above).
+            if !from_server {
+                log::warn!(
+                    "RACK | [SPAWN] card={} rack={} slot={} status=skipped reason=live_session_elsewhere",
+                    card_number,
+                    rack_id,
+                    slot
+                );
+                return;
+            }
+            true
+        }
+        _ => false,
+    };
+    if moved {
+        if let Some(old) = tasks.remove(&iccid) {
+            old.handle.abort();
+            log::info!(
+                "RACK | [SPAWN] card={} status=aborted reason=card_moved from_rack={} from_slot={} to_rack={} to_slot={}",
+                old.card_number,
+                old.rack_id,
+                old.slot,
+                rack_id,
+                slot
             );
-            return;
         }
     }
-    if tasks.iter().any(|(other_iccid, (number, _, handle))| {
-        *other_iccid != iccid && *number == card_number && !handle.inner().is_finished()
+    if tasks.iter().any(|(other_iccid, task)| {
+        *other_iccid != iccid
+            && task.card_number == card_number
+            && !task.handle.inner().is_finished()
     }) {
         log::warn!(
-            "RACK | [SPAWN] card={} slot={} status=skipped reason=served_by_another_slot",
+            "RACK | [SPAWN] card={} rack={} slot={} status=skipped reason=served_by_another_slot",
             card_number,
+            rack_id,
             slot
         );
         return;
     }
     log::info!(
-        "RACK | [SPAWN] card={} slot={} status=starting_session",
+        "RACK | [SPAWN] card={} rack={} slot={} status=starting_session",
         card_number,
+        rack_id,
         slot
     );
     let handle = async_runtime::spawn(rack_card_mqtt_loop(
@@ -162,11 +249,19 @@ fn spawn_rack_card(card_number: String, iccid: String, slot: u16, serial_port: S
         slot,
         serial_port,
     ));
-    tasks.insert(iccid, (card_number, slot, handle));
+    tasks.insert(
+        iccid,
+        RackCardTask {
+            card_number,
+            slot,
+            rack_id,
+            handle,
+        },
+    );
 }
 
 /// MQTT loop of one rack-backed card connection. Mirrors the rack's own loop — the same opaque
-/// envelope handling funneled into the shared serial port — plus the one-shot **rack link
+/// envelope handling funneled into the rack's serial port — plus the one-shot **rack link
 /// report** right after CONNACK (topic `rack`, `{"iccid":"...","slot":N}`) that binds this card
 /// session to its slot on the server. Without the report the server treats the card as
 /// reader-backed and uses the plain PC/SC envelope.
@@ -308,19 +403,21 @@ async fn rack_card_mqtt_loop(
 }
 
 lazy_static::lazy_static! {
-    /// The card presence watch task of the current rack connection, if armed.
-    static ref RACK_WATCH_TASK: std::sync::Mutex<Option<JoinHandle<()>>> =
-        std::sync::Mutex::new(None);
+    /// Card presence watch tasks, one per connected rack, keyed by the rack's
+    /// client_id.
+    static ref RACK_WATCH_TASKS: std::sync::Mutex<HashMap<String, JoinHandle<()>>> =
+        std::sync::Mutex::new(HashMap::new());
 }
 
-/// Arms (or re-arms) the card presence watch from a server `watch` instruction:
+/// Arms (or re-arms) one rack's card presence watch from a server `watch` instruction:
 /// `{"cmd":"<hex>","interval_ms":1000,"idle_ms":...,"deadline_ms":...}`. A background task
-/// executes the opaque command every interval through the same FIFO port queue and publishes
+/// executes the opaque command every interval through that rack's FIFO port queue and publishes
 /// the reply back (topic `watch`, the standard response envelope) ONLY when its bytes change.
 /// Re-arming resets the baseline, so the first successful exchange is always published — that
 /// is how the server catches updates missed while its discovery chain was busy.
 pub(super) fn start_rack_watch(
     payload: &[u8],
+    rack_id: &str,
     serial_port: &SharedPort,
     mqtt_client: &AsyncClient,
     log_header: &str,
@@ -413,31 +510,34 @@ pub(super) fn start_rack_watch(
         }
     });
 
-    let mut guard = match RACK_WATCH_TASK.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if let Some(old) = guard.replace(handle) {
+    if let Some(old) = lock(&RACK_WATCH_TASKS).insert(rack_id.to_string(), handle) {
         old.abort();
     }
 }
 
-/// Stops the card presence watch task, if armed.
-pub(super) fn stop_rack_watch() {
-    let mut guard = match RACK_WATCH_TASK.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if let Some(handle) = guard.take() {
+/// Stops one rack's card presence watch task, if armed.
+pub(super) fn stop_rack_watch(rack_id: &str) {
+    if let Some(handle) = lock(&RACK_WATCH_TASKS).remove(rack_id) {
         handle.abort();
-        log::info!("RACK | [WATCH] status=stopped");
+        log::info!("RACK {} | [WATCH] status=stopped", rack_id);
     }
 }
 
-/// `disconnect` message from the server: a card left its rack slot,
-/// `{"iccid":"...","slot":N}`. Closes the rack-backed card session (if one was spawned) and
-/// removes the card from the rack section of the UI.
-pub(super) fn handle_card_disconnect(payload: &[u8], log_header: &str) {
+/// Stops every rack's watch task. Shutdown backstop: reaps a watch whose rack
+/// entry was already removed elsewhere.
+pub(super) fn stop_all_rack_watches() {
+    let mut guard = lock(&RACK_WATCH_TASKS);
+    for (rack_id, handle) in guard.drain() {
+        handle.abort();
+        log::info!("RACK {} | [WATCH] status=stopped", rack_id);
+    }
+}
+
+/// `disconnect` message from the server: a card left a slot of the rack whose
+/// connection delivered the message, `{"iccid":"...","slot":N}`. Closes the
+/// rack-backed card session (if this rack owns it) and removes the card from
+/// this rack's section of the UI.
+pub(super) fn handle_card_disconnect(payload: &[u8], rack_id: &str, log_header: &str) {
     let json = match serde_json::from_slice::<serde_json::Value>(payload) {
         Ok(json) => json,
         Err(e) => {
@@ -469,35 +569,51 @@ pub(super) fn handle_card_disconnect(payload: &[u8], log_header: &str) {
         iccid
     );
 
-    // drop the card from the rack section of the UI
+    // Drop the card from this rack's section of the UI. The row must match
+    // BOTH slot and ICCID — same guard as the session path below: a late or
+    // redelivered `disconnect` for a card that was already replaced in this
+    // slot must not delete the new occupant's row.
     let cards = {
-        let mut ui = match RACK_CARDS_UI.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        ui.retain(|c| c.slot != slot as u16);
-        ui.clone()
+        let mut ui = lock(&RACK_CARDS_UI);
+        ui.get_mut(rack_id).map(|list| {
+            list.retain(|c| !(c.slot == slot as u16 && c.iccid.as_deref() == Some(iccid)));
+            list.clone()
+        })
     };
-    rack_update_cards(cards);
+    if let Some(cards) = cards {
+        rack_update_cards(rack_id, cards);
+    }
 
-    // Close the card session, if one was spawned. Lookup is by ICCID captured at
-    // spawn time — re-resolving the card number through the config here would
-    // leak the task when the entry was deleted or edited mid-session.
-    let mut tasks = match RACK_CARD_TASKS.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if let Some((card_number, _slot, handle)) = tasks.remove(iccid) {
-        handle.abort();
+    // Close the card session, if one was spawned — but only if it belongs to
+    // THIS rack. With several racks a `disconnect` can arrive after the card
+    // was already re-discovered in another rack (the old rack's connection
+    // lagged behind), and must not kill the new session. Lookup is by ICCID
+    // captured at spawn time — re-resolving the card number through the config
+    // here would leak the task when the entry was deleted or edited mid-session.
+    let mut tasks = lock(&RACK_CARD_TASKS);
+    let owned_here = tasks
+        .get(iccid)
+        .map(|task| task.rack_id == rack_id)
+        .unwrap_or(false);
+    if owned_here {
+        if let Some(task) = tasks.remove(iccid) {
+            task.handle.abort();
+            log::info!(
+                "{} [SPAWN] card={} status=aborted reason=card_removed",
+                log_header,
+                task.card_number
+            );
+        }
+    } else if tasks.contains_key(iccid) {
         log::info!(
-            "{} [SPAWN] card={} status=aborted reason=card_removed",
+            "{} [SPAWN] status=ignored reason=session_belongs_to_another_rack iccid={}",
             log_header,
-            card_number
+            iccid
         );
     }
 }
 
-/// Closes the rack-backed session of one card number, if the rack currently
+/// Closes the rack-backed session of one card number, if any rack currently
 /// serves it. Called when the card is removed from the config: `TASK_POOL` only
 /// holds reader-backed sessions, so without this the rack session would keep
 /// running with the removed card's MQTT client_id — leaking the task until the
@@ -510,77 +626,119 @@ pub(super) fn handle_card_disconnect(payload: &[u8], log_header: &str) {
 pub fn disconnect_rack_card(card_number: &str) {
     // Sessions are keyed by ICCID (stable across config edits), so the lookup
     // is by the number captured at spawn time.
-    let aborted: Vec<String> = {
-        let mut tasks = match RACK_CARD_TASKS.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+    {
+        let mut tasks = lock(&RACK_CARD_TASKS);
         let matching: Vec<String> = tasks
             .iter()
-            .filter(|(_, (number, _, _))| number == card_number)
+            .filter(|(_, task)| task.card_number == card_number)
             .map(|(iccid, _)| iccid.clone())
             .collect();
         for iccid in &matching {
-            if let Some((number, slot, handle)) = tasks.remove(iccid) {
-                handle.abort();
+            if let Some(task) = tasks.remove(iccid) {
+                task.handle.abort();
                 log::info!(
-                    "RACK | [SPAWN] card={} slot={} status=aborted reason=card_removed_from_config",
-                    number,
-                    slot
+                    "RACK | [SPAWN] card={} rack={} slot={} status=aborted reason=card_removed_from_config",
+                    task.card_number,
+                    task.rack_id,
+                    task.slot
                 );
             }
         }
-        matching
-    };
-
-    if aborted.is_empty() {
-        return;
     }
 
-    // Keep the card visible in the rack section, but unassigned — the physical
-    // card did not move, only its config entry is gone.
-    let cards = {
-        let mut ui = match RACK_CARDS_UI.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for card in ui.iter_mut() {
-            if card.card_number.as_deref() == Some(card_number) {
-                card.card_number = None;
-                card.name = None;
+    // Keep the card visible in its rack section, but unassigned — the physical
+    // card did not move, only its config entry is gone. The sweep runs even
+    // when no session was aborted: a rack row can carry the number without a
+    // session (spawn skipped as served_by_reader), and skipping it here would
+    // leave the deleted number on display forever.
+    let changed: Vec<(String, Vec<RackCard>)> = {
+        let mut ui = lock(&RACK_CARDS_UI);
+        let mut changed = Vec::new();
+        for (rack_id, list) in ui.iter_mut() {
+            let mut touched = false;
+            for card in list.iter_mut() {
+                if card.card_number.as_deref() == Some(card_number) {
+                    card.card_number = None;
+                    card.name = None;
+                    touched = true;
+                }
+            }
+            if touched {
+                changed.push((rack_id.clone(), list.clone()));
             }
         }
-        ui.clone()
+        changed
     };
-    rack_update_cards(cards);
+    for (rack_id, cards) in changed {
+        rack_update_cards(&rack_id, cards);
+    }
 }
 
-/// Aborts all rack-backed card sessions and clears the UI card list. Called when the rack
-/// disconnects or its MQTT/serial stack is restarted — without the rack there is no transport.
-pub(super) fn stop_rack_cards() {
-    let mut tasks = match RACK_CARD_TASKS.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    for (_iccid, (card_number, _slot, handle)) in tasks.drain() {
-        handle.abort();
-        log::info!(
-            "RACK | [SPAWN] card={} status=aborted reason=rack_gone",
-            card_number
-        );
+/// Aborts the card sessions of one rack and clears its UI card list. Called
+/// when that rack disconnects or its MQTT/serial stack is restarted — without
+/// the rack there is no transport to those cards.
+pub(super) fn stop_rack_cards(rack_id: &str) {
+    {
+        let mut tasks = lock(&RACK_CARD_TASKS);
+        let matching: Vec<String> = tasks
+            .iter()
+            .filter(|(_, task)| task.rack_id == rack_id)
+            .map(|(iccid, _)| iccid.clone())
+            .collect();
+        for iccid in matching {
+            if let Some(task) = tasks.remove(&iccid) {
+                task.handle.abort();
+                log::info!(
+                    "RACK | [SPAWN] card={} rack={} status=aborted reason=rack_gone",
+                    task.card_number,
+                    rack_id
+                );
+            }
+        }
     }
-    let mut ui = match RACK_CARDS_UI.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
+    let cleared = {
+        let mut ui = lock(&RACK_CARDS_UI);
+        ui.remove(rack_id)
+            .map(|list| !list.is_empty())
+            .unwrap_or(false)
     };
-    if !ui.is_empty() {
+    if cleared {
+        rack_update_cards(rack_id, Vec::new());
+    }
+}
+
+/// Aborts every rack-backed card session and clears the whole UI card list.
+/// Shutdown backstop: reaps sessions whose rack entry was already removed.
+pub(super) fn stop_all_rack_cards() {
+    {
+        let mut tasks = lock(&RACK_CARD_TASKS);
+        for (_iccid, task) in tasks.drain() {
+            task.handle.abort();
+            log::info!(
+                "RACK | [SPAWN] card={} rack={} status=aborted reason=rack_gone",
+                task.card_number,
+                task.rack_id
+            );
+        }
+    }
+    let rack_ids: Vec<String> = {
+        let mut ui = lock(&RACK_CARDS_UI);
+        let ids: Vec<String> = ui
+            .iter()
+            .filter(|(_, list)| !list.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect();
         ui.clear();
-        rack_update_cards(Vec::new());
+        ids
+    };
+    for rack_id in rack_ids {
+        rack_update_cards(&rack_id, Vec::new());
     }
 }
 
 pub(super) async fn handle_connect_spawn(
     payload: &[u8],
+    rack_id: &str,
     serial_port: &SharedPort,
     log_header: &str,
 ) {
@@ -624,9 +782,9 @@ pub(super) async fn handle_connect_spawn(
         ),
     }
 
-    // every reported card lands in the rack state (rack section of the UI), configured or
+    // every reported card lands in this rack's state (rack section of the UI), configured or
     // not: an unknown card is shown there with its ICCID, ready to be assigned a number
-    update_rack_card_ui(slot as u16, iccid, card_number.clone());
+    update_rack_card_ui(rack_id, slot as u16, iccid, card_number.clone());
 
     let Some(card_number) = card_number else {
         return;
@@ -636,8 +794,11 @@ pub(super) async fn handle_connect_spawn(
         card_number,
         iccid.to_string(),
         slot as u16,
+        rack_id.to_string(),
         serial_port.clone(),
         log_header,
+        // a fresh server `connect`: allowed to relocate a moved card's session
+        true,
     )
     .await;
 }
@@ -645,13 +806,15 @@ pub(super) async fn handle_connect_spawn(
 /// Final spawn step shared by the server `connect` handler and the pending-card
 /// retry: a reader-backed session for the same card number wins — never open a
 /// second connection with the same client_id (the server treats that as an
-/// ident collision).
+/// ident collision). `from_server` — see `spawn_rack_card`.
 async fn spawn_rack_card_checked(
     card_number: String,
     iccid: String,
     slot: u16,
+    rack_id: String,
     port: SharedPort,
     log_header: &str,
+    from_server: bool,
 ) {
     if TASK_POOL
         .lock()
@@ -668,5 +831,5 @@ async fn spawn_rack_card_checked(
         return;
     }
 
-    spawn_rack_card(card_number, iccid, slot, port);
+    spawn_rack_card(card_number, iccid, slot, rack_id, port, from_server);
 }

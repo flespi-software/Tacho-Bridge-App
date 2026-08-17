@@ -118,8 +118,10 @@
         </q-item>
       </div>
     </div>
-    <!-- Card rack block, below the plain readers. One rack holds many cards. -->
-    <RackList :rack="rack" @link="linkMode" />
+    <!-- Card rack blocks, below the plain readers. One block per connected
+         rack (several racks on separate USB ports are all served), each rack
+         holding many cards. -->
+    <RackList v-for="r in racks" :key="r.client_id" :rack="r" @link="linkMode" />
     <SmartCardList
       ref="cardlist"
       :cards="state.cards"
@@ -181,9 +183,10 @@ const state = reactive<{ readers: Reader[]; cards: Record<string, SmartCard> }>(
   cards: {},
 })
 
-// Card rack state, pushed from the backend via `rack-state`. null until the
-// backend reports a rack at least once; then it reflects connect/disconnect.
-const rack = ref<RackState | null>(null)
+// Card rack states, pushed from the backend via `rack-state` as the full list
+// keyed by client_id. Empty until the backend reports a rack at least once;
+// racks that disconnect stay listed with connected=false.
+const racks = ref<RackState[]>([])
 
 // Registered Tauri listeners. Kept in an array so we can detach them all
 // in onUnmounted — leaking listeners across HMR/navigation would let stale
@@ -278,19 +281,27 @@ function handleCardsSync(raw: unknown): void {
   }
 }
 
-// Runtime guard for the rack-state payload — fail closed on a malformed shape.
+// Runtime guard for one rack in the rack-state payload — fail closed on a
+// malformed shape.
 function isRackStatePayload(raw: unknown): raw is RackState {
   if (!raw || typeof raw !== 'object') return false
   const p = raw as Record<string, unknown>
-  return typeof p.connected === 'boolean' && typeof p.name === 'string' && Array.isArray(p.cards)
+  return (
+    typeof p.client_id === 'string' &&
+    typeof p.connected === 'boolean' &&
+    typeof p.name === 'string' &&
+    Array.isArray(p.cards)
+  )
 }
 
 function handleRackState(raw: unknown): void {
-  if (!isRackStatePayload(raw)) {
+  // The backend always sends the full rack list, so the local one is replaced
+  // wholesale — no delta merging.
+  if (!Array.isArray(raw) || !raw.every(isRackStatePayload)) {
     console.warn('rack-state: ignoring malformed payload', raw)
     return
   }
-  rack.value = raw
+  racks.value = raw
 }
 
 ///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
