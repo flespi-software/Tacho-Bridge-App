@@ -370,3 +370,11 @@ All notable changes to this project will be documented in this file.
 
 - Added support for multiple card racks connected to one application instance.
 - Internal hardening of the multi-rack support: fixed stale card rows and session rebinding when a card moves between racks, and deduplicated the rack state handling.
+
+### [0.8.0-beta.14] - 2026-08-17
+
+🆕 Features / Improvements
+
+- Narrow eslint glob to src/ so the vite checker stops watching src-tauri/target and running out of memory.
+- Smart card monitor: retry context establish with growing backoff (5s to 1 minute) and explain SecurityViolation as a pcscd/polkit access denial.
+- Smart card monitor: apply the retry backoff to panics too, drop a stale PCSC context and rescan flag after failed passes, and remove unreachable error handling around process_reader_states.
