@@ -378,3 +378,9 @@ All notable changes to this project will be documented in this file.
 - Narrow eslint glob to src/ so the vite checker stops watching src-tauri/target and running out of memory.
 - Smart card monitor: retry context establish with growing backoff (5s to 1 minute) and explain SecurityViolation as a pcscd/polkit access denial.
 - Smart card monitor: apply the retry backoff to panics too, drop a stale PCSC context and rescan flag after failed passes, and remove unreachable error handling around process_reader_states.
+
+### [0.8.0-beta.15] - 2026-08-22
+
+🛠 Fixes
+
+- Fixed session conflicts and stuck cards when moving cards between racks, slots and readers, plus APDU error recovery, rack scan indicator and log upload fixes.
