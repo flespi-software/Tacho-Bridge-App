@@ -82,14 +82,38 @@ pub fn dispatch_request(
     {
         let mut active = lock_active_request();
         if let Some(active_id) = *active {
-            // server re-send of the request in flight, or a stray overlap: drop it,
-            // the upload already running will produce the command result
+            if active_id == request_id {
+                // server re-send of the request in flight: drop it, the upload
+                // already running will produce this command's result
+                log::warn!(
+                    "{} [LOGS] status=duplicate_request request_id={}",
+                    log_header,
+                    request_id
+                );
+                return true;
+            }
+            // A DIFFERENT id is a new command, and the running upload only
+            // publishes under its own id — silently dropping this one would
+            // leave the server waiting for a `done` that never comes, failing
+            // only by timeout. Refuse it explicitly on the new id's done topic
+            // instead, so the command fails fast and readably.
             log::warn!(
-                "{} [LOGS] status=duplicate_request request_id={} active_request_id={}",
+                "{} [LOGS] status=rejected_concurrent_request request_id={} active_request_id={}",
                 log_header,
                 request_id,
                 active_id
             );
+            let client = client.clone();
+            let log_header = log_header.to_string();
+            async_runtime::spawn(async move {
+                publish_json(
+                    &client,
+                    &log_header,
+                    &format!("logs/{}/done", request_id),
+                    json!({"error": "another log upload is already in progress"}),
+                )
+                .await;
+            });
             return true;
         }
         *active = Some(request_id);

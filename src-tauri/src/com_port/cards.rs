@@ -56,10 +56,14 @@ lazy_static::lazy_static! {
         std::sync::Mutex::new(HashMap::new());
 }
 
-/// Opens rack-backed sessions for discovered cards that became resolvable after
-/// a config change: the server's `connect` for a card with an unknown ICCID is
-/// skipped at discovery time, and the server does not repeat it until the rack
-/// content changes — so assigning the number in the UI must retry it locally.
+/// Opens rack-backed sessions for discovered cards that currently have none.
+/// Covers two situations the server will not retry on its own (it repeats a
+/// `connect` only when the rack content changes):
+///  * a card whose ICCID was unknown at discovery time and has since been
+///    assigned a number in the UI (config change);
+///  * a card whose spawn was skipped because a reader-backed session served
+///    the same number (`served_by_reader`) and that reader session has since
+///    been torn down (see the hook in `mqtt::shutdown_connections`).
 pub async fn connect_pending_rack_cards() {
     // Live racks and their serial ports.
     let ports: Vec<(String, SharedPort)> = {
@@ -73,18 +77,30 @@ pub async fn connect_pending_rack_cards() {
         return; // no rack connected
     }
 
-    let pending: Vec<(String, u16, String)> = {
+    // UI rows first, live-session filter second — the two locks are taken
+    // sequentially, never nested (abort paths lock them in the other order).
+    let rows: Vec<(String, u16, String)> = {
         let ui = lock(&RACK_CARDS_UI);
         ui.iter()
             .flat_map(|(rack_id, cards)| {
-                cards
-                    .iter()
-                    .filter(|card| card.card_number.is_none())
-                    .filter_map(|card| {
-                        card.iccid
-                            .clone()
-                            .map(|iccid| (rack_id.clone(), card.slot, iccid))
-                    })
+                cards.iter().filter_map(|card| {
+                    card.iccid
+                        .clone()
+                        .map(|iccid| (rack_id.clone(), card.slot, iccid))
+                })
+            })
+            .collect()
+    };
+    let pending: Vec<(String, u16, String)> = {
+        let tasks = lock(&RACK_CARD_TASKS);
+        rows.into_iter()
+            .filter(|(_, _, iccid)| {
+                // Only rows without a live session are pending; rows already
+                // served skip the whole resolve/spawn round-trip here.
+                tasks
+                    .get(iccid)
+                    .map(|task| task.handle.inner().is_finished())
+                    .unwrap_or(true)
             })
             .collect()
     };
@@ -359,6 +375,18 @@ async fn rack_card_mqtt_loop(
                             log_header,
                             String::from_utf8_lossy(&publish.payload)
                         );
+                        // Only `request/...` publishes are serial envelopes —
+                        // same guard as the rack's own loop: anything else (a
+                        // future control topic, a retained stray) must not be
+                        // written raw to the COM port.
+                        if !topic.starts_with("request/") {
+                            log::warn!(
+                                "{} [MQTT] status=ignored reason=unknown_topic topic={}",
+                                log_header,
+                                topic
+                            );
+                            continue;
+                        }
                         // Activity marking now happens inside, driven by the
                         // envelope's `finish` flag rather than by the mere
                         // arrival of a command.
@@ -369,7 +397,7 @@ async fn rack_card_mqtt_loop(
                             &serial_port,
                             &log_header,
                             &mut idempotency,
-                            Some(&iccid),
+                            Some((&iccid, &card_number)),
                         )
                         .await;
                     }
@@ -610,6 +638,47 @@ pub(super) fn handle_card_disconnect(payload: &[u8], rack_id: &str, log_header: 
             log_header,
             iccid
         );
+    }
+}
+
+/// Aborts the live rack-backed session of one card number, if any. Called by
+/// the reader path (`mqtt::ensure_connection`) right before it opens its own
+/// MQTT connection under that client_id: the card was just physically detected
+/// in a PC/SC reader, so it cannot still sit in a rack slot — the rack session
+/// is stale (its server `disconnect` was lost or is still in flight), and
+/// letting it live would put two MQTT connections with the same client_id on
+/// the broker, which drops them both in a loop until the rack is unplugged.
+///
+/// Only the session is closed. The UI row keeps its slot and number: the row
+/// itself is removed by the server's `disconnect` once it arrives, and until
+/// then "present but not served" is the truthful display.
+pub fn abort_rack_card_session(card_number: &str) {
+    let aborted: Vec<String> = {
+        let mut tasks = lock(&RACK_CARD_TASKS);
+        let matching: Vec<String> = tasks
+            .iter()
+            .filter(|(_, task)| task.card_number == card_number)
+            .map(|(iccid, _)| iccid.clone())
+            .collect();
+        let mut aborted = Vec::new();
+        for iccid in matching {
+            if let Some(task) = tasks.remove(&iccid) {
+                task.handle.abort();
+                log::warn!(
+                    "RACK | [SPAWN] card={} rack={} slot={} status=aborted reason=card_now_in_reader",
+                    task.card_number,
+                    task.rack_id,
+                    task.slot
+                );
+                aborted.push(iccid);
+            }
+        }
+        aborted
+    };
+    // Outside the tasks lock: the state setter takes the UI lock, and the two
+    // must never be held together (lock-order discipline with the UI paths).
+    for iccid in aborted {
+        set_rack_card_state(&iccid, false, false);
     }
 }
 

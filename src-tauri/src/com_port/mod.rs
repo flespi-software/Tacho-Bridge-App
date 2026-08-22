@@ -43,6 +43,7 @@ use rack::rack_mqtt_loop;
 use transport::SharedPort;
 
 // Re-exported for the rest of the app: these are the only entry points.
+pub use cards::abort_rack_card_session;
 pub use cards::connect_pending_rack_cards;
 pub use cards::disconnect_rack_card;
 

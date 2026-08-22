@@ -235,6 +235,14 @@ pub async fn ensure_connection(
         return;
     }
 
+    // A live rack-backed session for the same card number would collide with
+    // the connection opened below: the flespi broker allows one session per
+    // client_id and would drop the two connections in a loop. The card was
+    // just physically detected in this reader, so it cannot still sit in a
+    // rack slot — the rack session is stale (its server `disconnect` was lost
+    // or is still in flight). Abort it before opening ours.
+    crate::com_port::abort_rack_card_session(&client_id);
+
     // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
 
@@ -343,6 +351,11 @@ pub async fn ensure_connection(
     let mut card_generation: u64 = 0;
     let mut cached_generation: u64 = 0;
 
+    // Identity of the pool entry this task belongs to (see
+    // ProcessingCard::session_id): the failure path below must only ever drop
+    // ITS OWN entry, never a successor registered under the same client_id.
+    let session_id = crate::smart_card::next_session_id();
+
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
         let iccid: String = match managed_card.get_iccid().await {
@@ -364,21 +377,30 @@ pub async fn ensure_connection(
                 // then the stale entry makes the card look served and blocks a
                 // rack-backed session for the same number from starting.
                 //
+                // Matched by session_id, not client_id: the card may have moved
+                // to another reader while this task was still starting, in which
+                // case the pool already holds the successor's entry under the
+                // same client_id — and removing THAT one would orphan a live
+                // session (unstoppable by remove_connections, invisible to the
+                // served_by_reader guard).
+                //
                 // Ordering is safe: the spawning `ensure_connection` holds the
                 // TASK_POOL lock across the spawn and releases it only after
                 // pushing our entry, so this lock cannot be taken before the
                 // entry exists.
                 let mut pool = TASK_POOL.lock().await;
-                if let Some(index) = pool
-                    .iter()
-                    .position(|card| card.client_id == client_id_cloned)
-                {
+                if let Some(index) = pool.iter().position(|card| card.session_id == session_id) {
                     pool.remove(index);
                     log::info!(
                         "{} [CONN] phase=init status=pool_entry_dropped reason=iccid_resolve_failed",
                         log_header
                     );
                 }
+                drop(pool);
+                // The dropped entry may have been the reason a rack-backed
+                // session for this number was skipped (served_by_reader) —
+                // retry the rack side now that the number is free again.
+                crate::com_port::connect_pending_rack_cards().await;
                 return;
             }
         };
@@ -497,10 +519,12 @@ pub async fn ensure_connection(
                                     log::debug!("Parsed JSON payload: {:?}", json_payload);
 
                                     let mut payload_ack = String::new();
-                                    // Set when the card exchange itself failed (send_apdu could
-                                    // not reach the card and substituted SW_TECHNICAL_PROBLEM).
-                                    // Such a reply must never be cached for idempotency — see
-                                    // the caching block below.
+                                    // Set when the card exchange itself failed (send_apdu
+                                    // returned a transport error and SW_TECHNICAL_PROBLEM was
+                                    // substituted on the wire). Such a reply must never be
+                                    // cached for idempotency — see the caching block below.
+                                    // A genuine 6F00 answered BY the card is an Ok and is
+                                    // cached like any other reply.
                                     let mut exchange_failed = false;
 
                                     // Server-requested T protocol for this session. Applied only on session
@@ -660,17 +684,34 @@ pub async fn ensure_connection(
                                                         );
                                                     }
 
-                                                    let rapdu = managed_card
+                                                    let rapdu = match managed_card
                                                         .send_apdu(hex_value, &client_id_cloned)
-                                                        .await;
-                                                    exchange_failed = rapdu == SW_TECHNICAL_PROBLEM;
-
-                                                    // Passive sniffer: extract plaintext EF data from SM'd responses
-                                                    crate::apdu_sniffer::sniff(
-                                                        &client_id_cloned,
-                                                        hex_value,
-                                                        &rapdu,
-                                                    );
+                                                        .await
+                                                    {
+                                                        Ok(rapdu) => {
+                                                            // Passive sniffer: extract plaintext EF
+                                                            // data from SM'd responses. Only a real
+                                                            // card reply is worth parsing — feeding
+                                                            // it a command that never ran would
+                                                            // poison the SELECT-EF tracking.
+                                                            crate::apdu_sniffer::sniff(
+                                                                &client_id_cloned,
+                                                                hex_value,
+                                                                &rapdu,
+                                                            );
+                                                            rapdu
+                                                        }
+                                                        Err(_) => {
+                                                            // Transport failure (already logged by
+                                                            // send_apdu): substitute the technical-
+                                                            // problem status on the wire and keep
+                                                            // this reply out of the idempotency
+                                                            // cache so the server's retry reaches
+                                                            // the card again.
+                                                            exchange_failed = true;
+                                                            SW_TECHNICAL_PROBLEM.to_string()
+                                                        }
+                                                    };
 
                                                     // Send the global-cards-sync event to the frontend that card is connected
                                                     emit_card_sync_event(
@@ -830,6 +871,7 @@ pub async fn ensure_connection(
 
     task_pool.push(ProcessingCard {
         client_id,
+        session_id,
         reader_name: Some(reader_name_str),
         atr: Some(atr),
         mqtt_client: mqtt_clinet_cloned,
@@ -857,6 +899,14 @@ pub async fn ensure_connection(
 /// normal close instead of an internal error), waits for the event loops to
 /// flush the packet and exit on their own, and force-aborts the stragglers.
 pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
+    // A reader-backed session that closes here may have been the reason a
+    // rack-backed session for the same card number was skipped
+    // (`served_by_reader`) — remembered so the rack side can be retried once
+    // the teardown is done (see the trailing call below).
+    let had_reader_backed = cards
+        .iter()
+        .any(|card| card.reader_name.is_some() && !card.client_id.is_empty());
+
     // Phase 1: queue DISCONNECTs; a task whose request queue is unreachable
     // (already dead or clogged) has nothing to flush and is aborted right away.
     let mut waiting: Vec<ProcessingCard> = Vec::with_capacity(cards.len());
@@ -922,6 +972,14 @@ pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
             SHUTDOWN_FLUSH_TIMEOUT_MS
         );
         card.task_handle.abort();
+    }
+
+    // The card numbers just released may belong to cards physically sitting in
+    // a rack whose session spawn was skipped while a reader served the number.
+    // Retry the rack side; a no-op when no rack is connected or nothing is
+    // pending (and during app shutdown the rack ports are already gone).
+    if had_reader_backed {
+        crate::com_port::connect_pending_rack_cards().await;
     }
 }
 

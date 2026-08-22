@@ -125,7 +125,7 @@ pub(super) async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                             // a card left its slot: close the session (if this rack
                             // owns it), drop it from this rack's UI section
                             handle_card_disconnect(&publish.payload, &client_id, &log_header);
-                        } else {
+                        } else if topic.starts_with("request/") {
                             handle_serial_request(
                                 &mqtt_client,
                                 &topic,
@@ -137,6 +137,18 @@ pub(super) async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
                                 None,
                             )
                             .await;
+                        } else {
+                            // An unknown control topic (a newer server feature, or
+                            // a retained stray) must not fall through to the serial
+                            // path: its payload would be written raw to the COM
+                            // port, and the reply published back to the control
+                            // topic itself (request_to_response_topic returns
+                            // non-`request/` topics unchanged). Log and drop.
+                            log::warn!(
+                                "{} [MQTT] status=ignored reason=unknown_topic topic={}",
+                                log_header,
+                                topic
+                            );
                         }
                     }
                     other => {
@@ -200,10 +212,10 @@ pub(super) async fn handle_serial_request(
     serial_port: &SharedPort,
     log_header: &str,
     idempotency: &mut IdempotencySlot,
-    // ICCID of the card this connection serves, when the caller is a card
-    // session. `None` for the rack's own connection, which has no single card
-    // and therefore no authentication state to track.
-    card_iccid: Option<&str>,
+    // `(iccid, card_number)` of the card this connection serves, when the
+    // caller is a card session. `None` for the rack's own connection, which
+    // has no single card and therefore no authentication state to track.
+    card: Option<(&str, &str)>,
 ) {
     // A server-driven rack exchange counts as card activity: the auto-updater
     // must not restart the app in the middle of a rack card operation. The
@@ -265,9 +277,15 @@ pub(super) async fn handle_serial_request(
             // Every other way a session can end already clears the state at its
             // own site — connection lost, card pulled from the slot, rack
             // unplugged — so this needs no timeout of its own.
-            if let Some(iccid) = card_iccid {
+            if let Some((iccid, card_number)) = card {
                 if envelope.finish == Some(true) {
                     set_rack_card_state(iccid, true, false);
+                    // Same bookkeeping as the reader path (mqtt.rs): persist
+                    // the auth timestamp so a card that only ever authenticates
+                    // through a rack still shows "Last auth" in the UI.
+                    // Detached — the config write must not park the serial
+                    // bridge between `finish` and the reply.
+                    crate::config::record_auth_result_detached(card_number, true);
                     log::info!("{} [MQTT] status=auth_finished", log_header);
                 } else {
                     // `finish: false`, or a server that omits the flag: either

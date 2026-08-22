@@ -45,7 +45,22 @@ pub(super) fn update_rack_card_ui(
             }
         }
         let list = ui.entry(rack_id.to_string()).or_default();
-        list.retain(|c| c.slot != slot);
+        // One row per ICCID also INSIDE the target rack, not only across racks:
+        // a card moved slot-to-slot with a lost `disconnect` would otherwise
+        // keep both rows, and `set_rack_card_state` (which looks the card up by
+        // ICCID and stops at the first hit) could land on the dead one.
+        if list
+            .iter()
+            .any(|c| c.slot != slot && c.iccid.as_deref() == Some(iccid))
+        {
+            log::info!(
+                "RACK {} | [SPAWN] status=stale_row_purged iccid={} now_in_slot={}",
+                rack_id,
+                iccid,
+                slot
+            );
+        }
+        list.retain(|c| c.slot != slot && c.iccid.as_deref() != Some(iccid));
         list.push(RackCard {
             slot,
             iccid: Some(iccid.to_string()),

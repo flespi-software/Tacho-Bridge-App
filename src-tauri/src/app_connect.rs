@@ -238,6 +238,7 @@ pub async fn app_connection() {
 
     task_pool.push(ProcessingCard {
         client_id,
+        session_id: crate::smart_card::next_session_id(),
         reader_name: None,
         atr: None,
         mqtt_client: mqtt_clinet_cloned,

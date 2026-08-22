@@ -1,7 +1,7 @@
 // ───── Std Lib ─────
 use std::error::Error as StdError;
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,9 +25,10 @@ use crate::mqtt::{ensure_connection, remove_connections_all};
 // ───── Constants ─────
 const READERS_BUFFER_SIZE: usize = 2048;
 const MANUAL_SYNC_TIMEOUT_SECS: u64 = 1;
-/// Status word substituted when the APDU could not be run against the card at
-/// all. `mqtt.rs` compares against it to keep such a non-reply out of the
-/// idempotency cache.
+/// Status word `mqtt.rs` substitutes on the wire when `send_apdu` returns a
+/// transport error (the APDU could not be run against the card at all). Never
+/// used to classify a reply — a card can legitimately answer `6F00` itself,
+/// and the two cases are told apart by `send_apdu`'s `Result`, not by bytes.
 pub(crate) const SW_TECHNICAL_PROBLEM: &str = "6F00";
 /// Upper bound for one `get_status_change` wait in the monitor loop. A bounded
 /// wait (instead of an infinite one) lets the loop notice a rescan request
@@ -42,27 +43,84 @@ const MONITOR_RETRY_MAX: Duration = Duration::from_secs(60);
 type DynError = Box<dyn StdError + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
 
-/// True when a transmit failure proves the PCSC handle (or the whole stack
-/// under it) is gone and the command was NOT delivered to the card — the only
-/// situation where recreating the handle and re-sending the same APDU is safe.
-fn error_indicates_dead_handle(err: &(dyn StdError + 'static)) -> bool {
-    matches!(
-        err.downcast_ref::<pcsc::Error>(),
-        Some(
-            pcsc::Error::InvalidHandle
-                | pcsc::Error::ResetCard
-                | pcsc::Error::RemovedCard
-                | pcsc::Error::ReaderUnavailable
-                | pcsc::Error::NoService
-                | pcsc::Error::ServiceStopped
-        )
-    )
+/// Failure of one APDU exchange, classified for the retry decision in
+/// `send_apdu` and reported to the MQTT bridge as a typed transport error —
+/// distinct from any status word the card itself can return (a genuine `6F00`
+/// reply is an `Ok`, not an error).
+#[derive(Debug)]
+pub enum ApduError {
+    /// The request hex could not be decoded — nothing was ever sent, and a
+    /// retry with the same bytes cannot succeed either.
+    BadRequest(String),
+    /// PCSC transmit failed; carries the typed error so the retry decision can
+    /// tell a dead handle from a failure of an already-delivered command.
+    Pcsc(pcsc::Error),
+    /// The blocking transmit task died (panicked, or was cancelled before it
+    /// started) without producing a result.
+    TaskDied(String),
+    /// The PCSC handle could not be recreated after a retriable failure.
+    RecreateFailed(String),
+}
+
+impl std::fmt::Display for ApduError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApduError::BadRequest(e) => write!(f, "APDU decode error: {}", e),
+            ApduError::Pcsc(e) => write!(f, "PCSC transmit error: {}", e),
+            ApduError::TaskDied(e) => write!(f, "APDU transmit task died: {}", e),
+            ApduError::RecreateFailed(e) => write!(f, "card handle recreate failed: {}", e),
+        }
+    }
+}
+
+impl StdError for ApduError {}
+
+impl ApduError {
+    /// True when the failure proves (or makes it overwhelmingly likely) that
+    /// the command was NOT delivered to the card — the only situation where
+    /// recreating the handle and re-sending the same APDU is safe. Replaying a
+    /// command the card may already have executed would run a stateful APDU
+    /// twice and corrupt the authentication state.
+    fn is_retriable(&self) -> bool {
+        match self {
+            // Nothing was sent, but a retry with the same bytes fails the same way.
+            ApduError::BadRequest(_) => false,
+            ApduError::Pcsc(e) => matches!(
+                e,
+                pcsc::Error::InvalidHandle
+                    | pcsc::Error::ResetCard
+                    | pcsc::Error::RemovedCard
+                    | pcsc::Error::ReaderUnavailable
+                    | pcsc::Error::NoService
+                    | pcsc::Error::ServiceStopped
+            ),
+            // A cancelled blocking task never started (spawn_blocking closures
+            // cannot be interrupted once running), and the only panic sites sit
+            // before the transmit call — the command did not reach the card.
+            ApduError::TaskDied(_) => true,
+            ApduError::RecreateFailed(_) => false,
+        }
+    }
+}
+
+/// Monotonic id source for `ProcessingCard::session_id`.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocates a process-unique id for one TASK_POOL entry (see
+/// `ProcessingCard::session_id`).
+pub fn next_session_id() -> u64 {
+    NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Represents a card currently being processed (i.e., connected and active).
 #[derive(Debug)]
 pub struct ProcessingCard {
     pub client_id: String, // It is Card number. Uses as client_id for mqtt connection
+    /// Process-unique identity of THIS pool entry. client_id alone is not an
+    /// identity: a card moving between readers replaces the entry under the
+    /// same client_id, and the outgoing task must never remove the successor's
+    /// entry when it cleans up after itself.
+    pub session_id: u64,
     pub reader_name: Option<String>, // Name of the smart card reader (e.g., "Alcor Micro AU9540 00 00").
     pub atr: Option<String>,         // ATR of the inserted card (hex-encoded).
     #[allow(dead_code)]
@@ -983,12 +1041,12 @@ impl ManagedCard {
     //     }
     // }
 
-    pub async fn apdu_transmit(&self, apdu_hex: &str) -> DynResult<String> {
+    pub async fn apdu_transmit(&self, apdu_hex: &str) -> Result<String, ApduError> {
         let apdu = match hex::decode(apdu_hex) {
             Ok(data) => data,
             Err(err) => {
                 error!("Failed to decode APDU '{}': {}", apdu_hex, err);
-                return Err(format!("Decode error: {}", err).into());
+                return Err(ApduError::BadRequest(err.to_string()));
             }
         };
 
@@ -1013,35 +1071,52 @@ impl ManagedCard {
                 }
             }
         })
-        .await??;
+        .await;
 
-        Ok(response)
+        match response {
+            Ok(Ok(rapdu)) => Ok(rapdu),
+            Ok(Err(pcsc_err)) => Err(ApduError::Pcsc(pcsc_err)),
+            // The blocking task itself died: keep this distinct from a pcsc
+            // failure so the retry decision does not lump it into the
+            // "may have reached the card" bucket (see ApduError::is_retriable).
+            Err(join_err) => Err(ApduError::TaskDied(join_err.to_string())),
+        }
     }
 
-    pub async fn send_apdu(&self, apdu_hex: &str, client_id: &str) -> String {
+    /// Runs one APDU against the card, recreating the PCSC handle and retrying
+    /// once when the failure proves the command never reached the card.
+    ///
+    /// `Ok` carries the card's actual reply — any status word, including a
+    /// genuine `6F00`. `Err` means the exchange failed at the transport level
+    /// and no card reply exists: the caller substitutes `SW_TECHNICAL_PROBLEM`
+    /// on the wire and must keep that reply out of the idempotency cache so the
+    /// server's retry reaches the card again (same rule the rack path applies
+    /// via `SerialExchange::is_ok()`).
+    pub async fn send_apdu(&self, apdu_hex: &str, client_id: &str) -> Result<String, ApduError> {
         debug!("{} Sending APDU command: {}", client_id, apdu_hex);
 
         // First attempt
         match self.apdu_transmit(apdu_hex).await {
             Ok(response) => {
                 debug!("{} APDU response: {:?}", client_id, response);
-                return response;
+                return Ok(response);
             }
             Err(err) => {
                 // Recreate-and-retry is only safe when the failure proves the
                 // command never reached the card (dead handle / reader / PCSC
-                // service). For anything else the card may already have
-                // executed it — recreating resets the card (destroying the SM
-                // auth state) and replaying a stateful APDU would run it twice.
-                if !error_indicates_dead_handle(err.as_ref()) {
+                // service, or a transmit task that died before sending). For
+                // anything else the card may already have executed it —
+                // recreating resets the card (destroying the SM auth state)
+                // and replaying a stateful APDU would run it twice.
+                if !err.is_retriable() {
                     error!(
                         "{} Failed to send APDU: {}. Not retried: the command may have reached the card.",
                         client_id, err
                     );
-                    return SW_TECHNICAL_PROBLEM.to_string();
+                    return Err(err);
                 }
                 error!(
-                    "{} Failed to send APDU: {}. Dead PCSC handle - attempting to recreate card...",
+                    "{} Failed to send APDU: {}. Command not delivered - attempting to recreate card...",
                     client_id, err
                 );
             }
@@ -1053,24 +1128,24 @@ impl ManagedCard {
                 "{} Failed to recreate card after APDU failure: {}",
                 client_id, e
             );
-            return SW_TECHNICAL_PROBLEM.to_string();
+            return Err(ApduError::RecreateFailed(e.to_string()));
         }
 
-        // Seccond attempt
+        // Second attempt
         match self.apdu_transmit(apdu_hex).await {
             Ok(response) => {
                 debug!(
                     "{} APDU response (after recreate): {:?}",
                     client_id, response
                 );
-                response
+                Ok(response)
             }
             Err(retry_err) => {
                 error!(
                     "{} Retry failed: could not send APDU after recreate: {}",
                     client_id, retry_err
                 );
-                SW_TECHNICAL_PROBLEM.to_string()
+                Err(retry_err)
             }
         }
     }

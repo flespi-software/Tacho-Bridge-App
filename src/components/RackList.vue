@@ -100,7 +100,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import type { RackCard, RackState } from './models'
 import { cardStatusIcon } from './cardFormatters'
 
@@ -113,17 +113,51 @@ const emit = defineEmits<{
 }>()
 
 /**
- * The rack is still being enumerated: connected, and the backend has not yet
- * reported the scan as finished.
- *
- * Derived rather than tracked. An earlier version inferred the end of the scan
- * from a silence timeout, which could only ever be wrong in one direction or
- * the other — too short cut the indicator off mid-scan, too long left it
- * spinning after the last card. `scan_complete` is the real signal (the backend
- * raises it when the server arms the rack's presence watch, which happens once
- * discovery has walked the rack), so there is nothing left to time out.
+ * Silence fallback for the scan indicator. `scan_complete` is the real signal
+ * (the backend raises it when the server arms the rack's presence watch), but
+ * it only ever arrives from the server — an older server that never sends
+ * `watch`, or a broker that stays unreachable, would leave the spinner (and
+ * suppress the "no cards" message) forever. So the indicator also ends after
+ * this long without any progress: no new card reported, no state change. Long
+ * enough that a slow slot walk (a few seconds per card) cannot trip it.
  */
-const scanning = computed(() => props.rack.connected && !props.rack.scan_complete)
+const SCAN_SILENCE_TIMEOUT_MS = 30_000
+
+const scanTimedOut = ref(false)
+let scanTimer: ReturnType<typeof setTimeout> | undefined
+
+function clearScanTimer() {
+  if (scanTimer !== undefined) {
+    clearTimeout(scanTimer)
+    scanTimer = undefined
+  }
+}
+
+// Any progress (connect, a new card row, a scan_complete flip) restarts the
+// silence window; a finished or disconnected rack needs no timer at all.
+watch(
+  () => [props.rack.connected, props.rack.scan_complete, props.rack.cards.length] as const,
+  ([connected, scanComplete]) => {
+    clearScanTimer()
+    scanTimedOut.value = false
+    if (connected && !scanComplete) {
+      scanTimer = setTimeout(() => {
+        scanTimedOut.value = true
+      }, SCAN_SILENCE_TIMEOUT_MS)
+    }
+  },
+  { immediate: true },
+)
+
+onUnmounted(clearScanTimer)
+
+/**
+ * The rack is still being enumerated: connected, the backend has not yet
+ * reported the scan as finished, and the silence fallback has not fired.
+ */
+const scanning = computed(
+  () => props.rack.connected && !props.rack.scan_complete && !scanTimedOut.value,
+)
 
 /**
  * Status icon for a rack card, from the shared vocabulary the readers list uses.
