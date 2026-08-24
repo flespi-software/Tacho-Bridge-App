@@ -402,6 +402,19 @@ async fn rack_card_mqtt_loop(
                         )
                         .await;
                     }
+                    Event::Incoming(Incoming::PingResp(..)) => {
+                        // A keep-alive ping means this connection sent nothing
+                        // for the whole keep-alive window: no serial exchange
+                        // is in flight. Clear the busy indicator — same
+                        // self-heal the reader path performs in mqtt.rs. This
+                        // is the only recovery when the closing `finish:true`
+                        // envelope never arrives (tracker aborted the session,
+                        // message lost, or an older server that does not send
+                        // the flag at all); without it the activity animation
+                        // blinks forever on an idle card.
+                        set_rack_card_state(&iccid, true, false);
+                        log::debug!("{} [MQTT] event=ping_resp status=idle", log_header);
+                    }
                     other => {
                         log::debug!("{} [MQTT] event=other detail={:?}", log_header, other);
                     }

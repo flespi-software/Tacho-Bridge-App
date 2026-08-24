@@ -277,7 +277,11 @@ pub(super) async fn handle_serial_request(
             //
             // Every other way a session can end already clears the state at its
             // own site — connection lost, card pulled from the slot, rack
-            // unplugged — so this needs no timeout of its own.
+            // unplugged. The one gap — the closing `finish:true` simply never
+            // arriving (tracker abort, lost message, or an older server that
+            // does not send the flag) — is covered by the keep-alive PingResp
+            // reset in the card's MQTT loop (see cards.rs), so no dedicated
+            // timeout is needed here.
             if let Some((iccid, card_number)) = card {
                 if envelope.finish == Some(true) {
                     set_rack_card_state(iccid, true, false);
