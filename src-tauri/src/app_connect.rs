@@ -95,9 +95,9 @@ pub async fn app_connection() {
     //  Create a new client ID for the MQTT connection
     //////////////////////////////////////////////////
     let mut mqtt_options = MqttOptions::new(client_id.clone(), &host, port);
-    // NOTE: username/password are reserved for future authorization - do not put anything else there.
+    crate::mqtt::apply_mqtt_credentials(&mut mqtt_options);
     mqtt_options.set_keep_alive(Duration::from_secs(120));
-    log::debug!("mqtt_options: {:?}", mqtt_options);
+    // No Debug dump of mqtt_options here: it would print the credentials.
     log::info!(
         "[CONN] phase=connect_attempt status=initialized client_id={} host={}:{}",
         client_id,

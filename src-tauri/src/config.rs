@@ -57,6 +57,14 @@ where
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerConfig {
     pub host: String,
+    /// Optional MQTT authentication for the broker connection (flespi channels
+    /// accept a token as the username, password usually empty). No UI yet —
+    /// hand-edited in config.yaml for now; absent fields keep today's
+    /// anonymous connect and are not written back to the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 // Dark Theme enum, part of AppearanceConfig that contains data about the theme.
@@ -433,8 +441,14 @@ pub fn update_server_config(
 
     let mut config = load_config(config_path)?;
 
+    // The settings dialog knows nothing about the MQTT credentials (no UI for
+    // them yet) — carry the hand-edited values over so saving the dialog does
+    // not silently strip authentication from the config.
+    let previous = config.server.take();
     config.server = Some(ServerConfig {
         host: host.to_string(),
+        username: previous.as_ref().and_then(|s| s.username.clone()),
+        password: previous.and_then(|s| s.password),
     });
     config.ident = Some(ident.to_string());
     config.appearance = Some(AppearanceConfig {
@@ -796,6 +810,9 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
 
         CacheSection::Server => match (&cache.server, key) {
             (Some(server), "host") => server.host.clone(),
+            // MQTT credentials; empty string = not configured (anonymous connect).
+            (Some(server), "username") => server.username.clone().unwrap_or_default(),
+            (Some(server), "password") => server.password.clone().unwrap_or_default(),
             (Some(_), _) => {
                 log::debug!("cache: unknown key for server section: {}", key);
                 "".to_string()
@@ -1096,6 +1113,8 @@ mod tests {
             ident: Some("TBA0000000000001".to_string()),
             server: Some(ServerConfig {
                 host: "mqtt.example.com:8883".to_string(),
+                username: None,
+                password: None,
             }),
             cards,
             beta_updates: None,
@@ -1121,6 +1140,64 @@ mod tests {
             loaded.server.as_ref().map(|s| s.host.as_str()),
             Some("mqtt.example.com:8883")
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_credentials_roundtrip_and_stay_optional() {
+        let dir = unique_tmp_dir("credentials");
+        let path = dir.join("config.yaml");
+
+        // Without credentials the file must not even mention the fields —
+        // existing configs stay byte-compatible.
+        save_config(&path, &sample_config()).expect("save without credentials");
+        let raw = fs::read_to_string(&path).expect("read yaml");
+        assert!(!raw.contains("username"), "absent username must not be written");
+        assert!(!raw.contains("password"), "absent password must not be written");
+        let loaded = load_config(&path).expect("load without credentials");
+        let server = loaded.server.expect("server section");
+        assert_eq!(server.username, None);
+        assert_eq!(server.password, None);
+
+        // Hand-edited credentials survive a save/load cycle.
+        let mut cfg = sample_config();
+        if let Some(server) = cfg.server.as_mut() {
+            server.username = Some("FlespiToken".to_string());
+            server.password = Some("secret".to_string());
+        }
+        save_config(&path, &cfg).expect("save with credentials");
+        let loaded = load_config(&path).expect("load with credentials");
+        let server = loaded.server.expect("server section");
+        assert_eq!(server.username.as_deref(), Some("FlespiToken"));
+        assert_eq!(server.password.as_deref(), Some("secret"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_server_config_preserves_hand_edited_credentials() {
+        // The settings dialog has no credentials UI: saving it goes through
+        // update_server_config, which must carry the hand-edited values over
+        // instead of stripping authentication from the config.
+        let dir = unique_tmp_dir("credentials_preserved");
+        let path = dir.join("config.yaml");
+
+        let mut cfg = sample_config();
+        if let Some(server) = cfg.server.as_mut() {
+            server.username = Some("FlespiToken".to_string());
+            server.password = Some("secret".to_string());
+        }
+        save_config(&path, &cfg).expect("save");
+
+        update_server_config(&path, "new.example.com:8883", "TBA0000000000001", "Auto", true, false)
+            .expect("update server config");
+
+        let loaded = load_config(&path).expect("load");
+        let server = loaded.server.expect("server section");
+        assert_eq!(server.host, "new.example.com:8883");
+        assert_eq!(server.username.as_deref(), Some("FlespiToken"));
+        assert_eq!(server.password.as_deref(), Some("secret"));
 
         let _ = fs::remove_dir_all(&dir);
     }

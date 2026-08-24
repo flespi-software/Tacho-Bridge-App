@@ -307,6 +307,7 @@ async fn rack_card_mqtt_loop(
     };
 
     let mut mqtt_options = MqttOptions::new(&card_number, &host, port);
+    crate::mqtt::apply_mqtt_credentials(&mut mqtt_options);
     mqtt_options.set_keep_alive(Duration::from_secs(120));
     log::info!(
         "{} [MQTT] phase=connect_attempt status=initialized host={}:{} slot={}",

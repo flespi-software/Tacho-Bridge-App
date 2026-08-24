@@ -156,6 +156,24 @@ pub(crate) fn log_connection_failure(
     }
 }
 
+/// Applies the optional MQTT credentials from the config's `server` section to
+/// freshly built connection options. flespi authenticates a channel connection
+/// with a username (typically a flespi token; password usually empty). No UI
+/// for these yet — they are hand-edited in config.yaml; an absent or empty
+/// username keeps today's anonymous connect. Shared by all four MQTT loops
+/// (app, per-card, rack, rack-card) so authentication can never be enabled for
+/// one transport and forgotten for another.
+pub(crate) fn apply_mqtt_credentials(mqtt_options: &mut MqttOptions) {
+    let username = get_from_cache(CacheSection::Server, "username");
+    if username.is_empty() {
+        return;
+    }
+    let password = get_from_cache(CacheSection::Server, "password");
+    // The values themselves must never reach the log file.
+    log::debug!("[CONN] mqtt credentials applied (username set)");
+    mqtt_options.set_credentials(username, password);
+}
+
 /// Rewrites a `request/...` topic to its matching `response/...` topic.
 /// Replaces only the leading segment so substrings deeper in the topic
 /// (in client_id, parcel id, etc.) cannot be accidentally mangled.
@@ -302,7 +320,7 @@ pub async fn ensure_connection(
     //  Create a new client ID for the MQTT connection
     //////////////////////////////////////////////////
     let mut mqtt_options = MqttOptions::new(&client_id, &host, port);
-    // mqtt_options.set_credentials(flespi_token, "");
+    apply_mqtt_credentials(&mut mqtt_options);
     mqtt_options.set_keep_alive(Duration::from_secs(120));
     log::info!(
         "[CONN] phase=connect_attempt status=initialized reader={} client_id={} host={}:{}",

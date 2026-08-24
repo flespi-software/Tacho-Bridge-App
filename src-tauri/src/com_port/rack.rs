@@ -40,6 +40,7 @@ pub(super) async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
     };
 
     let mut mqtt_options = MqttOptions::new(&client_id, &host, port);
+    crate::mqtt::apply_mqtt_credentials(&mut mqtt_options);
     mqtt_options.set_keep_alive(Duration::from_secs(120));
     log::info!(
         "{} [MQTT] phase=connect_attempt status=initialized host={}:{}",
