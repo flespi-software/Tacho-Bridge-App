@@ -135,8 +135,17 @@ function clearScanTimer() {
 
 // Any progress (connect, a new card row, a scan_complete flip) restarts the
 // silence window; a finished or disconnected rack needs no timer at all.
+//
+// The sources are an ARRAY OF GETTERS on purpose: Vue compares each source's
+// value element-wise, so the callback runs only when one of the three values
+// actually changes. A single getter returning a tuple would produce a fresh
+// array each run (compared with Object.is → always different), and since the
+// parent replaces the whole rack list on every `rack-state` event, the timer
+// would then restart on every emit from ANY rack — keeping the fallback from
+// ever firing exactly where it is needed (an older server that never sends
+// scan_complete, with any card actively exchanging).
 watch(
-  () => [props.rack.connected, props.rack.scan_complete, props.rack.cards.length] as const,
+  [() => props.rack.connected, () => props.rack.scan_complete, () => props.rack.cards.length],
   ([connected, scanComplete]) => {
     clearScanTimer()
     scanTimedOut.value = false

@@ -253,14 +253,6 @@ pub async fn ensure_connection(
         return;
     }
 
-    // A live rack-backed session for the same card number would collide with
-    // the connection opened below: the flespi broker allows one session per
-    // client_id and would drop the two connections in a loop. The card was
-    // just physically detected in this reader, so it cannot still sit in a
-    // rack slot — the rack session is stale (its server `disconnect` was lost
-    // or is still in flight). Abort it before opening ours.
-    crate::com_port::abort_rack_card_session(&client_id);
-
     // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
 
@@ -285,6 +277,12 @@ pub async fn ensure_connection(
             );
             return;
         }
+        // INVARIANT: no `.await` may sit between this removal and the push of
+        // the successor entry at the end of this function. The guard is held
+        // throughout, so concurrent pool readers (e.g. the rack side's
+        // served_by_reader check) can never observe the client_id as absent —
+        // an await inserted here would open exactly the client_id-collision
+        // window this replacement logic exists to prevent.
         let old = task_pool.remove(index);
         crate::apdu_sniffer::forget(&old.client_id);
         log::warn!(
@@ -315,6 +313,17 @@ pub async fn ensure_connection(
             return;
         }
     };
+
+    // A live rack-backed session for the same card number would collide with
+    // the connection opened below: the flespi broker allows one session per
+    // client_id and would drop the two connections in a loop. The card was
+    // just physically detected in this reader, so it cannot still sit in a
+    // rack slot — the rack session is stale (its server `disconnect` was lost
+    // or is still in flight). Abort it before opening ours. Deliberately AFTER
+    // every early return above (empty client_id, existing session, invalid
+    // host): killing the rack session and then not opening the reader one
+    // would leave the card served by neither transport.
+    crate::com_port::abort_rack_card_session(&client_id);
 
     //////////////////////////////////////////////////
     //  Create a new client ID for the MQTT connection
@@ -920,10 +929,12 @@ pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
     // A reader-backed session that closes here may have been the reason a
     // rack-backed session for the same card number was skipped
     // (`served_by_reader`) — remembered so the rack side can be retried once
-    // the teardown is done (see the trailing call below).
-    let had_reader_backed = cards
-        .iter()
-        .any(|card| card.reader_name.is_some() && !card.client_id.is_empty());
+    // the teardown is done (see the trailing call below). The retry is skipped
+    // on the replacement path: a successor entry for the same client_id is
+    // (or is being) registered, so the retry could only ever report
+    // served_by_reader again.
+    let had_reader_backed = reason != "stale_entry_replaced"
+        && cards.iter().any(|card| card.reader_name.is_some());
 
     // Phase 1: queue DISCONNECTs; a task whose request queue is unreachable
     // (already dead or clogged) has nothing to flush and is aborted right away.

@@ -650,18 +650,21 @@ pub(super) fn handle_card_disconnect(payload: &[u8], rack_id: &str, log_header: 
 /// letting it live would put two MQTT connections with the same client_id on
 /// the broker, which drops them both in a loop until the rack is unplugged.
 ///
-/// Only the session is closed. The UI row keeps its slot and number: the row
-/// itself is removed by the server's `disconnect` once it arrives, and until
-/// then "present but not served" is the truthful display.
+/// The card's rack UI rows are removed as well, exactly as a server
+/// `disconnect` would do. Keeping a row here would leave a slot the card
+/// physically left looking occupied AND make it eligible for
+/// `connect_pending_rack_cards` (no live session), which would later resurrect
+/// a rack session bound to the empty slot once the reader releases the number.
+/// If the card really is back in the rack, the server re-discovers it and
+/// sends a fresh `connect`, which re-creates the row.
 pub fn abort_rack_card_session(card_number: &str) {
-    let aborted: Vec<String> = {
+    {
         let mut tasks = lock(&RACK_CARD_TASKS);
         let matching: Vec<String> = tasks
             .iter()
             .filter(|(_, task)| task.card_number == card_number)
             .map(|(iccid, _)| iccid.clone())
             .collect();
-        let mut aborted = Vec::new();
         for iccid in matching {
             if let Some(task) = tasks.remove(&iccid) {
                 task.handle.abort();
@@ -671,15 +674,36 @@ pub fn abort_rack_card_session(card_number: &str) {
                     task.rack_id,
                     task.slot
                 );
-                aborted.push(iccid);
             }
         }
-        aborted
+    }
+    // Outside the tasks lock (lock-order discipline with the UI paths): drop
+    // every rack row carrying this number — including rows whose session was
+    // never spawned (skipped as served_by_reader) — and by the card's ICCID
+    // from the config, covering a row that is not number-resolved yet.
+    let iccid = crate::config::get_card_config_from_cache(card_number).map(|card| card.iccid);
+    let updates: Vec<(String, Vec<RackCard>)> = {
+        let mut ui = lock(&RACK_CARDS_UI);
+        let mut updates = Vec::new();
+        for (rack_id, list) in ui.iter_mut() {
+            let before = list.len();
+            list.retain(|c| {
+                c.card_number.as_deref() != Some(card_number)
+                    && (iccid.is_none() || c.iccid != iccid)
+            });
+            if list.len() != before {
+                log::info!(
+                    "RACK {} | [SPAWN] status=row_dropped reason=card_now_in_reader card={}",
+                    rack_id,
+                    card_number
+                );
+                updates.push((rack_id.clone(), list.clone()));
+            }
+        }
+        updates
     };
-    // Outside the tasks lock: the state setter takes the UI lock, and the two
-    // must never be held together (lock-order discipline with the UI paths).
-    for iccid in aborted {
-        set_rack_card_state(&iccid, false, false);
+    for (rack_id, cards) in updates {
+        rack_update_cards(&rack_id, cards);
     }
 }
 
