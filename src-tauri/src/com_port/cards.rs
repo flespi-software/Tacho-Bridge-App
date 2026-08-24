@@ -655,8 +655,18 @@ pub(super) fn handle_card_disconnect(payload: &[u8], rack_id: &str, log_header: 
 /// physically left looking occupied AND make it eligible for
 /// `connect_pending_rack_cards` (no live session), which would later resurrect
 /// a rack session bound to the empty slot once the reader releases the number.
-/// If the card really is back in the rack, the server re-discovers it and
-/// sends a fresh `connect`, which re-creates the row.
+///
+/// Recovery of the row relies on the server, and holds for the normal
+/// one-card-per-number world: the card leaving the rack changes the presence
+/// watch bytes (or, if the rack link was down, the re-armed watch republishes
+/// its first exchange unconditionally), so the server always learns the
+/// current rack content and re-sends `connect` when the card is back in a
+/// slot. The one case with no recovery signal is a misconfigured setup where
+/// two physical cards resolve to the same number: detecting the second card
+/// in a reader deletes the first card's row even though its rack content
+/// never changed, and that row only comes back on a rack replug. Accepted —
+/// the reader detection is strictly newer physical evidence, and a stale row
+/// resurrecting a session onto an empty slot is the worse failure.
 pub fn abort_rack_card_session(card_number: &str) {
     {
         let mut tasks = lock(&RACK_CARD_TASKS);

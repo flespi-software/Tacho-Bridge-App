@@ -38,6 +38,18 @@ const RECONNECT_DELAY_MAX_SECS: u64 = 300;
 const GLOBAL_CARDS_SYNC_EVENT: &str = "global-cards-sync";
 const CARD_PRESENT_STATE: &str = "PRESENT";
 
+/// Shutdown reasons that `shutdown_connections` branches on (most reasons are
+/// free-text log context only). Shared constants tie the producing call sites
+/// to the consuming comparisons — a bare literal drifting out of sync would
+/// silently re-enable the behavior the branch suppresses.
+///
+/// "A successor entry for the same client_id is being registered": skips both
+/// the rack-side retry (it could only report served_by_reader) and, for the
+/// app connection, the offline emit (a late `false` would race the successor's
+/// `true`).
+pub(crate) const SHUTDOWN_REASON_STALE_ENTRY_REPLACED: &str = "stale_entry_replaced";
+pub(crate) const SHUTDOWN_REASON_APP_CONNECTION_REPLACED: &str = "app_connection_replaced";
+
 /// How long a closing MQTT task gets to flush its DISCONNECT packet and exit
 /// before being force-aborted.
 const SHUTDOWN_FLUSH_TIMEOUT_MS: u64 = 2000;
@@ -293,7 +305,10 @@ pub async fn ensure_connection(
         );
         // Close the old session gracefully; detached so the fresh registration
         // below is not delayed behind its shutdown flush.
-        async_runtime::spawn(shutdown_connections(vec![old], "stale_entry_replaced"));
+        async_runtime::spawn(shutdown_connections(
+            vec![old],
+            SHUTDOWN_REASON_STALE_ENTRY_REPLACED,
+        ));
     }
 
     // Getting server data from the cache
@@ -933,7 +948,7 @@ pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
     // on the replacement path: a successor entry for the same client_id is
     // (or is being) registered, so the retry could only ever report
     // served_by_reader again.
-    let had_reader_backed = reason != "stale_entry_replaced"
+    let had_reader_backed = reason != SHUTDOWN_REASON_STALE_ENTRY_REPLACED
         && cards.iter().any(|card| card.reader_name.is_some());
 
     // Phase 1: queue DISCONNECTs; a task whose request queue is unreachable
@@ -949,7 +964,7 @@ pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
         // frontend explicitly so the UI cannot keep showing a dead connection
         // as online. The replacement path skips this: its successor connection
         // starts immediately and a late `false` would race the new `true`.
-        if card.reader_name.is_none() && reason != "app_connection_replaced" {
+        if card.reader_name.is_none() && reason != SHUTDOWN_REASON_APP_CONNECTION_REPLACED {
             crate::global_app_handle::app_emit_event(false);
         }
         match card.mqtt_client.try_disconnect() {

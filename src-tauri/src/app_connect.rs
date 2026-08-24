@@ -87,7 +87,7 @@ pub async fn app_connection() {
         // connection is not delayed behind the old one's shutdown.
         async_runtime::spawn(crate::mqtt::shutdown_connections(
             vec![old],
-            "app_connection_replaced",
+            crate::mqtt::SHUTDOWN_REASON_APP_CONNECTION_REPLACED,
         ));
     }
 
