@@ -384,3 +384,14 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed session conflicts and stuck cards when moving cards between racks, slots and readers, plus APDU error recovery, rack scan indicator and log upload fixes.
+
+### [0.8.0-rc.1] - 2026-08-24
+
+🛠 Fixes
+
+- Fixed edge cases in the rack and reader session handover: no more phantom rack sessions on empty slots, safer session takeover when the server host is misconfigured, and a reliable rack scanning indicator timeout.
+
+🆕 Features / Improvements
+
+- Added optional MQTT username/password authentication for the server connection, configurable in config.yaml.
+- Improved internal safety of the connection shutdown logic: shutdown reasons are now shared constants and the rack session takeover behavior is precisely documented.
