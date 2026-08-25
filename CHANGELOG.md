@@ -395,3 +395,9 @@ All notable changes to this project will be documented in this file.
 
 - Added optional MQTT username/password authentication for the server connection, configurable in config.yaml.
 - Improved internal safety of the connection shutdown logic: shutdown reasons are now shared constants and the rack session takeover behavior is precisely documented.
+
+### [0.8.0-rc.2] - 2026-08-25
+
+🛠 Fixes
+
+- Fixed the card activity animation getting stuck on rack cards when the authentication session ends without a closing message from the server.
