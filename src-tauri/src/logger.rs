@@ -56,7 +56,7 @@ fn parse_level(s: &str) -> Option<log::LevelFilter> {
 }
 
 /// Resolves the directory holding the application log files.
-pub fn log_dir() -> PathBuf {
+fn log_dir() -> PathBuf {
     let mut log_path = PathBuf::new();
 
     // Resolve the home directory without panicking if the env var is missing —
@@ -226,7 +226,7 @@ impl Write for RotatingLogWriter {
 
 /// Zips a single `log.txt` entry read from `source` into `sink` (streamed, not
 /// buffered). Shared by the rotation archiver and the fetch_logs upload packer.
-pub fn zip_log_entry<W: Write + std::io::Seek>(
+fn zip_log_entry<W: Write + std::io::Seek>(
     source: &mut impl std::io::Read,
     sink: W,
 ) -> std::io::Result<W> {

@@ -1,6 +1,7 @@
 // ───── Modules ─────
 mod apdu_sniffer; // Passive sniffer for plaintext EF data in proxied APDUs.
 mod app_connect; // Application connection to the MQTT broker.
+mod backoff; // Shared exponential reconnect backoff.
 mod com_port; // Card rack over the COM (serial) port.
 mod commands_settings; // Settings reporting to the server.
 mod config; // Configuration handling.

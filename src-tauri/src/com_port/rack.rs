@@ -5,7 +5,7 @@
 //! sessions live in `cards.rs`; the wire is in `transport.rs`.
 
 use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
+use rumqttc::v5::{AsyncClient, Event, Incoming};
 use std::time::Duration;
 
 use crate::config::{get_from_cache, split_host_to_parts, CacheSection};
@@ -39,17 +39,13 @@ pub(super) async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
         }
     };
 
-    let mut mqtt_options = MqttOptions::new(&client_id, &host, port);
-    crate::mqtt::apply_mqtt_credentials(&mut mqtt_options);
-    mqtt_options.set_keep_alive(Duration::from_secs(120));
     log::info!(
         "{} [MQTT] phase=connect_attempt status=initialized host={}:{}",
         log_header,
         host,
         port
     );
-
-    let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
+    let (mqtt_client, mut eventloop) = crate::mqtt::build_mqtt_client(&client_id, &host, port);
 
     let mut is_online = false;
     let mut reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;

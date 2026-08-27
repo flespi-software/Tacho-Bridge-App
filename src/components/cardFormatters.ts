@@ -12,7 +12,7 @@ export function formatCardMeta(card: Pick<SmartCard, 'structure_version' | 'card
   return parts.join(' | ')
 }
 
-export function formatCardType(type: number | null | undefined): string {
+function formatCardType(type: number | null | undefined): string {
   switch (type) {
     case 1:
       return 'Driver Card'
@@ -88,6 +88,10 @@ export function cardStatusIcon(state: CardStatusState, size = '25px'): CardStatu
   if (!state.online) {
     return { name: 'mdi-smart-card-outline', color: 'grey', size }
   }
+  // `.blinking-icon` and its @keyframes live in src/css/app.scss rather than in
+  // a component's scoped block: both the reader list and the rack list render
+  // this icon, and a scoped copy cannot be shared (Vue rewrites keyframe names
+  // per component).
   return state.authentication
     ? { name: 'mdi-smart-card', color: 'green', size, class: 'blinking-icon' }
     : { name: 'mdi-smart-card', color: 'green', size }

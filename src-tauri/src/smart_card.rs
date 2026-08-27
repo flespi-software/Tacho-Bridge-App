@@ -1051,47 +1051,6 @@ impl ManagedCard {
         Ok(())
     }
 
-    // pub async fn disconnect(&self) -> Result<(), Box<dyn StdError + Send + Sync>> {
-    //     let mut guard = self.inner.lock().await;
-
-    //     let dummy_card = mem::replace(
-    //         &mut *guard,
-    //         Context::establish(Scope::User)?
-    //             .connect(&self.reader_name, ShareMode::Shared, self.protocol)?
-    //     );
-
-    //     #[cfg(target_os = "linux")]
-    //     {
-    //         log::debug!("Linux-specific disconnect logic started.");
-
-    //         // force trigger status update
-    //         let mut reader_states = vec![
-    //             pcsc::ReaderState::new(self.reader_name.as_ref(), pcsc::State::UNAWARE)
-    //         ];
-
-    //         match Context::establish(Scope::User)?.get_status_change(Some(Duration::from_millis(1)), &mut reader_states) {
-    //             Ok(_) => log::debug!("Status change triggered successfully for {}", self.reader_name.to_string_lossy()),
-    //             Err(e) => log::warn!("get_status_change failed on Linux: {}", e),
-    //         }
-
-    //         return Ok(());
-    //     }
-
-    //     #[cfg(target_os = "macos")]
-    //     {
-    //         return dummy_card
-    //             .disconnect(pcsc::Disposition::ResetCard)
-    //             .map_err(|(_, err)| Box::new(err) as _);
-    //     }
-
-    //     #[cfg(target_os = "windows")]
-    //     {
-    //         return dummy_card
-    //             .disconnect(pcsc::Disposition::ResetCard)
-    //             .map_err(|(_, err)| Box::new(err) as _);
-    //     }
-    // }
-
     pub async fn apdu_transmit(&self, apdu_hex: &str) -> Result<String, ApduError> {
         let apdu = match hex::decode(apdu_hex) {
             Ok(data) => data,

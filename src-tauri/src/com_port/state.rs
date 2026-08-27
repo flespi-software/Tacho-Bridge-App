@@ -7,6 +7,29 @@ use crate::global_app_handle::{rack_update_cards, RackCard};
 use super::cards::RACK_CARDS_UI;
 use super::lock;
 
+/// Applies one mutation to every rack's UI card list and emits the lists that
+/// actually changed.
+///
+/// The lock-mutate-snapshot-emit sequence every multi-rack UI update shares:
+/// `mutate` is called once per rack with that rack's id and its mutable card
+/// list, and returns whether it changed anything. Snapshots are taken inside
+/// the lock but emitted after it is dropped — `rack_update_cards` reaches the
+/// webview, and holding the UI lock across that would serialise every rack
+/// update behind it.
+pub(super) fn mutate_rack_rows(mut mutate: impl FnMut(&str, &mut Vec<RackCard>) -> bool) {
+    let updates: Vec<(String, Vec<RackCard>)> = {
+        let mut ui = lock(&RACK_CARDS_UI);
+        ui.iter_mut()
+            .filter_map(|(rack_id, list)| {
+                mutate(rack_id, list).then(|| (rack_id.clone(), list.clone()))
+            })
+            .collect()
+    };
+    for (rack_id, cards) in updates {
+        rack_update_cards(&rack_id, cards);
+    }
+}
+
 /// Puts one discovered rack card into that rack's UI card list (keyed by slot)
 /// and re-emits the rack state. Cards without a local config entry are shown
 /// too — with no card number.

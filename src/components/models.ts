@@ -55,3 +55,9 @@ export interface RackState {
   // backends, where the UI falls back to its silence timeout.
   scan_complete?: boolean
 }
+
+/// The app identifier the backend generates and the server registers a device
+/// under: literal "TBA" followed by exactly 13 digits. Shared so the header's
+/// reconnect gate and the settings dialog's validation cannot drift apart on
+/// what counts as a valid identity.
+export const TBA_IDENT_REGEXP = /^TBA\d{13}$/

@@ -9,12 +9,13 @@
   "scripts": {
     "lint": "eslint -c ./eslint.config.js \"./src/**/*.{ts,js,cjs,mjs,vue}\"",
     "format": "prettier --write \"**/*.{js,ts,vue,scss,html,md,json}\" --ignore-path .gitignore",
-    "test": "echo \"No test specified\" && exit 0",
+    "test": "vitest run",
     "dev": "quasar dev",
     "build": "quasar build",
     "build:tauri": "quasar build || node .github/scripts/verify-frontend-dist.mjs",
     "tauri": "tauri",
-    "postinstall": "quasar prepare"
+    "postinstall": "quasar prepare",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@quasar/extras": "^1.16.4",
@@ -38,6 +39,7 @@
     "prettier": "^3.3.3",
     "typescript": "~5.9.3",
     "vite-plugin-checker": "^0.8.0",
+    "vitest": "^3.2.7",
     "vue-tsc": "~2.1.10"
   },
   "engines": {

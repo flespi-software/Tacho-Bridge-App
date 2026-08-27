@@ -6,7 +6,7 @@
 use std::time::Duration; // For specifying time durations.
 
 // ───── MQTT Client Library (rumqttc) ─────
-use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions}; // Core MQTT async client and options.
+use rumqttc::v5::{Event, Incoming}; // Core MQTT event types.
 
 // ───── Smart Card ─────
 use crate::smart_card::TASK_POOL; // Task pool for managing MQTT connections.
@@ -18,24 +18,13 @@ use tauri::async_runtime::{self, JoinHandle}; // Async runtime and task join han
 use serde_json::Value; // For working with JSON data structures.
 
 // ───── Local Modules ─────
+use crate::backoff::{next_reconnect_delay, RECONNECT_DELAY_INITIAL_SECS};
 use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
 use crate::config::split_host_to_parts; // Function to split the host into parts for MQTT connection.
 use crate::config::CacheSection; // Enum for cache sections for getting data from cache.
 use crate::global_app_handle::app_emit_event; // Emits app connection status to the frontend.
 use crate::smart_card::ProcessingCard;
 
-/// Initial delay (in seconds) before the first reconnect attempt after a
-/// connection failure. Subsequent failures back off exponentially up to
-/// `RECONNECT_DELAY_MAX_SECS`.
-const RECONNECT_DELAY_INITIAL_SECS: u64 = 10;
-/// Upper bound for the reconnect backoff. Past this point we keep retrying
-/// at this interval until either the server comes back or the task is killed.
-const RECONNECT_DELAY_MAX_SECS: u64 = 300;
-
-/// Returns the next reconnect delay given the current one (exponential, capped).
-fn next_reconnect_delay(current: u64) -> u64 {
-    current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
-}
 
 /// Ensures an MQTT connection for the specified client ID.
 #[tauri::command]
@@ -94,21 +83,13 @@ pub async fn app_connection() {
     //////////////////////////////////////////////////
     //  Create a new client ID for the MQTT connection
     //////////////////////////////////////////////////
-    let mut mqtt_options = MqttOptions::new(client_id.clone(), &host, port);
-    crate::mqtt::apply_mqtt_credentials(&mut mqtt_options);
-    mqtt_options.set_keep_alive(Duration::from_secs(120));
-    // No Debug dump of mqtt_options here: it would print the credentials.
     log::info!(
         "[CONN] phase=connect_attempt status=initialized client_id={} host={}:{}",
         client_id,
         host,
         port
     );
-
-    // Create a new asynchronous MQTT client and its associated event loop
-    // `mqtt_options` specifies the configuration for the MQTT connection
-    // `10` is the capacity of the internal channel used by the event loop for buffering operations
-    let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
+    let (mqtt_client, mut eventloop) = crate::mqtt::build_mqtt_client(client_id.clone(), &host, port);
     let mqtt_clinet_cloned = mqtt_client.clone();
     let mqtt_client_for_task = mqtt_client.clone();
     let log_header: String = format!("{} |", client_id);
@@ -262,23 +243,3 @@ pub async fn app_connection() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn next_reconnect_delay_doubles_then_saturates() {
-        assert_eq!(next_reconnect_delay(10), 20);
-        assert_eq!(next_reconnect_delay(40), 80);
-        assert_eq!(next_reconnect_delay(160), RECONNECT_DELAY_MAX_SECS);
-        assert_eq!(
-            next_reconnect_delay(RECONNECT_DELAY_MAX_SECS),
-            RECONNECT_DELAY_MAX_SECS
-        );
-    }
-
-    #[test]
-    fn next_reconnect_delay_overflow_safe() {
-        assert_eq!(next_reconnect_delay(u64::MAX), RECONNECT_DELAY_MAX_SECS);
-    }
-}

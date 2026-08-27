@@ -39,8 +39,9 @@
 
 <script setup lang="ts">
 import { useQuasar, Notify } from 'quasar'
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { ref, computed, onMounted } from 'vue'
+import { useTauriListeners } from 'src/composables/useTauriListeners'
+import { TBA_IDENT_REGEXP } from 'src/components/models'
 import { invoke } from '@tauri-apps/api/core'
 import 'animate.css'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
@@ -48,8 +49,6 @@ import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
 defineOptions({
   name: 'MainLayout',
 })
-
-const TBA_IDENT_REGEXP = /^TBA\d{13}$/
 
 const $q = useQuasar()
 const configOpen = ref(false)
@@ -68,122 +67,102 @@ async function reconnect() {
   }
 }
 
-// Registered Tauri listeners. Stored so we can detach them on unmount —
-// otherwise stale handlers keep mutating dead reactive state and pile up
-// across hot reloads in dev.
-const unlistenFns: UnlistenFn[] = []
+const { on } = useTauriListeners()
 
 const ACCESS_NOTIFICATION_TEXT =
   "The application cannot access the directory '~/Documents/tba' and cannot continue to operate. Perhaps such a directory has already been created by another version of the program, therefore it has local access restrictions. A possible solution may be: rename the current directory, for example, to tba1 and restart the application. It will create a new directory with the necessary access rights."
 
+/// Notification kinds the backend can raise, and how each is surfaced.
+/// Keyed lookup rather than an if/else ladder so adding a kind is one entry.
+const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
+  access: () =>
+    Notify.create({
+      message: ACCESS_NOTIFICATION_TEXT,
+      color: 'red',
+      position: 'bottom',
+      timeout: 999000,
+    }),
+
+  // Backend message names the new version; install_update downloads,
+  // verifies the signature, installs and restarts the app.
+  update: (message) =>
+    Notify.create({
+      message: message || 'Application update is available.',
+      color: 'primary',
+      position: 'bottom',
+      timeout: 999000,
+      actions: [
+        {
+          label: 'Install & restart',
+          color: 'white',
+          handler: () => {
+            void invoke('install_update').catch((e) => {
+              // On success the app restarts and this never runs; a silent
+              // catch here meant a failed download looked like nothing
+              // happened after the user clicked "Install & restart".
+              console.error('install_update failed:', e)
+              Notify.create({
+                message: `Update installation failed: ${String(e)}. You can retry from the update notification.`,
+                color: 'red',
+                position: 'bottom',
+                timeout: 8000,
+              })
+            })
+          },
+        },
+        { label: 'Later', color: 'white' },
+      ],
+    }),
+
+  // Backend message names the COM port occupied by another application.
+  port_busy: (message) =>
+    Notify.create({
+      message: message || 'The card rack COM port is busy by another application.',
+      color: 'orange',
+      position: 'bottom',
+      timeout: 999000,
+    }),
+
+  // Use the backend-provided message verbatim — it contains the new
+  // version string and the download URL.
+  version: (message) =>
+    Notify.create({
+      message: message || 'A new version is available.',
+      color: 'green',
+      position: 'bottom',
+      timeout: 15000,
+      classes: 'animate__animated animate__shakeX',
+    }),
+}
+
+function handleGlobalConfigServer(raw: unknown): void {
+  const payload = raw as { dark_theme?: string; host?: string; ident?: string }
+  if (payload.dark_theme === 'Dark') $q.dark.set(true)
+  else if (payload.dark_theme === 'Auto') $q.dark.set('auto')
+  else if (payload.dark_theme === 'Light') $q.dark.set(false)
+  // empty/unknown (old config without an appearance section): keep the current mode
+  serverHost.value = payload.host ?? ''
+  serverIdent.value = payload.ident ?? ''
+}
+
+function handleGlobalNotification(raw: unknown): void {
+  if (!raw || typeof raw !== 'object') return
+  const payload = raw as { notification_type?: unknown; message?: unknown }
+  const type = typeof payload.notification_type === 'string' ? payload.notification_type : ''
+  const message = typeof payload.message === 'string' ? payload.message : ''
+
+  console.log('global-notification:', type, 'message:', message)
+
+  const handler = NOTIFICATION_HANDLERS[type]
+  if (handler) handler(message)
+  else console.log('global-notification: unknown type:', type)
+}
+
 onMounted(async () => {
-  try {
-    const unlisten = await listen('global-config-server', (event) => {
-      const payload = event.payload as { dark_theme?: string; host?: string; ident?: string }
-      if (payload.dark_theme === 'Dark') $q.dark.set(true)
-      else if (payload.dark_theme === 'Auto') $q.dark.set('auto')
-      else if (payload.dark_theme === 'Light') $q.dark.set(false)
-      // empty/unknown (old config without an appearance section): keep the current mode
-      serverHost.value = payload.host ?? ''
-      serverIdent.value = payload.ident ?? ''
-    })
-    unlistenFns.push(unlisten)
-  } catch (error) {
-    console.error('Error listening to global-config-server:', error)
-  }
-
-  try {
-    const unlisten = await listen('app-connection-status', (event) => {
-      appConnected.value = event.payload === true
-    })
-    unlistenFns.push(unlisten)
-  } catch (error) {
-    console.error('Error listening to app-connection-status:', error)
-  }
-
-  try {
-    const unlisten = await listen('global-notification', (event) => {
-      const raw = event.payload
-      if (!raw || typeof raw !== 'object') return
-      const payload = raw as { notification_type?: unknown; message?: unknown }
-      const type = typeof payload.notification_type === 'string' ? payload.notification_type : ''
-      const message = typeof payload.message === 'string' ? payload.message : ''
-
-      console.log('global-notification:', type, 'message:', message)
-
-      if (type === 'access') {
-        Notify.create({
-          message: ACCESS_NOTIFICATION_TEXT,
-          color: 'red',
-          position: 'bottom',
-          timeout: 999000,
-        })
-      } else if (type === 'update') {
-        // Backend message names the new version; install_update downloads,
-        // verifies the signature, installs and restarts the app.
-        Notify.create({
-          message: message || 'Application update is available.',
-          color: 'primary',
-          position: 'bottom',
-          timeout: 999000,
-          actions: [
-            {
-              label: 'Install & restart',
-              color: 'white',
-              handler: () => {
-                void invoke('install_update').catch((e) => {
-                  // On success the app restarts and this never runs; a silent
-                  // catch here meant a failed download looked like nothing
-                  // happened after the user clicked "Install & restart".
-                  console.error('install_update failed:', e)
-                  Notify.create({
-                    message: `Update installation failed: ${String(e)}. You can retry from the update notification.`,
-                    color: 'red',
-                    position: 'bottom',
-                    timeout: 8000,
-                  })
-                })
-              },
-            },
-            { label: 'Later', color: 'white' },
-          ],
-        })
-      } else if (type === 'port_busy') {
-        // Backend message names the COM port occupied by another application.
-        Notify.create({
-          message: message || 'The card rack COM port is busy by another application.',
-          color: 'orange',
-          position: 'bottom',
-          timeout: 999000,
-        })
-      } else if (type === 'version') {
-        // Use the backend-provided message verbatim — it contains the new
-        // version string and the download URL.
-        Notify.create({
-          message: message || 'A new version is available.',
-          color: 'green',
-          position: 'bottom',
-          timeout: 15000,
-          classes: 'animate__animated animate__shakeX',
-        })
-      } else {
-        console.log('global-notification: unknown type:', type)
-      }
-    })
-    unlistenFns.push(unlisten)
-  } catch (error) {
-    console.error('Error listening to global-notification:', error)
-  }
-})
-
-onUnmounted(() => {
-  while (unlistenFns.length > 0) {
-    const fn = unlistenFns.pop()
-    try {
-      fn?.()
-    } catch (e) {
-      console.error('Error detaching Tauri listener:', e)
-    }
-  }
+  await on('global-config-server', handleGlobalConfigServer)
+  await on('app-connection-status', (raw) => {
+    appConnected.value = raw === true
+  })
+  await on('global-notification', handleGlobalNotification)
 })
 </script>

@@ -183,10 +183,12 @@
 </template>
 
 <script setup lang="ts">
-import { useQuasar, Notify } from 'quasar'
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { useQuasar } from 'quasar'
+import { ref, computed, watch, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { useTauriListeners } from 'src/composables/useTauriListeners'
+import { notifyError, notifyWarn, notifySuccess, TOAST_SHORT } from 'src/composables/notify'
+import { TBA_IDENT_REGEXP } from 'src/components/models'
 
 const props = defineProps<{
   modelValue: boolean
@@ -196,7 +198,6 @@ const emit = defineEmits<{
   'update:modelValue': [value: boolean]
 }>()
 
-const TBA_IDENT_REGEXP = /^TBA\d{13}$/
 const ident = ref('')
 const identInput = computed({
   get: () => `TBA${ident.value}`,
@@ -236,12 +237,7 @@ async function onAutostartToggled(value: boolean) {
   } catch (error) {
     autostartEnabled.value = !value
     console.error('Failed to change autostart:', error)
-    Notify.create({
-      message: `Failed to ${value ? 'enable' : 'disable'} launch at startup: ${String(error)}`,
-      color: 'red',
-      position: 'bottom',
-      timeout: 5000,
-    })
+    notifyError(`Failed to ${value ? 'enable' : 'disable'} launch at startup`, error)
   }
 }
 watch(
@@ -271,12 +267,7 @@ function onThemeSelected(mode: ThemeMode) {
     })
     .catch((error) => {
       console.error('Failed to persist theme:', error)
-      Notify.create({
-        message: `Theme was applied but not saved: ${String(error)}`,
-        color: 'red',
-        position: 'bottom',
-        timeout: 5000,
-      })
+      notifyError('Theme was applied but not saved', error)
     })
 }
 
@@ -291,12 +282,7 @@ const checkForUpdates = async () => {
       betaUpdates: betaUpdates.value,
     })
     if (result.status === 'up_to_date') {
-      Notify.create({
-        message: `You are running the latest version (${result.version}).`,
-        color: 'green',
-        position: 'bottom',
-        timeout: 5000,
-      })
+      notifySuccess(`You are running the latest version (${result.version}).`)
     }
   } catch (error) {
     console.error('Update check failed:', error)
@@ -304,14 +290,11 @@ const checkForUpdates = async () => {
     // before the first stable release ships one) is not a scary failure.
     const raw = String(error)
     const noManifest = raw.includes('Could not fetch a valid release JSON')
-    Notify.create({
-      message: noManifest
-        ? 'No update information is published for this channel yet.'
-        : `Update check failed: ${raw}`,
-      color: noManifest ? 'orange' : 'red',
-      position: 'bottom',
-      timeout: 5000,
-    })
+    if (noManifest) {
+      notifyWarn('No update information is published for this channel yet.')
+    } else {
+      notifyError(`Update check failed: ${raw}`)
+    }
   } finally {
     checking.value = false
   }
@@ -342,12 +325,7 @@ const openChangelog = async () => {
     changelogOpen.value = true
   } catch (error) {
     console.error('Failed to load changelog:', error)
-    Notify.create({
-      message: `Failed to open the changelog: ${String(error)}`,
-      color: 'red',
-      position: 'bottom',
-      timeout: 5000,
-    })
+    notifyError('Failed to open the changelog', error)
   }
 }
 
@@ -372,21 +350,11 @@ const saveServerConfig = async () => {
       throw new Error('the backend could not persist the settings')
     }
 
-    Notify.create({
-      message: 'Settings have been updated.',
-      color: 'green',
-      position: 'bottom',
-      timeout: 3000,
-    })
+    notifySuccess('Settings have been updated.', TOAST_SHORT)
     emit('update:modelValue', false)
   } catch (error) {
     console.error('Error updating server configuration:', error)
-    Notify.create({
-      message: `Failed to update settings: ${String(error)}`,
-      color: 'red',
-      position: 'bottom',
-      timeout: 5000,
-    })
+    notifyError('Failed to update settings', error)
     return
   } finally {
     saving.value = false
@@ -399,73 +367,44 @@ const saveServerConfig = async () => {
     await invoke('manual_sync_cards', { readername: '', restart: true })
   } catch (error) {
     console.error('Card sync after settings save failed:', error)
-    Notify.create({
-      message: `Settings saved, but card sync failed: ${String(error)}`,
-      color: 'orange',
-      position: 'bottom',
-      timeout: 5000,
-    })
+    notifyWarn('Settings saved, but card sync failed', error)
   }
   try {
     await invoke('app_connection')
   } catch (error) {
     console.error('App reconnect after settings save failed:', error)
-    Notify.create({
-      message: `Settings saved, but reconnect failed: ${String(error)}`,
-      color: 'orange',
-      position: 'bottom',
-      timeout: 5000,
-    })
+    notifyWarn('Settings saved, but reconnect failed', error)
   }
 }
 
-// Registered Tauri listeners. Stored so we can detach them on unmount —
-// a listener registered at setup top-level would outlive the component and
-// keep mutating dead state, piling up across remounts and hot reloads.
-const unlistenFns: UnlistenFn[] = []
+const { on } = useTauriListeners()
 
 onMounted(async () => {
-  try {
-    const unlisten = await listen('global-config-server', (event) => {
-      const payload = event.payload as {
-        host: string
-        ident: string
-        dark_theme?: string
-        beta_updates?: string
-        auto_install_updates?: string
-      }
-      hostValue.value = payload.host
-      // Seed the backing ref directly, NOT through the identInput setter: the
-      // setter strips dashes/non-digits, so a non-conforming persisted ident
-      // would be silently rewritten here and the next Save would persist the
-      // mangled identity of a device already registered on the server. The
-      // faithful value renders as-is and isIdentValid flags it instead.
-      ident.value = payload.ident.replace(/^TBA/i, '')
-      betaUpdates.value = payload.beta_updates === 'true'
-      autoInstallUpdates.value = payload.auto_install_updates === 'true'
-      if (
-        payload.dark_theme === 'Auto' ||
-        payload.dark_theme === 'Light' ||
-        payload.dark_theme === 'Dark'
-      ) {
-        // Reflect the persisted mode; no watcher, so nothing re-persists.
-        themeMode.value = payload.dark_theme
-      }
-    })
-    unlistenFns.push(unlisten)
-  } catch (error) {
-    console.error('Error listening to global-config-server:', error)
-  }
-})
-
-onUnmounted(() => {
-  while (unlistenFns.length > 0) {
-    const fn = unlistenFns.pop()
-    try {
-      fn?.()
-    } catch (e) {
-      console.error('Error detaching Tauri listener:', e)
+  await on('global-config-server', (raw) => {
+    const payload = raw as {
+      host: string
+      ident: string
+      dark_theme?: string
+      beta_updates?: string
+      auto_install_updates?: string
     }
-  }
+    hostValue.value = payload.host
+    // Seed the backing ref directly, NOT through the identInput setter: the
+    // setter strips dashes/non-digits, so a non-conforming persisted ident
+    // would be silently rewritten here and the next Save would persist the
+    // mangled identity of a device already registered on the server. The
+    // faithful value renders as-is and isIdentValid flags it instead.
+    ident.value = payload.ident.replace(/^TBA/i, '')
+    betaUpdates.value = payload.beta_updates === 'true'
+    autoInstallUpdates.value = payload.auto_install_updates === 'true'
+    if (
+      payload.dark_theme === 'Auto' ||
+      payload.dark_theme === 'Light' ||
+      payload.dark_theme === 'Dark'
+    ) {
+      // Reflect the persisted mode; no watcher, so nothing re-persists.
+      themeMode.value = payload.dark_theme
+    }
+  })
 })
 </script>

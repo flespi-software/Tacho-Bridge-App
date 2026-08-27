@@ -15,31 +15,38 @@ lazy_static! {
     static ref APP_HANDLE: Mutex<Option<AppHandle>> = Mutex::new(None);
 }
 
+/// Locks [`APP_HANDLE`], recovering the inner value if an earlier panic
+/// poisoned the mutex — a cascading panic here would silently kill every
+/// later `emit_*` call.
+fn lock_handle() -> std::sync::MutexGuard<'static, Option<AppHandle>> {
+    APP_HANDLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // initialize the global app handle
 pub fn set_app_handle(handle: AppHandle) {
-    // Lock failure here means the mutex was poisoned by an earlier panic.
-    // Recover the inner value instead of cascading the panic so subsequent
-    // emit_* calls keep working.
-    let mut guard = match APP_HANDLE.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            log::warn!("APP_HANDLE mutex was poisoned — recovering");
-            poisoned.into_inner()
-        }
-    };
-    *guard = Some(handle);
+    *lock_handle() = Some(handle);
 }
 
 // getting the global app handle
 pub fn get_app_handle() -> Option<AppHandle> {
-    let guard = match APP_HANDLE.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            log::warn!("APP_HANDLE mutex was poisoned — recovering");
-            poisoned.into_inner()
-        }
+    lock_handle().clone()
+}
+
+/// Emits one event to the frontend, logging the outcome uniformly. Every
+/// `emit_*` in this module funnels through here so a missing app handle (the
+/// window not built yet, or already torn down) is always a warning rather than
+/// a silent drop.
+fn emit_to_frontend<P: Serialize + Clone>(event_name: &str, payload: P) {
+    let Some(app_handle) = get_app_handle() else {
+        log::warn!("emit '{}' skipped: app handle not set", event_name);
+        return;
     };
-    guard.clone()
+    match app_handle.emit(event_name, payload) {
+        Ok(()) => log::debug!("'{}' has been sent", event_name),
+        Err(e) => log::error!("emit '{}' failed: {:?}", event_name, e),
+    }
 }
 
 /// Represents the state of a tachograph card.
@@ -82,15 +89,7 @@ pub fn card_emit_event(
         authentication,
     };
 
-    if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit(event_name, payload) {
-            log::error!("emit '{}' failed: {:?}", event_name, e);
-        } else {
-            log::debug!("'{}' has been sent", event_name);
-        }
-    } else {
-        log::warn!("emit '{}' skipped: app handle not set", event_name);
-    }
+    emit_to_frontend(event_name, payload);
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -105,15 +104,7 @@ pub fn emit_card_config_event(event_name: &str, card_number: String, config: Opt
         content: config,
     };
 
-    if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit(event_name, payload) {
-            log::error!("emit '{}' failed: {:?}", event_name, e);
-        } else {
-            log::debug!("'{}' has been sent", event_name);
-        }
-    } else {
-        log::warn!("emit '{}' skipped: app handle not set", event_name);
-    }
+    emit_to_frontend(event_name, payload);
 }
 
 #[derive(Clone, Serialize)]
@@ -132,15 +123,7 @@ pub fn app_emit_event(online: bool) {
 }
 
 pub fn emit_notification_event(event_name: &str, payload: NotificationPayload) {
-    if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit(event_name, payload) {
-            log::error!("emit '{}' failed: {:?}", event_name, e);
-        } else {
-            log::debug!("'{}' has been sent", event_name);
-        }
-    } else {
-        log::warn!("emit '{}' skipped: app handle not set", event_name);
-    }
+    emit_to_frontend(event_name, payload);
 }
 
 /// One card currently held in a rack slot, as reported by the server's rack
@@ -198,15 +181,7 @@ lazy_static! {
 /// is always every known rack, so the frontend replaces its list wholesale and
 /// never has to merge deltas.
 fn emit_rack_states(states: Vec<RackState>) {
-    if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit("rack-state", states) {
-            log::error!("emit 'rack-state' failed: {:?}", e);
-        } else {
-            log::debug!("'rack-state' has been sent");
-        }
-    } else {
-        log::warn!("emit 'rack-state' skipped: app handle not set");
-    }
+    emit_to_frontend("rack-state", states);
 }
 
 /// Applies one mutation to the rack map under its lock and emits the full list

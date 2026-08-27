@@ -95,7 +95,7 @@ pub struct AppearanceConfig {
 
 /// Retrieves the configuration file path.
 /// This function constructs the path to the configuration file, creating the necessary directories if they do not exist.
-pub fn get_config_path() -> io::Result<PathBuf> {
+fn get_config_path() -> io::Result<PathBuf> {
     let mut config_path = PathBuf::new();
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -311,7 +311,7 @@ fn update_card_config(
 /// NOTE: a successful save may create a new ICCID -> card number association;
 /// callers must then trigger session reconciliation the way update_card does
 /// (smart_card::request_rescan + com_port::connect_pending_rack_cards).
-pub fn persist_card(card_number: &str, content: CardConfig) -> Result<(), String> {
+fn persist_card(card_number: &str, content: CardConfig) -> Result<(), String> {
     let config_path = get_config_path().map_err(|e| {
         log::error!("Failed to get config path: {}", e);
         format!("configuration file is unavailable: {e}")
@@ -430,7 +430,7 @@ fn dark_theme_from_label(theme: &str) -> DarkTheme {
 }
 
 /// Persists only the appearance section; host/ident are untouched.
-pub fn update_appearance_config(
+fn update_appearance_config(
     config_path: &Path,
     theme: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -447,7 +447,7 @@ pub fn update_appearance_config(
     Ok(())
 }
 
-pub fn update_server_config(
+fn update_server_config(
     config_path: &Path,
     host: &str,
     ident: &str,
@@ -501,7 +501,7 @@ pub async fn remove_card(cardnumber: String) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn remove_card_from_config(
+async fn remove_card_from_config(
     config_path: &Path,
     card_number: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -803,7 +803,7 @@ pub fn find_card_number_by_iccid(iccid: &str) -> Option<String> {
 /// `success == true` → green "success" line in UI; `false` → red "fail".
 /// The processing state while auth is running is derived from Reader.authentication
 /// in the frontend and is NOT stored here (it's transient, lost on restart).
-pub fn record_auth_result(card_number: &str, success: bool) {
+fn record_auth_result(card_number: &str, success: bool) {
     let ts = chrono::Utc::now().timestamp() as u64;
     // Mutate fresh file state under the config lock instead of writing a full
     // cache snapshot back — a stale snapshot would revert fields a concurrent
@@ -909,7 +909,7 @@ pub fn split_host_to_parts(host: &str) -> Result<(String, u16), String> {
 /// Loads the configuration file into the cache.
 /// This function reads the configuration file, parses it, and loads the cards into the global cache,
 /// which is used to synchronize the launch of asynchronous tasks for MQTT connection, as well as for display on the interface.
-pub fn load_config_to_cache(
+fn load_config_to_cache(
     config: &ConfigurationFile,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::debug!("load_config_to_cache");
@@ -924,39 +924,8 @@ pub fn load_config_to_cache(
         auto_install_updates: config.auto_install_updates,
     };
 
-    // trace_cache(&*cache);
-
     Ok(())
 }
-
-// pub fn trace_cache(cache: &CacheConfigData) {
-//     log::debug!("HashMap: Company Card Number => Card Configuration ----------");
-//     for (card_number, card_config) in cache.cards.iter() {
-//         log::debug!(
-//             "CN: {:<16} | ICCID: {:<16} | Expire: {}",
-//             card_number,
-//             card_config.iccid,
-//             card_config.expire.unwrap_or(0)
-//         );
-//     }
-//     log::debug!("{}", "-".repeat(70));
-
-//     if let Some(ident) = &cache.ident {
-//         log::debug!("ident: {}", ident);
-//     }
-
-//     if let Some(server) = &cache.server {
-//         log::debug!("Server Host: {}", server.host);
-//     } else {
-//         log::warn!("No server configuration found.");
-//     }
-
-//     if let Some(appearance) = &cache.appearance {
-//         log::debug!("Appearance: {:?}", appearance);
-//     } else {
-//         log::warn!("No appearance configuration found.");
-//     }
-// }
 
 /// Generates a unique ident value based on the current time in microseconds.
 /// The ident value is in the format "TBA" followed by 13 digits.

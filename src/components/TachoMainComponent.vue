@@ -131,31 +131,6 @@
     />
   </div>
 </template>
-
-<style scoped>
-/* `.blinking-icon` and its @keyframes live in src/css/app.scss: the rack list
-   needs the same animation, and a scoped copy cannot be shared (Vue rewrites
-   keyframe names per component). */
-.toolbar-block {
-  margin-bottom: 8px;
-}
-.custom-font-size-reader {
-  font-size: 10px;
-}
-.header-flex-container {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding-right: 16px;
-}
-.card-number-dialog .q-card {
-  width: 300px; /* Window width */
-  max-width: 90vw; /* Maximum window width */
-  height: 160px; /* Window height */
-  max-height: 90vh; /* Maximum window height */
-}
-</style>
-
 <script setup lang="ts">
 import SmartCardList from './SmartCardList.vue'
 import RackList from './RackList.vue'
@@ -167,10 +142,11 @@ import {
   formatAuthDate,
   cardStatusIcon,
 } from './cardFormatters'
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { listen, emit, type UnlistenFn } from '@tauri-apps/api/event'
-import { Notify } from 'quasar'
+import { emit } from '@tauri-apps/api/event'
+import { useTauriListeners } from 'src/composables/useTauriListeners'
+import { notifyError, TOAST_LONG } from 'src/composables/notify'
 
 const cardlist = ref<null | {
   linkMode: (iccid: string) => void
@@ -189,9 +165,7 @@ const state = reactive<{ readers: Reader[]; cards: Record<string, SmartCard> }>(
 const racks = ref<RackState[]>([])
 
 // Registered Tauri listeners. Kept in an array so we can detach them all
-// in onUnmounted — leaking listeners across HMR/navigation would let stale
-// handlers keep mutating dead state and double-fire on remount.
-const unlistenFns: UnlistenFn[] = []
+const { on } = useTauriListeners()
 
 // Transient "authentication in progress" flag per card_number, derived from
 // the Reader.authentication field emitted by the backend via global-cards-sync.
@@ -324,12 +298,7 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
     console.log('Card number updated successfully')
   } catch (error) {
     console.error(`Failed to update card ${cardNumber}:`, error)
-    Notify.create({
-      message: `Failed to save card ${cardNumber}: ${String(error)}`,
-      color: 'red',
-      position: 'bottom',
-      timeout: 8000,
-    })
+    notifyError(`Failed to save card ${cardNumber}`, error, TOAST_LONG)
   }
 }
 
@@ -365,12 +334,7 @@ const removeCard = async (cardNumber: string) => {
     console.log('Card removed:', cardNumber)
   } catch (error) {
     console.error('Failed to remove card:', error)
-    Notify.create({
-      message: `Failed to remove card ${cardNumber}: ${String(error)}`,
-      color: 'red',
-      position: 'bottom',
-      timeout: 8000,
-    })
+    notifyError(`Failed to remove card ${cardNumber}`, error, TOAST_LONG)
   }
 }
 
@@ -397,28 +361,9 @@ onMounted(async () => {
   // Register listeners BEFORE notifying the backend that we're loaded.
   // Otherwise the initial sync burst can race the channel registration and
   // arrive into the void, leaving the UI stuck on stale empty state.
-  try {
-    const unlisten = await listen('global-cards-sync', (event) => handleCardsSync(event.payload))
-    unlistenFns.push(unlisten)
-  } catch (error) {
-    console.error('Error listening to global-cards-sync:', error)
-  }
-
-  try {
-    const unlisten = await listen('global-card-config-updated', (event) =>
-      handleCardConfigUpdated(event.payload),
-    )
-    unlistenFns.push(unlisten)
-  } catch (error) {
-    console.error('Error listening to global-card-config-updated:', error)
-  }
-
-  try {
-    const unlisten = await listen('rack-state', (event) => handleRackState(event.payload))
-    unlistenFns.push(unlisten)
-  } catch (error) {
-    console.error('Error listening to rack-state:', error)
-  }
+  await on('global-cards-sync', handleCardsSync)
+  await on('global-card-config-updated', handleCardConfigUpdated)
+  await on('rack-state', handleRackState)
 
   // Now that the listeners are wired, tell the backend it can start
   // emitting initial state. The replay bursts one event per EXISTING card and
@@ -429,17 +374,6 @@ onMounted(async () => {
     await emit('frontend-loaded', { message: 'Hello from frontend!' })
   } catch (error) {
     console.error('Error emitting frontend-loaded event:', error)
-  }
-})
-
-onUnmounted(() => {
-  while (unlistenFns.length > 0) {
-    const fn = unlistenFns.pop()
-    try {
-      fn?.()
-    } catch (e) {
-      console.error('Error detaching Tauri listener:', e)
-    }
   }
 })
 </script>

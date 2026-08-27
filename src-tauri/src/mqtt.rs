@@ -21,6 +21,7 @@ use tauri::async_runtime::{self, JoinHandle}; // Async runtime and task join han
 use serde_json::Value; // For working with JSON data structures.
 
 // ───── Local Modules ─────
+use crate::backoff::{next_reconnect_delay, RECONNECT_DELAY_INITIAL_SECS};
 use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
 use crate::config::split_host_to_parts; // Function to split the host into parts for MQTT connection.
 use crate::config::CacheSection; // Enum for cache sections for getting data from cache.
@@ -28,13 +29,6 @@ use crate::global_app_handle::card_emit_event; // Sends events to the frontend v
 use crate::smart_card::ProcessingCard;
 use crate::smart_card::{ManagedCard, SW_TECHNICAL_PROBLEM, TASK_POOL}; // Managed card object, global task pool, and the "card unreachable" status word.
 
-/// Initial delay (in seconds) before the first reconnect attempt after a
-/// connection failure. Subsequent failures back off exponentially up to
-/// `RECONNECT_DELAY_MAX_SECS`.
-const RECONNECT_DELAY_INITIAL_SECS: u64 = 10;
-/// Upper bound for the reconnect backoff. Past this point we keep retrying
-/// at this interval until either the server comes back or the task is killed.
-const RECONNECT_DELAY_MAX_SECS: u64 = 300;
 const GLOBAL_CARDS_SYNC_EVENT: &str = "global-cards-sync";
 const CARD_PRESENT_STATE: &str = "PRESENT";
 
@@ -55,11 +49,6 @@ pub(crate) const SHUTDOWN_REASON_APP_CONNECTION_REPLACED: &str = "app_connection
 const SHUTDOWN_FLUSH_TIMEOUT_MS: u64 = 2000;
 /// Poll step while waiting for closing MQTT tasks to finish.
 const SHUTDOWN_POLL_INTERVAL_MS: u64 = 50;
-
-/// Returns the next reconnect delay given the current one (exponential, capped).
-fn next_reconnect_delay(current: u64) -> u64 {
-    current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
-}
 
 /// Seconds (on a monotonic clock) of the most recent card-facing exchange: a
 /// server request on a reader-backed card connection, or a rack serial
@@ -192,6 +181,33 @@ pub(crate) fn log_connection_failure(
 /// username keeps today's anonymous connect. Shared by all four MQTT loops
 /// (app, per-card, rack, rack-card) so authentication can never be enabled for
 /// one transport and forgotten for another.
+/// Keep-alive for every MQTT connection the app opens. The broker drops a
+/// silent client after roughly 1.5× this, so it also bounds how long a dead
+/// link goes unnoticed.
+const MQTT_KEEP_ALIVE_SECS: u64 = 120;
+
+/// Capacity of the event loop's internal request channel.
+const MQTT_CHANNEL_CAPACITY: usize = 10;
+
+/// Builds an MQTT client and its event loop with the settings every connection
+/// in the app shares: broker credentials from config and the common keep-alive.
+///
+/// Used by all four connection loops (the per-card APDU bridge, the app-level
+/// connection, and the rack and rack-card loops) so they cannot drift apart on
+/// how they authenticate or how quickly a dead link is detected. Callers log
+/// the attempt themselves — each has its own identifiers to report.
+pub(crate) fn build_mqtt_client(
+    client_id: impl Into<String>,
+    host: &str,
+    port: u16,
+) -> (AsyncClient, rumqttc::v5::EventLoop) {
+    let mut mqtt_options = MqttOptions::new(client_id.into(), host, port);
+    apply_mqtt_credentials(&mut mqtt_options);
+    mqtt_options.set_keep_alive(Duration::from_secs(MQTT_KEEP_ALIVE_SECS));
+    // No Debug dump of mqtt_options anywhere: it would print the credentials.
+    AsyncClient::new(mqtt_options, MQTT_CHANNEL_CAPACITY)
+}
+
 pub(crate) fn apply_mqtt_credentials(mqtt_options: &mut MqttOptions) {
     let username = get_from_cache(CacheSection::Server, "username");
     if username.is_empty() {
@@ -360,9 +376,6 @@ pub async fn ensure_connection(
     //////////////////////////////////////////////////
     //  Create a new client ID for the MQTT connection
     //////////////////////////////////////////////////
-    let mut mqtt_options = MqttOptions::new(&client_id, &host, port);
-    apply_mqtt_credentials(&mut mqtt_options);
-    mqtt_options.set_keep_alive(Duration::from_secs(120));
     log::info!(
         "[CONN] phase=connect_attempt status=initialized reader={} client_id={} host={}:{}",
         reader_name.to_string_lossy(),
@@ -370,11 +383,7 @@ pub async fn ensure_connection(
         host,
         port
     );
-
-    // Create a new asynchronous MQTT client and its associated event loop
-    // `mqtt_options` specifies the configuration for the MQTT connection
-    // `10` is the capacity of the internal channel used by the event loop for buffering operations
-    let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
+    let (mqtt_client, mut eventloop) = build_mqtt_client(&client_id, &host, port);
 
     let mqtt_clinet_cloned = mqtt_client.clone();
     let client_id_cloned = client_id.clone();
@@ -1239,23 +1248,6 @@ mod tests {
         assert_eq!(request_id_from_topic("request/abc/ABCDEF"), None);
         assert_eq!(request_id_from_topic("response/1/ABCDEF"), None);
         assert_eq!(request_id_from_topic("request/"), None);
-    }
-
-    #[test]
-    fn next_reconnect_delay_doubles_then_saturates() {
-        assert_eq!(next_reconnect_delay(10), 20);
-        assert_eq!(next_reconnect_delay(20), 40);
-        assert_eq!(next_reconnect_delay(150), RECONNECT_DELAY_MAX_SECS);
-        assert_eq!(
-            next_reconnect_delay(RECONNECT_DELAY_MAX_SECS),
-            RECONNECT_DELAY_MAX_SECS
-        );
-    }
-
-    #[test]
-    fn next_reconnect_delay_overflow_safe() {
-        // saturating_mul prevents overflow; should still cap at max.
-        assert_eq!(next_reconnect_delay(u64::MAX), RECONNECT_DELAY_MAX_SECS);
     }
 
     #[test]

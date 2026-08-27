@@ -15,6 +15,8 @@ use std::sync::Mutex;
 
 use lazy_static::lazy_static;
 
+use crate::config::CardConfig;
+
 struct SniffState {
     /// FID of the most recently SELECTed EF (plain or SM-wrapped).
     last_selected_ef: Option<u16>,
@@ -215,6 +217,52 @@ fn ber_length(data: &[u8]) -> Option<(usize, usize)> {
 
 // ─────────── Field parsers ───────────
 
+/// Applies a sniffed field update to the card's stored config, off the async
+/// task that produced it.
+///
+/// `sniff()` runs on the card's MQTT task, so the write (file I/O with fsync)
+/// is offloaded to the blocking pool. `mutate_card_config` re-applies `apply`
+/// against fresh file state under the global config lock, so a concurrent
+/// writer cannot be reverted by a stale snapshot. `apply` returns whether it
+/// actually changed anything.
+fn persist_sniffed(
+    client_id: &str,
+    what: &'static str,
+    apply: impl FnOnce(&mut CardConfig) -> bool + Send + 'static,
+) {
+    log::debug!("{} → config update for {}", what, client_id);
+    let client_id = client_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        if !crate::config::mutate_card_config(&client_id, apply) {
+            log::error!("sniffer: failed to persist {} fields for {}", what, client_id);
+        }
+    });
+}
+
+/// Assigns `new` over `field` when it differs, reporting whether it changed.
+/// The building block of every sniffed-field update: a field absent from this
+/// response (`None`) is left untouched rather than cleared.
+fn set_if_changed<T: PartialEq>(field: &mut T, new: Option<T>, changed: &mut bool) {
+    if let Some(new) = new {
+        if *field != new {
+            *field = new;
+            *changed = true;
+        }
+    }
+}
+
+/// Gen2 cards expose EF_Application_Identification under BOTH DF_Tachograph
+/// (Gen1, ver 00.00) and DF_Tachograph_G2 (Gen2, ver 01.xx). Keep only the
+/// highest version seen — tuple comparison is lexicographic:
+/// (0,0) < (1,0) < (1,1) < (1,2) ...
+fn version_is_higher(current: Option<(u8, u8)>, candidate: (u8, u8)) -> bool {
+    match current {
+        Some(current) => candidate > current,
+        None => true,
+    }
+}
+
+
 /// Parses EF_Identification (Annex 1C §2.24 CardIdentification + holder block).
 /// Logs all fields and persists the subset we track (expire, company_name,
 /// company_address) into the card's config if values changed.
@@ -291,42 +339,12 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
         return;
     }
 
-    log::debug!("EF_Identification → config update for {}", client_id);
-
-    // sniff() runs on the card's async MQTT task, so the write (file I/O with
-    // fsync) is offloaded to the blocking pool. mutate_card_config re-applies
-    // the change against fresh file state under the global config lock, so a
-    // concurrent writer cannot be reverted by a stale snapshot.
-    let client_id = client_id.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        let ok = crate::config::mutate_card_config(&client_id, move |card| {
-            let mut changed = false;
-            if let Some(v) = new_expire {
-                if card.expire != v {
-                    card.expire = v;
-                    changed = true;
-                }
-            }
-            if let Some(v) = new_company_name {
-                if card.company_name != v {
-                    card.company_name = v;
-                    changed = true;
-                }
-            }
-            if let Some(v) = new_company_address {
-                if card.company_address != v {
-                    card.company_address = v;
-                    changed = true;
-                }
-            }
-            changed
-        });
-        if !ok {
-            log::error!(
-                "sniffer: failed to persist EF_Identification fields for {}",
-                client_id
-            );
-        }
+    persist_sniffed(client_id, "EF_Identification", move |card| {
+        let mut changed = false;
+        set_if_changed(&mut card.expire, new_expire, &mut changed);
+        set_if_changed(&mut card.company_name, new_company_name, &mut changed);
+        set_if_changed(&mut card.company_address, new_company_address, &mut changed);
+        changed
     });
 }
 
@@ -371,18 +389,10 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
     } else {
         None
     };
-    // Gen2 cards expose EF_Application_Identification under BOTH DF_Tachograph (Gen1, ver 00.00)
-    // and DF_Tachograph_G2 (Gen2, ver 01.xx). Keep only the highest version seen —
-    // tuple comparison is lexicographic: (0,0) < (1,0) < (1,1) < (1,2) ...
     let new_structure_version = if data.len() >= 3 {
         Some((data[1], data[2]))
     } else {
         None
-    };
-
-    let version_is_higher = |current: Option<(u8, u8)>, candidate: (u8, u8)| match current {
-        Some(current) => candidate > current,
-        None => true,
     };
 
     let would_change = new_card_type.is_some_and(|t| cfg.card_type != Some(t))
@@ -391,37 +401,17 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
         return;
     }
 
-    log::debug!(
-        "EF_Application_Identification → config update for {}",
-        client_id
-    );
-
-    // Same offload pattern as EF_Identification: blocking write on the blocking
-    // pool, change re-applied to fresh file state under the global config lock.
-    let client_id = client_id.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        let ok = crate::config::mutate_card_config(&client_id, move |card| {
-            let mut changed = false;
-            if let Some(t) = new_card_type {
-                if card.card_type != Some(t) {
-                    card.card_type = Some(t);
-                    changed = true;
-                }
+    persist_sniffed(client_id, "EF_Application_Identification", move |card| {
+        let mut changed = false;
+        set_if_changed(&mut card.card_type, new_card_type.map(Some), &mut changed);
+        // Not set_if_changed: a lower version must never overwrite a higher one.
+        if let Some(v) = new_structure_version {
+            if version_is_higher(card.structure_version, v) {
+                card.structure_version = Some(v);
+                changed = true;
             }
-            if let Some(v) = new_structure_version {
-                if version_is_higher(card.structure_version, v) {
-                    card.structure_version = Some(v);
-                    changed = true;
-                }
-            }
-            changed
-        });
-        if !ok {
-            log::error!(
-                "sniffer: failed to persist EF_Application_Identification fields for {}",
-                client_id
-            );
         }
+        changed
     });
 }
 
@@ -491,6 +481,84 @@ fn time_real(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CardConfig with every sniffed field empty — the starting point for the
+    /// `set_if_changed` / `version_is_higher` cases below.
+    fn blank_card() -> CardConfig {
+        CardConfig {
+            iccid: "0123456789ABCDEF".to_string(),
+            expire: None,
+            name: None,
+            t_protocol: None,
+            card_type: None,
+            structure_version: None,
+            company_name: None,
+            company_address: None,
+            last_auth: None,
+        }
+    }
+
+    #[test]
+    fn set_if_changed_ignores_a_field_absent_from_the_response() {
+        // A short response must leave a stored value alone, never clear it.
+        let mut card = blank_card();
+        card.company_name = Some("ACME".to_string());
+        let mut changed = false;
+        set_if_changed(&mut card.company_name, None, &mut changed);
+        assert!(!changed);
+        assert_eq!(card.company_name.as_deref(), Some("ACME"));
+    }
+
+    #[test]
+    fn set_if_changed_reports_only_a_real_change() {
+        let mut card = blank_card();
+        card.expire = Some(42);
+        let mut changed = false;
+
+        // Same value: no write, no change reported.
+        set_if_changed(&mut card.expire, Some(Some(42)), &mut changed);
+        assert!(!changed, "re-reading an unchanged EF must not dirty the config");
+
+        // Different value: written and reported.
+        set_if_changed(&mut card.expire, Some(Some(99)), &mut changed);
+        assert!(changed);
+        assert_eq!(card.expire, Some(99));
+    }
+
+    #[test]
+    fn set_if_changed_can_clear_a_field_the_card_reports_as_empty() {
+        // Outer Some = the EF carried the field; inner None = it is empty.
+        let mut card = blank_card();
+        card.expire = Some(7);
+        let mut changed = false;
+        set_if_changed(&mut card.expire, Some(None), &mut changed);
+        assert!(changed);
+        assert_eq!(card.expire, None);
+    }
+
+    #[test]
+    fn set_if_changed_accumulates_across_fields() {
+        // `changed` is threaded through several fields; one real change must
+        // survive later no-op assignments.
+        let mut card = blank_card();
+        let mut changed = false;
+        set_if_changed(&mut card.company_name, Some(Some("A".into())), &mut changed);
+        assert!(changed);
+        set_if_changed(&mut card.company_address, None, &mut changed);
+        assert!(changed, "an earlier change must not be reset by a later no-op");
+    }
+
+    #[test]
+    fn version_is_higher_keeps_the_highest_generation_seen() {
+        // Gen2 cards expose the EF under both DF_Tachograph (00.00) and
+        // DF_Tachograph_G2 (01.xx); the Gen1 read must not clobber the Gen2 one.
+        assert!(version_is_higher(None, (0, 0)), "first read always stores");
+        assert!(version_is_higher(Some((0, 0)), (1, 0)));
+        assert!(version_is_higher(Some((1, 0)), (1, 1)));
+        assert!(!version_is_higher(Some((1, 0)), (0, 0)), "Gen1 must not overwrite Gen2");
+        assert!(!version_is_higher(Some((1, 1)), (1, 1)), "same version is not higher");
+        assert!(!version_is_higher(Some((1, 2)), (1, 1)));
+    }
 
     #[test]
     fn select_ef_fid_plain_form() {

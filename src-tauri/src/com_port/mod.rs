@@ -47,13 +47,7 @@ pub use cards::abort_rack_card_session;
 pub use cards::connect_pending_rack_cards;
 pub use cards::disconnect_rack_card;
 
-const RECONNECT_DELAY_INITIAL_SECS: u64 = 10;
-const RECONNECT_DELAY_MAX_SECS: u64 = 300;
-
-/// Returns the next reconnect delay given the current one (exponential, capped).
-fn next_reconnect_delay(current: u64) -> u64 {
-    current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
-}
+use crate::backoff::{next_reconnect_delay, RECONNECT_DELAY_INITIAL_SECS};
 
 /// Guards against starting more than one rack monitor. `initialize_backend` in
 /// `lib.rs` runs once, so this is a backstop rather than the load-bearing guard

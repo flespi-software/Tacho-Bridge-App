@@ -7,7 +7,7 @@
 //! the server once its discovery has walked that rack.
 
 use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
+use rumqttc::v5::{AsyncClient, Event, Incoming};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use crate::global_app_handle::{rack_update_cards, RackCard};
 use crate::smart_card::TASK_POOL;
 
 use super::rack::{handle_serial_request, IdempotencySlot};
-use super::state::{set_rack_card_state, update_rack_card_ui};
+use super::state::{mutate_rack_rows, set_rack_card_state, update_rack_card_ui};
 use super::transport::{
     execute_envelope, normalize_hex, SerialEnvelope, SharedPort, SERIAL_MS_MAX, SERIAL_MS_MIN,
     SERIAL_READ_DEADLINE, SERIAL_REPLY_TIMEOUT,
@@ -306,9 +306,6 @@ async fn rack_card_mqtt_loop(
         }
     };
 
-    let mut mqtt_options = MqttOptions::new(&card_number, &host, port);
-    crate::mqtt::apply_mqtt_credentials(&mut mqtt_options);
-    mqtt_options.set_keep_alive(Duration::from_secs(120));
     log::info!(
         "{} [MQTT] phase=connect_attempt status=initialized host={}:{} slot={}",
         log_header,
@@ -316,8 +313,7 @@ async fn rack_card_mqtt_loop(
         port,
         slot
     );
-
-    let (mqtt_client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
+    let (mqtt_client, mut eventloop) = crate::mqtt::build_mqtt_client(&card_number, &host, port);
 
     let mut is_online = false;
     let mut reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
@@ -705,29 +701,21 @@ pub fn abort_rack_card_session(card_number: &str) {
     // never spawned (skipped as served_by_reader) — and by the card's ICCID
     // from the config, covering a row that is not number-resolved yet.
     let iccid = crate::config::get_card_config_from_cache(card_number).map(|card| card.iccid);
-    let updates: Vec<(String, Vec<RackCard>)> = {
-        let mut ui = lock(&RACK_CARDS_UI);
-        let mut updates = Vec::new();
-        for (rack_id, list) in ui.iter_mut() {
-            let before = list.len();
-            list.retain(|c| {
-                c.card_number.as_deref() != Some(card_number)
-                    && (iccid.is_none() || c.iccid != iccid)
-            });
-            if list.len() != before {
-                log::info!(
-                    "RACK {} | [SPAWN] status=row_dropped reason=card_now_in_reader card={}",
-                    rack_id,
-                    card_number
-                );
-                updates.push((rack_id.clone(), list.clone()));
-            }
+    mutate_rack_rows(|rack_id, list| {
+        let before = list.len();
+        list.retain(|c| {
+            c.card_number.as_deref() != Some(card_number) && (iccid.is_none() || c.iccid != iccid)
+        });
+        if list.len() == before {
+            return false;
         }
-        updates
-    };
-    for (rack_id, cards) in updates {
-        rack_update_cards(&rack_id, cards);
-    }
+        log::info!(
+            "RACK {} | [SPAWN] status=row_dropped reason=card_now_in_reader card={}",
+            rack_id,
+            card_number
+        );
+        true
+    });
 }
 
 /// Closes the rack-backed session of one card number, if any rack currently
@@ -768,27 +756,17 @@ pub fn disconnect_rack_card(card_number: &str) {
     // when no session was aborted: a rack row can carry the number without a
     // session (spawn skipped as served_by_reader), and skipping it here would
     // leave the deleted number on display forever.
-    let changed: Vec<(String, Vec<RackCard>)> = {
-        let mut ui = lock(&RACK_CARDS_UI);
-        let mut changed = Vec::new();
-        for (rack_id, list) in ui.iter_mut() {
-            let mut touched = false;
-            for card in list.iter_mut() {
-                if card.card_number.as_deref() == Some(card_number) {
-                    card.card_number = None;
-                    card.name = None;
-                    touched = true;
-                }
-            }
-            if touched {
-                changed.push((rack_id.clone(), list.clone()));
+    mutate_rack_rows(|_rack_id, list| {
+        let mut touched = false;
+        for card in list.iter_mut() {
+            if card.card_number.as_deref() == Some(card_number) {
+                card.card_number = None;
+                card.name = None;
+                touched = true;
             }
         }
-        changed
-    };
-    for (rack_id, cards) in changed {
-        rack_update_cards(&rack_id, cards);
-    }
+        touched
+    });
 }
 
 /// Aborts the card sessions of one rack and clears its UI card list. Called
