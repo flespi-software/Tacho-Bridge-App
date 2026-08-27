@@ -425,8 +425,17 @@ mod tests {
     }
 
     #[test]
-    fn giving_up_takes_fewer_attempts_than_a_day_of_ticks() {
-        // Before the cap existed a broken update was retried ~288 times a day.
-        assert!(MAX_INSTALL_ATTEMPTS < 10);
+    fn giving_up_happens_far_sooner_than_a_day_of_ticks() {
+        // Before the cap existed a broken update was retried on every 5-minute
+        // tick — ~288 full re-downloads a day. Bound the total retry window
+        // instead of the bare attempt count, so the guarantee survives a change
+        // to either constant.
+        let total_wait: u64 = (0..MAX_INSTALL_ATTEMPTS)
+            .map(|attempt| install_retry_backoff(attempt).as_secs())
+            .sum();
+        assert!(
+            total_wait < 24 * 60 * 60,
+            "retries must give up within a day, got {total_wait}s"
+        );
     }
 }

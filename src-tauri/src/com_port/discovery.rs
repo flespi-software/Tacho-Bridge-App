@@ -372,13 +372,38 @@ fn sort_racks(racks: &mut [RackInfo]) {
     });
 }
 
-/// Two entries that build the same client_id are one MQTT identity — only the
-/// first (in the deterministic order) can be served, the rest are dropped.
-/// This is the NORMAL state on macOS, where every USB serial device enumerates
-/// as both its /dev/cu.* and /dev/tty.* node with identical metadata (the sort
-/// keeps /dev/cu.*, the callout node, first). Logged once per change of the
+/// Two entries that build the same client_id are one MQTT identity — only one
+/// can be served, the rest are dropped. This is the NORMAL state on macOS,
+/// where every USB serial device enumerates as both its /dev/cu.* and
+/// /dev/tty.* node with identical metadata. Logged once per change of the
 /// dropped set, at info — it is expected housekeeping, not a fault.
+///
+/// The winner is STICKY: a descriptor we already have open keeps winning even
+/// if a lexicographically smaller alias for the same device shows up later.
+/// macOS can expose one rack as both `/dev/cu.usbserial-<serial>` and
+/// `/dev/cu.usbserial-<N>`, and `<N>` sorts before `<serial>`; without
+/// stickiness the newcomer displaced the live descriptor, which tore down a
+/// working rack (its MQTT task and every card session) just to reopen the same
+/// physical device under another name. Falls back to the deterministic sort
+/// order when nothing is open yet.
 fn dedupe_by_client_id(racks: &mut Vec<RackInfo>) {
+    let active = super::active_rack_ports();
+    if !active.is_empty() {
+        // Stable partition: entries whose port is already open float to the
+        // front of their client_id group, so the `retain` below keeps them.
+        let mut preferred: Vec<RackInfo> = Vec::with_capacity(racks.len());
+        let mut rest: Vec<RackInfo> = Vec::with_capacity(racks.len());
+        for rack in racks.drain(..) {
+            if active.contains(&rack.port_name) {
+                preferred.push(rack);
+            } else {
+                rest.push(rack);
+            }
+        }
+        preferred.append(&mut rest);
+        *racks = preferred;
+    }
+
     let mut seen = std::collections::HashSet::new();
     let mut dropped: Vec<String> = Vec::new();
     racks.retain(|r| {
@@ -841,5 +866,44 @@ mod tests {
         dedupe_by_client_id(&mut racks);
         assert_eq!(racks.len(), 1);
         assert_eq!(racks[0].port_name, "COM3");
+    }
+
+    #[test]
+    fn an_open_descriptor_is_not_displaced_by_a_new_alias() {
+        // Regression: macOS exposes one rack as both /dev/cu.usbserial-<serial>
+        // and /dev/cu.usbserial-<N>. "-3" sorts before "-SC1799", so when the
+        // second alias appeared the plain sort handed discovery a "changed"
+        // rack, which tore down the live MQTT task and every card session on it
+        // just to reopen the same physical device — and the reopen then failed
+        // as busy because the old handle had not closed yet.
+        let serial = Some("SC1799");
+        let live_port = "/dev/cu.usbserial-SC1799";
+        let client_id = info(live_port, serial).client_id();
+
+        super::super::set_active_rack_port_for_test(&client_id, Some(live_port));
+
+        let mut racks = vec![
+            info("/dev/cu.usbserial-3", serial),
+            info(live_port, serial),
+        ];
+        sort_racks(&mut racks);
+        dedupe_by_client_id(&mut racks);
+
+        assert_eq!(racks.len(), 1);
+        assert_eq!(
+            racks[0].port_name, live_port,
+            "the descriptor already open must keep winning"
+        );
+
+        // With nothing open, the deterministic sort order decides as before.
+        super::super::set_active_rack_port_for_test(&client_id, None);
+        let mut racks = vec![
+            info("/dev/cu.usbserial-3", serial),
+            info(live_port, serial),
+        ];
+        sort_racks(&mut racks);
+        dedupe_by_client_id(&mut racks);
+        assert_eq!(racks.len(), 1);
+        assert_eq!(racks[0].port_name, "/dev/cu.usbserial-3");
     }
 }

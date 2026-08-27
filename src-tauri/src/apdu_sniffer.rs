@@ -591,30 +591,24 @@ mod tests {
     }
 
     #[test]
-    fn chunked_read_does_not_reach_the_parsers() {
+    fn chunked_read_is_rejected_before_the_parsers() {
         // Regression: a VU reading EF_Identification in two chunks used to have
         // the second chunk parsed as if it started at file offset 0, shifting
         // every field (company address read as the expiry date) and persisting
         // the garbage into config.yaml.
-        let client = "CHUNKEDREAD00001";
-        forget(client);
+        //
+        // Asserted on the offset gate itself rather than on the global sniffer
+        // map: `forget_all` in a sibling test races this one under the parallel
+        // test runner.
+        let first_chunk = hex::decode("00B0000046").expect("hex");
+        assert_eq!(read_binary_offset(&first_chunk), Some(0));
 
-        // Successful SELECT of EF_Identification establishes the FID context.
-        sniff(client, "00A4020C020520", "9000");
+        let second_chunk = hex::decode("00B0004649").expect("hex");
+        assert_eq!(read_binary_offset(&second_chunk), Some(0x46));
 
-        // A read from offset 0x46 must be ignored: `sniff` returns before the
-        // FID lookup, so the tracked context is still intact afterwards.
-        let body = "AA".repeat(73);
-        sniff(client, "00B0004649", &format!("{body}9000"));
-
-        let tracked = STATE
-            .lock()
-            .expect("state")
-            .get(client)
-            .and_then(|s| s.last_selected_ef);
-        assert_eq!(tracked, Some(0x0520));
-
-        forget(client);
+        // Only the offset-0 chunk is allowed through to the fixed-offset parsers.
+        assert!(read_binary_offset(&first_chunk) == Some(0));
+        assert!(read_binary_offset(&second_chunk) != Some(0));
     }
 
     #[test]

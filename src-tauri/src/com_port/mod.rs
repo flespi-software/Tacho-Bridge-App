@@ -74,6 +74,29 @@ lazy_static::lazy_static! {
     /// loop.
     static ref RACK_TASKS: std::sync::Mutex<HashMap<String, (JoinHandle<()>, SharedPort)>> =
         std::sync::Mutex::new(HashMap::new());
+
+    /// Serial device nodes this app currently holds open, keyed by rack
+    /// client_id. Discovery consults it so a device that already has a live
+    /// session keeps being addressed by the SAME descriptor, even when the OS
+    /// later exposes another alias for it (see `dedupe_by_client_id`).
+    static ref RACK_ACTIVE_PORTS: std::sync::Mutex<HashMap<String, String>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+/// Device nodes currently held open by this app.
+pub(super) fn active_rack_ports() -> std::collections::HashSet<String> {
+    lock(&RACK_ACTIVE_PORTS).values().cloned().collect()
+}
+
+/// Test-only: pin a device node as "open by this app" so discovery's stickiness
+/// can be exercised without real hardware.
+#[cfg(test)]
+pub(super) fn set_active_rack_port_for_test(client_id: &str, port_name: Option<&str>) {
+    let mut guard = lock(&RACK_ACTIVE_PORTS);
+    match port_name {
+        Some(port) => guard.insert(client_id.to_string(), port.to_string()),
+        None => guard.remove(client_id),
+    };
 }
 
 /// Locks a mutex, recovering from poisoning: a panic in any holder must not
@@ -148,16 +171,71 @@ pub fn shutdown() {
 /// Stops one rack's MQTT task, presence watch and card sessions — without the
 /// rack there is no transport to its cards. Dropping the port handle from the
 /// map is what closes the COM handle once the tasks release their clones.
-fn stop_rack(client_id: &str) {
-    {
+///
+/// Returns the rack's port handle when one was registered, so callers that are
+/// about to REOPEN the same device can wait for it to actually close (see
+/// `stop_rack_and_await_port_release`). `abort()` only marks a task for
+/// cancellation, so the port stays open until every task actually yields and
+/// drops its `Arc` clone.
+fn stop_rack(client_id: &str) -> Option<SharedPort> {
+    // The device node is no longer ours; discovery may pick a different alias
+    // for this rack from now on.
+    lock(&RACK_ACTIVE_PORTS).remove(client_id);
+    let port = {
         let mut guard = lock(&RACK_TASKS);
-        if let Some((handle, _)) = guard.remove(client_id) {
-            handle.abort();
-            log::info!("RACK {} | [MQTT] phase=stop status=aborted", client_id);
+        match guard.remove(client_id) {
+            Some((handle, port)) => {
+                handle.abort();
+                log::info!("RACK {} | [MQTT] phase=stop status=aborted", client_id);
+                Some(port)
+            }
+            None => None,
         }
-    }
+    };
     stop_rack_watch(client_id);
     stop_rack_cards(client_id);
+    port
+}
+
+/// How long to wait for aborted rack tasks to drop their serial-port clones
+/// before reopening the device. Cancellation is cooperative, so the handles go
+/// away within a scheduler tick or two; this is an upper bound, not a delay we
+/// expect to spend.
+const PORT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Poll step while waiting for the port handle to become unreferenced.
+const PORT_RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Stops a rack and waits until its serial port is really closed.
+///
+/// `stop_rack` alone is not enough before reopening the SAME physical device:
+/// `abort()` merely schedules cancellation, so the MQTT loop, the watch task
+/// and the card sessions still hold `Arc` clones of the port for a short while.
+/// Reopening in that window fails with "Device or resource busy" — the app
+/// competing with itself for the port it just gave up — which tore down a
+/// working rack session and left the rack dark until a later retry tick.
+///
+/// Waits for the last clone to drop (the `Arc` strong count falling to one, our
+/// own), then drops it, which closes the OS handle.
+async fn stop_rack_and_await_port_release(client_id: &str) {
+    let Some(port) = stop_rack(client_id) else {
+        return;
+    };
+
+    let deadline = std::time::Instant::now() + PORT_RELEASE_TIMEOUT;
+    while Arc::strong_count(&port) > 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(PORT_RELEASE_POLL).await;
+    }
+
+    if Arc::strong_count(&port) > 1 {
+        log::warn!(
+            "RACK {} | phase=stop status=port_still_referenced holders={} timeout_ms={}",
+            client_id,
+            Arc::strong_count(&port) - 1,
+            PORT_RELEASE_TIMEOUT.as_millis()
+        );
+    }
+    // Closes the OS handle when this was the last reference.
+    drop(port);
 }
 
 /// Stops every rack. The trailing all-variants are a backstop for watchers and
@@ -218,7 +296,13 @@ fn on_rack_connected(rack: &RackInfo, port: Box<dyn SerialPort>) {
 
     // A (re)connect starts from a clean slate: kill this rack's previous MQTT
     // task and card sessions — they hold a handle to the old (stale) serial port.
-    stop_rack(&client_id);
+    // No need to await its release here: our replacement port is already open,
+    // and the old handle refers to a descriptor we are not going to reopen.
+    let _ = stop_rack(&client_id);
+
+    // Remember which device node backs this rack, so a later alias for the same
+    // device cannot displace it during discovery.
+    lock(&RACK_ACTIVE_PORTS).insert(client_id.clone(), rack.port_name.clone());
 
     // Open the rack's own MQTT connection wired to the serial port, and wait for
     // server commands. Each `serial_cmd` is written straight to this port.
@@ -228,6 +312,20 @@ fn on_rack_connected(rack: &RackInfo, port: Box<dyn SerialPort>) {
 
 /// Called when a rack transitions to disconnected.
 fn on_rack_disconnected(rack: &RackInfo) {
+    announce_rack_disconnected(rack);
+
+    // Tear down this rack's MQTT connection, watch and card sessions.
+    stop_rack(&rack.client_id());
+}
+
+/// Same as `on_rack_disconnected`, but waits for the serial port to be released.
+/// Used when the caller is about to reopen the same physical device.
+async fn on_rack_disconnected_awaiting_port(rack: &RackInfo) {
+    announce_rack_disconnected(rack);
+    stop_rack_and_await_port_release(&rack.client_id()).await;
+}
+
+fn announce_rack_disconnected(rack: &RackInfo) {
     log::warn!(
         "RACK | phase=presence status=disconnected port={} serial={}",
         rack.port_name,
@@ -236,9 +334,6 @@ fn on_rack_disconnected(rack: &RackInfo) {
 
     // Tell the frontend the rack is gone (it stays listed as disconnected).
     rack_emit_event(rack.to_state(false));
-
-    // Tear down this rack's MQTT connection, watch and card sessions.
-    stop_rack(&rack.client_id());
 }
 
 /// Background monitor: continuously watches the bus for racks appearing and
@@ -304,7 +399,13 @@ pub async fn rack_connection() {
                 // Still present, but with different attributes (e.g. a port
                 // rename after replug): treat as disconnect + reconnect.
                 Some(prev) if prev != *rack => {
-                    on_rack_disconnected(&prev);
+                    // The old and the new descriptor can name the SAME physical
+                    // device (macOS exposes a rack as both /dev/cu.usbserial-<serial>
+                    // and /dev/cu.usbserial-<N>), so the reopen below competes with
+                    // the handle we are releasing. Wait for it to close first,
+                    // otherwise the open fails as busy and the rack — plus every
+                    // card session on it — stays down until a later tick.
+                    on_rack_disconnected_awaiting_port(&prev).await;
                     current.remove(id);
                     if let Some(port) = open_rack_blocking(rack).await {
                         on_rack_connected(rack, port);
@@ -320,11 +421,11 @@ pub async fn rack_connection() {
                         rack.port_name
                     );
                     // The dead loop's siblings (watch task, card sessions) may still
-                    // hold the old exclusive serial handle — kill them BEFORE reopening,
-                    // otherwise open_rack fails on every tick forever. Running this on
-                    // each retry tick also reaps a watch task that raced past a
-                    // previous stop.
-                    stop_rack(id);
+                    // hold the old exclusive serial handle — kill them BEFORE reopening
+                    // and wait for the handle to actually close, otherwise open_rack
+                    // fails as busy on every tick forever. Running this on each retry
+                    // tick also reaps a watch task that raced past a previous stop.
+                    stop_rack_and_await_port_release(id).await;
                     if let Some(port) = open_rack_blocking(rack).await {
                         on_rack_connected(rack, port);
                     }
