@@ -407,3 +407,9 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed rack and reader sessions being able to open two MQTT connections for the same card at once Fixed the old card's session leaking when a card is swapped in a reader faster than the monitor polls Fixed a manual sync running alongside the card monitor being able to reset a card during authentication Fixed corrupted card details being saved when the tachograph reads the identification file in several chunks Fixed one physical card being linkable to two card entries, which could authenticate it under the wrong number Fixed a pre-release update still being installed after switching back to the stable channel Fixed a failing update being re-downloaded every five minutes instead of backing off and giving up Fixed a system clock change being able to restart the application during an active authentication Added background card bridging that no longer depends on the app window being loaded.
+
+### [0.8.0-rc.4] - 2026-08-27
+
+🛠 Fixes
+
+- Fixed the card rack being torn down and failing to reopen when the system exposes a second device name for it.
