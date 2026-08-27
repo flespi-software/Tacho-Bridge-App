@@ -193,6 +193,26 @@ fn update_card_config(
     let mut config = load_config(config_path)?;
     log::debug!("Loaded configuration: {:?}", config);
 
+    // One physical card belongs to exactly one card number. Linking an ICCID
+    // that another entry already holds would make `find_card_number_by_iccid`
+    // ambiguous, so the card could authenticate under the wrong client_id and
+    // sniffed EF data could land on the wrong entry. Reject the link here — the
+    // frontend only disables entries that already carry an ICCID, so nothing
+    // stops the user from linking one physical card into two empty entries.
+    if !content.iccid.is_empty() {
+        if let Some((owner, _)) = config
+            .cards
+            .iter()
+            .find(|(number, card)| number.as_str() != card_number && card.iccid == content.iccid)
+        {
+            return Err(format!(
+                "ICCID {} is already linked to card {}; unlink it there before assigning it to {}",
+                content.iccid, owner, card_number
+            )
+            .into());
+        }
+    }
+
     let mut changed = false;
 
     // Metadata fields are owned by the backend (APDU sniffer, auth recorder):
@@ -291,23 +311,20 @@ fn update_card_config(
 /// NOTE: a successful save may create a new ICCID -> card number association;
 /// callers must then trigger session reconciliation the way update_card does
 /// (smart_card::request_rescan + com_port::connect_pending_rack_cards).
-pub fn persist_card(card_number: &str, content: CardConfig) -> bool {
-    let config_path = match get_config_path() {
-        Ok(path) => path,
-        Err(e) => {
-            log::error!("Failed to get config path: {}", e);
-            return false;
-        }
-    };
+pub fn persist_card(card_number: &str, content: CardConfig) -> Result<(), String> {
+    let config_path = get_config_path().map_err(|e| {
+        log::error!("Failed to get config path: {}", e);
+        format!("configuration file is unavailable: {e}")
+    })?;
 
     match update_card_config(&config_path, card_number, content) {
         Ok(_) => {
             log::info!("The card, {} is added to the configuration!", card_number);
-            true
+            Ok(())
         }
         Err(e) => {
             log::error!("Failed to update config: {}", e);
-            false
+            Err(e.to_string())
         }
     }
 }
@@ -375,16 +392,18 @@ where
 /// Public function to update the configuration with a new card.
 /// This is a Tauri command: a thin async wrapper so the webview invoke never
 /// runs file I/O on the main thread — the blocking core goes to the blocking pool.
+/// Returns the reason on failure so the frontend can show it verbatim — a bare
+/// "refused" tells the user nothing about a rejected duplicate ICCID link.
 #[tauri::command]
-pub async fn update_card(cardnumber: String, content: CardConfig) -> bool {
+pub async fn update_card(cardnumber: String, content: CardConfig) -> Result<(), String> {
     let updated = tauri::async_runtime::spawn_blocking(move || persist_card(&cardnumber, content))
         .await
         .unwrap_or_else(|e| {
             log::error!("update_card: blocking task failed: {:?}", e);
-            false
+            Err("internal error while saving the card".to_string())
         });
 
-    if updated {
+    if updated.is_ok() {
         // A card just linked to an inserted physical card has no MQTT session yet
         // (its ICCID resolved to nothing when it was detected): wake the PCSC
         // monitor to re-register reader-backed cards, and retry the rack cards
@@ -747,11 +766,37 @@ pub fn find_card_number_by_iccid(iccid: &str) -> Option<String> {
         return None;
     }
     let cache = cache_guard();
-    cache
+    let mut matches: Vec<&String> = cache
         .cards
         .iter()
-        .find(|(_, card)| card.iccid == iccid)
-        .map(|(number, _)| number.clone())
+        .filter(|(_, card)| card.iccid == iccid)
+        .map(|(number, _)| number)
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    // `cards` is a HashMap, so `find` would return an arbitrary entry and could
+    // pick a different one from run to run. With two entries sharing an ICCID
+    // that means the physical card authenticates under a nondeterministic
+    // client_id — bridging the VU session to the wrong flespi identity and
+    // persisting sniffed EF data onto the wrong card. Sorting makes the choice
+    // stable, and the warning surfaces the misconfiguration that has to be
+    // fixed in the UI.
+    matches.sort();
+    if matches.len() > 1 {
+        log::warn!(
+            "Config error: ICCID {} is linked to {} card entries ({}). Using {} — remove the duplicate links.",
+            iccid,
+            matches.len(),
+            matches
+                .iter()
+                .map(|number| number.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            matches[0]
+        );
+    }
+    Some(matches[0].clone())
 }
 
 /// Records the final state of an authentication attempt in the card config:
@@ -1326,6 +1371,67 @@ mod tests {
             1 + THREADS * UPDATES_PER_THREAD,
             "every concurrent update must be preserved"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_card_config_rejects_an_iccid_owned_by_another_card() {
+        let dir = unique_tmp_dir("dupiccid");
+        let path = dir.join("config.yaml");
+
+        // Two entries: one already linked to a physical card, one still empty.
+        let mut cfg = sample_config();
+        cfg.cards.insert(
+            "FEDCBA9876543210".to_string(),
+            CardConfig {
+                iccid: String::new(),
+                expire: None,
+                name: None,
+                t_protocol: None,
+                card_type: None,
+                structure_version: None,
+                company_name: None,
+                company_address: None,
+                last_auth: None,
+            },
+        );
+        save_config(&path, &cfg).expect("save");
+
+        // Linking the same physical card into the empty entry must be refused:
+        // a duplicate ICCID makes find_card_number_by_iccid ambiguous, so the
+        // card could authenticate under the wrong client_id.
+        let mut content = cfg
+            .cards
+            .get("FEDCBA9876543210")
+            .cloned()
+            .expect("second card");
+        content.iccid = "1122334455667788".to_string();
+        let err = update_card_config(&path, "FEDCBA9876543210", content)
+            .expect_err("duplicate ICCID must be rejected");
+        assert!(
+            err.to_string().contains("already linked"),
+            "unexpected error: {err}"
+        );
+
+        // The file is untouched: the second entry still has no ICCID.
+        let loaded = load_config(&path).expect("load");
+        assert_eq!(
+            loaded
+                .cards
+                .get("FEDCBA9876543210")
+                .expect("second card")
+                .iccid,
+            ""
+        );
+
+        // Re-saving the SAME card with its own ICCID stays allowed.
+        let own = loaded
+            .cards
+            .get("ABCDEF0123456789")
+            .cloned()
+            .expect("first card");
+        update_card_config(&path, "ABCDEF0123456789", own).expect("self-update must be allowed");
 
         let _ = fs::remove_dir_all(&dir);
     }

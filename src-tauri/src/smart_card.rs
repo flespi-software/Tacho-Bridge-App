@@ -224,9 +224,25 @@ fn setup_reader_states(
     Ok(())
 }
 
+lazy_static::lazy_static! {
+    /// Serializes whole reader-sweep passes. Two callers run `process_reader_states`
+    /// against the same physical readers: the `sc_monitor` thread and the
+    /// `manual_sync_cards` command. Their per-card work is NOT protected by the
+    /// TASK_POOL lock alone — `should_register_new_card` releases the pool before
+    /// the `await` points that follow (get_iccid, switch_protocol), and the
+    /// successor entry is only pushed at the very end of `ensure_connection`. So
+    /// both sweeps can see "no entry", open Shared-mode PC/SC handles on the same
+    /// card, interleave SELECT/READ APDUs, and — when the config prescribes a
+    /// protocol switch — have the loser call `switch_protocol` (Disposition::ResetCard)
+    /// right after the winner registered its session, wiping the card's security
+    /// state in the middle of a live VU authentication.
+    static ref READER_SWEEP: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
+}
+
 // Every failure here is per-card and non-fatal: it is logged and the loop
 // moves on to the next reader, so there is nothing to propagate to the caller.
 async fn process_reader_states(reader_states: &mut [ReaderState]) {
+    let _sweep = READER_SWEEP.lock().await;
     for rs in reader_states {
         if rs.name() == PNP_NOTIFICATION() {
             continue;
@@ -351,6 +367,40 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProce
         });
 
         if !exists {
+            // A reader physically holds one card at a time, so any entry bound
+            // to this reader with a DIFFERENT non-empty ATR describes a card
+            // that is already gone. Evict it here, because the empty-ATR pass
+            // below (Case 2, the only other eviction path) never runs for it:
+            // when a card is swapped faster than the monitor polls, PC/SC
+            // coalesces the removal and the insertion into a single PRESENT
+            // event carrying the new ATR, so no empty-ATR event is ever
+            // observed. Leaving the entry behind keeps the removed card shown
+            // as online with a live MQTT session retrying a dead PC/SC handle,
+            // and lets a later empty-ATR event evict whichever same-reader
+            // entry `position()` happens to find first — possibly orphaning the
+            // new card's session instead.
+            let stale: Vec<usize> = pool
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.reader_name.as_deref() == Some(reader_name)
+                        && c.atr.as_deref().is_some_and(|a| !a.is_empty() && a != atr)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for index in stale.into_iter().rev() {
+                let removed = pool.remove(index);
+                log::warn!(
+                    "Evicting ProcessingCard for reader {} — card swapped (old ATR {}, new ATR {})",
+                    removed.reader_name.as_deref().unwrap_or("unknown"),
+                    removed.atr.as_deref().unwrap_or("unknown"),
+                    atr,
+                );
+                tauri::async_runtime::spawn(crate::mqtt::shutdown_connections(
+                    vec![removed],
+                    "card_swapped",
+                ));
+            }
             return CardProcessingResult::Create;
         }
     }
@@ -394,10 +444,11 @@ fn is_virtual_reader(reader_name: &CStr) -> bool {
         || reader_name_lower.contains("remote")
 }
 
-/// Guards against starting more than one smart-card monitor. The
-/// `frontend-loaded` event in `lib.rs` can fire several times at startup,
-/// which would otherwise spawn duplicate monitors (duplicate PCSC contexts
-/// and doubled APDU traffic to the same card).
+/// Guards against starting more than one smart-card monitor. `initialize_backend`
+/// in `lib.rs` runs once, so this is a backstop rather than the load-bearing
+/// guard it was when initialization hung off the repeatable `frontend-loaded`
+/// event: a second monitor would mean duplicate PCSC contexts and doubled APDU
+/// traffic to the same card.
 static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 
 // Automatically sync cards.

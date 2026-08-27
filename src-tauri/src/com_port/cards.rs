@@ -933,12 +933,16 @@ async fn spawn_rack_card_checked(
     log_header: &str,
     from_server: bool,
 ) {
-    if TASK_POOL
-        .lock()
-        .await
-        .iter()
-        .any(|card| card.client_id == card_number)
-    {
+    // INVARIANT: the TASK_POOL guard is held across both the served-by-reader
+    // check and the RACK_CARD_TASKS insert inside `spawn_rack_card`. Releasing
+    // it in between (the guard used to be a temporary dropped at the end of
+    // this `if`) opens the window the reader path exploits: `ensure_connection`
+    // holds the same guard while it aborts rack sessions and registers its own
+    // entry, so a rack spawn that checked before that abort and inserted after
+    // it would leave two live MQTT connections under one client_id — the broker
+    // then drops both in a mutual-takeover loop until the card is replugged.
+    let pool = TASK_POOL.lock().await;
+    if pool.iter().any(|card| card.client_id == card_number) {
         log::warn!(
             "{} [SPAWN] card={} slot={} status=skipped reason=served_by_reader",
             log_header,
@@ -949,4 +953,5 @@ async fn spawn_rack_card_checked(
     }
 
     spawn_rack_card(card_number, iccid, slot, rack_id, port, from_server);
+    drop(pool);
 }

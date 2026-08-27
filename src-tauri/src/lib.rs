@@ -17,11 +17,6 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{async_runtime, Listener, Manager, RunEvent, WindowEvent}; // Tauri application framework and async runtime.
 
-/// `frontend-loaded` fires on every webview (re)load — dev hot-reload, manual
-/// refresh, sometimes twice at startup. The one-time backend initialization
-/// (logging, config, background tasks) must only run for the first one.
-static BACKEND_INITIALIZED: AtomicBool = AtomicBool::new(false);
-
 /// Set once the tray icon is successfully created. While the tray is active,
 /// closing the window only hides it and the APDU bridge keeps running in the
 /// background; if the tray could not be created (e.g. a Linux desktop without
@@ -93,6 +88,53 @@ fn shutdown_cleanup() {
     log::info!("-== Application is closed by user ==-\n");
 }
 
+/// Starts every backend subsystem: logging, configuration, the PC/SC card
+/// monitor, the app-level MQTT connection, the rack monitor and the updater.
+/// Called once from `setup()`, before the webview has loaded — card bridging is
+/// then live regardless of what the frontend does.
+fn initialize_backend(app_handle: tauri::AppHandle) {
+    // Initialize logging (fern). Must be first so everything below logs.
+    logger::setup_logging();
+
+    // Read config.yaml (or create the default) and fill the runtime cache.
+    match config::init_config() {
+        Ok(_) => log::info!("Config initialized successfully."),
+        Err(e) => log::error!("Failed to initialize config: {}", e),
+    }
+
+    // The smart-card monitor is a blocking PC/SC loop (get_status_change parks
+    // its thread until a card event), so it runs on the blocking pool, not on
+    // an async worker.
+    async_runtime::spawn_blocking(|| {
+        smart_card::sc_monitor();
+    });
+
+    // Start the main MQTT app client connection.
+    async_runtime::spawn(async {
+        app_connect::app_connection().await;
+    });
+
+    // Background task for the card rack on the COM port. Runs concurrently with
+    // the PCSC reader monitor — a plugged-in reader and a connected rack work
+    // in parallel.
+    async_runtime::spawn(async {
+        com_port::rack_connection().await;
+    });
+
+    // One-shot update check against the release endpoint.
+    let updater_handle = app_handle.clone();
+    async_runtime::spawn(async move {
+        updater::check_for_updates(updater_handle).await;
+    });
+
+    // Unattended update loop: idle while the setting is off, otherwise checks
+    // hourly and installs during a pause in card activity (an install restarts
+    // the app).
+    async_runtime::spawn(async move {
+        updater::auto_update_loop(app_handle).await;
+    });
+}
+
 /// Creates the system tray icon with its Show/Quit menu. Failure is reported
 /// to the caller instead of aborting setup — the app is fully usable without
 /// a tray, closing the window then simply quits as before.
@@ -153,6 +195,17 @@ pub fn run() {
             // Initialize the global application handle
             global_app_handle::set_app_handle(app_handle.clone());
 
+            // ── One-time backend initialization ──
+            //
+            // Runs here, not from the webview's `frontend-loaded` event: the
+            // APDU bridge is the product, and it must not depend on a webview
+            // that may load late, fail to load, or (with the tray active) never
+            // be shown at all — an app started with `--minimized` bridges cards
+            // from the tray with no window in sight. Tauri calls setup() exactly
+            // once, which is also why none of the subsystems below need their
+            // own duplicate-spawn latch any more.
+            initialize_backend(app_handle.clone());
+
             // System tray: with it active, closing the window hides the app
             // to the tray and card bridging keeps running in the background.
             // Logging is not initialized yet at this point, so eprintln is
@@ -186,64 +239,11 @@ pub fn run() {
 
                 let front_app_handle = app_handle.clone();
 
-                // Frontend loading is late, so we execute a callback to the "frontend-loaded" event which the front sends when it is loaded
+                // The backend is already running (started in setup()); this
+                // event only replays current state into a freshly loaded
+                // webview — at startup, and again after every reload or dev
+                // hot-reload.
                 window.listen("frontend-loaded", move |event: tauri::Event| {
-                    #[cfg(target_os = "linux")]
-                    {
-                        // Temporary solution only for linux because webview does not load even after response from front.
-                        // Apparently loading occurs later, not like Windows and MacOS. Fix later.
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                    }
-                    #[cfg(target_os = "windows")]
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                    }
-
-                    // ── One-time backend initialization ──
-                    if !BACKEND_INITIALIZED.swap(true, Ordering::SeqCst) {
-                        // Initialize logging (fern). Must be first so everything below logs.
-                        logger::setup_logging();
-
-                        // Read config.yaml (or create the default) and fill the runtime cache.
-                        match config::init_config() {
-                            Ok(_) => log::info!("Config initialized successfully."),
-                            Err(e) => log::error!("Failed to initialize config: {}", e),
-                        }
-
-                        // The smart-card monitor is a blocking PC/SC loop
-                        // (get_status_change parks its thread until a card event),
-                        // so it runs on the blocking pool, not on an async worker.
-                        async_runtime::spawn_blocking(|| {
-                            smart_card::sc_monitor();
-                        });
-
-                        async_runtime::spawn(async {
-                            // Start Main MQTT App client connection
-                            app_connect::app_connection().await;
-                        });
-
-                        // Background task for the card rack on the COM port. Runs
-                        // concurrently with the PCSC reader monitor — a plugged-in
-                        // reader and a connected rack work in parallel.
-                        async_runtime::spawn(async {
-                            com_port::rack_connection().await;
-                        });
-
-                        // One-shot update check against the release endpoint.
-                        let updater_handle = front_app_handle.clone();
-                        async_runtime::spawn(async move {
-                            updater::check_for_updates(updater_handle).await;
-                        });
-
-                        // Unattended update loop: idle while the setting is off,
-                        // otherwise checks hourly and installs during a pause in
-                        // card activity (an install restarts the app).
-                        let auto_update_handle = front_app_handle.clone();
-                        async_runtime::spawn(async move {
-                            updater::auto_update_loop(auto_update_handle).await;
-                        });
-                    }
-
                     // ── Per-(re)load: replay current state to the fresh frontend ──
                     log::debug!("frontend-loaded: payload={:?}", event.payload());
 

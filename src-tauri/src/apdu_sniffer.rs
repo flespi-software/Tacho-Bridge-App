@@ -82,6 +82,19 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
         return;
     }
 
+    // The field parsers below slice the EF at fixed offsets counted from the
+    // start of the file, so they are only valid for a read that actually starts
+    // at offset 0. A VU is free to read an EF in several chunks (and does for
+    // the 143-byte EF_Identification); parsing a chunk read from offset N as if
+    // it began at 0 shifts every field and silently persists garbage into
+    // config.yaml.
+    let Some(offset) = read_binary_offset(&cmd) else {
+        return;
+    };
+    if offset != 0 {
+        return;
+    }
+
     let fid = {
         let Ok(state) = STATE.lock() else {
             return;
@@ -125,14 +138,35 @@ fn is_read_binary(cmd: &[u8]) -> bool {
     cmd.len() >= 2 && (cmd[0] == 0x00 || cmd[0] == 0x0C) && cmd[1] == 0xB0
 }
 
+/// Offset a READ BINARY reads from, per ISO 7816-4: P1|P2 is a 15-bit offset
+/// when bit 8 of P1 is clear. With bit 8 set, P1 carries a short EF identifier
+/// instead and P2 alone is the offset — that form re-selects a different EF, so
+/// the tracked-FID context no longer applies and we report no usable offset.
+fn read_binary_offset(cmd: &[u8]) -> Option<u16> {
+    if cmd.len() < 4 {
+        return None;
+    }
+    let (p1, p2) = (cmd[2], cmd[3]);
+    if p1 & 0x80 != 0 {
+        return None;
+    }
+    Some(u16::from_be_bytes([p1, p2]))
+}
+
 /// Extracts plaintext body from a RAPDU.
 /// - SM response: body is the value of DO'81 (plain value), expected as the
 ///   first data object before DO'99/DO'8E and the trailing SW.
 /// - Plain response: body is everything except the trailing 2-byte SW.
 ///
-/// Returns None if the response has no payload (e.g. only SW).
+/// Returns None if the response has no payload (e.g. only SW) or if the card
+/// did not report full success: a warning status such as 6282 ("end of file
+/// reached before reading Le bytes") returns FEWER bytes than asked for, and
+/// the fixed-offset parsers would read past the data into whatever follows.
 fn extract_plain_body(resp: &[u8]) -> Option<Vec<u8>> {
     if resp.len() < 2 {
+        return None;
+    }
+    if resp[resp.len() - 2] != 0x90 || resp[resp.len() - 1] != 0x00 {
         return None;
     }
     let body = &resp[..resp.len() - 2];
@@ -517,6 +551,70 @@ mod tests {
         assert_eq!(extract_plain_body(&[0x90]), None);
         // Only SW, no payload
         assert_eq!(extract_plain_body(&[0x90, 0x00]), None);
+    }
+
+    #[test]
+    fn extract_plain_body_refuses_partial_read_status() {
+        // 6282: end of file reached before Le bytes were read. The data is
+        // short, so parsing it at fixed offsets would read past the real
+        // content — the whole response must be rejected.
+        let resp = [0x12, 0x34, 0x56, 0x62, 0x82];
+        assert_eq!(extract_plain_body(&resp), None);
+        // A DO'81-wrapped body under a non-9000 status is rejected too.
+        let sm = [0x81, 0x03, 0xAA, 0xBB, 0xCC, 0x62, 0x82];
+        assert_eq!(extract_plain_body(&sm), None);
+    }
+
+    #[test]
+    fn read_binary_offset_reads_p1p2() {
+        // Offset 0 — the only form the fixed-offset parsers are valid for.
+        assert_eq!(read_binary_offset(&[0x00, 0xB0, 0x00, 0x00, 0x40]), Some(0));
+        // A second chunk of a split read starts at a non-zero offset.
+        assert_eq!(
+            read_binary_offset(&[0x00, 0xB0, 0x00, 0x46, 0x49]),
+            Some(0x46)
+        );
+        // High byte participates in the 15-bit offset.
+        assert_eq!(
+            read_binary_offset(&[0x00, 0xB0, 0x01, 0x00, 0x10]),
+            Some(0x0100)
+        );
+    }
+
+    #[test]
+    fn read_binary_offset_rejects_short_ef_identifier_form() {
+        // Bit 8 of P1 set: P1 carries a short EF id, not an offset, and the
+        // command re-selects a different EF — the tracked FID no longer applies.
+        assert_eq!(read_binary_offset(&[0x00, 0xB0, 0x82, 0x00, 0x10]), None);
+        // Too short to carry P1/P2 at all.
+        assert_eq!(read_binary_offset(&[0x00, 0xB0]), None);
+    }
+
+    #[test]
+    fn chunked_read_does_not_reach_the_parsers() {
+        // Regression: a VU reading EF_Identification in two chunks used to have
+        // the second chunk parsed as if it started at file offset 0, shifting
+        // every field (company address read as the expiry date) and persisting
+        // the garbage into config.yaml.
+        let client = "CHUNKEDREAD00001";
+        forget(client);
+
+        // Successful SELECT of EF_Identification establishes the FID context.
+        sniff(client, "00A4020C020520", "9000");
+
+        // A read from offset 0x46 must be ignored: `sniff` returns before the
+        // FID lookup, so the tracked context is still intact afterwards.
+        let body = "AA".repeat(73);
+        sniff(client, "00B0004649", &format!("{body}9000"));
+
+        let tracked = STATE
+            .lock()
+            .expect("state")
+            .get(client)
+            .and_then(|s| s.last_selected_ef);
+        assert_eq!(tracked, Some(0x0520));
+
+        forget(client);
     }
 
     #[test]

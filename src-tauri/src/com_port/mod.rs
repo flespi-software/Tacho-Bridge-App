@@ -55,9 +55,9 @@ fn next_reconnect_delay(current: u64) -> u64 {
     current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
 }
 
-/// Guards against starting more than one rack monitor. The `frontend-loaded`
-/// event in `lib.rs` can fire several times at startup, which would otherwise
-/// spawn duplicate monitors.
+/// Guards against starting more than one rack monitor. `initialize_backend` in
+/// `lib.rs` runs once, so this is a backstop rather than the load-bearing guard
+/// it was when initialization hung off the repeatable `frontend-loaded` event.
 static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Set when the app is closing: stops the presence monitor from re-opening the

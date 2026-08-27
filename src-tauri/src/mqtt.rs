@@ -61,29 +61,46 @@ fn next_reconnect_delay(current: u64) -> u64 {
     current.saturating_mul(2).min(RECONNECT_DELAY_MAX_SECS)
 }
 
-/// Unix seconds of the most recent card-facing exchange: a server request on a
-/// reader-backed card connection, or a rack serial envelope. A timestamp (not
-/// a session counter) on purpose — a counter would leak on an aborted task and
-/// block auto-updates forever, while an APDU flow going quiet is a robust
-/// "no authentication in progress" signal.
-static LAST_CARD_ACTIVITY_SECS: AtomicU64 = AtomicU64::new(0);
+/// Seconds (on a monotonic clock) of the most recent card-facing exchange: a
+/// server request on a reader-backed card connection, or a rack serial
+/// envelope. A timestamp (not a session counter) on purpose — a counter would
+/// leak on an aborted task and block auto-updates forever, while an APDU flow
+/// going quiet is a robust "no authentication in progress" signal.
+///
+/// Measured against `PROCESS_START` rather than the wall clock: the auto-updater
+/// gates an app-restarting install on this going quiet, and an NTP correction
+/// stepping the wall clock forward would fake the quiet period and kill the app
+/// mid-authentication (a backward step would block updates just as wrongly).
+/// Sentinel for "no card exchange has happened in this process yet". Distinct
+/// from a real timestamp because the monotonic clock starts near 0: a plain 0
+/// would read as "a card was busy at process start" and needlessly postpone
+/// unattended installs for the first minute of every run.
+const CARD_ACTIVITY_NONE: u64 = u64::MAX;
+static LAST_CARD_ACTIVITY_SECS: AtomicU64 = AtomicU64::new(CARD_ACTIVITY_NONE);
 
-fn unix_now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+lazy_static::lazy_static! {
+    /// Monotonic origin for `LAST_CARD_ACTIVITY_SECS`. `Instant` is not const-
+    /// constructible, so the origin is captured on first use.
+    static ref PROCESS_START: Instant = Instant::now();
+}
+
+fn monotonic_now_secs() -> u64 {
+    PROCESS_START.elapsed().as_secs()
 }
 
 /// Records "a card exchange is happening right now". Called on every server
 /// request that reaches a card (reader APDU bridge and rack serial bridge).
 pub fn touch_card_activity() {
-    LAST_CARD_ACTIVITY_SECS.store(unix_now_secs(), Ordering::Relaxed);
+    LAST_CARD_ACTIVITY_SECS.store(monotonic_now_secs(), Ordering::Relaxed);
 }
 
 /// Seconds since the last card exchange; a large value when none happened yet.
 pub fn seconds_since_card_activity() -> u64 {
-    unix_now_secs().saturating_sub(LAST_CARD_ACTIVITY_SECS.load(Ordering::Relaxed))
+    let last = LAST_CARD_ACTIVITY_SECS.load(Ordering::Relaxed);
+    if last == CARD_ACTIVITY_NONE {
+        return u64::MAX;
+    }
+    monotonic_now_secs().saturating_sub(last)
 }
 
 /// Maps a connection error to a short stable `kind` for one-line logs, plus a
@@ -372,7 +389,16 @@ pub async fn ensure_connection(
 
     let mut is_online: bool = false; // flag to control the card connection (to the server) status
     let mut was_online = false; // Flag to track the previous connection status
-    let mut auth_process: bool = false; // Flag to control the authentication process
+    // Two distinct pieces of state that used to share one flag:
+    //  * `auth_process` — the card has been driven mid-authentication and its
+    //    security state is dirty, so a new session must reset it first. Only a
+    //    real card exchange sets it; only an explicit session boundary
+    //    (`finish`, or the reset at session start) clears it.
+    //  * `busy_announced` — whether the frontend has already been told this
+    //    session is active. Purely cosmetic, and cleared by the keep-alive
+    //    self-heal, which must NOT make the card look clean to the reset gate.
+    let mut auth_process: bool = false;
+    let mut busy_announced: bool = false;
     let mut reconnect_delay_secs: u64 = RECONNECT_DELAY_INITIAL_SECS; // exponential backoff state
 
     // Idempotency state for the current MQTT connection. The server re-sends a command with the
@@ -629,7 +655,11 @@ pub async fn ensure_connection(
 
                                             payload_ack = process_rapdu_mqtt_hex("".to_string());
 
-                                            auth_process = false; // Authorization process is finished
+                                            // Session closed cleanly and the card was just reset:
+                                            // it holds no session state, and the UI indicator is
+                                            // cleared by the emit above.
+                                            auth_process = false;
+                                            busy_announced = false;
 
                                         // handle the case when finish == true
                                         } else {
@@ -669,6 +699,10 @@ pub async fn ensure_connection(
                                                         managed_card.reconnect().await;
                                                         card_generation =
                                                             card_generation.wrapping_add(1);
+                                                        // The card is clean again; the fresh session
+                                                        // below re-announces itself on its first APDU.
+                                                        auth_process = false;
+                                                        busy_announced = false;
                                                     }
 
                                                     // Session start is the only safe point to honor the requested
@@ -755,16 +789,30 @@ pub async fn ensure_connection(
                                                         }
                                                     };
 
-                                                    // Send the global-cards-sync event to the frontend that card is connected
-                                                    emit_card_sync_event(
-                                                        &iccid,
-                                                        &reader_name,
-                                                        &client_id_cloned,
-                                                        Some(true),
-                                                        Some(true),
-                                                    );
+                                                    // Announce "authenticating" once per session, not
+                                                    // once per APDU: an authentication is hundreds of
+                                                    // exchanges, and each emit costs a serialized IPC
+                                                    // event plus a reactive row replacement in the UI
+                                                    // (multiplied across parallel rack cards). Skipped
+                                                    // entirely when the exchange failed — the card was
+                                                    // not reached, and claiming PRESENT/online here
+                                                    // resurrects a row the monitor may have just
+                                                    // deleted for an unplugged reader, leaving a ghost
+                                                    // entry nothing can clear.
+                                                    if !exchange_failed && !busy_announced {
+                                                        emit_card_sync_event(
+                                                            &iccid,
+                                                            &reader_name,
+                                                            &client_id_cloned,
+                                                            Some(true),
+                                                            Some(true),
+                                                        );
+                                                        busy_announced = true;
+                                                    }
 
-                                                    auth_process = true; // Authorization process is in progress
+                                                    if !exchange_failed {
+                                                        auth_process = true; // the card now holds session state
+                                                    }
                                                     rapdu
                                                 };
 
@@ -854,7 +902,29 @@ pub async fn ensure_connection(
                         Event::Incoming(Incoming::PingResp(..)) => {
                             log::debug!("{} Ping response received from the server.", log_header);
 
-                            // Send the global-cards-sync event to the frontend that card is connected
+                            // A keep-alive ping means this connection exchanged
+                            // nothing for the whole keep-alive window, so no APDU
+                            // is in flight and the card is idle. Clearing the busy
+                            // indicator here is the only recovery when the closing
+                            // `finish:true` never arrives (tracker aborted the
+                            // session, message lost, older server): without it the
+                            // activity animation blinks forever. Mirrors the rack
+                            // path's PingResp self-heal in com_port/cards.rs.
+                            //
+                            // Only the cosmetic flag is cleared, so the next real
+                            // APDU re-announces the session instead of being
+                            // swallowed by the once-per-session emit gate. The
+                            // card's dirty-state flag (`auth_process`) is left
+                            // alone: a ping is not a session boundary, and
+                            // clearing it would skip the reset a resumed session
+                            // needs.
+                            if busy_announced {
+                                log::debug!(
+                                    "{} [CONN] event=ping_resp status=idle action=clear_busy",
+                                    log_header
+                                );
+                            }
+                            busy_announced = false;
                             emit_card_sync_event(
                                 &iccid,
                                 &reader_name,

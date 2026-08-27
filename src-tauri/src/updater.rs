@@ -12,8 +12,36 @@ use tokio::sync::Mutex;
 
 use crate::global_app_handle::{emit_notification_event, NotificationPayload};
 
-/// The update found by the last check, waiting for the user to accept it.
-static PENDING_UPDATE: Mutex<Option<tauri_plugin_updater::Update>> = Mutex::const_new(None);
+/// The update found by the last check, waiting for the user to accept it,
+/// together with the channel it was found on.
+static PENDING_UPDATE: Mutex<Option<PendingUpdate>> = Mutex::const_new(None);
+
+/// A parked update plus the bookkeeping the auto-install loop needs.
+struct PendingUpdate {
+    update: tauri_plugin_updater::Update,
+    /// Channel this update came from. A parked pre-release must never be
+    /// installed after the user switches back to stable, so a channel mismatch
+    /// discards it instead of installing it.
+    beta: bool,
+    /// Consecutive failed install attempts, used to back off and eventually
+    /// give up on a permanently broken artifact (bad signature, truncated
+    /// asset) instead of re-downloading it every tick forever.
+    failed_attempts: u32,
+    /// Monotonic time of the last failed attempt; the next retry waits for the
+    /// backoff derived from `failed_attempts`.
+    last_failure: Option<std::time::Instant>,
+}
+
+/// After this many consecutive failures the parked update is dropped. A fresh
+/// network check can still find it again later (hourly at most), so a genuinely
+/// transient outage is not fatal — this only stops the tight retry loop.
+const MAX_INSTALL_ATTEMPTS: u32 = 5;
+
+/// Backoff before retrying a failed install: 10 min, 20, 40, 80 …
+fn install_retry_backoff(failed_attempts: u32) -> std::time::Duration {
+    let minutes = 10u64 << failed_attempts.min(3);
+    std::time::Duration::from_secs(minutes * 60)
+}
 
 /// Set while a download+install is in flight, so only one can run at a time.
 ///
@@ -102,7 +130,12 @@ async fn perform_check(
             let message = format!(
                 "Version {version} is available. Install it now? The application will restart."
             );
-            *PENDING_UPDATE.lock().await = Some(update);
+            *PENDING_UPDATE.lock().await = Some(PendingUpdate {
+                update,
+                beta,
+                failed_attempts: 0,
+                last_failure: None,
+            });
             emit_notification_event(
                 "global-notification",
                 NotificationPayload {
@@ -120,6 +153,18 @@ async fn perform_check(
                 "{TAG} phase=check status=up_to_date current={}",
                 env!("CARGO_PKG_VERSION")
             );
+            // The channel we just asked has nothing newer than what is running,
+            // so anything still parked is stale — typically a pre-release
+            // parked while beta was on, which must not be installed now that
+            // the check answers for stable. Leaving it would let the auto-loop
+            // install a build the user opted out of.
+            if let Some(stale) = PENDING_UPDATE.lock().await.take() {
+                log::info!(
+                    "{TAG} phase=check status=dropped_stale_pending version={} parked_channel={}",
+                    stale.update.version,
+                    if stale.beta { "beta" } else { "stable" }
+                );
+            }
             Ok(CheckResult {
                 status: "up_to_date",
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -191,16 +236,38 @@ pub async fn auto_update_loop(app: AppHandle) {
         if INSTALL_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
             continue;
         }
-        let (pending, version) = {
-            let guard = PENDING_UPDATE.lock().await;
-            match guard.as_ref() {
-                Some(update) => (true, update.version.clone()),
-                None => (false, String::new()),
+        // The channel the user is on right now. A parked update from the other
+        // channel is discarded rather than installed: flipping beta off must
+        // not leave a pre-release queued for unattended install.
+        let beta_now = crate::config::get_from_cache(
+            crate::config::CacheSection::Updates,
+            "beta_updates",
+        ) == "true";
+        let (version, prior_attempts) = {
+            let mut guard = PENDING_UPDATE.lock().await;
+            let Some(pending) = guard.as_ref() else {
+                continue;
+            };
+            if pending.beta != beta_now {
+                log::info!(
+                    "{TAG} phase=auto_install status=dropped version={} reason=channel_changed parked_channel={} current_channel={}",
+                    pending.update.version,
+                    if pending.beta { "beta" } else { "stable" },
+                    if beta_now { "beta" } else { "stable" }
+                );
+                *guard = None;
+                continue;
             }
+            // Respect the backoff after a failed attempt so a permanently
+            // broken artifact is not re-downloaded on every tick.
+            if let Some(last_failure) = pending.last_failure {
+                let wait = install_retry_backoff(pending.failed_attempts.saturating_sub(1));
+                if last_failure.elapsed() < wait {
+                    continue;
+                }
+            }
+            (pending.update.version.clone(), pending.failed_attempts)
         };
-        if !pending {
-            continue;
-        }
         let quiet_for = crate::mqtt::seconds_since_card_activity();
         if quiet_for < AUTO_INSTALL_QUIET_SECS {
             log::info!(
@@ -211,20 +278,44 @@ pub async fn auto_update_loop(app: AppHandle) {
             continue;
         }
 
-        log::info!("{TAG} phase=auto_install status=starting version={version}");
-        emit_notification_event(
-            "global-notification",
-            NotificationPayload {
-                notification_type: "version".to_string(),
-                message: format!(
-                    "Installing update {version} — the application will restart shortly."
-                ),
-            },
+        log::info!(
+            "{TAG} phase=auto_install status=starting version={version} attempt={}",
+            prior_attempts + 1
         );
+        // Announce the install once. A retry after a failed attempt must not
+        // re-promise a restart that never came — repeating the banner every
+        // retry was pure noise to the user.
+        if prior_attempts == 0 {
+            emit_notification_event(
+                "global-notification",
+                NotificationPayload {
+                    notification_type: "version".to_string(),
+                    message: format!(
+                        "Installing update {version} — the application will restart shortly."
+                    ),
+                },
+            );
+        }
         // On success this restarts the app and never returns; on failure the
-        // update is put back into PENDING_UPDATE and the next tick retries.
+        // update stays parked and the next tick retries after a backoff.
         if let Err(e) = install_update(app.clone()).await {
             log::error!("{TAG} phase=auto_install status=failed version={version} err={e}");
+            let mut guard = PENDING_UPDATE.lock().await;
+            if let Some(pending) = guard.as_mut() {
+                // Only count the failure against the update we actually tried:
+                // a concurrent check may have replaced the slot meanwhile.
+                if pending.update.version == version {
+                    pending.failed_attempts += 1;
+                    pending.last_failure = Some(std::time::Instant::now());
+                    if pending.failed_attempts >= MAX_INSTALL_ATTEMPTS {
+                        log::error!(
+                            "{TAG} phase=auto_install status=gave_up version={version} attempts={} — a later check may find it again",
+                            pending.failed_attempts
+                        );
+                        *guard = None;
+                    }
+                }
+            }
         }
     }
 }
@@ -272,7 +363,7 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
         let guard = PENDING_UPDATE.lock().await;
         guard
             .as_ref()
-            .cloned()
+            .map(|pending| pending.update.clone())
             .ok_or_else(|| "no pending update".to_string())?
     };
 
@@ -315,4 +406,27 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
     // Release the rack's serial port before the restart, same as window close.
     crate::com_port::shutdown();
     app.restart();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_retry_backoff_grows_then_caps() {
+        // A deterministically failing artifact must not be re-downloaded every
+        // 5-minute tick: the wait grows from 10 minutes and stops doubling once
+        // it reaches 80, so the retries stay bounded and cheap.
+        assert_eq!(install_retry_backoff(0).as_secs(), 10 * 60);
+        assert_eq!(install_retry_backoff(1).as_secs(), 20 * 60);
+        assert_eq!(install_retry_backoff(2).as_secs(), 40 * 60);
+        assert_eq!(install_retry_backoff(3).as_secs(), 80 * 60);
+        assert_eq!(install_retry_backoff(9).as_secs(), 80 * 60);
+    }
+
+    #[test]
+    fn giving_up_takes_fewer_attempts_than_a_day_of_ticks() {
+        // Before the cap existed a broken update was retried ~288 times a day.
+        assert!(MAX_INSTALL_ATTEMPTS < 10);
+    }
 }

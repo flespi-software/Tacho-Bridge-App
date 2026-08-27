@@ -315,13 +315,12 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
   // `global-card-config-updated`, the single source of truth — an optimistic
   // local write would show a "saved" card that a failed write never persisted.
   try {
-    const update_result = await invoke('update_card', {
+    // The command rejects with a human-readable reason (e.g. an ICCID already
+    // linked to another card), so the message below can be shown verbatim.
+    await invoke('update_card', {
       cardnumber: cardNumber,
       content: content,
     })
-    if (!update_result) {
-      throw new Error('the backend refused the update')
-    }
     console.log('Card number updated successfully')
   } catch (error) {
     console.error(`Failed to update card ${cardNumber}:`, error)
