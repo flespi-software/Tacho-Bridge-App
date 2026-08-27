@@ -413,3 +413,9 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed the card rack being torn down and failing to reopen when the system exposes a second device name for it.
+
+### [0.8.0-rc.5] - 2026-08-27
+
+🆕 Features / Improvements
+
+- Reduced duplicated code across the MQTT, rack and UI layers and added the first frontend test suite.
