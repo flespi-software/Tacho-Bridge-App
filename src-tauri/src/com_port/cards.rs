@@ -9,7 +9,7 @@
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, Event, Incoming};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tauri::async_runtime::{self, JoinHandle};
 
@@ -34,6 +34,12 @@ struct RackCardTask {
     slot: u16,
     rack_id: String,
     handle: JoinHandle<()>,
+    /// MQTT client of the session, set by its loop once built. Lets a repeated
+    /// server `connect` ask the live session to re-publish its rack link report
+    /// without disturbing the session itself — the server needs that report to
+    /// know the card is still served (it repaints the slot LED from it) after
+    /// its rack connection re-established and re-ran discovery.
+    client: Arc<OnceLock<AsyncClient>>,
 }
 
 lazy_static::lazy_static! {
@@ -205,6 +211,32 @@ fn spawn_rack_card(
     let moved = match tasks.get(&iccid) {
         Some(existing) if !existing.handle.inner().is_finished() => {
             if existing.rack_id == rack_id && existing.slot == slot {
+                // The server re-ran discovery for a slot it already served —
+                // typically its rack connection re-established while this card
+                // session stayed up. Discovery paints such a slot as unserved
+                // (red LED); re-publishing the link report over the live
+                // session tells the server the card is still connected, which
+                // re-binds the slot and repaints it. Detached: publish() can
+                // park on a full request channel, and this path holds the
+                // task-map lock.
+                if let Some(client) = existing.client.get().cloned() {
+                    let card = existing.card_number.clone();
+                    let report = serde_json::json!({ "iccid": iccid, "slot": slot }).to_string();
+                    async_runtime::spawn(async move {
+                        match client.publish("rack", QoS::AtLeastOnce, false, report).await {
+                            Ok(()) => log::info!(
+                                "RACKCARD {} | [MQTT] status=link_report_republished slot={}",
+                                card,
+                                slot
+                            ),
+                            Err(e) => log::warn!(
+                                "RACKCARD {} | [MQTT] status=link_report_republish_failed err={:?}",
+                                card,
+                                e
+                            ),
+                        }
+                    });
+                }
                 log::debug!(
                     "RACK | [SPAWN] card={} status=skipped reason=already_running",
                     card_number
@@ -259,11 +291,13 @@ fn spawn_rack_card(
         rack_id,
         slot
     );
+    let client_slot = Arc::new(OnceLock::new());
     let handle = async_runtime::spawn(rack_card_mqtt_loop(
         card_number.clone(),
         iccid.clone(),
         slot,
         serial_port,
+        client_slot.clone(),
     ));
     tasks.insert(
         iccid,
@@ -272,6 +306,7 @@ fn spawn_rack_card(
             slot,
             rack_id,
             handle,
+            client: client_slot,
         },
     );
 }
@@ -286,6 +321,9 @@ async fn rack_card_mqtt_loop(
     iccid: String,
     slot: u16,
     serial_port: SharedPort,
+    // shared back-reference to this session's MQTT client, filled once built —
+    // see RackCardTask.client
+    client_slot: Arc<OnceLock<AsyncClient>>,
 ) {
     let log_header = format!("RACKCARD {} |", card_number);
 
@@ -314,6 +352,7 @@ async fn rack_card_mqtt_loop(
         slot
     );
     let (mqtt_client, mut eventloop) = crate::mqtt::build_mqtt_client(&card_number, &host, port);
+    let _ = client_slot.set(mqtt_client.clone());
 
     let mut is_online = false;
     let mut reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;

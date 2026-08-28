@@ -271,27 +271,34 @@ pub(super) async fn handle_serial_request(
             // while the tracker thinks after the ATR read is indistinguishable
             // from the end of a session, so guessing got it wrong either way.
             //
+            // Only session exchanges carry the flag at all (the server always
+            // sets it, true or false). An envelope without it is plain
+            // signalling on the same serial path — e.g. a slot LED repaint —
+            // executed and answered like any exchange, but never shown or
+            // recorded as authentication activity.
+            //
             // Every other way a session can end already clears the state at its
             // own site — connection lost, card pulled from the slot, rack
             // unplugged. The one gap — the closing `finish:true` simply never
-            // arriving (tracker abort, lost message, or an older server that
-            // does not send the flag) — is covered by the keep-alive PingResp
-            // reset in the card's MQTT loop (see cards.rs), so no dedicated
-            // timeout is needed here.
+            // arriving (tracker abort or lost message) — is covered by the
+            // keep-alive PingResp reset in the card's MQTT loop (see cards.rs),
+            // so no dedicated timeout is needed here.
             if let Some((iccid, card_number)) = card {
-                if envelope.finish == Some(true) {
-                    set_rack_card_state(iccid, true, false);
-                    // Same bookkeeping as the reader path (mqtt.rs): persist
-                    // the auth timestamp so a card that only ever authenticates
-                    // through a rack still shows "Last auth" in the UI.
-                    // Detached — the config write must not park the serial
-                    // bridge between `finish` and the reply.
-                    crate::config::record_auth_result_detached(card_number, true);
-                    log::info!("{} [MQTT] status=auth_finished", log_header);
-                } else {
-                    // `finish: false`, or a server that omits the flag: either
-                    // way a command is in flight, so the card is busy.
-                    set_rack_card_state(iccid, true, true);
+                match envelope.finish {
+                    Some(true) => {
+                        set_rack_card_state(iccid, true, false);
+                        // Same bookkeeping as the reader path (mqtt.rs): persist
+                        // the auth timestamp so a card that only ever authenticates
+                        // through a rack still shows "Last auth" in the UI.
+                        // Detached — the config write must not park the serial
+                        // bridge between `finish` and the reply.
+                        crate::config::record_auth_result_detached(card_number, true);
+                        log::info!("{} [MQTT] status=auth_finished", log_header);
+                    }
+                    // a command of the session is in flight, so the card is busy
+                    Some(false) => set_rack_card_state(iccid, true, true),
+                    // non-session signalling: no activity to show or record
+                    None => {}
                 }
             }
 

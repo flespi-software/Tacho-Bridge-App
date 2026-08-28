@@ -133,8 +133,9 @@ pub(super) struct SerialEnvelope {
     /// End-of-authentication marker, same semantics as the `finish` flag of the
     /// PC/SC path: `false` on every command of an ongoing session, `true` on the
     /// closing message the server sends (with an empty `serial_cmd`) once the
-    /// tracker reports the authentication finished. Absent on older servers,
-    /// which is why it is an Option — see `handle_serial_request`.
+    /// tracker reports the authentication finished. Session envelopes always
+    /// carry it; `None` marks non-session signalling on the same serial path
+    /// (e.g. a slot LED repaint) — see `handle_serial_request`.
     pub(super) finish: Option<bool>,
 }
 
