@@ -260,6 +260,11 @@ pub fn run() {
                     // and may have reported the rack before the frontend subscribed.
                     global_app_handle::emit_current_rack_state();
 
+                    // Last known app connection status: the connection task
+                    // starts before the webview and its first ONLINE emit may
+                    // have fired with no listener.
+                    global_app_handle::emit_current_app_connection();
+
                     // Reader state has no replay of its own: the PCSC monitor only
                     // emits on card-state CHANGES, so a reloaded webview would show
                     // "no readers" forever while a card sits inserted. A rescan from
@@ -293,6 +298,7 @@ pub fn run() {
             config::remove_card,           // remove card from config
             smart_card::manual_sync_cards, // manual sync cards from the frontend
             app_connect::app_connection,   // App connection to the MQTT broker
+            global_app_handle::get_app_connection_status, // cached connection status for a late-mounting webview
             updater::install_update,       // download + install the pending update
             updater::check_updates_now,    // forced update check from the settings dialog
             updater::get_changelog,        // bundled CHANGELOG.md for the settings dialog

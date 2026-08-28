@@ -1,4 +1,5 @@
 // ───── Std Lib ─────
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 // ───── External Crates ─────
@@ -113,13 +114,30 @@ pub struct NotificationPayload {
     pub message: String,
 }
 
-/// Emits the app connection status to the frontend.
+// Last known app connection status. The connection task starts from setup(),
+// before the webview loads, so the first OFFLINE->ONLINE emit can fire with no
+// listener and be lost — the status is cached here and replayed on
+// `frontend-loaded` (and pulled via the `get_app_connection_status` command).
+static APP_ONLINE: AtomicBool = AtomicBool::new(false);
+
+/// Emits the app connection status to the frontend and caches it for replay.
 pub fn app_emit_event(online: bool) {
-    if let Some(app_handle) = get_app_handle() {
-        if let Err(e) = app_handle.emit("app-connection-status", online) {
-            log::error!("[CONN] failed to emit app connection status: {:?}", e);
-        }
-    }
+    APP_ONLINE.store(online, Ordering::SeqCst);
+    emit_to_frontend("app-connection-status", online);
+}
+
+/// Re-emits the cached app connection status. Called on `frontend-loaded` so a
+/// freshly loaded webview shows the real status without waiting for the next
+/// OFFLINE<->ONLINE transition.
+pub fn emit_current_app_connection() {
+    emit_to_frontend("app-connection-status", APP_ONLINE.load(Ordering::SeqCst));
+}
+
+/// Frontend pull of the cached app connection status — covers the race where
+/// the webview mounts after the replay emit has already fired.
+#[tauri::command]
+pub fn get_app_connection_status() -> bool {
+    APP_ONLINE.load(Ordering::SeqCst)
 }
 
 pub fn emit_notification_event(event_name: &str, payload: NotificationPayload) {

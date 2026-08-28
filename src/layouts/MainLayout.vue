@@ -160,9 +160,21 @@ function handleGlobalNotification(raw: unknown): void {
 
 onMounted(async () => {
   await on('global-config-server', handleGlobalConfigServer)
+  // The backend connects before the webview loads, so the status event may
+  // have fired with no listener: subscribe first, then pull the cached
+  // snapshot. An event that arrives in between is fresher than the snapshot
+  // and must not be overwritten by it.
+  let statusEventSeen = false
   await on('app-connection-status', (raw) => {
+    statusEventSeen = true
     appConnected.value = raw === true
   })
   await on('global-notification', handleGlobalNotification)
+  try {
+    const online = await invoke<boolean>('get_app_connection_status')
+    if (!statusEventSeen) appConnected.value = online === true
+  } catch (error) {
+    console.error('get_app_connection_status failed:', error)
+  }
 })
 </script>
