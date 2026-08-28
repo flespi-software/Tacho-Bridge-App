@@ -419,3 +419,11 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Reduced duplicated code across the MQTT, rack and UI layers and added the first frontend test suite.
+
+### [0.8.0-rc.6] - 2026-08-28
+
+🛠 Fixes
+
+- Fixed the development server port being silently hijacked by VS Code port forwarding, which showed a white screen in dev builds.
+- Fixed a connected rack card turning grey for a couple of minutes when another card is removed from the rack.
+- Fixed the server connection icon staying grey after startup even though the connection was already established.
