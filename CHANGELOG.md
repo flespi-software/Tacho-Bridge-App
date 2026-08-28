@@ -433,3 +433,9 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Added support for server slot LED signalling: envelopes without the finish flag are executed as plain serial exchanges without counting as authentication activity, and a live card session re-announces itself on a repeated connect so its slot repaints green after a rack reconnect.
+
+### [0.8.0-rc.8] - 2026-08-28
+
+🛠 Fixes
+
+- Fixed the reader monitor spinning at full CPU on a persistent PC/SC failure and the manual card sync doing nothing when a card was already in the reader.
