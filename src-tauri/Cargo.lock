@@ -3917,7 +3917,7 @@ dependencies = [
 
 [[package]]
 name = "tacho-bridge-application"
-version = "0.8.0-rc.6"
+version = "0.8.0-rc.7"
 dependencies = [
  "chrono",
  "fern",

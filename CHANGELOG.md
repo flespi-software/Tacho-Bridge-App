@@ -427,3 +427,9 @@ All notable changes to this project will be documented in this file.
 - Fixed the development server port being silently hijacked by VS Code port forwarding, which showed a white screen in dev builds.
 - Fixed a connected rack card turning grey for a couple of minutes when another card is removed from the rack.
 - Fixed the server connection icon staying grey after startup even though the connection was already established.
+
+### [0.8.0-rc.7] - 2026-08-28
+
+🆕 Features / Improvements
+
+- Added support for server slot LED signalling: envelopes without the finish flag are executed as plain serial exchanges without counting as authentication activity, and a live card session re-announces itself on a repeated connect so its slot repaints green after a rack reconnect.
