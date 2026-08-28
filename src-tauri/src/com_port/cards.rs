@@ -690,6 +690,49 @@ pub(super) fn handle_card_disconnect(payload: &[u8], rack_id: &str, log_header: 
     }
 }
 
+/// Removes every rack card session matching `pred` and aborts its task.
+///
+/// The three callers (card moved to a reader, card deleted from the config,
+/// rack gone) differ only in which sessions they select and what they log, so
+/// the collect-remove-abort sequence lives here once. `reason` fills the reason
+/// field of the one log line emitted per aborted session; `warn` picks its
+/// level, since a card reappearing in a reader is unexpected enough to warrant
+/// WARN while the other two are routine.
+///
+/// The `RACK_CARD_TASKS` guard is dropped before returning: callers follow up
+/// with UI mutations, which take the UI lock, and taking the two in this order
+/// is what keeps the rack locks deadlock-free.
+fn abort_rack_sessions_where(pred: impl Fn(&RackCardTask) -> bool, reason: &str, warn: bool) {
+    let mut tasks = lock(&RACK_CARD_TASKS);
+    let matching: Vec<String> = tasks
+        .iter()
+        .filter(|(_, task)| pred(task))
+        .map(|(iccid, _)| iccid.clone())
+        .collect();
+    for iccid in matching {
+        if let Some(task) = tasks.remove(&iccid) {
+            task.handle.abort();
+            if warn {
+                log::warn!(
+                    "RACK | [SPAWN] card={} rack={} slot={} status=aborted reason={}",
+                    task.card_number,
+                    task.rack_id,
+                    task.slot,
+                    reason
+                );
+            } else {
+                log::info!(
+                    "RACK | [SPAWN] card={} rack={} slot={} status=aborted reason={}",
+                    task.card_number,
+                    task.rack_id,
+                    task.slot,
+                    reason
+                );
+            }
+        }
+    }
+}
+
 /// Aborts the live rack-backed session of one card number, if any. Called by
 /// the reader path (`mqtt::ensure_connection`) right before it opens its own
 /// MQTT connection under that client_id: the card was just physically detected
@@ -716,25 +759,11 @@ pub(super) fn handle_card_disconnect(payload: &[u8], rack_id: &str, log_header: 
 /// the reader detection is strictly newer physical evidence, and a stale row
 /// resurrecting a session onto an empty slot is the worse failure.
 pub fn abort_rack_card_session(card_number: &str) {
-    {
-        let mut tasks = lock(&RACK_CARD_TASKS);
-        let matching: Vec<String> = tasks
-            .iter()
-            .filter(|(_, task)| task.card_number == card_number)
-            .map(|(iccid, _)| iccid.clone())
-            .collect();
-        for iccid in matching {
-            if let Some(task) = tasks.remove(&iccid) {
-                task.handle.abort();
-                log::warn!(
-                    "RACK | [SPAWN] card={} rack={} slot={} status=aborted reason=card_now_in_reader",
-                    task.card_number,
-                    task.rack_id,
-                    task.slot
-                );
-            }
-        }
-    }
+    abort_rack_sessions_where(
+        |task| task.card_number == card_number,
+        "card_now_in_reader",
+        true,
+    );
     // Outside the tasks lock (lock-order discipline with the UI paths): drop
     // every rack row carrying this number — including rows whose session was
     // never spawned (skipped as served_by_reader) — and by the card's ICCID
@@ -770,25 +799,11 @@ pub fn abort_rack_card_session(card_number: &str) {
 pub fn disconnect_rack_card(card_number: &str) {
     // Sessions are keyed by ICCID (stable across config edits), so the lookup
     // is by the number captured at spawn time.
-    {
-        let mut tasks = lock(&RACK_CARD_TASKS);
-        let matching: Vec<String> = tasks
-            .iter()
-            .filter(|(_, task)| task.card_number == card_number)
-            .map(|(iccid, _)| iccid.clone())
-            .collect();
-        for iccid in &matching {
-            if let Some(task) = tasks.remove(iccid) {
-                task.handle.abort();
-                log::info!(
-                    "RACK | [SPAWN] card={} rack={} slot={} status=aborted reason=card_removed_from_config",
-                    task.card_number,
-                    task.rack_id,
-                    task.slot
-                );
-            }
-        }
-    }
+    abort_rack_sessions_where(
+        |task| task.card_number == card_number,
+        "card_removed_from_config",
+        false,
+    );
 
     // Keep the card visible in its rack section, but unassigned — the physical
     // card did not move, only its config entry is gone. The sweep runs even
@@ -812,24 +827,7 @@ pub fn disconnect_rack_card(card_number: &str) {
 /// when that rack disconnects or its MQTT/serial stack is restarted — without
 /// the rack there is no transport to those cards.
 pub(super) fn stop_rack_cards(rack_id: &str) {
-    {
-        let mut tasks = lock(&RACK_CARD_TASKS);
-        let matching: Vec<String> = tasks
-            .iter()
-            .filter(|(_, task)| task.rack_id == rack_id)
-            .map(|(iccid, _)| iccid.clone())
-            .collect();
-        for iccid in matching {
-            if let Some(task) = tasks.remove(&iccid) {
-                task.handle.abort();
-                log::info!(
-                    "RACK | [SPAWN] card={} rack={} status=aborted reason=rack_gone",
-                    task.card_number,
-                    rack_id
-                );
-            }
-        }
-    }
+    abort_rack_sessions_where(|task| task.rack_id == rack_id, "rack_gone", false);
     let cleared = {
         let mut ui = lock(&RACK_CARDS_UI);
         ui.remove(rack_id)

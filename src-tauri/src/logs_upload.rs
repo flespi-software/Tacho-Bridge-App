@@ -128,8 +128,15 @@ pub fn dispatch_request(
 
     let client = client.clone();
     let log_header = log_header.to_string();
+    // The guard is constructed HERE, not inside the async block, and moved into
+    // the future. Built inside, it would only exist once the task is first
+    // polled — a future dropped before that (runtime shutting down) would leave
+    // ACTIVE_REQUEST set forever and reject every later fetch_logs with
+    // "already in progress" until a restart. Owned by the future value itself,
+    // its Drop runs even on that path.
+    let reset = ActiveRequestReset;
     async_runtime::spawn(async move {
-        let _reset = ActiveRequestReset;
+        let _reset = reset;
         run_upload(&client, &log_header, request_id, period).await;
     });
     true

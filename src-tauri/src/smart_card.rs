@@ -475,11 +475,21 @@ pub fn sc_monitor() {
         // detection for the rest of the process — nothing ever respawns this
         // monitor. Catch it, log it, start a fresh pass.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(monitor_pass)) {
-            Ok(Ok(())) => {
-                // Healthy pass ended (rescan or transient error inside the
-                // monitored window): re-establish immediately, no backoff.
+            Ok(Ok(PassEnd::Rescan)) => {
+                // Deliberate restart (rescan requested, or the monitored
+                // window closed normally): re-establish immediately.
                 retry_delay = MONITOR_RETRY_MIN;
                 continue;
+            }
+            Ok(Ok(PassEnd::Failed)) => {
+                // The pass gave up early. Fall through to the backoff sleep:
+                // the fault (PCSC daemon down, reader enumeration refusing the
+                // buffer) is usually persistent, and restarting immediately
+                // would spin this thread at 100% CPU.
+                log::warn!(
+                    "sc_monitor pass ended early. Retrying in {} seconds...",
+                    retry_delay.as_secs()
+                );
             }
             Ok(Err(e)) => {
                 log::error!(
@@ -519,11 +529,26 @@ pub fn sc_monitor() {
     }
 }
 
+/// Why a monitor pass ended. The caller paces the next pass from this: a
+/// rescan is a deliberate restart and must not be delayed, while a failed pass
+/// must back off — returning "healthy" for both is what let a persistently
+/// broken PCSC stack (daemon down, `list_readers` refusing the buffer) spin the
+/// monitor thread at 100% CPU, re-establishing a context per iteration.
+#[derive(Debug, PartialEq, Eq)]
+enum PassEnd {
+    /// A rescan was requested (or the poll window closed normally): the next
+    /// pass should start immediately.
+    Rescan,
+    /// The pass could not do its job and gave up early. Back off before
+    /// retrying so a permanent fault does not spin.
+    Failed,
+}
+
 /// One pass of the reader monitor: establish a PCSC context, watch reader
 /// state changes until the context needs re-establishing, then return.
 /// Returns the PCSC error when the context could not be established; all retry
 /// pacing (sleep, backoff) is the caller's job.
-fn monitor_pass() -> Result<(), pcsc::Error> {
+fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
     log::debug!("Establishing PCSC context...");
     let ctx = Context::establish(Scope::User)?;
     log::debug!("Successfully established context.");
@@ -546,12 +571,18 @@ fn monitor_pass() -> Result<(), pcsc::Error> {
 
     log::debug!("Initialized readers buffer and reader states.");
 
+    // How this pass ended; only an explicit failure downgrades it.
+    let mut outcome = PassEnd::Rescan;
+
     loop {
         // These repeat every poll timeout (30s), so they live at trace to
         // keep debug output focused on actual card events.
         log::trace!("Starting the inner loop to monitor reader states...");
         if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
             log::error!("Failed to setup_reader_states: {:?}", e);
+            // A failing enumeration is usually persistent (daemon down, buffer
+            // too small): report it as a failed pass so the caller backs off.
+            outcome = PassEnd::Failed;
             break; // Exit the inner loop to re-establish context
         }
         log::trace!(
@@ -594,6 +625,7 @@ fn monitor_pass() -> Result<(), pcsc::Error> {
                 // Small backoff prevents a tight reconnect loop if the PCSC
                 // service is repeatedly returning errors (e.g. daemon down).
                 std::thread::sleep(Duration::from_secs(1));
+                outcome = PassEnd::Failed;
                 break;
             }
         }
@@ -614,7 +646,7 @@ fn monitor_pass() -> Result<(), pcsc::Error> {
     set_monitor_ctx(None);
 
     log::debug!("Re-establishing context...");
-    Ok(())
+    Ok(outcome)
 }
 
 /// Renders a PCSC protocol as the config string form ("T0"/"T1").
@@ -690,7 +722,9 @@ fn resolve_t_protocol(card_number: &str, atr: &AtrProtocol) -> Protocols {
             if mutate_card_config(card_number, |card| {
                 card.t_protocol = Some(value.to_string());
                 true
-            }) {
+            })
+            .is_ok()
+            {
                 info!(
                     "Card {}: stored ATR-derived T protocol {} in config",
                     card_number, value
@@ -863,19 +897,18 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
         log::debug!("Context established successfully.");
 
         let mut readers_buf = [0; READERS_BUFFER_SIZE];
-        match ctx.list_readers(&mut readers_buf) {
-            Ok(readers) => {
-                if readers.count() == 0 {
-                    log::warn!("No readers found. Exiting...");
-                    return Ok(());
-                }
-                log::debug!("Available readers found");
-            }
-            Err(e) => {
-                log::error!("Failed to list readers: {:?}", e);
-                return Ok(());
-            }
+        // A failed enumeration is reported to the caller: returning Ok here
+        // told the frontend the sync succeeded while nothing had been swept,
+        // so a broken PCSC stack looked like an empty reader list.
+        let reader_count = ctx
+            .list_readers(&mut readers_buf)
+            .map_err(|e| format!("failed to list readers: {e}"))?
+            .count();
+        if reader_count == 0 {
+            log::warn!("No readers found. Nothing to sync.");
+            return Ok(());
         }
+        log::debug!("Available readers found: {}", reader_count);
 
         let mut reader_states = vec![
             // Listen for reader insertions/removals, if supported.
@@ -886,12 +919,18 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
         if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
             log::error!("Failed to setup reader states: {:?}", e);
         }
-        // waiting for the status change
-        ctx.get_status_change(
+        // Waiting for the status change. A timeout is the normal outcome when
+        // nothing changed since the states were seeded, and it must NOT skip
+        // the sweep below — treating it as fatal made the manual sync a no-op
+        // in exactly its main use case (a card already sitting in the reader).
+        // The monitor loop makes the same distinction.
+        match ctx.get_status_change(
             Some(Duration::from_secs(MANUAL_SYNC_TIMEOUT_SECS)),
             &mut reader_states,
-        )
-        .map_err(|e| format!("failed to get status change: {e}"))?;
+        ) {
+            Ok(()) | Err(pcsc::Error::Timeout) => {}
+            Err(e) => return Err(format!("failed to get status change: {e}")),
+        }
 
         block_on(process_reader_states(&mut reader_states));
         Ok(())

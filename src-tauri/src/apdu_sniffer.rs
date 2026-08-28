@@ -180,10 +180,12 @@ fn extract_plain_body(resp: &[u8]) -> Option<Vec<u8>> {
     if body[0] == 0x81 {
         let (len, len_bytes) = ber_length(&body[1..])?;
         let start = 1 + len_bytes;
-        if start + len <= body.len() {
-            return Some(body[start..start + len].to_vec());
-        }
-        return None;
+        // Checked: a BER long-form length is up to 4 bytes, so `len` can reach
+        // 0xFFFFFFFF. On a 32-bit target `start + len` would wrap and pass a
+        // plain `<= body.len()` test, and the slice below would then panic on
+        // a malformed (or hostile) response instead of being rejected here.
+        let end = start.checked_add(len)?;
+        return body.get(start..end).map(<[u8]>::to_vec);
     }
 
     // SM with encrypted body (DO'87) — cannot decode without session keys
@@ -233,8 +235,18 @@ fn persist_sniffed(
     log::debug!("{} → config update for {}", what, client_id);
     let client_id = client_id.to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        if !crate::config::mutate_card_config(&client_id, apply) {
-            log::error!("sniffer: failed to persist {} fields for {}", what, client_id);
+        match crate::config::mutate_card_config(&client_id, apply) {
+            // The sniffer runs for every proxied card, including ones with no
+            // config entry yet — nothing to persist there, and it is not an error.
+            crate::config::CardMutation::UnknownCard => log::debug!(
+                "sniffer: no config entry for {}, skipping {} fields",
+                client_id,
+                what
+            ),
+            crate::config::CardMutation::Failed => {
+                log::error!("sniffer: failed to persist {} fields for {}", what, client_id)
+            }
+            crate::config::CardMutation::Saved | crate::config::CardMutation::Unchanged => {}
         }
     });
 }
@@ -417,12 +429,11 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
 
 // ─────────── Helpers ───────────
 
+/// Fixed-offset field read, bounds-checked. `get` handles the overflow of
+/// `start + len` for free, so a short or malformed EF body yields None instead
+/// of panicking.
 fn slice(d: &[u8], start: usize, len: usize) -> Option<&[u8]> {
-    if start + len <= d.len() {
-        Some(&d[start..start + len])
-    } else {
-        None
-    }
+    d.get(start..start.checked_add(len)?)
 }
 
 /// Trims trailing padding (0x00 / 0xFF) from tachograph fixed-length strings.
@@ -611,6 +622,35 @@ mod tests {
     fn extract_plain_body_refuses_encrypted_do87() {
         let resp = [0x87, 0x02, 0xAA, 0xBB, 0x90, 0x00];
         assert_eq!(extract_plain_body(&resp), None);
+    }
+
+    #[test]
+    fn extract_plain_body_rejects_oversized_do81_length_without_panicking() {
+        // A DO'81 whose long-form length (4 bytes, 0xFFFFFFFF) far exceeds the
+        // body. On a 32-bit target `start + len` wraps and used to slip past a
+        // plain `<= body.len()` bound check, panicking on the slice; the
+        // checked add must reject it on every target instead.
+        let resp = [0x81, 0x84, 0xFF, 0xFF, 0xFF, 0xFF, 0xAA, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp), None);
+    }
+
+    #[test]
+    fn extract_plain_body_rejects_do81_length_past_the_body() {
+        // Ordinary truncation: the declared length is larger than what is
+        // actually present.
+        let resp = [0x81, 0x08, 0xAA, 0xBB, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp), None);
+    }
+
+    #[test]
+    fn slice_rejects_out_of_range_and_overflowing_reads() {
+        let data = [1u8, 2, 3, 4];
+        assert_eq!(slice(&data, 0, 4), Some(&data[..]));
+        assert_eq!(slice(&data, 2, 2), Some(&data[2..]));
+        // past the end
+        assert_eq!(slice(&data, 2, 3), None);
+        // start + len overflows usize
+        assert_eq!(slice(&data, 1, usize::MAX), None);
     }
 
     #[test]

@@ -337,8 +337,33 @@ fn persist_card(card_number: &str, content: CardConfig) -> Result<(), String> {
 /// This is the safe primitive for "change one field" writers (sniffer, auth
 /// results): mutating fresh file state under the lock means concurrent writers
 /// cannot revert each other's fields, which a cache-read + full-write would do.
+/// Outcome of `mutate_card_config`. "The card is not in the config" is a
+/// routine condition (a rack card whose ICCID is not linked to a number yet),
+/// not a failure — collapsing it into the same `false` as a failed write made
+/// every caller log a spurious ERROR for it, which in turn masked the real
+/// write failures the message was meant to surface.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CardMutation {
+    /// The mutation applied and the config was written.
+    Saved,
+    /// The card exists but the closure reported nothing to change; no write.
+    Unchanged,
+    /// No such card number in the config.
+    UnknownCard,
+    /// The config could not be read back or written.
+    Failed,
+}
+
+impl CardMutation {
+    /// True when the card's stored state now reflects the request — either it
+    /// was written or it already matched.
+    pub fn is_ok(&self) -> bool {
+        matches!(self, CardMutation::Saved | CardMutation::Unchanged)
+    }
+}
+
 /// Blocking (file I/O + fsync) — call from a blocking thread.
-pub fn mutate_card_config<F>(card_number: &str, mutate: F) -> bool
+pub fn mutate_card_config<F>(card_number: &str, mutate: F) -> CardMutation
 where
     F: FnOnce(&mut CardConfig) -> bool,
 {
@@ -346,7 +371,7 @@ where
         Ok(path) => path,
         Err(e) => {
             log::error!("Failed to get config path: {}", e);
-            return false;
+            return CardMutation::Failed;
         }
     };
 
@@ -356,28 +381,28 @@ where
         Ok(config) => config,
         Err(e) => {
             log::error!("mutate_card_config: failed to load config: {}", e);
-            return false;
+            return CardMutation::Failed;
         }
     };
 
     let Some(card) = config.cards.get_mut(card_number) else {
-        log::warn!("mutate_card_config: unknown card_number {}", card_number);
-        return false;
+        log::debug!("mutate_card_config: unknown card_number {}", card_number);
+        return CardMutation::UnknownCard;
     };
 
     if !mutate(card) {
         // Nothing changed against the authoritative file state — no write.
-        return true;
+        return CardMutation::Unchanged;
     }
     let updated = card.clone();
 
     if let Err(e) = save_config(&config_path, &config) {
         log::error!("mutate_card_config: failed to save config: {}", e);
-        return false;
+        return CardMutation::Failed;
     }
     if let Err(e) = load_config_to_cache(&config) {
         log::error!("mutate_card_config: failed to refresh cache: {}", e);
-        return false;
+        return CardMutation::Failed;
     }
 
     emit_card_config_event(
@@ -386,7 +411,7 @@ where
         Some(updated),
     );
 
-    true
+    CardMutation::Saved
 }
 
 /// Public function to update the configuration with a new card.
@@ -808,14 +833,22 @@ fn record_auth_result(card_number: &str, success: bool) {
     // Mutate fresh file state under the config lock instead of writing a full
     // cache snapshot back — a stale snapshot would revert fields a concurrent
     // writer (e.g. the sniffer) just persisted.
-    if !mutate_card_config(card_number, |card| {
+    let outcome = mutate_card_config(card_number, |card| {
         card.last_auth = Some((ts, success));
         true
-    }) {
-        log::error!(
+    });
+    match outcome {
+        // A card that is not in the config has no last_auth to record — the
+        // normal case for an unlinked rack card, not a failure.
+        CardMutation::UnknownCard => log::debug!(
+            "record_auth_result: no config entry for card_number {}",
+            card_number
+        ),
+        CardMutation::Failed => log::error!(
             "record_auth_result: failed to persist last_auth for card_number {}",
             card_number
-        );
+        ),
+        CardMutation::Saved | CardMutation::Unchanged => {}
     }
 }
 
@@ -952,6 +985,12 @@ pub fn init_config() -> io::Result<()> {
 
     let config_path = get_config_path()?;
     let config: ConfigurationFile;
+    // Whether the file on disk still matches what we would write. A config that
+    // parsed cleanly and needs no field change is left byte-for-byte alone:
+    // rewriting it round-trips through serde_yaml, which drops comments and
+    // reorders keys in a file the user is expected to hand-edit (the MQTT
+    // credentials have no UI). Only a real change earns a write.
+    let mut needs_save = true;
 
     if config_path.exists() {
         let mut contents = String::new();
@@ -959,7 +998,9 @@ pub fn init_config() -> io::Result<()> {
 
         match serde_yaml::from_str::<ConfigurationFile>(&contents) {
             Ok(mut loaded_config) => {
-                loaded_config.version = env!("CARGO_PKG_VERSION").to_string();
+                let version = env!("CARGO_PKG_VERSION");
+                needs_save = loaded_config.version != version;
+                loaded_config.version = version.to_string();
                 config = loaded_config;
             }
             Err(e) => {
@@ -992,9 +1033,12 @@ pub fn init_config() -> io::Result<()> {
         config = generate_default_config();
     }
 
-    save_config(&config_path, &config).map_err(io::Error::other)?;
-
-    log::debug!("config: saved config");
+    if needs_save {
+        save_config(&config_path, &config).map_err(io::Error::other)?;
+        log::debug!("config: saved config");
+    } else {
+        log::debug!("config: unchanged on disk, left as-is");
+    }
 
     load_config_to_cache(&config).map_err(io::Error::other)?;
 
@@ -1403,6 +1447,23 @@ mod tests {
         update_card_config(&path, "ABCDEF0123456789", own).expect("self-update must be allowed");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // `mutate_card_config` reports four distinct outcomes. Callers branch on
+    // them to decide the log level, and the whole point of the enum is that a
+    // missing card is NOT an error — an unlinked rack card hits that path on
+    // every sniffed field, and reporting it as a failure buried the real
+    // write failures. Pin the classification so it cannot silently collapse
+    // back into a bool.
+    #[test]
+    fn card_mutation_separates_missing_cards_from_failures() {
+        assert!(CardMutation::Saved.is_ok());
+        assert!(CardMutation::Unchanged.is_ok());
+        assert!(!CardMutation::UnknownCard.is_ok());
+        assert!(!CardMutation::Failed.is_ok());
+        // The two non-ok outcomes must stay distinguishable: callers log the
+        // first at debug and only the second at error.
+        assert_ne!(CardMutation::UnknownCard, CardMutation::Failed);
     }
 
     #[test]

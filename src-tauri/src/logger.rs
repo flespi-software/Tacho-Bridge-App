@@ -153,6 +153,7 @@ impl RotatingLogWriter {
         // the displaced generation is detached under a unique temp name and zipped in
         // a background thread: deflating 50 MB inline would stall every logging thread
         // on the fern mutex for the whole compression
+        let mut detach_failed = false;
         if archived.exists() {
             let temp = detach_temp_path(&self.dir);
             match std::fs::rename(&archived, &temp) {
@@ -164,15 +165,21 @@ impl RotatingLogWriter {
                 Err(e) => {
                     // Keep the displaced generation. Deleting it here would destroy up
                     // to 50 MB of history over a transient failure (e.g. an antivirus
-                    // or the log collector briefly holding the file on Windows). The
-                    // rotation below then fails against the still-present log.1.txt,
-                    // pauses via failed_rotate_at and retries the detach in a minute.
+                    // or the log collector briefly holding the file on Windows).
                     eprintln!("Failed to detach {:?} for archiving: {}", archived, e);
+                    detach_failed = true;
                 }
             }
         }
 
-        if let Err(e) = std::fs::rename(&current, &archived) {
+        // Only rotate onto log.1.txt once it is free. `rename` overwrites the
+        // destination silently on POSIX, so rotating after a failed detach
+        // would destroy the very generation the detach just refused to give
+        // up. Leaving log.txt oversized instead makes the reopen below set
+        // failed_rotate_at, which retries the whole sequence a minute later.
+        if detach_failed {
+            eprintln!("Skipping rotation: {:?} is still in place", archived);
+        } else if let Err(e) = std::fs::rename(&current, &archived) {
             eprintln!("Failed to rotate log file: {}", e);
         }
 
@@ -529,6 +536,31 @@ mod tests {
         assert!(archived.contains("old line"));
         let current = std::fs::read_to_string(dir.join("log.txt")).unwrap();
         assert_eq!(current, "new line\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A detach failure must never cost a generation. The failure itself is
+    // OS-dependent (a locked file on Windows, a read-only dir on POSIX), so the
+    // test pins the property the fix guarantees on the reachable path: whatever
+    // ends up in log.1.txt after a rotation is a real previous generation, and
+    // rotation never silently overwrites content it failed to move aside.
+    #[test]
+    fn rotation_never_discards_the_previous_generation_unarchived() {
+        let dir = scratch_dir("no_clobber");
+        let mut writer = RotatingLogWriter::new(dir.clone(), 16, 3).unwrap();
+
+        writer.write_all(b"generation one line\n").unwrap();
+        writer.write_all(b"generation two line\n").unwrap();
+        writer.flush().unwrap();
+
+        // After the first rotation log.1.txt holds generation one verbatim.
+        let archived = std::fs::read_to_string(dir.join("log.1.txt")).unwrap();
+        assert!(
+            archived.contains("generation one"),
+            "displaced generation must survive rotation, got {:?}",
+            archived
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
