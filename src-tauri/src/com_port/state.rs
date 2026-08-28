@@ -83,16 +83,28 @@ pub(super) fn update_rack_card_ui(
                 slot
             );
         }
+        // A repeat server `connect` for a card that did not move (same slot,
+        // same ICCID — the server re-walks discovery whenever ANY card leaves
+        // the rack) must carry the live session flags over: the running session
+        // is kept as-is (`spawn_rack_card` skips it as already_running), so no
+        // ConnAck follows to repaint a reset row, and a connected card would
+        // show grey until the next keep-alive ping.
+        let (online, authentication) = list
+            .iter()
+            .find(|c| c.slot == slot && c.iccid.as_deref() == Some(iccid))
+            .map(|c| (c.online, c.authentication))
+            .unwrap_or((None, None));
         list.retain(|c| c.slot != slot && c.iccid.as_deref() != Some(iccid));
         list.push(RackCard {
             slot,
             iccid: Some(iccid.to_string()),
             card_number,
             name,
-            // A freshly discovered card has no session yet; `set_rack_card_state`
-            // fills these in once its MQTT loop connects and starts exchanging.
-            online: None,
-            authentication: None,
+            // A freshly discovered card has no session yet (`set_rack_card_state`
+            // fills these in once its MQTT loop connects); a re-discovered one
+            // keeps the state of its live session.
+            online,
+            authentication,
         });
         list.sort_by_key(|c| c.slot);
         updates.push((rack_id.to_string(), list.clone()));
