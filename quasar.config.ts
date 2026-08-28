@@ -101,6 +101,13 @@ export default defineConfig((/* ctx */) => {
       // requests -> white screen in `tauri dev`). Must match `build.devUrl`
       // in src-tauri/tauri.conf.json.
       port: 9314,
+      // Bind 127.0.0.1 explicitly, not the wildcard: the Tauri webview only
+      // ever loads via localhost, and with the wildcard bind the specific
+      // 127.0.0.1:<port> slot stays free for VS Code's remembered port
+      // forward to grab on every extension-host restart — it then shadows
+      // the dev server for all localhost traffic (white screen again).
+      // Holding the specific bind makes VS Code's grab fail instead.
+      host: 'localhost',
       open: false, // opens browser window automatically
     },
 
