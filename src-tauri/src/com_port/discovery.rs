@@ -44,8 +44,8 @@ pub(super) struct DeviceProfile {
     fallback_vid: u16,
     fallback_pid: u16,
     /// Canonical manufacturer substituted when the OS hides the device's own
-    /// strings, so the client_id and UI match the platforms where the same
-    /// hardware reports them via its descriptors.
+    /// strings, so the UI matches the platforms where the same hardware
+    /// reports them via its descriptors.
     fallback_manufacturer: &'static str,
     /// Validates a reported serial against the vendor's scheme and normalizes
     /// it to the descriptor form (e.g. "SC1799A" -> "SC1799").
@@ -71,65 +71,34 @@ static PROFILES: &[&DeviceProfile] = &[&LISLE_RACK];
 /// How often the monitor scans the bus for devices appearing/disappearing.
 pub(super) const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// MQTT client_id construction for a device connection.
+/// Rack identity, shared with the server: the device serial kept to `[0-9A-Z]`.
 ///
-/// The id must match the server's `^[0-9A-Z]{16}$` (exactly 16 uppercase
-/// alphanumerics). Layout is `BRAND` + filler zeros + `SERIAL`: the brand comes
-/// from the device's own manufacturer string (no hard-coded value), the serial
-/// is kept flush at the end, and the gap between them is padded with zeros.
-const RACK_ID_LEN: usize = 16; // server contract: exactly 16 chars
-const RACK_ID_BRAND_LEN: usize = 5; // chars of the brand kept in the id
-const RACK_ID_PAD: char = '0'; // filler placed between brand and serial
-
-/// Extracts the brand prefix for the client_id from the manufacturer string:
-/// the first whitespace-separated word, kept to `[0-9A-Z]`, uppercased, and
-/// limited to `RACK_ID_BRAND_LEN` chars. e.g. "Lisle Design Ltd" -> "LISLE".
-fn brand_prefix(manufacturer: &str) -> String {
-    manufacturer
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_uppercase())
-        .take(RACK_ID_BRAND_LEN)
-        .collect()
-}
-
-/// Builds the device's MQTT client_id as `<brand>` + zero filler + sanitised
-/// serial, uppercased, kept to `[0-9A-Z]`, exactly 16 chars. The serial sits
-/// flush at the end; if brand + serial would exceed 16, the serial is truncated
-/// to its trailing chars (no filler).
+/// The rack has no MQTT connection of its own — it is a peripheral of the
+/// application connection, addressed there by the `rack/<id>/...` topic prefix
+/// (see `rack.rs`). The id therefore has to be topic-safe (no `/`, `+`, `#`),
+/// which the alphanumeric filter guarantees. It also keys every per-rack
+/// structure in the app (open ports, card sessions, UI state).
 ///
-/// Examples (manufacturer, serial → id):
-///   "Lisle Design Ltd", "SC1234" → "LISLE00000SC1234"
-///   "Lisle Design Ltd", none/""  → "LISLE00000000000"
-fn build_client_id(manufacturer: &str, serial: Option<&str>) -> String {
-    let brand = brand_prefix(manufacturer);
+/// A device without a serial gets a fixed placeholder, so two such devices
+/// collapse into one identity and only one of them is served.
+const RACK_ID_NO_SERIAL: &str = "NOSERIAL";
 
-    // Keep only [0-9A-Z] from the serial, uppercased.
-    let mut serial_clean: String = serial
+/// Builds the rack id from the device serial: uppercased, kept to `[0-9A-Z]`.
+///
+/// Examples (serial → id): "SC1234" → "SC1234", "sc-12/34" → "SC1234",
+/// none/"" → "NOSERIAL".
+fn build_rack_id(serial: Option<&str>) -> String {
+    let clean: String = serial
         .unwrap_or("")
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_uppercase())
         .collect();
-
-    // Space available for the serial after the brand.
-    let serial_room = RACK_ID_LEN - brand.len();
-    if serial_clean.len() > serial_room {
-        // Too long: keep the trailing chars so the serial stays flush at the end.
-        serial_clean = serial_clean[serial_clean.len() - serial_room..].to_string();
+    if clean.is_empty() {
+        RACK_ID_NO_SERIAL.to_string()
+    } else {
+        clean
     }
-
-    let mut id = String::with_capacity(RACK_ID_LEN);
-    id.push_str(&brand);
-    // Filler zeros between brand and serial, so the serial ends at position 16.
-    for _ in 0..(serial_room - serial_clean.len()) {
-        id.push(RACK_ID_PAD);
-    }
-    id.push_str(&serial_clean);
-    id
 }
 
 /// Details of a discovered rack device, for logging and later use. `vid`/`pid`
@@ -177,22 +146,19 @@ impl RackInfo {
             .unwrap_or(false)
     }
 
-    /// The MQTT client_id the server uses to address this device. The brand
-    /// prefix is derived from the device's own manufacturer string. Also the
-    /// key of every per-rack structure in the app (connections, card sessions,
-    /// UI state).
-    pub(super) fn client_id(&self) -> String {
-        build_client_id(
-            self.manufacturer.as_deref().unwrap_or(""),
-            self.serial.as_deref(),
-        )
+    /// The id the server addresses this device by on the application
+    /// connection (`rack/<id>/...`), built from the device serial. Also the key
+    /// of every per-rack structure in the app (open ports, card sessions, UI
+    /// state).
+    pub(super) fn rack_id(&self) -> String {
+        build_rack_id(self.serial.as_deref())
     }
 
     /// Build the frontend payload for this rack. The card list is empty for now;
     /// it will be filled once the server reports the cards in the rack's slots.
     pub(super) fn to_state(&self, connected: bool) -> RackState {
         RackState {
-            client_id: self.client_id(),
+            id: self.rack_id(),
             connected,
             name: self
                 .product
@@ -245,7 +211,7 @@ static PORT_INVENTORY: ChangeGuard = ChangeGuard::new();
 /// Last logged discovery-match outcome (the whole matched set).
 static DISCOVERY_MATCH: ChangeGuard = ChangeGuard::new();
 
-/// Last logged set of client_id duplicates dropped by `dedupe_by_client_id`.
+/// Last logged set of rack id duplicates dropped by `dedupe_by_rack_id`.
 /// Must be change-gated like every other discovery log: on macOS every USB
 /// serial device enumerates as BOTH its /dev/cu.* and /dev/tty.* node with
 /// identical metadata, so duplicates are the NORMAL state there and an
@@ -280,7 +246,7 @@ fn describe_port(p: &serialport::SerialPortInfo) -> String {
 
 /// Find every supported device on the bus. Runs all matching passes for every
 /// profile, then orders the result deterministically (serial, then port name)
-/// and drops client_id duplicates — so which device is "first" never depends
+/// and drops rack id duplicates — so which device is "first" never depends
 /// on OS enumeration order, which can change across reboots.
 pub(super) fn find_racks() -> Vec<RackInfo> {
     let ports = match serialport::available_ports() {
@@ -325,12 +291,12 @@ pub(super) fn find_racks() -> Vec<RackInfo> {
         collect_by_usb_descriptor(profile, &ports, &mut racks);
         // Last resort: no descriptor strings anywhere — match by chip identity
         // plus the vendor's serial scheme, and substitute the canonical strings
-        // so client_id/UI stay identical across platforms.
+        // so rack id/UI stay identical across platforms.
         collect_by_chip_identity(profile, &ports, &mut racks);
     }
 
     sort_racks(&mut racks);
-    dedupe_by_client_id(&mut racks);
+    dedupe_by_rack_id(&mut racks);
 
     // One log line per change of the matched set, covering every pass.
     let snapshot = if racks.is_empty() {
@@ -372,8 +338,8 @@ fn sort_racks(racks: &mut [RackInfo]) {
     });
 }
 
-/// Two entries that build the same client_id are one MQTT identity — only one
-/// can be served, the rest are dropped. This is the NORMAL state on macOS,
+/// Two entries that build the same rack id are one identity on the server —
+/// only one can be served, the rest are dropped. This is the NORMAL state on macOS,
 /// where every USB serial device enumerates as both its /dev/cu.* and
 /// /dev/tty.* node with identical metadata. Logged once per change of the
 /// dropped set, at info — it is expected housekeeping, not a fault.
@@ -383,14 +349,14 @@ fn sort_racks(racks: &mut [RackInfo]) {
 /// macOS can expose one rack as both `/dev/cu.usbserial-<serial>` and
 /// `/dev/cu.usbserial-<N>`, and `<N>` sorts before `<serial>`; without
 /// stickiness the newcomer displaced the live descriptor, which tore down a
-/// working rack (its MQTT task and every card session) just to reopen the same
+/// working rack (its link and every card session) just to reopen the same
 /// physical device under another name. Falls back to the deterministic sort
 /// order when nothing is open yet.
-fn dedupe_by_client_id(racks: &mut Vec<RackInfo>) {
+fn dedupe_by_rack_id(racks: &mut Vec<RackInfo>) {
     let active = super::active_rack_ports();
     if !active.is_empty() {
         // Stable partition: entries whose port is already open float to the
-        // front of their client_id group, so the `retain` below keeps them.
+        // front of their rack id group, so the `retain` below keeps them.
         let mut preferred: Vec<RackInfo> = Vec::with_capacity(racks.len());
         let mut rest: Vec<RackInfo> = Vec::with_capacity(racks.len());
         for rack in racks.drain(..) {
@@ -407,7 +373,7 @@ fn dedupe_by_client_id(racks: &mut Vec<RackInfo>) {
     let mut seen = std::collections::HashSet::new();
     let mut dropped: Vec<String> = Vec::new();
     racks.retain(|r| {
-        let id = r.client_id();
+        let id = r.rack_id();
         if seen.insert(id.clone()) {
             true
         } else {
@@ -422,7 +388,7 @@ fn dedupe_by_client_id(racks: &mut Vec<RackInfo>) {
     };
     if DISCOVERY_DUPLICATES.changed(&snapshot) && !dropped.is_empty() {
         log::info!(
-            "RACK | phase=discovery status=duplicate_client_id_dropped list=[{}]",
+            "RACK | phase=discovery status=duplicate_rack_id_dropped list=[{}]",
             snapshot
         );
     }
@@ -466,7 +432,7 @@ fn collect_by_descriptor(
 /// caches the device's own iProduct on the USB node (`BusReportedDeviceDesc`,
 /// surfaced by nusb as `product_string`) along with the clean EEPROM serial —
 /// the same values macOS/Linux read from the descriptors directly, so the
-/// resulting client_id matches across platforms. The device is never opened.
+/// resulting rack id matches across platforms. The device is never opened.
 #[cfg(windows)]
 fn collect_by_usb_descriptor(
     profile: &'static DeviceProfile,
@@ -528,7 +494,7 @@ fn collect_by_usb_descriptor(
 
 /// Last resort: no descriptor strings anywhere — match by the profile's chip
 /// identity plus its serial scheme, substituting the canonical strings so the
-/// client_id and UI stay identical across platforms.
+/// rack id and UI stay identical across platforms.
 fn collect_by_chip_identity(
     profile: &'static DeviceProfile,
     ports: &[serialport::SerialPortInfo],
@@ -712,86 +678,54 @@ mod tests {
     }
 
     #[test]
-    fn fallback_identity_builds_same_client_id_as_descriptor_match() {
+    fn fallback_identity_builds_same_rack_id_as_descriptor_match() {
         // The same physical rack: macOS reports the descriptors, Windows the
-        // driver strings + suffixed serial. Both must yield one client_id.
-        let windows_id = build_client_id(
-            LISLE_RACK.fallback_manufacturer,
-            lisle_serial("SC1799A").as_deref(),
-        );
-        let macos_id = build_client_id("Lisle Design Ltd", Some("SC1799"));
+        // driver strings + suffixed serial. Both must yield one rack id.
+        let windows_id = build_rack_id(lisle_serial("SC1799A").as_deref());
+        let macos_id = build_rack_id(Some("SC1799"));
         assert_eq!(windows_id, macos_id);
-        assert_eq!(windows_id, "LISLE00000SC1799");
-        assert!(matches_server_contract(&windows_id));
+        assert_eq!(windows_id, "SC1799");
     }
 
-    // The server contract: client_id must match ^[0-9A-Z]{16}$.
-    fn matches_server_contract(id: &str) -> bool {
-        id.len() == 16
-            && id
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    // The rack id rides the `rack/<id>/...` topics of the application
+    // connection: it must be non-empty and free of MQTT topic syntax.
+    fn is_topic_safe(id: &str) -> bool {
+        !id.is_empty() && id.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
     }
 
     #[test]
-    fn brand_prefix_from_manufacturer() {
-        assert_eq!(brand_prefix("Lisle Design Ltd"), "LISLE");
-        assert_eq!(brand_prefix("lisle design ltd"), "LISLE"); // case-insensitive
-        assert_eq!(brand_prefix("Acme Co"), "ACME"); // shorter first word
-        assert_eq!(brand_prefix(""), ""); // empty
+    fn rack_id_is_the_serial() {
+        assert_eq!(build_rack_id(Some("SC1234")), "SC1234");
+        assert_eq!(info("/dev/x", Some("SC1234")).rack_id(), "SC1234");
     }
 
     #[test]
-    fn client_id_from_serial() {
-        // Brand (from manufacturer) + zero filler + serial; serial flush at end.
-        assert_eq!(build_client_id(MFR, Some("SC1234")), "LISLE00000SC1234");
-    }
-
-    #[test]
-    fn client_id_serial_is_flush_at_end() {
-        // Whatever the serial length, it must end the id (filler in the middle).
-        assert!(build_client_id(MFR, Some("SC1234")).ends_with("SC1234"));
-        assert!(build_client_id(MFR, Some("AB")).ends_with("AB"));
-    }
-
-    #[test]
-    fn client_id_always_matches_server_contract() {
+    fn rack_id_is_always_topic_safe() {
         for serial in [
             Some("SC1234"),
-            Some("sc1234"),                  // lowercase gets uppercased
-            Some("SC-12/34"),                // punctuation stripped
-            Some(""),                        // empty serial
-            None,                            // no serial at all
-            Some("VERYLONGSERIALNUMBER123"), // longer than 16 → truncated
+            Some("sc1234"),      // lowercase gets uppercased
+            Some("SC-12/34"),    // punctuation stripped
+            Some("SC+12#34"),    // MQTT wildcards stripped
+            Some(""),            // empty serial
+            None,                // no serial at all
+            Some("VERYLONGSERIALNUMBER123"),
         ] {
-            let id = build_client_id(MFR, serial);
+            let id = build_rack_id(serial);
             assert!(
-                matches_server_contract(&id),
-                "id {:?} from serial {:?} violates ^[0-9A-Z]{{16}}$",
+                is_topic_safe(&id),
+                "id {:?} from serial {:?} is not topic-safe",
                 id,
                 serial
             );
         }
+        assert_eq!(build_rack_id(Some("sc-12/34")), "SC1234");
     }
 
     #[test]
-    fn client_id_starts_with_brand_from_manufacturer() {
-        assert!(build_client_id(MFR, Some("ANYTHING")).starts_with("LISLE"));
-    }
-
-    #[test]
-    fn client_id_empty_serial_is_padded() {
-        assert_eq!(build_client_id(MFR, None), "LISLE00000000000");
-    }
-
-    #[test]
-    fn client_id_long_serial_keeps_trailing_chars() {
-        // Serial longer than the room → keep its tail, still 16 and contract-valid.
-        let id = build_client_id(MFR, Some("VERYLONGSERIAL123"));
-        assert!(matches_server_contract(&id));
-        assert!(id.starts_with("LISLE"));
-        // 11 chars of room after "LISLE" → trailing 11 of the serial.
-        assert_eq!(id, "LISLENGSERIAL123");
+    fn rack_id_without_serial_is_the_placeholder() {
+        assert_eq!(build_rack_id(None), RACK_ID_NO_SERIAL);
+        assert_eq!(build_rack_id(Some("")), RACK_ID_NO_SERIAL);
+        assert_eq!(build_rack_id(Some("-/-")), RACK_ID_NO_SERIAL);
     }
 
     #[test]
@@ -853,17 +787,17 @@ mod tests {
     #[test]
     fn distinct_serials_are_all_kept() {
         let mut racks = vec![info("COM3", Some("SC4953")), info("COM4", Some("SC5465"))];
-        dedupe_by_client_id(&mut racks);
+        dedupe_by_rack_id(&mut racks);
         assert_eq!(racks.len(), 2);
     }
 
     #[test]
-    fn duplicate_client_ids_keep_only_the_first() {
-        // No serial at all → both devices build "LISLE00000000000": one MQTT
+    fn duplicate_rack_ids_keep_only_the_first() {
+        // No serial at all → both devices build the placeholder id: one
         // identity, so only the first (deterministic order) survives.
         let mut racks = vec![info("COM4", None), info("COM3", None)];
         sort_racks(&mut racks);
-        dedupe_by_client_id(&mut racks);
+        dedupe_by_rack_id(&mut racks);
         assert_eq!(racks.len(), 1);
         assert_eq!(racks[0].port_name, "COM3");
     }
@@ -878,16 +812,16 @@ mod tests {
         // as busy because the old handle had not closed yet.
         let serial = Some("SC1799");
         let live_port = "/dev/cu.usbserial-SC1799";
-        let client_id = info(live_port, serial).client_id();
+        let rack_id = info(live_port, serial).rack_id();
 
-        super::super::set_active_rack_port_for_test(&client_id, Some(live_port));
+        super::super::set_active_rack_port_for_test(&rack_id, Some(live_port));
 
         let mut racks = vec![
             info("/dev/cu.usbserial-3", serial),
             info(live_port, serial),
         ];
         sort_racks(&mut racks);
-        dedupe_by_client_id(&mut racks);
+        dedupe_by_rack_id(&mut racks);
 
         assert_eq!(racks.len(), 1);
         assert_eq!(
@@ -896,13 +830,13 @@ mod tests {
         );
 
         // With nothing open, the deterministic sort order decides as before.
-        super::super::set_active_rack_port_for_test(&client_id, None);
+        super::super::set_active_rack_port_for_test(&rack_id, None);
         let mut racks = vec![
             info("/dev/cu.usbserial-3", serial),
             info(live_port, serial),
         ];
         sort_racks(&mut racks);
-        dedupe_by_client_id(&mut racks);
+        dedupe_by_rack_id(&mut racks);
         assert_eq!(racks.len(), 1);
         assert_eq!(racks[0].port_name, "/dev/cu.usbserial-3");
     }

@@ -135,7 +135,7 @@ pub(super) struct SerialEnvelope {
     /// closing message the server sends (with an empty `serial_cmd`) once the
     /// tracker reports the authentication finished. Session envelopes always
     /// carry it; `None` marks non-session signalling on the same serial path
-    /// (e.g. a slot LED repaint) — see `handle_serial_request`.
+    /// (e.g. a slot LED repaint) — see `run_serial_request`.
     pub(super) finish: Option<bool>,
 }
 

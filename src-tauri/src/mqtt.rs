@@ -366,8 +366,9 @@ pub async fn ensure_connection(
     // the connection opened below: the flespi broker allows one session per
     // client_id and would drop the two connections in a loop. The card was
     // just physically detected in this reader, so it cannot still sit in a
-    // rack slot — the rack session is stale (its server `disconnect` was lost
-    // or is still in flight). Abort it before opening ours. Deliberately AFTER
+    // rack slot — the rack session is stale (the server's card set dropping
+    // it was lost or is still in flight). Abort it before opening ours.
+    // Deliberately AFTER
     // every early return above (empty client_id, existing session, invalid
     // host): killing the rack session and then not opening the reader one
     // would leave the card served by neither transport.

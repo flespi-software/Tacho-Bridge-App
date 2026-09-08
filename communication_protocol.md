@@ -32,15 +32,17 @@ follow one rule:
 TBA maintains several MQTT connections in parallel, one per role. Each has its
 own `client_id`, which is how the server tells them apart.
 
-| Connection | client_id                                                                            | Purpose                                                                     |
-| ---------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
-| App        | `TBA` + 13 digits (e.g. `TBA1740000000000`)                                          | Application presence: one per running TBA instance.                         |
-| Card       | 16-character company card number                                                     | One per inserted card; carries the card's authentication traffic.           |
-| Rack       | 16 characters: brand prefix + zero padding + device serial (e.g. `LISLE00000SC1234`) | One per connected serial card-rack device; carries opaque serial exchanges. |
+| Connection | client_id                                   | Purpose                                                           |
+| ---------- | ------------------------------------------- | ----------------------------------------------------------------- |
+| App        | `TBA` + 13 digits (e.g. `TBA1740000000000`) | Application presence: one per running TBA instance; also carries the traffic of every connected card rack (section 6). |
+| Card       | 16-character company card number            | One per inserted card; carries the card's authentication traffic. |
 
-Lifecycle: a card connection is opened when a configured card is inserted and
-closed when it is removed. A rack connection is opened when a supported serial
-device is detected on USB and closed when it disappears.
+Lifecycle: a card connection is opened when a configured card is inserted (in
+a reader, or in a rack slot the server told TBA to serve) and closed when it
+is removed. A serial card rack has no connection of its own: it is a
+peripheral of the application, like a reader, addressed on the app
+connection under the `rack/<serial>/` topic prefix from the moment its port
+is open until it disappears.
 
 ## 4. Request/response model
 
@@ -108,13 +110,48 @@ fallback. Sources in priority order:
 An unknown `protocol` value is ignored with a warning. Old TBA versions
 ignore the request field entirely and reply without the `protocol` field.
 
-## 6. Rack connection payloads
+## 6. Rack traffic on the app connection
 
-The rack connection is a transparent byte pipe between the server and the
-serial device. TBA does not build, parse, or interpret these bytes — the wire
-protocol of the device is owned entirely by the server.
+A serial card rack is served over the **app connection**: every rack message
+travels under the topic prefix `rack/<serial>/`, where `<serial>` is the rack
+device serial reduced to `[0-9A-Z]` (e.g. `SC1234`). Several racks ride the
+same connection, each under its own prefix. The tails have no `/<sender>`
+segment: the server is the only sender on this path.
 
-Incoming command shape (only `serial_cmd` is required; every other field is
+| Direction    | Topic                            | Payload                                | When                                                                              |
+| ------------ | -------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------- |
+| TBA → server | `rack/<serial>/link`             | `{"state":"up"}`                       | the rack's port is open; repeated for every open rack after each CONNACK of the app connection |
+| TBA → server | `rack/<serial>/link`             | `{"state":"down"}`                     | the rack's port was closed or lost                                                |
+| TBA → server | `rack/<serial>/response/<id>`    | response envelope (below)              | reply to `request/<id>` of this rack                                              |
+| TBA → server | `rack/<serial>/watch`            | response envelope (below)              | the presence watch saw a change (below)                                           |
+| server → TBA | `rack/<serial>/request/<id>`     | command envelope (below)               | one serial exchange with the rack                                                 |
+| server → TBA | `rack/<serial>/watch`            | watch envelope (below)                 | arm or re-arm the presence watch                                                  |
+| server → TBA | `rack/<serial>/cards`            | `[{"slot":N,"iccid":"<16 hex>"},...]` | the complete set of cards of this rack to serve                                   |
+
+`<id>` is counted by the server per rack. The request idempotency of section
+4 applies per rack too, and its cache is reset on every CONNACK. A reply or a
+watch report is delivered only to the connection its request or watch came
+in on: once the app connection dropped or reconnected, the pending result is
+discarded, never handed to the next connection.
+
+TBA does not build, parse, or interpret the bytes it exchanges with the rack:
+the wire protocol of the device is owned entirely by the server. TBA is a
+transparent byte pipe between the server and the serial port.
+
+### Link
+
+`link` `up` announces a rack the server may address; the server starts its
+card discovery from it, and repeats it for every `up` (the app reconnecting,
+or the port re-opened). `link` `down` ends that life of the rack: TBA
+publishes nothing of it afterwards — a serial exchange or watch report that
+was still running is discarded, not delivered late. The server drops
+everything it knew about the rack on `down` and starts over on the next `up`,
+so a late reply of the previous life could be mistaken for a reply of the new
+one.
+
+### Serial exchange (`request` / `response`)
+
+Command envelope (only `serial_cmd` is required; every other field is
 optional):
 
 ```json
@@ -139,8 +176,8 @@ them blindly):
    `poll.deadline_ms` returns the last reply — the server decodes the device
    state from it.
 
-The whole envelope is executed atomically on the port: exchanges of parallel
-card sessions of one rack queue up FIFO and interleave at envelope
+The whole envelope is executed atomically on the port: exchanges of the rack
+and of the card sessions of that rack queue up FIFO and interleave at envelope
 granularity.
 
 The response is published for **every** request, always in one shape:
@@ -155,67 +192,66 @@ The response is published for **every** request, always in one shape:
 cached for `request_id` idempotency — a repeat after an error retries the
 device.
 
-### Card spawn (`connect`) and the rack link report
+### Card set (`cards`) and the rack link report
 
-When the server has identified a card in a rack slot, it publishes a spawn
-instruction on the rack connection — topic `connect`:
+At the end of every discovery pass over a rack the server publishes the
+complete set of cards it wants served — topic `rack/<serial>/cards`:
 
 ```json
-{ "iccid": "<16 hex>", "slot": 3 }
+[{ "slot": 1, "iccid": "<16 hex>" }, { "slot": 3, "iccid": "<16 hex>" }]
 ```
 
-TBA resolves the ICCID to the company card number through its local config
-(unknown ICCID — logged and skipped) and opens a regular card connection for
-it (same contract as §5), backed by the rack serial link instead of PC/SC. If
-a PC/SC connection for that card number is already active, the spawn is
-skipped — one `client_id` never gets two connections.
+The set is the desired state, not a notice. TBA reconciles the rack's card
+sessions with it, keyed by the `(slot, iccid)` pair: a listed card without a
+session gets one, a session of that rack whose pair is not listed is closed.
+For a new session TBA resolves the ICCID to the company card number through
+its local config (unknown ICCID — shown in the UI, not served) and opens a
+regular card connection for it (same contract as section 5), backed by the
+rack serial link instead of PC/SC. If a PC/SC connection for that card number
+is already active, the spawn is skipped — one `client_id` never gets two
+connections. A card listed in a different slot than its live session was
+opened for gets a new session: the server binds a session to its slot. An
+empty set closes every session of the rack.
 
 Right after CONNACK such a rack-backed card connection publishes a one-shot
 **rack link report** — topic `rack`:
 
 ```json
-{ "iccid": "<16 hex>", "slot": 3 }
+{ "iccid": "<16 hex>", "slot": 3, "rack": "<serial>" }
 ```
 
 It binds the card session to its slot on the server; without it the server
-treats the card as reader-backed. On this connection the server then sends
-serial envelopes (this section) instead of the §5 card payloads. All
-rack-backed card connections are closed when the rack disconnects.
+treats the card as reader-backed. `rack` is diagnostics only. On this
+connection the server then sends serial envelopes (this section) instead of
+the section 5 card payloads; their topics keep the section 4 shape
+`request/<id>/<sender>` — the `rack/` prefix exists on the app connection
+only. All rack-backed card connections are closed when the rack disconnects.
 
-### Card presence watch (`watch`) and card removal (`disconnect`)
+### Card presence watch (`watch`)
 
-After discovery the server arms a client-side presence watch — topic `watch`
-on the rack connection:
+After discovery the server arms a client-side presence watch — topic
+`rack/<serial>/watch`:
 
 ```json
 { "cmd": "<hex>", "interval_ms": 1000, "idle_ms": 50, "deadline_ms": 2000 }
 ```
 
 TBA re-executes the opaque `cmd` every `interval_ms` through the same FIFO
-port queue and publishes the reply back (topic `watch`, the standard
-`serial_resp`/`serial_err` envelope) **only when its bytes change**. Arming
-again replaces the loop and resets the change baseline, so the first reply
-after (re)arming is always published — this is how the server catches states
-that changed while it was busy. TBA compares bytes blindly; what the command
-means and what changed is decided entirely by the server.
-
-When the server concludes a card left its slot, it publishes a removal notice
-on the rack connection — topic `disconnect`:
-
-```json
-{ "iccid": "<16 hex>", "slot": 3 }
-```
-
-TBA closes the rack-backed card connection of that card (if one was spawned)
-and removes the card from the rack UI. Newly inserted cards need no special
-message: the server discovers them from a watch update and sends a regular
-`connect` spawn.
+port queue and publishes the reply back (topic `rack/<serial>/watch`, the
+standard `serial_resp`/`serial_err` envelope) **only when its bytes change**.
+Arming again replaces the loop and resets the change baseline, so the first
+reply after (re)arming is always published — this is how the server catches
+states that changed while it was busy. TBA compares bytes blindly; what the
+command means and what changed is decided entirely by the server. Inserted
+and removed cards need no special message: the server learns of them from a
+watch report and publishes the updated card set.
 
 ## 7. App connection
 
 The application-level connection identifies a running TBA instance (presence,
 diagnostics). It follows the same topic scheme. The only command it carries
-is the log fetch (below).
+is the log fetch (below); everything under the `rack/` prefix belongs to the
+card racks (section 6) and does not collide with it.
 
 The username/password fields of the MQTT CONNECT packet are reserved for
 future authorization and must not be used to carry anything else.

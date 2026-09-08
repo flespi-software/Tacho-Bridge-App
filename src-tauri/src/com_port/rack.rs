@@ -1,188 +1,328 @@
-//! The rack's own MQTT connection.
+//! Rack traffic of the application connection.
 //!
-//! Carries the server's rack-level commands (`connect`, `watch`, `disconnect`)
-//! and the plain serial envelopes addressed to the rack itself. Per-card
-//! sessions live in `cards.rs`; the wire is in `transport.rs`.
+//! The rack has no MQTT connection of its own: it is a peripheral of the
+//! application, and everything the server exchanges with it rides the app
+//! connection under the `rack/<id>/` topic prefix, `<id>` being the rack id
+//! (the device serial, see `discovery.rs`). This module owns that prefix:
+//! the link reports (`rack/<id>/link`), the dispatch of the server's rack
+//! publishes (`request/<n>`, `watch`, `cards`) and the reply path of the
+//! serial exchanges. Per-card sessions live in `cards.rs`; the wire is in
+//! `transport.rs`.
+//!
+//! Topics, TBA -> server: `rack/<id>/link` (`{"state":"up"|"down"}`),
+//! `rack/<id>/response/<n>` (reply to `request/<n>`), `rack/<id>/watch`
+//! (presence watch report). Server -> TBA: `rack/<id>/request/<n>` (one serial
+//! exchange), `rack/<id>/watch` (arm the presence watch), `rack/<id>/cards`
+//! (the set of cards to serve). No `/<sender>` tail on this path: the sender
+//! is always the server.
 
 use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::{AsyncClient, Event, Incoming};
-use std::time::Duration;
+use rumqttc::v5::AsyncClient;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tauri::async_runtime;
 
-use crate::config::{get_from_cache, split_host_to_parts, CacheSection};
 use crate::mqtt::{request_id_from_topic, request_to_response_topic};
 
-use super::cards::{handle_card_disconnect, handle_connect_spawn, start_rack_watch};
+use super::cards::{handle_cards_set, start_rack_watch, stop_all_rack_watches};
 use super::state::set_rack_card_state;
 use super::transport::{execute_envelope, parse_envelope, SerialExchange, SharedPort};
-use super::{next_reconnect_delay, RECONNECT_DELAY_INITIAL_SECS};
+use super::{
+    linked_rack, linked_rack_ids, lock, rack_port_is_live, reset_all_rack_idempotency,
+    LinkedRack,
+};
 
-pub(super) async fn rack_mqtt_loop(client_id: String, serial_port: SharedPort) {
-    let log_header = format!("RACK {} |", client_id);
+/// Topic prefix of every rack publish on the application connection; the rack
+/// id and a `/` follow it.
+pub(super) const RACK_TOPIC_PREFIX: &str = "rack/";
 
-    // Do not exit when the server host is missing or invalid — typical on
-    // first launch, when the rack is plugged in before the server is
-    // configured. Exiting would leave a finished task in RACK_MQTT_TASK and
-    // no rack MQTT until the device is re-plugged; poll the config instead.
-    let (host, port) = loop {
-        let full_host = get_from_cache(CacheSection::Server, "host");
-        match split_host_to_parts(&full_host) {
-            Ok(hp) => break hp,
-            Err(e) => {
-                log::warn!(
-                    "{} [MQTT] phase=config status=waiting reason=invalid_host err={} retry_secs={}",
-                    log_header,
-                    e,
-                    RECONNECT_DELAY_INITIAL_SECS
-                );
-                tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_INITIAL_SECS)).await;
-            }
-        }
-    };
+/// MQTT client of the current application connection: the one every rack
+/// publish of TBA goes through. Replaced together with the connection (see
+/// `app_connect`), so a rack never publishes into a client whose event loop is
+/// gone.
+static APP_CLIENT: std::sync::Mutex<Option<AsyncClient>> = std::sync::Mutex::new(None);
 
-    log::info!(
-        "{} [MQTT] phase=connect_attempt status=initialized host={}:{}",
-        log_header,
-        host,
-        port
-    );
-    let (mqtt_client, mut eventloop) = crate::mqtt::build_mqtt_client(&client_id, &host, port);
+/// Registers the MQTT client of the application connection as the carrier of
+/// the rack traffic. Called when the app connection is (re)created.
+pub fn register_app_client(client: &AsyncClient) {
+    *lock(&APP_CLIENT) = Some(client.clone());
+}
 
-    let mut is_online = false;
-    let mut reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
+fn app_client() -> Option<AsyncClient> {
+    lock(&APP_CLIENT).clone()
+}
 
-    // Idempotency state for the current MQTT connection: the server re-sends a request with the
-    // same id when it does not get a timely reply. Remember the last id we answered and its reply
-    // so a repeat re-sends the cached response instead of re-forwarding to the rack. Reset on every
-    // CONNACK, because a new MQTT session restarts the server-side request_id counter at 1.
-    let mut idempotency = IdempotencySlot::default();
+/// Generation of the application connection: 0 before its first CONNACK,
+/// incremented on every CONNACK. The server runs a fresh instance per
+/// connection, so a rack reply belongs to the generation its request came in
+/// with: a reply that outlives it would reach the next server instance, which
+/// never sent that request (and counts its ids from 1 again).
+static APP_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-    loop {
-        match eventloop.poll().await {
-            Ok(notification) => {
-                if !is_online {
-                    is_online = true;
-                    reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
-                    log::info!(
-                        "{} [MQTT] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
-                        log_header
-                    );
-                }
+/// True between a CONNACK of the application connection and its next event
+/// loop failure. While it is false the server has no instance to hear a rack
+/// publish, so none is made: the CONNACK that ends the outage announces every
+/// linked rack anyway, and a publish queued during the outage would only
+/// reach the new instance out of order or twice.
+static APP_ONLINE: AtomicBool = AtomicBool::new(false);
 
-                match notification {
-                    Event::Incoming(Incoming::ConnAck(..)) => {
-                        // New MQTT session: server restarts request_id at 1, drop the idempotency slot.
-                        idempotency.reset();
-                        log::debug!("{} [MQTT] event=CONNACK status=received", log_header);
-                    }
-                    Event::Incoming(Incoming::Publish(publish)) => {
-                        let topic = String::from_utf8_lossy(&publish.topic).into_owned();
+/// The current generation of the application connection, captured when a
+/// server publish is dispatched.
+pub(super) fn app_generation() -> u64 {
+    APP_GENERATION.load(Ordering::SeqCst)
+}
 
-                        log::info!(
-                            "{} [MQTT] event=command topic={} bytes={} qos={:?}",
-                            log_header,
-                            topic,
-                            publish.payload.len(),
-                            publish.qos,
-                        );
-                        // Full command text only at debug: the rack protocol
-                        // must not end up in users' log files at INFO level.
-                        log::debug!(
-                            "{} [MQTT] command_text={}",
-                            log_header,
-                            String::from_utf8_lossy(&publish.payload)
-                        );
+/// True while the application connection is online and still the generation
+/// a publish was dispatched in: the server instance that sent the request is
+/// the one that will hear the reply.
+pub(super) fn app_link_is(generation: u64) -> bool {
+    APP_ONLINE.load(Ordering::SeqCst) && APP_GENERATION.load(Ordering::SeqCst) == generation
+}
 
-                        if topic == "connect" {
-                            // spawn instruction: the server discovered a card in a rack slot
-                            handle_connect_spawn(
-                                &publish.payload,
-                                &client_id,
-                                &serial_port,
-                                &log_header,
-                            )
-                            .await;
-                        } else if topic == "watch" {
-                            // arm/re-arm this rack's card presence watch with the
-                            // server-supplied bytes
-                            start_rack_watch(
-                                &publish.payload,
-                                &client_id,
-                                &serial_port,
-                                &mqtt_client,
-                                &log_header,
-                            );
-                            // The server arms the presence watch once its discovery
-                            // chain has walked the rack, so this doubles as the
-                            // "enumeration finished" signal the UI needs to stop
-                            // showing a scan in progress. Treated as a hint, not a
-                            // contract: the frontend still has its own timeout in
-                            // case a server version never sends `watch`.
-                            crate::global_app_handle::rack_mark_scan_complete(&client_id);
-                        } else if topic == "disconnect" {
-                            // a card left its slot: close the session (if this rack
-                            // owns it), drop it from this rack's UI section
-                            handle_card_disconnect(&publish.payload, &client_id, &log_header);
-                        } else if topic.starts_with("request/") {
-                            handle_serial_request(
-                                &mqtt_client,
-                                &topic,
-                                &publish.payload,
-                                &serial_port,
-                                &log_header,
-                                &mut idempotency,
-                                // the rack's own connection serves no single card
-                                None,
-                            )
-                            .await;
-                        } else {
-                            // An unknown control topic (a newer server feature, or
-                            // a retained stray) must not fall through to the serial
-                            // path: its payload would be written raw to the COM
-                            // port, and the reply published back to the control
-                            // topic itself (request_to_response_topic returns
-                            // non-`request/` topics unchanged). Log and drop.
-                            log::warn!(
-                                "{} [MQTT] status=ignored reason=unknown_topic topic={}",
-                                log_header,
-                                topic
-                            );
-                        }
-                    }
-                    other => {
-                        // Full broker exchange is visible at debug (TBA_LOG=com_port=debug).
-                        log::debug!("{} [MQTT] event=other detail={:?}", log_header, other);
-                    }
-                }
-            }
-            Err(e) => {
-                let transition = if is_online {
-                    "ONLINE->OFFLINE"
-                } else {
-                    "OFFLINE"
-                };
-                is_online = false;
-
-                // One line per failed poll: kind + retry delay; full error
-                // details only for genuinely unexpected failures.
-                crate::mqtt::log_connection_failure(
-                    &log_header,
-                    "MQTT",
-                    transition,
-                    &e,
-                    reconnect_delay_secs,
-                );
-
-                tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
-                reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
-            }
-        }
+/// The application connection lost its server: rack publishes stop until the
+/// next CONNACK. Called on every failed poll of the app event loop.
+pub fn on_app_offline() {
+    if APP_ONLINE.swap(false, Ordering::SeqCst) {
+        log::info!("RACK | [LINK] status=app_offline");
     }
 }
 
-/// Handles one `request/...` publish on a rack-linked MQTT connection (the rack's own or a
-/// rack-backed card's): idempotency, envelope parsing, serial execution, and the always-reply
-/// response publish — the app is the server's only feedback channel, so a silent rack must be
-/// reported, not swallowed.
+/// The topic of one rack publish: prefix, rack id, tail.
+pub(super) fn rack_topic(rack_id: &str, tail: &str) -> String {
+    format!("{RACK_TOPIC_PREFIX}{rack_id}/{tail}")
+}
+
+/// Splits a rack topic into its rack id and tail (`rack/SC1799/request/5` ->
+/// `SC1799`, `request/5`). `None` for anything else, including a rack topic
+/// with an empty id or tail.
+pub(super) fn parse_rack_topic(topic: &str) -> Option<(&str, &str)> {
+    let rest = topic.strip_prefix(RACK_TOPIC_PREFIX)?;
+    let (rack_id, tail) = rest.split_once('/')?;
+    if rack_id.is_empty() || tail.is_empty() {
+        return None;
+    }
+    Some((rack_id, tail))
+}
+
+/// Publishes the link state of the given racks to the server, in order, from
+/// one task: a `down` followed by an `up` of the same rack (a port reopened)
+/// must reach the server in that order, and separately spawned publishes give
+/// no such guarantee. Nothing is published while the application connection
+/// is offline (or does not exist yet): the CONNACK that brings it online
+/// announces every linked rack anyway, and a report queued before it would
+/// make the server hear the same `up` twice, running its discovery twice.
+pub(super) fn announce_links(links: Vec<(String, bool)>) {
+    if links.is_empty() {
+        return;
+    }
+    let client = match app_client() {
+        Some(client) if APP_ONLINE.load(Ordering::SeqCst) => client,
+        _ => {
+            log::debug!(
+                "RACK | [LINK] status=deferred reason=app_offline racks={}",
+                links.len()
+            );
+            return;
+        }
+    };
+    async_runtime::spawn(async move {
+        for (rack_id, up) in links {
+            let state = if up { "up" } else { "down" };
+            let payload = serde_json::json!({ "state": state }).to_string();
+            match client
+                .publish(rack_topic(&rack_id, "link"), QoS::AtLeastOnce, false, payload)
+                .await
+            {
+                Ok(()) => log::info!("RACK {} | [LINK] status=published state={}", rack_id, state),
+                Err(e) => log::warn!(
+                    "RACK {} | [LINK] status=publish_failed state={} err={:?}",
+                    rack_id,
+                    state,
+                    e
+                ),
+            }
+        }
+    });
+}
+
+/// CONNACK of the application connection: the server runs a fresh instance
+/// per connection and knows nothing about the racks, so every linked rack is
+/// announced again and its discovery restarts from the server side. The
+/// generation advances first, so a reply still in flight for the previous
+/// instance is dropped instead of delivered to this one. The old presence
+/// watches are stopped (the server re-arms them once its discovery is done; a
+/// report of the old baseline would only be noise), and the reply cache is
+/// dropped (the server's request id counters restart at 1).
+pub fn on_app_connack(client: &AsyncClient) {
+    register_app_client(client);
+    APP_GENERATION.fetch_add(1, Ordering::SeqCst);
+    APP_ONLINE.store(true, Ordering::SeqCst);
+    stop_all_rack_watches();
+    reset_all_rack_idempotency();
+    let ids = linked_rack_ids();
+    if ids.is_empty() {
+        return;
+    }
+    log::info!("RACK | [LINK] phase=connack racks={}", ids.len());
+    announce_links(ids.into_iter().map(|id| (id, true)).collect());
+}
+
+/// Routes one publish of the application connection when it belongs to a
+/// rack (`rack/<id>/...`). Returns `false` for every other topic, which the
+/// caller handles as before. The rack publishes are handled off the app event
+/// loop: a serial exchange takes up to seconds, and the loop must keep
+/// polling so the other racks and the app-level commands are not stalled
+/// behind it.
+pub fn handle_app_publish(client: &AsyncClient, topic: &str, payload: &[u8]) -> bool {
+    if !topic.starts_with(RACK_TOPIC_PREFIX) {
+        return false;
+    }
+    let Some((rack_id, tail)) = parse_rack_topic(topic) else {
+        log::warn!(
+            "RACK | [MQTT] status=ignored reason=malformed_rack_topic topic={}",
+            topic
+        );
+        return true;
+    };
+    let log_header = format!("RACK {} |", rack_id);
+    log::info!(
+        "{} [MQTT] event=command topic={} bytes={}",
+        log_header,
+        topic,
+        payload.len()
+    );
+    // Full command text only at debug: the rack protocol must not end up in
+    // users' log files at INFO level.
+    log::debug!(
+        "{} [MQTT] command_text={}",
+        log_header,
+        String::from_utf8_lossy(payload)
+    );
+    // A rack the server addresses is one we announced with `link up`; one that
+    // is not linked any more went away in between (its `link down` is on the
+    // way or already delivered), and nothing may be executed or answered for
+    // it — the port is gone with it.
+    let Some(rack) = linked_rack(rack_id) else {
+        log::warn!(
+            "{} [MQTT] status=ignored reason=rack_not_linked topic={}",
+            log_header,
+            topic
+        );
+        return true;
+    };
+
+    // The server instance behind this publish: a reply is delivered to it or
+    // not at all (see `app_link_is`).
+    let generation = app_generation();
+    if tail.starts_with("request/") {
+        async_runtime::spawn(handle_rack_request(
+            client.clone(),
+            generation,
+            rack_id.to_string(),
+            tail.to_string(),
+            payload.to_vec(),
+            rack,
+            log_header,
+        ));
+    } else if tail == "watch" {
+        // arm/re-arm this rack's card presence watch with the server-supplied
+        // bytes; its reports go back on the same rack topic
+        start_rack_watch(payload, generation, rack_id, &rack.port, client, &log_header);
+    } else if tail == "cards" {
+        // the set of cards of this rack to serve: reconcile the card sessions
+        async_runtime::spawn(handle_cards_set(
+            payload.to_vec(),
+            rack_id.to_string(),
+            rack.port.clone(),
+            log_header,
+        ));
+    } else {
+        // An unknown rack topic (a newer server feature, or a retained stray)
+        // must not fall through to the serial path: its payload would be
+        // written raw to the COM port. Log and drop.
+        log::warn!(
+            "{} [MQTT] status=ignored reason=unknown_topic topic={}",
+            log_header,
+            topic
+        );
+    }
+    true
+}
+
+/// One `rack/<id>/request/<n>` of the server: the serial exchange on that
+/// rack's port and its `rack/<id>/response/<n>`. The rack's idempotency slot
+/// is held for the whole exchange, which also serialises the exchanges of one
+/// rack (the server sends them one at a time anyway).
+async fn handle_rack_request(
+    client: AsyncClient,
+    generation: u64,
+    rack_id: String,
+    tail: String,
+    payload: Vec<u8>,
+    rack: LinkedRack,
+    log_header: String,
+) {
+    let mut slot = rack.idempotency.lock().await;
+    let Some((resp_tail, resp_payload)) = run_serial_request(
+        &tail,
+        &payload,
+        &rack.port,
+        &log_header,
+        &mut *slot,
+        // the rack's own exchanges serve no single card
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    drop(slot);
+    // The link may have gone down while the exchange ran: the server must not
+    // hear a result of a life of the rack it was told is over.
+    if !rack_port_is_live(&rack_id, &rack.port) {
+        log::warn!(
+            "{} [MQTT] status=reply_dropped reason=link_down topic={}",
+            log_header,
+            tail
+        );
+        return;
+    }
+    // The application connection went down or was re-established while the
+    // exchange ran: the server instance that asked is gone, and the one that
+    // replaced it never sent this request.
+    if !app_link_is(generation) {
+        log::warn!(
+            "{} [MQTT] status=reply_dropped reason=app_connection_changed topic={}",
+            log_header,
+            tail
+        );
+        return;
+    }
+    publish_reply(
+        &client,
+        rack_topic(&rack_id, &resp_tail),
+        resp_payload,
+        &log_header,
+    )
+    .await;
+}
+
+/// Publishes the reply of a serial exchange. The app is the server's only
+/// feedback channel, so a failure to publish is an error, not a debug line.
+pub(super) async fn publish_reply(
+    client: &AsyncClient,
+    topic: String,
+    payload: String,
+    log_header: &str,
+) {
+    if let Err(e) = client.publish(topic, QoS::AtLeastOnce, false, payload).await {
+        log::error!(
+            "{} [MQTT] status=reply_publish_failed err={:?}",
+            log_header,
+            e
+        );
+    }
+}
+
 /// Per-connection idempotency slot: the last request id answered and the reply
 /// sent for it. The server re-sends a request with the same id when it does not
 /// get a timely response; kept together so it can be threaded through as one
@@ -202,18 +342,26 @@ impl IdempotencySlot {
     }
 }
 
-pub(super) async fn handle_serial_request(
-    mqtt_client: &AsyncClient,
+/// Handles one `request/<n>...` publish addressed to a rack port — a rack's own
+/// exchange (`rack/<id>/request/<n>`, `topic` being the tail after the rack
+/// prefix) or one of a rack-backed card session (`request/<n>/<client_id>`):
+/// idempotency, envelope parsing and serial execution. Returns the reply as
+/// `(response topic, payload)` for the caller to publish — relative to the
+/// same prefix `topic` was — or `None` when nothing is to be sent (a duplicate
+/// of a request still in flight, or a publish that is no envelope at all).
+/// The app is the server's only feedback channel, so a silent rack is
+/// reported as an error reply, not swallowed.
+pub(super) async fn run_serial_request(
     topic: &str,
     payload: &[u8],
     serial_port: &SharedPort,
     log_header: &str,
     idempotency: &mut IdempotencySlot,
     // `(iccid, card_number)` of the card this connection serves, when the
-    // caller is a card session. `None` for the rack's own connection, which
-    // has no single card and therefore no authentication state to track.
+    // caller is a card session. `None` for a rack's own exchange, which has
+    // no single card and therefore no authentication state to track.
     card: Option<(&str, &str)>,
-) {
+) -> Option<(String, String)> {
     // A server-driven rack exchange counts as card activity: the auto-updater
     // must not restart the app in the middle of a rack card operation. The
     // 1 Hz presence watch does NOT go through here, so idle racks stay quiet.
@@ -222,29 +370,26 @@ pub(super) async fn handle_serial_request(
     // answered this id, re-send the cached response without touching the port again; if it is
     // still in flight, drop the duplicate.
     let req_id = request_id_from_topic(topic);
+    let resp_topic = request_to_response_topic(topic);
     if req_id.is_some() && req_id == idempotency.last_request_id {
-        match &idempotency.last_response_payload {
+        return match &idempotency.last_response_payload {
             Some(cached) => {
                 log::warn!(
                     "{} [MQTT] status=duplicate_request request_id={:?} action=resend_cached",
                     log_header,
                     req_id
                 );
-                let resp_topic = request_to_response_topic(topic);
-                if let Err(e) = mqtt_client
-                    .publish(resp_topic, QoS::AtLeastOnce, false, cached.clone())
-                    .await
-                {
-                    log::error!("{} [MQTT] status=cached_reply_publish_failed err={:?}", log_header, e);
-                }
+                Some((resp_topic, cached.clone()))
             }
-            None => log::warn!(
-                "{} [MQTT] status=duplicate_request request_id={:?} action=ignored reason=in_flight",
-                log_header,
-                req_id
-            ),
-        }
-        return;
+            None => {
+                log::warn!(
+                    "{} [MQTT] status=duplicate_request request_id={:?} action=ignored reason=in_flight",
+                    log_header,
+                    req_id
+                );
+                None
+            }
+        };
     }
 
     let json = match serde_json::from_slice::<serde_json::Value>(payload) {
@@ -255,12 +400,12 @@ pub(super) async fn handle_serial_request(
                 log_header,
                 e
             );
-            return;
+            return None;
         }
     };
     let Some(parsed) = parse_envelope(&json) else {
         log::warn!("{} [MQTT] status=ignored reason=no_serial_cmd", log_header);
-        return;
+        return None;
     };
 
     let exchange = match parsed {
@@ -315,7 +460,6 @@ pub(super) async fn handle_serial_request(
         Err(code) => SerialExchange::error(code),
     };
 
-    let resp_topic = request_to_response_topic(topic);
     let resp_payload = exchange.to_payload();
     // Only successful exchanges are cached for idempotency: a repeated request after an error
     // must retry the rack (the device may have recovered), a repeat after success is answered
@@ -324,14 +468,78 @@ pub(super) async fn handle_serial_request(
         idempotency.last_request_id = req_id;
         idempotency.last_response_payload = Some(resp_payload.clone());
     }
-    if let Err(e) = mqtt_client
-        .publish(resp_topic, QoS::AtLeastOnce, false, resp_payload)
-        .await
-    {
-        log::error!(
-            "{} [MQTT] status=reply_publish_failed err={:?}",
-            log_header,
-            e
+    Some((resp_topic, resp_payload))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rack_topic_is_prefix_id_tail() {
+        assert_eq!(rack_topic("SC1799", "link"), "rack/SC1799/link");
+        assert_eq!(rack_topic("SC1799", "response/5"), "rack/SC1799/response/5");
+        assert_eq!(rack_topic("SC1799", "watch"), "rack/SC1799/watch");
+    }
+
+    #[test]
+    fn parse_rack_topic_splits_id_and_tail() {
+        assert_eq!(
+            parse_rack_topic("rack/SC1799/request/5"),
+            Some(("SC1799", "request/5"))
+        );
+        assert_eq!(parse_rack_topic("rack/SC1799/watch"), Some(("SC1799", "watch")));
+        assert_eq!(parse_rack_topic("rack/SC1799/cards"), Some(("SC1799", "cards")));
+    }
+
+    #[test]
+    fn parse_rack_topic_rejects_other_shapes() {
+        // not a rack topic at all
+        assert_eq!(parse_rack_topic("request/5/0"), None);
+        assert_eq!(parse_rack_topic("logs/5/0"), None);
+        assert_eq!(parse_rack_topic("rack"), None);
+        // rack topic without a tail, or without an id
+        assert_eq!(parse_rack_topic("rack/SC1799"), None);
+        assert_eq!(parse_rack_topic("rack/SC1799/"), None);
+        assert_eq!(parse_rack_topic("rack//link"), None);
+    }
+
+    #[tokio::test]
+    async fn reply_is_bound_to_the_connection_generation() {
+        // The statics are process-wide; the test only asserts transitions
+        // relative to whatever state it starts from.
+        let (client, _eventloop) = AsyncClient::new(
+            rumqttc::v5::MqttOptions::new("TBA0000000000000", "localhost", 1883),
+            1,
+        );
+        on_app_offline();
+        let stale = app_generation();
+        // offline: nothing is delivered, whatever the generation
+        assert!(!app_link_is(stale));
+        on_app_connack(&client);
+        let live = app_generation();
+        assert_eq!(live, stale + 1);
+        assert!(app_link_is(live));
+        // a reply dispatched under the previous instance is dropped
+        assert!(!app_link_is(stale));
+        // the connection dropped: the pending reply of this instance is dropped too
+        on_app_offline();
+        assert!(!app_link_is(live));
+        // reconnected: a new instance, the old generation stays dead
+        on_app_connack(&client);
+        assert!(!app_link_is(live));
+        assert!(app_link_is(app_generation()));
+    }
+
+    #[test]
+    fn request_tail_maps_to_response_tail_under_the_same_prefix() {
+        // the reply of `rack/<id>/request/<n>` is `rack/<id>/response/<n>`:
+        // the tail is rewritten, the prefix is put back by the caller
+        let (rack_id, tail) = parse_rack_topic("rack/SC1799/request/12").unwrap();
+        assert_eq!(request_id_from_topic(tail), Some(12));
+        assert_eq!(
+            rack_topic(rack_id, &request_to_response_topic(tail)),
+            "rack/SC1799/response/12"
         );
     }
 }

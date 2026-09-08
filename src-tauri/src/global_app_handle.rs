@@ -166,9 +166,10 @@ pub struct RackCard {
 /// device identity + presence + the (eventual) card list — no wire protocol.
 #[derive(Clone, Serialize)]
 pub struct RackState {
-    /// Stable identity of this rack: its MQTT client_id, derived from the
-    /// device serial. Keys the rack list in the UI and every per-rack update.
-    pub client_id: String,
+    /// Stable identity of this rack: its rack id, derived from the device
+    /// serial (the server addresses the rack by it on the application
+    /// connection). Keys the rack list in the UI and every per-rack update.
+    pub id: String,
     pub connected: bool,
     pub name: String,
     pub serial: Option<String>,
@@ -179,16 +180,16 @@ pub struct RackState {
     pub cards: Vec<RackCard>,
     /// True once the server has finished enumerating the rack, so the UI can
     /// stop its "scanning" indicator instead of guessing from a silence
-    /// timeout. Set when the presence `watch` is armed — the server arms it
-    /// after its discovery chain has walked the rack (see `start_rack_watch`).
+    /// timeout. Set when the server publishes the rack's card set, which
+    /// closes its discovery chain (see `handle_cards_set`).
     pub scan_complete: bool,
 }
 
-// Last known state of every rack reported this session, keyed by client_id.
+// Last known state of every rack reported this session, keyed by rack id.
 // The rack monitor runs independently of the frontend, so an emit can fire
 // before the UI has subscribed (the event would be lost) — the states are
 // cached and re-emitted when the frontend (re)loads. BTreeMap: the emitted
-// list is ordered by client_id (i.e. by device serial), so the UI order is
+// list is ordered by rack id (i.e. by device serial), so the UI order is
 // stable across updates and restarts.
 lazy_static! {
     static ref RACK_STATES: Mutex<std::collections::BTreeMap<String, RackState>> =
@@ -222,13 +223,13 @@ fn mutate_rack_states_and_emit(
     emit_rack_states(states);
 }
 
-/// Upserts one rack's state (keyed by its client_id) and emits the full rack
+/// Upserts one rack's state (keyed by its rack id) and emits the full rack
 /// list, caching it so a freshly-loaded frontend can be brought up to date via
 /// [`emit_current_rack_state`]. A disconnected rack stays in the list marked
 /// `connected: false` — "was here and vanished" is useful diagnostics.
 pub fn rack_emit_event(state: RackState) {
     mutate_rack_states_and_emit(|states| {
-        states.insert(state.client_id.clone(), state);
+        states.insert(state.id.clone(), state);
         true
     });
 }
@@ -236,8 +237,8 @@ pub fn rack_emit_event(state: RackState) {
 /// Updates the card list of one rack and re-emits the full list. Called by the
 /// rack module as rack-backed card sessions are spawned and closed; a no-op
 /// when that rack has never been reported.
-pub fn rack_update_cards(client_id: &str, cards: Vec<RackCard>) {
-    mutate_rack_states_and_emit(|states| match states.get_mut(client_id) {
+pub fn rack_update_cards(rack_id: &str, cards: Vec<RackCard>) {
+    mutate_rack_states_and_emit(|states| match states.get_mut(rack_id) {
         Some(state) => {
             state.cards = cards;
             true
@@ -249,11 +250,11 @@ pub fn rack_update_cards(client_id: &str, cards: Vec<RackCard>) {
 /// Marks one rack's scan as finished and re-emits the list, so the UI can end
 /// that rack's "scanning" indicator on a real signal rather than a silence
 /// timeout. A no-op when the rack is unknown or already marked.
-pub fn rack_mark_scan_complete(client_id: &str) {
-    mutate_rack_states_and_emit(|states| match states.get_mut(client_id) {
+pub fn rack_mark_scan_complete(rack_id: &str) {
+    mutate_rack_states_and_emit(|states| match states.get_mut(rack_id) {
         Some(state) if !state.scan_complete => {
             state.scan_complete = true;
-            log::info!("RACK {} | phase=discovery status=scan_complete", client_id);
+            log::info!("RACK {} | phase=discovery status=scan_complete", rack_id);
             true
         }
         // Already complete, or unknown rack — nothing to announce.

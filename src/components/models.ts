@@ -40,9 +40,9 @@ export interface RackCard {
 // an array via `rack-state` — several racks can be connected at once, each on
 // its own USB port. Unlike a plain reader, one rack holds many cards.
 export interface RackState {
-  // Stable identity of the rack (its MQTT client_id, derived from the device
+  // Stable identity of the rack (its rack id, derived from the device
   // serial); keys the rack rows in the UI.
-  client_id: string
+  id: string
   connected: boolean
   name: string
   serial?: string | null

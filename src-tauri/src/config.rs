@@ -656,10 +656,11 @@ pub async fn update_server(
             log::error!("Failed to emit global-config-server after update: {}", e);
         }
 
-        // The rack MQTT loops resolve the broker host once at start; reader-backed
-        // cards migrate via manual_sync_cards, the rack needs an explicit restart.
+        // The rack card session loops resolve the broker host once at start;
+        // reader-backed cards migrate via manual_sync_cards, the racks need an
+        // explicit restart of their sessions.
         if old_host != host {
-            crate::com_port::restart_rack_mqtt("server_host_changed");
+            crate::com_port::restart_rack_links("server_host_changed");
         }
 
         // Channel switched → re-check against the newly selected endpoint.

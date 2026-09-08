@@ -29,15 +29,14 @@
       </q-chip>
     </div>
 
-    <!-- Cards held in the rack, as reported by the server one `connect` at a
-         time. While that series is still arriving we show an indeterminate
-         progress bar: the server sends no total, so there is no honest
-         percentage to display (see `scanning` below). -->
+    <!-- Cards held in the rack, as reported by the server's card set at the
+         end of its discovery. While the discovery is still running we show an
+         indeterminate progress bar: the server sends no total, so there is no
+         honest percentage to display (see `scanning` below). -->
     <div class="rack-cards">
       <!-- Only the two terminal states live here; the scan indicator sits BELOW
-           the card list (see after the v-for), because the rack reports its
-           slots one `connect` at a time and the scan keeps running long after
-           the first card lands. -->
+           the card list (see after the v-for), because rows can be listed
+           from an earlier set while a re-discovery is still running. -->
       <div v-if="rack.cards.length === 0 && !scanning" class="rack-cards-empty text-grey-6">
         <q-icon name="mdi-card-search-outline" size="xs" class="q-mr-xs" />
         <template v-if="rack.connected">No cards in the rack</template>
@@ -84,10 +83,9 @@
       </div>
 
       <!-- Scan still in flight. Deliberately OUTSIDE the "list is empty" branch:
-           a large rack reports its slots one `connect` at a time, so the bar has
-           to survive the arrival of the first card and keep running underneath
-           the rows that are already listed. Indeterminate because the server
-           sends no total — there is no honest percentage to show. -->
+           a re-discovery keeps the rows of the previous set listed, so the bar
+           has to keep running underneath them. Indeterminate because the
+           server sends no total — there is no honest percentage to show. -->
       <div v-if="scanning" class="rack-scan text-grey-6">
         <div class="row items-center no-wrap q-mb-xs">
           <q-spinner size="xs" class="q-mr-xs" />

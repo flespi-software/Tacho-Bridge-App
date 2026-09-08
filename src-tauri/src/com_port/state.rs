@@ -36,9 +36,10 @@ pub(super) fn mutate_rack_rows(mut mutate: impl FnMut(&str, &mut Vec<RackCard>) 
 ///
 /// Also enforces one row per ICCID across ALL racks: a physical card sits in
 /// exactly one slot, so its appearance here removes any stale row another rack
-/// still shows (e.g. the old rack's `disconnect` was lost while its connection
-/// was down). Without the purge the card would be displayed in two rack blocks,
-/// and the stale row would feed `connect_pending_rack_cards` a wrong location.
+/// still shows (e.g. the old rack's card set has not been re-delivered since
+/// the application connection was down). Without the purge the card would be
+/// displayed in two rack blocks, and the stale row would feed
+/// `connect_pending_rack_cards` a wrong location.
 pub(super) fn update_rack_card_ui(
     rack_id: &str,
     slot: u16,
@@ -69,9 +70,10 @@ pub(super) fn update_rack_card_ui(
         }
         let list = ui.entry(rack_id.to_string()).or_default();
         // One row per ICCID also INSIDE the target rack, not only across racks:
-        // a card moved slot-to-slot with a lost `disconnect` would otherwise
-        // keep both rows, and `set_rack_card_state` (which looks the card up by
-        // ICCID and stops at the first hit) could land on the dead one.
+        // a card moved slot-to-slot while the rack's set was not delivered
+        // would otherwise keep both rows, and `set_rack_card_state` (which
+        // looks the card up by ICCID and stops at the first hit) could land on
+        // the dead one.
         if list
             .iter()
             .any(|c| c.slot != slot && c.iccid.as_deref() == Some(iccid))
@@ -83,12 +85,12 @@ pub(super) fn update_rack_card_ui(
                 slot
             );
         }
-        // A repeat server `connect` for a card that did not move (same slot,
-        // same ICCID — the server re-walks discovery whenever ANY card leaves
-        // the rack) must carry the live session flags over: the running session
-        // is kept as-is (`spawn_rack_card` skips it as already_running), so no
-        // ConnAck follows to repaint a reset row, and a connected card would
-        // show grey until the next keep-alive ping.
+        // A repeated card set listing a card that did not move (same slot,
+        // same ICCID — the server publishes the whole set at the end of every
+        // discovery chain) must carry the live session flags over: the running
+        // session is kept as-is (`spawn_rack_card` skips it as already_running),
+        // so no ConnAck follows to repaint a reset row, and a connected card
+        // would show grey until the next keep-alive ping.
         let (online, authentication) = list
             .iter()
             .find(|c| c.slot == slot && c.iccid.as_deref() == Some(iccid))

@@ -90,6 +90,10 @@ pub async fn app_connection() {
         port
     );
     let (mqtt_client, mut eventloop) = crate::mqtt::build_mqtt_client(client_id.clone(), &host, port);
+    // The racks publish through the app connection (`rack/<id>/...`): hand
+    // them the new client right away, so a rack linking before the first
+    // CONNACK queues its report into the right connection.
+    crate::com_port::register_app_client(&mqtt_client);
     let mqtt_clinet_cloned = mqtt_client.clone();
     let mqtt_client_for_task = mqtt_client.clone();
     let log_header: String = format!("{} |", client_id);
@@ -131,6 +135,17 @@ pub async fn app_connection() {
                                     continue;
                                 }
                             };
+
+                            // Rack traffic rides this connection under the
+                            // `rack/<id>/` prefix; its payloads are handled as
+                            // raw bytes by the rack module.
+                            if crate::com_port::handle_app_publish(
+                                &mqtt_client_for_task,
+                                topic,
+                                &publish.payload,
+                            ) {
+                                continue;
+                            }
 
                             // server command requests come as JSON publishes on request/<id>/0
                             match serde_json::from_slice::<Value>(&publish.payload) {
@@ -175,6 +190,11 @@ pub async fn app_connection() {
                                 crate::commands_settings::publish_settings_report(&client, &header)
                                     .await;
                             });
+                            // The server runs a fresh instance per connection:
+                            // every linked rack is announced again (`link up`)
+                            // so its discovery restarts. Spawned inside, for
+                            // the same reason as the settings report.
+                            crate::com_port::on_app_connack(&mqtt_client_for_task);
                         }
                         Event::Outgoing(rumqttc::Outgoing::Disconnect) => {
                             // graceful teardown: the DISCONNECT packet is already flushed to the
@@ -199,6 +219,9 @@ pub async fn app_connection() {
                         is_online = false;
                         app_emit_event(false);
                     }
+                    // The racks publish through this connection: hold their
+                    // reports until the next CONNACK, which announces them all.
+                    crate::com_port::on_app_offline();
 
                     // One line per failed poll: kind + retry delay; full error
                     // details only for genuinely unexpected failures.

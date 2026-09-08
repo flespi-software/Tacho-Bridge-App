@@ -121,7 +121,7 @@
     <!-- Card rack blocks, below the plain readers. One block per connected
          rack (several racks on separate USB ports are all served), each rack
          holding many cards. -->
-    <RackList v-for="r in racks" :key="r.client_id" :rack="r" @link="linkMode" />
+    <RackList v-for="r in racks" :key="r.id" :rack="r" @link="linkMode" />
     <SmartCardList
       ref="cardlist"
       :cards="state.cards"
@@ -160,7 +160,7 @@ const state = reactive<{ readers: Reader[]; cards: Record<string, SmartCard> }>(
 })
 
 // Card rack states, pushed from the backend via `rack-state` as the full list
-// keyed by client_id. Empty until the backend reports a rack at least once;
+// keyed by rack id. Empty until the backend reports a rack at least once;
 // racks that disconnect stay listed with connected=false.
 const racks = ref<RackState[]>([])
 
@@ -261,7 +261,7 @@ function isRackStatePayload(raw: unknown): raw is RackState {
   if (!raw || typeof raw !== 'object') return false
   const p = raw as Record<string, unknown>
   return (
-    typeof p.client_id === 'string' &&
+    typeof p.id === 'string' &&
     typeof p.connected === 'boolean' &&
     typeof p.name === 'string' &&
     Array.isArray(p.cards)
