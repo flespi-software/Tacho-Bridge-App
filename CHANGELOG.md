@@ -445,3 +445,9 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Card racks no longer open an MQTT connection of their own: a rack is served over the app connection under the `rack/<serial>/` topic prefix (link up/down, serial exchanges, presence watch), so no rack device appears on the server any more. The server now publishes the complete set of cards to serve per rack instead of per-card connect/disconnect notices, and TBA reconciles its rack card sessions with that set. The rack link report of a card session carries the rack serial. Requires the server protocol update that introduced the `rack/` topics; older servers are not supported by this version.
+
+### [0.8.0-rc.9] - 2026-09-08
+
+🆕 Features / Improvements
+
+- Changed the server communication scheme for card racks: a rack no longer opens an MQTT connection with an identifier of its own and shares the application connection instead, because a rack is a peripheral of the application like a card reader and must not appear on the server as a device; the server now sends the complete set of cards to serve per rack.
