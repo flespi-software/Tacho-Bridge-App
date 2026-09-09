@@ -442,6 +442,16 @@ All notable changes to this project will be documented in this file.
 
 ### [Unreleased]
 
+- Preserve live rack card identities across app reconnect and coordinate discovery with authentication through slot reservations (requires the matching server update).
+- Treat partial serial reads ending by deadline or IO failure as transport errors and drain their late tails, including pushed results.
+- Refresh the rack presence snapshot every 30 seconds so deferred discovery and unconfirmed removals recover even without a status change.
+
+🛠 Fixes
+
+- Fixed card detection and card sessions of a large rack breaking down under their own signalling: the rack link report of a live card session is now repeated only after a full re-discovery of its rack instead of on every card set, which on a rack of a hundred cards had put hundreds of LED frames a minute on the serial link ahead of the tracker exchanges.
+- Fixed a failed serial exchange corrupting the ones after it: a device that answers after its deadline had its late reply read at the head of the next exchange, where the two frames together decoded as a corrupt one. The line is now drained until it goes quiet before the port is released.
+- Serial reads now log why they ended (the device finished, or a bound cut the reply), so a reply cut short by a too-narrow timing is visible in the log instead of surfacing as a checksum error on the server.
+
 🆕 Features / Improvements
 
 - Card racks no longer open an MQTT connection of their own: a rack is served over the app connection under the `rack/<serial>/` topic prefix (link up/down, serial exchanges, presence watch), so no rack device appears on the server any more. The server now publishes the complete set of cards to serve per rack instead of per-card connect/disconnect notices, and TBA reconciles its rack card sessions with that set. The rack link report of a card session carries the rack serial. Requires the server protocol update that introduced the `rack/` topics; older servers are not supported by this version.

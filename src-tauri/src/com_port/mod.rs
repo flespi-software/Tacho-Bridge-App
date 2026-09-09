@@ -24,6 +24,7 @@
 //! - `cards` — per-card MQTT sessions and the per-rack presence watches
 //! - `state` — the per-rack card lists shown in the UI
 
+mod access;
 mod cards;
 mod discovery;
 mod rack;

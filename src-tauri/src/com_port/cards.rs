@@ -18,7 +18,9 @@ use crate::config::{get_from_cache, split_host_to_parts, CacheSection};
 use crate::global_app_handle::{rack_update_cards, RackCard};
 use crate::smart_card::TASK_POOL;
 
-use super::rack::{app_link_is, publish_reply, rack_topic, run_serial_request, IdempotencySlot};
+use super::rack::{
+    app_link_is, publish_reply, rack_topic, run_serial_request, take_rebind, IdempotencySlot,
+};
 use super::state::{mutate_rack_rows, set_rack_card_state, update_rack_card_ui};
 use super::transport::{
     execute_envelope, normalize_hex, SerialEnvelope, SharedPort, SERIAL_MS_MAX, SERIAL_MS_MIN,
@@ -64,6 +66,18 @@ lazy_static::lazy_static! {
     /// rack id.
     pub(super) static ref RACK_CARDS_UI: std::sync::Mutex<HashMap<String, Vec<RackCard>>> =
         std::sync::Mutex::new(HashMap::new());
+}
+
+/// Live card identities survive an application MQTT reconnect. The server uses
+/// this snapshot to preserve sessions while validating the rack again.
+pub(super) fn inventory(rack_id: &str) -> serde_json::Value {
+    let tasks = lock(&RACK_CARD_TASKS);
+    let mut cards: Vec<_> = tasks.iter()
+        .filter(|(_, task)| task.rack_id == rack_id && !task.handle.inner().is_finished())
+        .map(|(iccid, task)| serde_json::json!({"slot": task.slot, "iccid": iccid}))
+        .collect();
+    cards.sort_by_key(|card| card["slot"].as_u64());
+    serde_json::Value::Array(cards)
 }
 
 /// Opens rack-backed sessions for discovered cards that currently have none.
@@ -133,6 +147,8 @@ pub async fn connect_pending_rack_cards() {
             "RACK |",
             // a replay of cached UI rows: must not displace a live session
             false,
+            // no server discovery behind it: nothing to re-bind
+            false,
         )
         .await;
     }
@@ -148,6 +164,10 @@ pub async fn connect_pending_rack_cards() {
 /// former may relocate a live session to another rack/slot: a replayed row can
 /// be stale, and rebinding a working session to it would funnel the card's
 /// APDUs into a port where the card no longer sits.
+///
+/// `rebind` tells whether a card already served must re-publish its rack link
+/// report — true only for the card set that follows a `link up` (see
+/// `rack::take_rebind`).
 fn spawn_rack_card(
     card_number: String,
     iccid: String,
@@ -155,6 +175,7 @@ fn spawn_rack_card(
     rack_id: String,
     serial_port: SharedPort,
     from_server: bool,
+    rebind: bool,
 ) {
     // The rack may have been torn down while the caller was awaiting between
     // its dedup check and this spawn (config-change path racing the monitor).
@@ -203,13 +224,17 @@ fn spawn_rack_card(
             if existing.rack_id == rack_id && existing.slot == slot {
                 // The server re-ran discovery for a slot it already served —
                 // typically the application connection re-established while
-                // this card session stayed up. Discovery paints such a slot as
-                // unserved (red LED); re-publishing the link report over the
-                // live session tells the server the card is still connected,
-                // which re-binds the slot and repaints it. Detached: publish()
-                // can park on a full request channel, and this path holds the
-                // task-map lock.
-                if let Some(client) = existing.client.get().cloned() {
+                // this card session stayed up. Such a discovery may paint the
+                // slot as unserved (red LED); re-publishing the link report
+                // over the live session tells the server the card is still
+                // connected, which re-binds the slot and repaints it. Only
+                // after a `link up`, though: every report costs a serial LED
+                // frame, and a routine card set (one per discovery chain, and
+                // a chain runs on every card insertion or removal) would then
+                // put one frame per card of the rack on the wire, ahead of the
+                // tracker exchanges. Detached: publish() can park on a full
+                // request channel, and this path holds the task-map lock.
+                if let Some(client) = existing.client.get().cloned().filter(|_| rebind) {
                     let card = existing.card_number.clone();
                     let report = link_report(&iccid, slot, &rack_id);
                     async_runtime::spawn(async move {
@@ -309,6 +334,14 @@ fn link_report(iccid: &str, slot: u16, rack_id: &str) -> String {
     serde_json::json!({ "iccid": iccid, "slot": slot, "rack": rack_id }).to_string()
 }
 
+/// Task aborts (card removed/moved or a rack restart) release local ownership.
+struct AuthCleanup(SharedPort, u16);
+impl Drop for AuthCleanup {
+    fn drop(&mut self) {
+        super::access::release(&self.0, self.1, false, None);
+    }
+}
+
 /// MQTT loop of one rack-backed card connection: the opaque envelope handling funneled into
 /// the rack's serial port, plus the one-shot **rack link report** right after CONNACK (topic
 /// `rack`, see `link_report`) that binds this card session to its slot on the server. Without
@@ -323,6 +356,7 @@ async fn rack_card_mqtt_loop(
     // see RackCardTask.client
     client_slot: Arc<OnceLock<AsyncClient>>,
 ) {
+    let _ownership = AuthCleanup(serial_port.clone(), slot);
     let log_header = format!("RACKCARD {} |", card_number);
 
     // same waiting policy as the rack loop: the server may not be configured yet
@@ -372,6 +406,7 @@ async fn rack_card_mqtt_loop(
                     Event::Incoming(Incoming::ConnAck(..)) => {
                         // new MQTT session: the server-side request_id counter restarts at 1
                         idempotency.reset();
+                        super::access::release(&serial_port, slot, false, None);
                         // Session is up: show the card as served and idle.
                         set_rack_card_state(&iccid, true, false);
                         // rack link report: must be the first publish of the session
@@ -429,7 +464,7 @@ async fn rack_card_mqtt_loop(
                             &serial_port,
                             &log_header,
                             &mut idempotency,
-                            Some((&iccid, &card_number)),
+                            Some((&iccid, &card_number, slot)),
                         )
                         .await
                         {
@@ -462,6 +497,7 @@ async fn rack_card_mqtt_loop(
                     "OFFLINE"
                 };
                 is_online = false;
+                super::access::release(&serial_port, slot, false, None);
                 // Connection lost: the card is present in its slot but no
                 // longer served, so it must stop looking active.
                 set_rack_card_state(&iccid, false, false);
@@ -530,6 +566,7 @@ pub(super) fn start_rack_watch(
             .map(|v| v.min(SERIAL_MS_MAX))
     };
     let interval = Duration::from_millis(ms("interval_ms").unwrap_or(1000).max(SERIAL_MS_MIN));
+    let refresh = Duration::from_millis(ms("refresh_ms").unwrap_or(30_000).max(1000));
     let idle = ms("idle_ms")
         .map(Duration::from_millis)
         .unwrap_or(SERIAL_REPLY_TIMEOUT);
@@ -551,6 +588,7 @@ pub(super) fn start_rack_watch(
 
     let handle = async_runtime::spawn(async move {
         let mut last: Option<String> = None;
+        let mut last_report = std::time::Instant::now();
         loop {
             tokio::time::sleep(interval).await;
             let envelope = SerialEnvelope {
@@ -562,13 +600,14 @@ pub(super) fn start_rack_watch(
                 // presence polling is not part of any authentication session
                 finish: None,
             };
-            let exchange = execute_envelope(&serial_port, envelope, &log_header, false).await;
+            let (exchange, end) =
+                execute_envelope(&serial_port, envelope, &log_header, false).await;
             if !exchange.is_ok() {
                 // transport errors are already logged by execute_envelope; the rack presence
                 // monitor handles a truly gone device, so just keep trying
                 continue;
             }
-            if last.as_deref() == Some(exchange.resp_hex.as_str()) {
+            if last.as_deref() == Some(exchange.resp_hex.as_str()) && last_report.elapsed() < refresh {
                 continue;
             }
             // The link went down while the exchange ran: this watch is being
@@ -586,10 +625,14 @@ pub(super) fn start_rack_watch(
                 );
                 continue;
             }
+            // `end` says whether the device finished the reply (silence) or a bound cut it
+            // (deadline): a global status of a multi-block rack is streamed with pauses inside
+            // the frame, and a cut one reaches the server as a checksum mismatch
             log::info!(
-                "{} [WATCH] status=change_detected rx_bytes={}",
+                "{} [WATCH] status=change_detected rx_bytes={} end={}",
                 log_header,
-                exchange.resp_hex.len() / 2
+                exchange.resp_hex.len() / 2,
+                end
             );
             match mqtt_client
                 .publish(
@@ -604,7 +647,10 @@ pub(super) fn start_rack_watch(
                 // publish can fail immediately (bounded client channel while the
                 // connection is down), and advancing it anyway would silently
                 // drop this presence change — the next tick must retry it.
-                Ok(()) => last = Some(exchange.resp_hex.clone()),
+                Ok(()) => {
+                    last = Some(exchange.resp_hex.clone());
+                    last_report = std::time::Instant::now();
+                }
                 Err(e) => {
                     log::error!("{} [WATCH] status=publish_failed err={:?}", log_header, e);
                 }
@@ -866,10 +912,14 @@ pub(super) async fn handle_cards_set(
             return;
         }
     };
+    // a set that follows a `link up` closes a full re-discovery: the sessions it
+    // lists re-publish their link reports, every other set leaves them alone
+    let rebind = take_rebind(&rack_id);
     log::info!(
-        "{} [CARDS] status=set_received count={}",
+        "{} [CARDS] status=set_received count={} rebind={}",
         log_header,
-        cards.len()
+        cards.len(),
+        rebind
     );
     let listed = |slot: u16, iccid: &str| cards.iter().any(|(s, i)| *s == slot && i == iccid);
 
@@ -943,6 +993,7 @@ pub(super) async fn handle_cards_set(
             &log_header,
             // a fresh server set: allowed to relocate a moved card's session
             true,
+            rebind,
         )
         .await;
     }
@@ -965,6 +1016,7 @@ async fn spawn_rack_card_checked(
     port: SharedPort,
     log_header: &str,
     from_server: bool,
+    rebind: bool,
 ) {
     // INVARIANT: the TASK_POOL guard is held across both the served-by-reader
     // check and the RACK_CARD_TASKS insert inside `spawn_rack_card`. Releasing
@@ -985,7 +1037,7 @@ async fn spawn_rack_card_checked(
         return;
     }
 
-    spawn_rack_card(card_number, iccid, slot, rack_id, port, from_server);
+    spawn_rack_card(card_number, iccid, slot, rack_id, port, from_server, rebind);
     drop(pool);
 }
 

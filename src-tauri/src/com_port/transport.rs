@@ -44,6 +44,16 @@ const SERIAL_ERR_WRITE_FAILED: &str = "write_failed";
 const SERIAL_ERR_BAD_HEX: &str = "bad_hex";
 const SERIAL_ERR_TRUNCATED: &str = "truncated";
 
+/// Why one serial read ended. Log-only (the server never sees these), but the
+/// distinction is what tells a reply cut by the inter-byte silence from one cut
+/// by the total deadline, and either from a rack that never answered at all.
+const READ_END_SILENCE: &str = "silence";
+const READ_END_DEADLINE: &str = "deadline";
+const READ_END_CAP: &str = "cap";
+const READ_END_SHUTDOWN: &str = "shutdown";
+const READ_END_EOF: &str = "eof";
+const READ_END_ERROR: &str = "error";
+
 /// Outcome of one server command → rack exchange, mirroring the v2 response
 /// envelope: `resp_hex` carries whatever bytes came back (possibly empty, or
 /// partial on truncation), `err` is `""` on success or one of the
@@ -81,6 +91,15 @@ impl SerialExchange {
         serde_json::json!({ "serial_resp": self.resp_hex, "serial_err": self.err }).to_string()
     }
 }
+
+/// Bounds of the line resync that follows a failed operation: the rack answers a
+/// command it did not answer in time LATER, on its own, and those bytes would
+/// otherwise open the next read window and make two good frames decode as one
+/// broken one on the server. `QUIET` is the silence that ends the resync,
+/// `BUDGET` caps the whole of it, `SLICE` is how often the line is sampled.
+const SERIAL_RESYNC_QUIET: Duration = Duration::from_millis(300);
+const SERIAL_RESYNC_BUDGET: Duration = Duration::from_millis(1500);
+const SERIAL_RESYNC_SLICE: Duration = Duration::from_millis(20);
 
 /// Poll spec defaults when the server omits the optional timing fields.
 const POLL_INTERVAL_DEFAULT: Duration = Duration::from_millis(20);
@@ -250,8 +269,11 @@ fn drain_buffered(port: &mut Box<dyn SerialPort>, log_header: &str) -> Vec<u8> {
 ///
 /// Two hard bounds protect against a misbehaving device that streams bytes continuously
 /// (each read would then succeed before the timeout and the loop would never exit): a cap
-/// on the reply size and `deadline` on the whole read phase. Returns the bytes and whether
-/// the size cap truncated them.
+/// on the reply size and `deadline` on the whole read phase. Returns the bytes, whether
+/// the size cap truncated them, and WHY the read ended - a reply cut short by the silence
+/// bound and one cut by the total deadline look identical in the bytes but mean opposite
+/// things when the server timings are tuned (a multi-block rack streams its global status
+/// with pauses inside the frame, so both bounds have to clear those pauses).
 fn read_reply(
     port: &mut Box<dyn SerialPort>,
     carry: Vec<u8>,
@@ -259,12 +281,13 @@ fn read_reply(
     idle: Duration,
     deadline: Duration,
     log_header: &str,
-) -> (Vec<u8>, bool) {
+) -> (Vec<u8>, bool, &'static str) {
     let mut reply = carry;
     let mut first_byte_pending = reply.is_empty();
 
     let mut buf = [0u8; 512];
     let mut truncated = false;
+    let mut end = READ_END_SILENCE;
     let read_started = std::time::Instant::now();
     // the total bound must never undercut the first-byte budget it contains
     let total = if deadline > first_wait {
@@ -284,6 +307,7 @@ fn read_reply(
                 SERIAL_REPLY_MAX_BYTES
             );
             truncated = true;
+            end = READ_END_CAP;
             break;
         }
         let now = std::time::Instant::now();
@@ -294,6 +318,7 @@ fn read_reply(
                 total,
                 reply.len()
             );
+            end = READ_END_DEADLINE;
             break;
         }
         // App is closing: stop waiting so the blocking closure releases the
@@ -304,6 +329,7 @@ fn read_reply(
                 log_header,
                 reply.len()
             );
+            end = READ_END_SHUTDOWN;
             break;
         }
         // Wait in short slices so the deadline/shutdown checks above run even
@@ -324,7 +350,10 @@ fn read_reply(
             );
         }
         match port.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                end = READ_END_EOF;
+                break;
+            }
             Ok(n) => {
                 if first_byte_pending {
                     // reply started: from here on the read is bounded by line silence.
@@ -350,11 +379,46 @@ fn read_reply(
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(e) => {
                 log::warn!("{} [SERIAL] read error: {}", log_header, e);
+                end = READ_END_ERROR;
                 break;
             }
         }
     }
-    (reply, truncated)
+    (reply, truncated, end)
+}
+
+/// Drains the line until it goes quiet, after an operation that failed. The rack does
+/// answer a command it missed its deadline on - just late, on its own - and those bytes
+/// sit in the port buffer until the next read picks them up in front of the reply they
+/// do not belong to. The server then sees two valid frames glued into one buffer whose
+/// length does not match its header, i.e. a checksum mismatch, and the failure spreads
+/// from the operation that timed out to the ones after it.
+fn resync_line(port: &mut Box<dyn SerialPort>, log_header: &str) {
+    let started = std::time::Instant::now();
+    let mut last_byte = started;
+    let mut dropped = 0usize;
+    loop {
+        if started.elapsed() >= SERIAL_RESYNC_BUDGET || SHUTTING_DOWN.load(Ordering::SeqCst) {
+            break;
+        }
+        let late = drain_buffered(port, log_header);
+        if late.is_empty() {
+            if last_byte.elapsed() >= SERIAL_RESYNC_QUIET {
+                break;
+            }
+            std::thread::sleep(SERIAL_RESYNC_SLICE);
+            continue;
+        }
+        dropped += late.len();
+        last_byte = std::time::Instant::now();
+    }
+    if dropped > 0 {
+        log::warn!(
+            "{} [SERIAL] resync dropped {} late bytes after a failed exchange",
+            log_header,
+            dropped
+        );
+    }
 }
 
 /// Listens for up to `interval` for a frame the rack pushes without being asked, and reads
@@ -371,18 +435,20 @@ fn wait_for_push(
     idle: Duration,
     deadline: Duration,
     log_header: &str,
-) -> (Vec<u8>, bool) {
-    let (bytes, truncated) = read_reply(port, Vec::new(), interval, idle, deadline, log_header);
+) -> (Vec<u8>, bool, &'static str) {
+    let (bytes, truncated, end) =
+        read_reply(port, Vec::new(), interval, idle, deadline, log_header);
     if !bytes.is_empty() {
         log::debug!(
-            "{} [SERIAL] rx pushed bytes={} truncated={} hex={}",
+            "{} [SERIAL] rx pushed bytes={} truncated={} end={} hex={}",
             log_header,
             bytes.len(),
             truncated,
+            end,
             hex::encode_upper(&bytes)
         );
     }
-    (bytes, truncated)
+    (bytes, truncated, end)
 }
 
 /// One write+read exchange on an already-locked port. `deadline` bounds the whole read phase,
@@ -397,13 +463,13 @@ fn exchange_once(
     deadline: Duration,
     purge_stale: bool,
     log_header: &str,
-) -> SerialExchange {
+) -> (SerialExchange, &'static str) {
     // envelope hex is pre-normalized; this guard covers direct callers only
     let bytes = match hex::decode(cmd_hex) {
         Ok(b) => b,
         Err(e) => {
             log::warn!("{} [SERIAL] bad hex in serial_cmd: {}", log_header, e);
-            return SerialExchange::error(SERIAL_ERR_BAD_HEX);
+            return (SerialExchange::error(SERIAL_ERR_BAD_HEX), READ_END_ERROR);
         }
     };
 
@@ -451,12 +517,12 @@ fn exchange_once(
 
     if let Err(e) = port.write_all(&bytes) {
         log::error!("{} [SERIAL] write failed: {}", log_header, e);
-        return SerialExchange::error(SERIAL_ERR_WRITE_FAILED);
+        return (SerialExchange::error(SERIAL_ERR_WRITE_FAILED), READ_END_ERROR);
     }
     let _ = port.flush();
 
-    let (reply, truncated) = read_reply(port, carry, deadline, idle, deadline, log_header);
-    let exchange = if truncated {
+    let (reply, truncated, end) = read_reply(port, carry, deadline, idle, deadline, log_header);
+    let exchange = if truncated || (!reply.is_empty() && end != READ_END_SILENCE) {
         // Partial data + error code: the server sees what came through AND
         // knows the exchange is unusable.
         SerialExchange {
@@ -469,13 +535,14 @@ fn exchange_once(
         SerialExchange::ok(hex::encode_upper(&reply))
     };
     log::debug!(
-        "{} [SERIAL] rx bytes={} err={} hex={}",
+        "{} [SERIAL] rx bytes={} err={} end={} hex={}",
         log_header,
         exchange.resp_hex.len() / 2,
         exchange.err,
+        end,
         exchange.resp_hex
     );
-    exchange
+    (exchange, end)
 }
 
 /// The blocking core of one logical operation on an already-locked port: the command exchange
@@ -492,13 +559,15 @@ fn run_envelope(
     port: &mut Box<dyn SerialPort>,
     env: &SerialEnvelope,
     log_header: &str,
-) -> (SerialExchange, u32, u32) {
+) -> (SerialExchange, u32, u32, &'static str) {
     let mut polls: u32 = 0;
     let mut pushes: u32 = 0;
 
     // first exchange of the operation: the port lock was just taken, so anything still
     // buffered belongs to an operation that is already over — purge it
-    let first = exchange_once(port, &env.cmd_hex, env.idle, env.deadline, true, log_header);
+    let (first, first_end) =
+        exchange_once(port, &env.cmd_hex, env.idle, env.deadline, true, log_header);
+    let mut end = first_end;
     let outcome = 'op: {
         if !first.is_ok() {
             break 'op first;
@@ -516,18 +585,20 @@ fn run_envelope(
         loop {
             // App is closing: abandon the operation so the port lock is released.
             if SHUTTING_DOWN.load(Ordering::SeqCst) {
+                end = READ_END_SHUTDOWN;
                 break 'op SerialExchange::error(SERIAL_ERR_NO_REPLY);
             }
             // listen through the poll interval instead of sleeping through it: the rack
             // pushes the card result on its own and only once, so an unwatched gap loses
             // it. A pushed frame that is exactly the predicted "busy" bytes is just a
             // late poll reply — same rule as below, keep waiting for the real outcome.
-            let (pushed, pushed_truncated) =
+            let (pushed, pushed_truncated, pushed_end) =
                 wait_for_push(port, poll.interval, env.idle, env.deadline, log_header);
             if !pushed.is_empty() {
                 pushes += 1;
+                end = pushed_end;
                 let pushed_hex = hex::encode_upper(&pushed);
-                if pushed_truncated {
+                if pushed_truncated || pushed_end != READ_END_SILENCE {
                     // capped frame: partial data + error code, same contract as
                     // exchange_once — the server must not parse it as a result
                     break 'op SerialExchange {
@@ -542,7 +613,7 @@ fn run_envelope(
             polls += 1;
             // not the first exchange: pending bytes are this operation's pushed result,
             // they get carried into the poll reply rather than dropped
-            let reply = exchange_once(
+            let (reply, reply_end) = exchange_once(
                 port,
                 &poll.cmd_hex,
                 env.idle,
@@ -550,6 +621,7 @@ fn run_envelope(
                 false,
                 log_header,
             );
+            end = reply_end;
             if !reply.is_ok() || reply.resp_hex != poll.while_hex {
                 // the first differing reply is the operation result (or a transport error)
                 break 'op reply;
@@ -567,7 +639,13 @@ fn run_envelope(
             }
         }
     };
-    (outcome, polls, pushes)
+    // A failed operation leaves the line in an unknown state: the rack may still be about
+    // to answer it. Those bytes are drained here, under the same port lock, so the next
+    // operation starts on a quiet line instead of reading someone else's frame first.
+    if !outcome.is_ok() {
+        resync_line(port, log_header);
+    }
+    (outcome, polls, pushes, end)
 }
 
 /// Executes a whole envelope on the shared port: the command exchange plus the optional
@@ -575,14 +653,17 @@ fn run_envelope(
 /// is Master/Slave (one request on the wire at a time), so concurrent card sessions of one rack
 /// interleave at operation granularity; tokio's Mutex queues the waiters FIFO-fair, which is the
 /// per-port queue. Blocking serial I/O runs on a blocking thread so the async runtime isn't stalled.
-/// `log_summary=false` silences the per-operation INFO line — the 1 Hz watch loop would flood
-/// the log otherwise; its caller logs only actual changes.
+/// `log_summary=false` silences the per-operation INFO line — the periodic watch loop would
+/// flood the log otherwise; its caller logs only actual changes. Returns the outcome and why
+/// its last read ended, which is what tells a reply the device finished from one cut short by
+/// a bound (a cut global status of a multi-block rack decodes as a checksum mismatch on the
+/// server, and the byte count alone does not say which bound cut it).
 pub(super) async fn execute_envelope(
     port: &SharedPort,
     env: SerialEnvelope,
     log_header: &str,
     log_summary: bool,
-) -> SerialExchange {
+) -> (SerialExchange, &'static str) {
     let port = port.clone();
     let log_header_blocking = log_header.to_string();
 
@@ -595,32 +676,34 @@ pub(super) async fn execute_envelope(
     // result — no reply was obtained, report it as such.
     .unwrap_or_else(|e| {
         log::error!("{} [SERIAL] exchange task failed: {}", log_header, e);
-        (SerialExchange::error(SERIAL_ERR_NO_REPLY), 0, 0)
+        (SerialExchange::error(SERIAL_ERR_NO_REPLY), 0, 0, READ_END_ERROR)
     });
 
-    let (exchange, polls, pushes) = result;
+    let (exchange, polls, pushes, end) = result;
     // one INFO summary per logical operation; per-exchange details are at debug
     if exchange.is_ok() {
         if log_summary {
             log::info!(
-                "{} [SERIAL] op done polls={} pushes={} rx bytes={}",
+                "{} [SERIAL] op done polls={} pushes={} end={} rx bytes={}",
                 log_header,
                 polls,
                 pushes,
+                end,
                 exchange.resp_hex.len() / 2
             );
         }
     } else {
         log::warn!(
-            "{} [SERIAL] op failed err={} polls={} pushes={} partial_bytes={}",
+            "{} [SERIAL] op failed err={} end={} polls={} pushes={} partial_bytes={}",
             log_header,
             exchange.err,
+            end,
             polls,
             pushes,
             exchange.resp_hex.len() / 2
         );
     }
-    exchange
+    (exchange, end)
 }
 
 #[cfg(test)]
@@ -1055,7 +1138,8 @@ mod tests {
             (POLL_CMD, &[(10, IDLE_STATUS)]),
         ]);
         let mut port: Box<dyn SerialPort> = Box::new(port);
-        let (outcome, _polls, _pushes) = run_envelope(&mut port, &two_phase_envelope(), "TEST |");
+        let (outcome, _polls, _pushes, _end) =
+            run_envelope(&mut port, &two_phase_envelope(), "TEST |");
 
         // The invariant is what the bug broke: the result reaches the server. Whether it was
         // caught by the listening window or carried into a poll reply is a scheduling detail
@@ -1079,7 +1163,8 @@ mod tests {
         // predicted bytes, so it goes straight back to the server (which owns the framing).
         let port = ScriptedPort::new(&[(CMD, &[(10, ACCEPTED), (20, RESULT)])]);
         let mut port: Box<dyn SerialPort> = Box::new(port);
-        let (outcome, polls, pushes) = run_envelope(&mut port, &two_phase_envelope(), "TEST |");
+        let (outcome, polls, pushes, _end) =
+            run_envelope(&mut port, &two_phase_envelope(), "TEST |");
 
         assert_eq!(outcome.resp_hex, format!("{}{}", ACCEPTED, RESULT));
         assert_eq!((polls, pushes), (0, 0));
@@ -1095,7 +1180,8 @@ mod tests {
             (POLL_CMD, &[(10, RESULT)]),
         ]);
         let mut port: Box<dyn SerialPort> = Box::new(port);
-        let (outcome, polls, pushes) = run_envelope(&mut port, &two_phase_envelope(), "TEST |");
+        let (outcome, polls, pushes, _end) =
+            run_envelope(&mut port, &two_phase_envelope(), "TEST |");
 
         assert_eq!(outcome.resp_hex, RESULT);
         assert_eq!((polls, pushes), (1, 1));
@@ -1109,7 +1195,7 @@ mod tests {
         let mut port: Box<dyn SerialPort> = Box::new(port);
         let mut env = two_phase_envelope();
         env.deadline = Duration::from_millis(50); // no point waiting a full budget in a test
-        let (outcome, polls, pushes) = run_envelope(&mut port, &env, "TEST |");
+        let (outcome, polls, pushes, _end) = run_envelope(&mut port, &env, "TEST |");
 
         assert_eq!(outcome.err, SERIAL_ERR_NO_REPLY);
         assert_eq!((polls, pushes), (0, 0));
@@ -1122,7 +1208,7 @@ mod tests {
         // parser is the one that walks a buffer of several frames.
         let port = ScriptedPort::new(&[(POLL_CMD, &[(10, BUSY)])]).with_pending(RESULT);
         let mut port: Box<dyn SerialPort> = Box::new(port);
-        let ex = exchange_once(&mut port, POLL_CMD, T_IDLE, T_DEADLINE, false, "TEST |");
+        let (ex, _end) = exchange_once(&mut port, POLL_CMD, T_IDLE, T_DEADLINE, false, "TEST |");
 
         assert_eq!(ex.resp_hex, format!("{}{}", RESULT, BUSY));
     }
@@ -1134,9 +1220,90 @@ mod tests {
         // frame to this operation's reply.
         let port = ScriptedPort::new(&[(CMD, &[(10, ACCEPTED)])]).with_pending(RESULT);
         let mut port: Box<dyn SerialPort> = Box::new(port);
-        let ex = exchange_once(&mut port, CMD, T_IDLE, T_DEADLINE, true, "TEST |");
+        let (ex, _end) = exchange_once(&mut port, CMD, T_IDLE, T_DEADLINE, true, "TEST |");
 
         assert_eq!(ex.resp_hex, ACCEPTED);
+    }
+
+    /// One-shot envelope (no poll spec) for the given command.
+    fn one_shot_envelope(cmd: &str) -> SerialEnvelope {
+        SerialEnvelope {
+            cmd_hex: cmd.into(),
+            expect_hex: None,
+            idle: T_IDLE,
+            deadline: T_DEADLINE,
+            poll: None,
+            finish: None,
+        }
+    }
+
+    #[test]
+    fn a_late_reply_of_a_failed_operation_does_not_leak_into_the_next_one() {
+        // A rack that missed its deadline still answers - later, on its own. Those bytes sit
+        // in the port buffer, and without the resync they open the read window of the NEXT
+        // operation: the server then decodes two valid frames glued into one buffer, i.e. a
+        // checksum mismatch, and the failure of one exchange spreads to the ones after it.
+        let port = ScriptedPort::new(&[
+            (CMD, &[(250, RESULT)]), // answers long after this operation gave up
+            (POLL_CMD, &[(10, BUSY)]),
+        ]);
+        let mut port: Box<dyn SerialPort> = Box::new(port);
+        let mut env = one_shot_envelope(CMD);
+        env.deadline = Duration::from_millis(50);
+        let (first, _, _, end) = run_envelope(&mut port, &env, "TEST |");
+        assert_eq!(first.err, SERIAL_ERR_NO_REPLY);
+        assert_eq!(end, READ_END_DEADLINE);
+
+        let (second, _, _, _) = run_envelope(&mut port, &one_shot_envelope(POLL_CMD), "TEST |");
+        assert_eq!(
+            second.resp_hex, BUSY,
+            "the late frame of the failed operation leaked into the next reply"
+        );
+    }
+
+    #[test]
+    fn partial_deadline_is_an_error_and_drains_the_late_tail() {
+        let port = ScriptedPort::new(&[
+            (CMD, &[(10, "5501"), (250, "0205900013")]),
+            (POLL_CMD, &[(10, BUSY)]),
+        ]);
+        let mut port: Box<dyn SerialPort> = Box::new(port);
+        let mut env = one_shot_envelope(CMD);
+        env.idle = Duration::from_millis(300);
+        env.deadline = Duration::from_millis(50);
+        let (first, _, _, end) = run_envelope(&mut port, &env, "TEST |");
+        assert_eq!(first.err, SERIAL_ERR_TRUNCATED);
+        assert_eq!(first.resp_hex, "5501");
+        assert_eq!(end, READ_END_DEADLINE);
+        let (second, _, _, _) = run_envelope(&mut port, &one_shot_envelope(POLL_CMD), "TEST |");
+        assert_eq!(second.resp_hex, BUSY);
+    }
+
+    #[test]
+    fn partial_pushed_result_is_not_reported_as_success() {
+        let port = ScriptedPort::new(&[(CMD, &[
+            (10, ACCEPTED), (60, "55"), (90, "01"), (120, "02"), (150, "05"), (400, "900013"),
+        ])]);
+        let mut port: Box<dyn SerialPort> = Box::new(port);
+        let mut env = two_phase_envelope();
+        env.idle = Duration::from_millis(40);
+        env.deadline = Duration::from_millis(110);
+        env.poll.as_mut().unwrap().interval = Duration::from_millis(100);
+        let (first, _, pushes, end) = run_envelope(&mut port, &env, "TEST |");
+        assert_eq!(first.err, SERIAL_ERR_TRUNCATED);
+        assert_eq!(end, READ_END_DEADLINE);
+        assert_eq!(pushes, 1);
+    }
+
+    #[test]
+    fn read_end_reason_tells_silence_from_deadline() {
+        // The two bounds cut a reply the same way in the bytes and mean opposite things:
+        // silence = the device finished, deadline = it was still sending (or never started).
+        let port = ScriptedPort::new(&[(CMD, &[(10, RESULT)])]);
+        let mut port: Box<dyn SerialPort> = Box::new(port);
+        let (outcome, _, _, end) = run_envelope(&mut port, &one_shot_envelope(CMD), "TEST |");
+        assert_eq!(outcome.resp_hex, RESULT);
+        assert_eq!(end, READ_END_SILENCE);
     }
 
     #[test]
@@ -1145,15 +1312,8 @@ mod tests {
         let port = ScriptedPort::new(&[(CMD, &[(10, RESULT)])]);
         let writes = port.writes.clone();
         let mut port: Box<dyn SerialPort> = Box::new(port);
-        let env = SerialEnvelope {
-            cmd_hex: CMD.into(),
-            expect_hex: None,
-            idle: T_IDLE,
-            deadline: T_DEADLINE,
-            poll: None,
-            finish: None,
-        };
-        let (outcome, polls, pushes) = run_envelope(&mut port, &env, "TEST |");
+        let env = one_shot_envelope(CMD);
+        let (outcome, polls, pushes, _end) = run_envelope(&mut port, &env, "TEST |");
 
         assert_eq!(outcome.resp_hex, RESULT);
         assert_eq!((polls, pushes), (0, 0));

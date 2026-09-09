@@ -78,9 +78,36 @@ pub(super) fn app_link_is(generation: u64) -> bool {
     APP_ONLINE.load(Ordering::SeqCst) && APP_GENERATION.load(Ordering::SeqCst) == generation
 }
 
+/// Racks whose next card set follows a `link up`, i.e. a full re-discovery of
+/// the server. Only such a set makes the live card sessions re-publish their
+/// rack link reports: the report is what re-binds a slot on a server instance
+/// that has just (re)built its card map, and it costs one serial LED frame per
+/// card. Doing it for EVERY card set is what buried a 100-card rack under
+/// hundreds of LED frames a minute, starving the discovery and the tracker
+/// exchanges queued behind them on the same port.
+static RACK_REBIND: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// Marks the rack as re-discovered: its next card set re-publishes the link
+/// reports of the sessions it lists.
+fn mark_rebind(rack_id: &str) {
+    lock(&RACK_REBIND)
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(rack_id.to_string());
+}
+
+/// Takes the re-discovery mark of a rack, clearing it: the card set being
+/// handled is the one that follows its `link up`.
+pub(super) fn take_rebind(rack_id: &str) -> bool {
+    lock(&RACK_REBIND)
+        .as_mut()
+        .is_some_and(|marked| marked.remove(rack_id))
+}
+
 /// The application connection lost its server: rack publishes stop until the
 /// next CONNACK. Called on every failed poll of the app event loop.
 pub fn on_app_offline() {
+    super::access::cancel_discovery();
     if APP_ONLINE.swap(false, Ordering::SeqCst) {
         log::info!("RACK | [LINK] status=app_offline");
     }
@@ -127,12 +154,24 @@ pub(super) fn announce_links(links: Vec<(String, bool)>) {
     async_runtime::spawn(async move {
         for (rack_id, up) in links {
             let state = if up { "up" } else { "down" };
-            let payload = serde_json::json!({ "state": state }).to_string();
+            let payload = if up {
+                serde_json::json!({"state": state, "guarded_discovery": true,
+                    "cards": super::cards::inventory(&rack_id)})
+            } else {
+                serde_json::json!({"state": state})
+            }
+            .to_string();
             match client
                 .publish(rack_topic(&rack_id, "link"), QoS::AtLeastOnce, false, payload)
                 .await
             {
-                Ok(()) => log::info!("RACK {} | [LINK] status=published state={}", rack_id, state),
+                Ok(()) => {
+                    // the server rebuilds its card map from the discovery this starts
+                    if up {
+                        mark_rebind(&rack_id);
+                    }
+                    log::info!("RACK {} | [LINK] status=published state={}", rack_id, state)
+                }
                 Err(e) => log::warn!(
                     "RACK {} | [LINK] status=publish_failed state={} err={:?}",
                     rack_id,
@@ -157,6 +196,7 @@ pub fn on_app_connack(client: &AsyncClient) {
     APP_GENERATION.fetch_add(1, Ordering::SeqCst);
     APP_ONLINE.store(true, Ordering::SeqCst);
     stop_all_rack_watches();
+    super::access::cancel_discovery();
     reset_all_rack_idempotency();
     let ids = linked_rack_ids();
     if ids.is_empty() {
@@ -223,6 +263,17 @@ pub fn handle_app_publish(client: &AsyncClient, topic: &str, payload: &[u8]) -> 
             rack,
             log_header,
         ));
+    } else if tail == "release" {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(payload) {
+            if let Some(slot) = json
+                .get("slot")
+                .and_then(|v| v.as_u64())
+                .filter(|s| (1..=240).contains(s)) {
+                if let Some(request_id) = json.get("request_id").and_then(|v| v.as_u64()) {
+                    super::access::release(&rack.port, slot as u16, true, Some(request_id));
+                }
+            }
+        }
     } else if tail == "watch" {
         // arm/re-arm this rack's card presence watch with the server-supplied
         // bytes; its reports go back on the same rack topic
@@ -262,6 +313,9 @@ async fn handle_rack_request(
     log_header: String,
 ) {
     let mut slot = rack.idempotency.lock().await;
+    if !app_link_is(generation) || !rack_port_is_live(&rack_id, &rack.port) {
+        return;
+    }
     let Some((resp_tail, resp_payload)) = run_serial_request(
         &tail,
         &payload,
@@ -357,10 +411,10 @@ pub(super) async fn run_serial_request(
     serial_port: &SharedPort,
     log_header: &str,
     idempotency: &mut IdempotencySlot,
-    // `(iccid, card_number)` of the card this connection serves, when the
+    // `(iccid, card_number, slot)` of the card this connection serves, when the
     // caller is a card session. `None` for a rack's own exchange, which has
     // no single card and therefore no authentication state to track.
-    card: Option<(&str, &str)>,
+    card: Option<(&str, &str, u16)>,
 ) -> Option<(String, String)> {
     // A server-driven rack exchange counts as card activity: the auto-updater
     // must not restart the app in the middle of a rack card operation. The
@@ -428,7 +482,29 @@ pub(super) async fn run_serial_request(
             // arriving (tracker abort or lost message) — is covered by the
             // keep-alive PingResp reset in the card's MQTT loop (see cards.rs),
             // so no dedicated timeout is needed here.
-            if let Some((iccid, card_number)) = card {
+            let discovery_slot = json
+                .get("discovery_slot")
+                .and_then(|v| v.as_u64())
+                .filter(|s| (1..=240).contains(s))
+                .map(|s| s as u16);
+            let lease = if card.is_none() {
+                discovery_slot.map(|slot| (slot, true))
+            } else if envelope.finish == Some(false) {
+                card.map(|(_, _, slot)| (slot, false))
+            } else {
+                None
+            };
+            if let Some((slot, discovery)) = lease {
+                if !super::access::acquire(serial_port, slot, discovery, req_id.unwrap_or(0))
+                    .await
+                {
+                    return Some((
+                        resp_topic,
+                        SerialExchange::error("card_busy").to_payload(),
+                    ));
+                }
+            }
+            if let Some((iccid, card_number, _)) = card {
                 match envelope.finish {
                     Some(true) => {
                         set_rack_card_state(iccid, true, false);
@@ -451,11 +527,18 @@ pub(super) async fn run_serial_request(
             // exists only to mark the end of the session, so there is nothing to
             // put on the wire. Running it as an exchange would write a zero-byte
             // frame to the rack and come back `no_reply`.
-            if envelope.cmd_hex.is_empty() {
+            let finished = envelope.finish == Some(true);
+            let exchange = if envelope.cmd_hex.is_empty() {
                 SerialExchange::ok(String::new())
             } else {
-                execute_envelope(serial_port, envelope, log_header, true).await
+                execute_envelope(serial_port, envelope, log_header, true).await.0
+            };
+            if finished {
+                if let Some((_, _, slot)) = card {
+                    super::access::release(serial_port, slot, false, None);
+                }
             }
+            exchange
         }
         Err(code) => SerialExchange::error(code),
     };

@@ -120,12 +120,13 @@ segment: the server is the only sender on this path.
 
 | Direction    | Topic                            | Payload                                | When                                                                              |
 | ------------ | -------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------- |
-| TBA → server | `rack/<serial>/link`             | `{"state":"up"}`                       | the rack's port is open; repeated for every open rack after each CONNACK of the app connection |
+| TBA → server | `rack/<serial>/link`             | link snapshot (below)                 | the rack's port is open; repeated for every open rack after each CONNACK of the app connection |
 | TBA → server | `rack/<serial>/link`             | `{"state":"down"}`                     | the rack's port was closed or lost                                                |
 | TBA → server | `rack/<serial>/response/<id>`    | response envelope (below)              | reply to `request/<id>` of this rack                                              |
 | TBA → server | `rack/<serial>/watch`            | response envelope (below)              | the presence watch saw a change (below)                                           |
 | server → TBA | `rack/<serial>/request/<id>`     | command envelope (below)               | one serial exchange with the rack                                                 |
 | server → TBA | `rack/<serial>/watch`            | watch envelope (below)                 | arm or re-arm the presence watch                                                  |
+| server → TBA | `rack/<serial>/release`          | `{"slot":N,"request_id":N}`             | release the matching discovery reservation                                      |
 | server → TBA | `rack/<serial>/cards`            | `[{"slot":N,"iccid":"<16 hex>"},...]` | the complete set of cards of this rack to serve                                   |
 
 `<id>` is counted by the server per rack. The request idempotency of section
@@ -140,14 +141,35 @@ transparent byte pipe between the server and the serial port.
 
 ### Link
 
-`link` `up` announces a rack the server may address; the server starts its
-card discovery from it, and repeats it for every `up` (the app reconnecting,
-or the port re-opened). `link` `down` ends that life of the rack: TBA
-publishes nothing of it afterwards — a serial exchange or watch report that
-was still running is discarded, not delivered late. The server drops
-everything it knew about the rack on `down` and starts over on the next `up`,
-so a late reply of the previous life could be mistaken for a reply of the new
-one.
+`link up` announces an open rack and includes the identities of its live card
+sessions, including sessions that survived the app connection:
+
+```json
+{"state":"up","guarded_discovery":true,"cards":[{"slot":1,"iccid":"<16 hex>"}]}
+```
+
+The server restores this inventory before checking the rack. A global status
+omission must be confirmed by a per-slot status request before removing a
+known card. Failed identity reads remain pending and retry on watch refresh.
+The physical port disappearing closes its card sessions on TBA; `link down`
+parks server state and preserves request numbering. A new app connection
+starts new server state and therefore needs the inventory again.
+
+`guarded_discovery` enables slot ownership across the reset/select/read
+sequence. The server adds `discovery_slot` to its discovery envelopes. TBA
+returns `serial_err:"card_busy"` without writing to a slot in authentication;
+the server defers it without removing the card or repainting its LED. Otherwise
+TBA reserves the slot until `rack/<serial>/release` with the slot and the last
+discovery request id. A stale release cannot free a newer reservation. A new
+authentication waits for this reservation without holding the serial port.
+Authentication ownership follows the card envelope's `finish` flag, survives
+app reconnect, and ends on finish, card disconnect, or a 65 second inactivity
+limit (the server's session gap is 60 seconds). Discovery reservations also
+expire after 65 seconds and are cancelled when the app connection changes.
+
+These fields are optional for older clients. Deploy the updated server before
+TBA; preservation across app reconnect and ownership protection require both
+sides of this extension.
 
 ### Serial exchange (`request` / `response`)
 
@@ -188,9 +210,18 @@ The response is published for **every** request, always in one shape:
 
 `serial_err` is `""` on success or one of: `no_reply` (device stayed silent),
 `write_failed`, `bad_hex` (malformed envelope), `truncated` (reply hit the
-64 KB cap; the partial hex is still supplied). Only successful exchanges are
+64 KB cap, or a nonempty read ended by deadline, EOF, shutdown or IO error;
+the partial hex is still supplied), and `card_busy` (slot ownership conflict). Only successful exchanges are
 cached for `request_id` idempotency — a repeat after an error retries the
 device.
+
+After a failed exchange TBA resyncs the line before releasing the port: it
+drains whatever arrives until the line has been silent for 300 ms (capped at
+1.5 s in total). A device that missed its deadline does answer, just late, and
+those bytes could otherwise contaminate the next exchange with an incomplete
+frame tail. The drain is bounded, so it cannot guarantee recovery from a device
+that resumes sending after the drain budget. The server still validates framing
+and checksum for every received buffer.
 
 ### Card set (`cards`) and the rack link report
 
@@ -214,7 +245,13 @@ opened for gets a new session: the server binds a session to its slot. An
 empty set closes every session of the rack.
 
 Right after CONNACK such a rack-backed card connection publishes a one-shot
-**rack link report** — topic `rack`:
+**rack link report** — topic `rack`. It is repeated over a live session only
+for the card set that follows a `link up` of its rack, i.e. after a full
+re-discovery, because the server may then have rebuilt its card map from
+scratch and needs to hear that the card is still served. Repeating it for
+every card set would put one LED frame per card of the rack on the wire ahead
+of the tracker exchanges — on a full rack that is minutes of the serial link
+per set, and a set closes every discovery pass:
 
 ```json
 { "iccid": "<16 hex>", "slot": 3, "rack": "<serial>" }
@@ -233,18 +270,28 @@ After discovery the server arms a client-side presence watch — topic
 `rack/<serial>/watch`:
 
 ```json
-{ "cmd": "<hex>", "interval_ms": 1000, "idle_ms": 50, "deadline_ms": 2000 }
+{ "cmd": "<hex>", "interval_ms": 2000, "idle_ms": 300, "deadline_ms": 3000, "refresh_ms": 30000 }
 ```
 
 TBA re-executes the opaque `cmd` every `interval_ms` through the same FIFO
 port queue and publishes the reply back (topic `rack/<serial>/watch`, the
-standard `serial_resp`/`serial_err` envelope) **only when its bytes change**.
+standard `serial_resp`/`serial_err` envelope) **when its bytes change or the refresh interval has elapsed** (`refresh_ms`,
+default 30 seconds). The periodic snapshot retries failed discovery and
+unconfirmed removals without a baseline re-arm loop.
 Arming again replaces the loop and resets the change baseline, so the first
 reply after (re)arming is always published — this is how the server catches
 states that changed while it was busy. TBA compares bytes blindly; what the
 command means and what changed is decided entirely by the server. Inserted
 and removed cards need no special message: the server learns of them from a
 watch report and publishes the updated card set.
+
+The timings are the server's to choose and are not the same for every command.
+A rack built of several blocks answers a whole-rack query (the watch command is
+one) with pauses inside the frame, while it polls its blocks: the reply is one
+frame but not one burst, so the server sends a wider `idle_ms` for it than for
+a single-reader exchange. TBA logs why each read ended (`end=silence` — the
+device finished, `end=deadline` — a bound cut the reply), which is what makes a
+too-narrow bound visible on the client side.
 
 ## 7. App connection
 
