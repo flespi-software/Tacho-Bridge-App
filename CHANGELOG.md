@@ -461,3 +461,9 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Changed the server communication scheme for card racks: a rack no longer opens an MQTT connection with an identifier of its own and shares the application connection instead, because a rack is a peripheral of the application like a card reader and must not appear on the server as a device; the server now sends the complete set of cards to serve per rack.
+
+### [0.8.0-rc.10] - 2026-09-09
+
+🆕 Features / Improvements
+
+- Improve Lisle rack reliability and preserve active card sessions during reconnection and discovery.
