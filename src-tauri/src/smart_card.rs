@@ -7,15 +7,17 @@ use std::time::Duration;
 
 // ───── Crates ─────
 use lazy_static::lazy_static;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use once_cell::sync::OnceCell;
 use rumqttc::v5::AsyncClient;
 
 use tauri::async_runtime::{block_on, JoinHandle, Mutex};
 
 // ───── PCSC ─────
-use pcsc::*;
-use pcsc::{Card, Protocols, State as PcscState};
+use pcsc::{
+    Card, Context, Disposition, Protocols, ReaderState, Scope, ShareMode, State as PcscState,
+    PNP_NOTIFICATION,
+};
 
 // ───── Local Modules ─────
 use crate::config::{get_card_config_from_cache, get_from_cache, mutate_card_config, CacheSection};
@@ -123,9 +125,7 @@ pub struct ProcessingCard {
     pub session_id: u64,
     pub reader_name: Option<String>, // Name of the smart card reader (e.g., "Alcor Micro AU9540 00 00").
     pub atr: Option<String>,         // ATR of the inserted card (hex-encoded).
-    #[allow(dead_code)]
-    // to say the compiler does not warn about an unused field that is used in another file.
-    pub mqtt_client: AsyncClient, // MQTT client instance.
+    pub mqtt_client: AsyncClient,    // MQTT client instance.
     pub task_handle: JoinHandle<()>, // Async task handle managing communication for this card.
 }
 
@@ -170,14 +170,14 @@ pub fn request_rescan() {
     };
     match guard.as_ref() {
         Some(ctx) => match ctx.cancel() {
-            Ok(()) => log::info!("Rescan requested: monitor get_status_change cancelled"),
-            Err(e) => log::warn!(
+            Ok(()) => info!("Rescan requested: monitor get_status_change cancelled"),
+            Err(e) => warn!(
                 "Rescan requested, but cancel failed: {:?} (will be picked up within {}s on the poll timeout)",
                 e,
                 MONITOR_POLL_TIMEOUT_SECS
             ),
         },
-        None => log::warn!("Rescan requested, but the monitor context is not available yet"),
+        None => warn!("Rescan requested, but the monitor context is not available yet"),
     }
 }
 
@@ -194,24 +194,18 @@ fn setup_reader_states(
 
     for rs in reader_states.iter() {
         if is_dead(rs) {
-            log::debug!("Removing {:?}", rs.name());
+            debug!("Removing {:?}", rs.name());
         }
     }
 
     reader_states.retain(|rs| !is_dead(rs));
     // Add new readers.
 
-    let names = match ctx.list_readers(readers_buf) {
-        Ok(names) => names,
-        Err(e) => {
-            log::error!("Failed to list readers: {:?}", e);
-            return Err(Box::new(e)); // Return the error
-        }
-    };
+    let names = ctx.list_readers(readers_buf)?;
 
     for name in names {
         if !reader_states.iter().any(|rs| rs.name() == name) {
-            log::debug!("Reader {:?} has been connected to the computer", name);
+            debug!("Reader {:?} has been connected to the computer", name);
             reader_states.push(ReaderState::new(name, PcscState::UNAWARE));
         }
     }
@@ -228,7 +222,7 @@ lazy_static::lazy_static! {
     /// Serializes whole reader-sweep passes. Two callers run `process_reader_states`
     /// against the same physical readers: the `sc_monitor` thread and the
     /// `manual_sync_cards` command. Their per-card work is NOT protected by the
-    /// TASK_POOL lock alone — `should_register_new_card` releases the pool before
+    /// TASK_POOL lock alone — `reconcile_reader_event` releases the pool before
     /// the `await` points that follow (get_iccid, switch_protocol), and the
     /// successor entry is only pushed at the very end of `ensure_connection`. So
     /// both sweeps can see "no entry", open Shared-mode PC/SC handles on the same
@@ -249,13 +243,13 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) {
         }
 
         if is_virtual_reader(rs.name()) {
-            log::warn!("Virtual reader {:?} detected. Skipping...", rs.name());
+            warn!("Virtual reader {:?} detected. Skipping...", rs.name());
             continue;
         }
 
         let reader_name = rs.name();
         let Ok(reader_name_string) = reader_name.to_str() else {
-            log::warn!(
+            warn!(
                 "Reader name is not valid UTF-8: {:?}. Skipping...",
                 reader_name
             );
@@ -264,59 +258,29 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) {
 
         let atr = hex::encode(rs.atr());
         let atr_protocol = parse_atr_and_get_protocol(&atr);
-        let protocol = atr_protocol.protocol();
-        let mut effective_protocol = protocol;
-
         let card_state_string = format!("{:?}", rs.event_state());
-        log::debug!("card_state_string {}", card_state_string);
+        debug!("card_state_string {}", card_state_string);
 
-        let mut card_number = String::new();
-        let mut iccid = String::new();
-
-        let action = should_register_new_card(reader_name_string, &atr).await;
-
-        match action {
-            CardProcessingResult::Create => match ManagedCard::new(reader_name, protocol) {
-                Ok(mut managed_card) => match managed_card.get_iccid().await {
-                    Ok(received_iccid) => {
-                        log::info!("ICCID: {}", received_iccid);
-
-                        iccid = received_iccid;
-                        card_number = get_from_cache(CacheSection::Cards, &iccid);
-
-                        // The card number (and thus the config entry) is known only after
-                        // reading the ICCID, so the card is opened with the ATR-derived
-                        // protocol first and switched if the config says otherwise.
-                        effective_protocol = resolve_t_protocol(&card_number, &atr_protocol);
-                        if effective_protocol != protocol {
-                            managed_card.switch_protocol(effective_protocol).await;
-                        }
-
-                        ensure_connection(
-                            rs.name(),
-                            card_number.clone(),
-                            atr.clone(),
-                            managed_card,
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        log::error!("Failed to get ICCID: {}", e);
-                    }
-                },
-                Err(e) => {
-                    log::error!(
-                        "Failed to create ManagedCard for reader {}: {}",
-                        reader_name_string,
-                        e
-                    );
-                }
-            },
+        let action = reconcile_reader_event(reader_name_string, &atr).await;
+        let registered = match action {
+            CardProcessingResult::Create => register_card(reader_name, &atr, &atr_protocol).await,
             CardProcessingResult::Delete => {
-                log::debug!("CARD DELETED {}", card_state_string);
+                debug!("CARD DELETED {}", card_state_string);
+                None
             }
-            CardProcessingResult::Ignore => {}
-        }
+            CardProcessingResult::Ignore => None,
+        };
+        // Failed registration and removal still emit the reader state with
+        // empty card identifiers, so the frontend sees every non-ignored event.
+        let RegisteredCard {
+            iccid,
+            card_number,
+            protocol: effective_protocol,
+        } = registered.unwrap_or_else(|| RegisteredCard {
+            iccid: String::new(),
+            card_number: String::new(),
+            protocol: atr_protocol.protocol(),
+        });
 
         if action != CardProcessingResult::Ignore {
             card_emit_event(
@@ -329,7 +293,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) {
                 None,
             );
 
-            log::info!(
+            info!(
                 "{:?} {:?} {:?}, {:?}, Protocol: {:?}",
                 rs.name(),
                 rs.event_state(),
@@ -341,6 +305,60 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) {
     }
 }
 
+struct RegisteredCard {
+    iccid: String,
+    card_number: String,
+    protocol: Protocols,
+}
+
+// Called under READER_SWEEP: keep ICCID reads, protocol switching and pool
+// registration serialized with every other reader sweep.
+async fn register_card(
+    reader_name: &CStr,
+    atr: &str,
+    atr_protocol: &AtrProtocol,
+) -> Option<RegisteredCard> {
+    let mut managed_card = match ManagedCard::new(reader_name, atr_protocol.protocol()) {
+        Ok(card) => card,
+        Err(e) => {
+            error!(
+                "Failed to create ManagedCard for reader {:?}: {}",
+                reader_name, e
+            );
+            return None;
+        }
+    };
+    let iccid = match managed_card.get_iccid().await {
+        Ok(iccid) => iccid,
+        Err(e) => {
+            error!("Failed to get ICCID for reader {:?}: {}", reader_name, e);
+            return None;
+        }
+    };
+    info!("ICCID: {}", iccid);
+    let card_number = get_from_cache(CacheSection::Cards, &iccid);
+
+    // The config entry is known only after reading the ICCID, so open with
+    // the ATR-derived protocol first and then apply the configured protocol.
+    let requested_protocol = resolve_t_protocol(&card_number, atr_protocol);
+    managed_card.switch_protocol(requested_protocol).await;
+    // A failed switch keeps the old protocol; report the actual stored value.
+    let protocol = managed_card.protocol;
+    ensure_connection(
+        reader_name,
+        card_number.clone(),
+        atr.to_owned(),
+        managed_card,
+    )
+    .await;
+
+    Some(RegisteredCard {
+        iccid,
+        card_number,
+        protocol,
+    })
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CardProcessingResult {
     Create,
@@ -349,12 +367,13 @@ pub enum CardProcessingResult {
 }
 
 /// Determines what action should be taken for a card with the given reader name and ATR.
-/// Also removes any stale entries with the same reader name but a previously stored ATR.
-pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProcessingResult {
+/// Removes stale entries for removed or replaced cards and schedules their
+/// connections for shutdown.
+pub async fn reconcile_reader_event(reader_name: &str, atr: &str) -> CardProcessingResult {
     let mut pool = TASK_POOL.lock().await;
 
-    log::debug!(
-        "should_register_new_card: reader='{}' atr_len={} pool_size={}",
+    debug!(
+        "reconcile_reader_event: reader='{}' atr_len={} pool_size={}",
         reader_name,
         atr.len(),
         pool.len()
@@ -390,7 +409,7 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProce
                 .collect();
             for index in stale.into_iter().rev() {
                 let removed = pool.remove(index);
-                log::warn!(
+                warn!(
                     "Evicting ProcessingCard for reader {} — card swapped (old ATR {}, new ATR {})",
                     removed.reader_name.as_deref().unwrap_or("unknown"),
                     removed.atr.as_deref().unwrap_or("unknown"),
@@ -413,7 +432,7 @@ pub async fn should_register_new_card(reader_name: &str, atr: &str) -> CardProce
         });
         if let Some(index) = to_remove {
             let removed = pool.remove(index);
-            log::warn!(
+            warn!(
                 "Removed stale ProcessingCard for reader {} with old ATR {}",
                 removed.reader_name.as_deref().unwrap_or("unknown"),
                 removed.atr.as_deref().unwrap_or("unknown"),
@@ -454,14 +473,14 @@ static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 // Automatically sync cards.
 //
 // Blocking by design: PC/SC is a synchronous API and `get_status_change` with
-// no timeout parks the calling thread until a reader/card event. This function
+// a timeout parks the calling thread until an event or the timeout. This function
 // must therefore run on a thread that is allowed to block (it is spawned via
 // `async_runtime::spawn_blocking` in lib.rs), never on a tokio async worker.
 // The async parts (task pool, card registration) are bridged via `block_on`.
 pub fn sc_monitor() {
-    // Ignore duplicate spawns from repeated `frontend-loaded` events.
+    // Guard against accidentally starting a second monitor.
     if MONITOR_RUNNING.swap(true, Ordering::SeqCst) {
-        log::debug!("sc_monitor is already running. Skipping duplicate spawn.");
+        debug!("sc_monitor is already running. Skipping duplicate spawn.");
         return;
     }
 
@@ -486,19 +505,19 @@ pub fn sc_monitor() {
                 // the fault (PCSC daemon down, reader enumeration refusing the
                 // buffer) is usually persistent, and restarting immediately
                 // would spin this thread at 100% CPU.
-                log::warn!(
+                warn!(
                     "sc_monitor pass ended early. Retrying in {} seconds...",
                     retry_delay.as_secs()
                 );
             }
             Ok(Err(e)) => {
-                log::error!(
+                error!(
                     "Failed to establish context: {:?}. Retrying in {} seconds...",
                     e,
                     retry_delay.as_secs()
                 );
                 if e == pcsc::Error::SecurityViolation {
-                    log::error!(
+                    error!(
                         "SecurityViolation means the PC/SC daemon denied this process access. \
                          On Linux pcscd is usually guarded by polkit, which only allows clients \
                          from an active local desktop session - processes started inside a \
@@ -513,7 +532,7 @@ pub fn sc_monitor() {
                     .map(|s| s.to_string())
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "non-string panic payload".to_string());
-                log::error!(
+                error!(
                     "sc_monitor pass panicked: {}. Restarting in {} seconds...",
                     msg,
                     retry_delay.as_secs()
@@ -549,9 +568,9 @@ enum PassEnd {
 /// Returns the PCSC error when the context could not be established; all retry
 /// pacing (sleep, backoff) is the caller's job.
 fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
-    log::debug!("Establishing PCSC context...");
+    debug!("Establishing PCSC context...");
     let ctx = Context::establish(Scope::User)?;
-    log::debug!("Successfully established context.");
+    debug!("Successfully established context.");
 
     // A fresh pass re-reports every reader and card from UNAWARE, so a rescan
     // requested while no context was alive (establish backoff, panic restart)
@@ -569,7 +588,7 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
         ReaderState::new(PNP_NOTIFICATION(), PcscState::UNAWARE),
     ];
 
-    log::debug!("Initialized readers buffer and reader states.");
+    debug!("Initialized readers buffer and reader states.");
 
     // How this pass ended; only an explicit failure downgrades it.
     let mut outcome = PassEnd::Rescan;
@@ -577,15 +596,18 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
     loop {
         // These repeat every poll timeout (30s), so they live at trace to
         // keep debug output focused on actual card events.
-        log::trace!("Starting the inner loop to monitor reader states...");
+        trace!("Starting the inner loop to monitor reader states...");
         if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
-            log::error!("Failed to setup_reader_states: {:?}", e);
+            error!(
+                "Failed to list readers while updating monitor states: {:?}",
+                e
+            );
             // A failing enumeration is usually persistent (daemon down, buffer
             // too small): report it as a failed pass so the caller backs off.
             outcome = PassEnd::Failed;
             break; // Exit the inner loop to re-establish context
         }
-        log::trace!(
+        trace!(
             "Reader states: {:?}",
             reader_states
                 .iter()
@@ -602,7 +624,7 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
                 // Nothing changed within the poll window — check for a
                 // rescan request that missed the cancel(), keep waiting.
                 if RESCAN_REQUESTED.swap(false, Ordering::SeqCst) {
-                    log::info!(
+                    info!(
                         "Rescan requested (picked up on poll timeout). Re-establishing context..."
                     );
                     break;
@@ -615,13 +637,11 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
                 // re-report every inserted card, and process_reader_states
                 // re-registers them against the (now empty) task pool.
                 RESCAN_REQUESTED.store(false, Ordering::SeqCst);
-                log::info!(
-                    "Rescan requested (get_status_change cancelled). Re-establishing context..."
-                );
+                info!("Rescan requested (get_status_change cancelled). Re-establishing context...");
                 break;
             }
             Err(e) => {
-                log::error!("get_status_change failed: {:?}", e);
+                error!("get_status_change failed: {:?}", e);
                 // Small backoff prevents a tight reconnect loop if the PCSC
                 // service is repeatedly returning errors (e.g. daemon down).
                 std::thread::sleep(Duration::from_secs(1));
@@ -635,7 +655,7 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
         // on the async workers; this thread just waits for the result.
         block_on(process_reader_states(&mut reader_states));
 
-        log::debug!("Waiting for the next status change...");
+        debug!("Waiting for the next status change...");
     }
 
     // The context is about to be dropped: clear the published clone so
@@ -645,7 +665,7 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
     // picks up on its bounded wait.
     set_monitor_ctx(None);
 
-    log::debug!("Re-establishing context...");
+    debug!("Re-establishing context...");
     Ok(outcome)
 }
 
@@ -793,7 +813,7 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> AtrProtocol {
     let atr_bytes = match hex::decode(atr) {
         Ok(bytes) => bytes,
         Err(_) => {
-            log::error!("Invalid ATR format: {}", atr);
+            error!("Invalid ATR format: {}", atr);
             return AtrProtocol::Indeterminate(Protocols::T0);
         }
     };
@@ -805,14 +825,13 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> AtrProtocol {
     }
 
     if atr_bytes.len() < 2 {
-        log::warn!("ATR is too short: {:?}", atr_bytes);
+        warn!("ATR is too short: {:?}", atr_bytes);
         return AtrProtocol::Indeterminate(Protocols::T0);
     }
 
     // Advances past the TA/TB/TC bytes selected by `y`, reporting whether they
-    // all actually fit in the ATR. Previously these skips were unchecked, so a
-    // truncated ATR silently walked `index` past the end and the TD lookups
-    // below quietly found nothing — reported as a confident T0.
+    // all fit in the ATR. Missing interface bytes make the protocol
+    // indeterminate, so the fallback T0 must not be persisted.
     fn skip_interface_bytes(index: &mut usize, y: u8, len: usize) -> bool {
         for bit in [0x1, 0x2, 0x4] {
             if y & bit != 0 {
@@ -832,7 +851,7 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> AtrProtocol {
 
     // TA1, TB1, TC1 — presence selected by Y1.
     if !skip_interface_bytes(&mut index, y1, len) {
-        log::warn!("ATR truncated inside its first interface bytes: {}", atr);
+        warn!("ATR truncated inside its first interface bytes: {}", atr);
         return AtrProtocol::Indeterminate(Protocols::T0);
     }
 
@@ -842,7 +861,7 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> AtrProtocol {
         return AtrProtocol::Resolved(Protocols::T0);
     }
     if index >= len {
-        log::warn!("ATR claims TD1 but ends before it: {}", atr);
+        warn!("ATR claims TD1 but ends before it: {}", atr);
         return AtrProtocol::Indeterminate(Protocols::T0);
     }
     let td1 = atr_bytes[index];
@@ -851,7 +870,7 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> AtrProtocol {
     // TA2, TB2, TC2 — presence selected by Y2 (the high nibble of TD1).
     let y2 = td1 >> 4;
     if !skip_interface_bytes(&mut index, y2, len) {
-        log::warn!("ATR truncated inside its second interface bytes: {}", atr);
+        warn!("ATR truncated inside its second interface bytes: {}", atr);
         return AtrProtocol::Indeterminate(Protocols::T0);
     }
 
@@ -860,7 +879,7 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> AtrProtocol {
         return AtrProtocol::Resolved(protocol_from_td(td1));
     }
     if index >= len {
-        log::warn!("ATR claims TD2 but ends before it: {}", atr);
+        warn!("ATR claims TD2 but ends before it: {}", atr);
         return AtrProtocol::Indeterminate(Protocols::T0);
     }
 
@@ -873,7 +892,7 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> AtrProtocol {
 // Manually sync cards. Clicking on the button in the frontend will trigger this function
 #[tauri::command]
 pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(), String> {
-    log::debug!("Manual sync cards function is called. Restart: {}", restart);
+    debug!("Manual sync cards function is called. Restart: {}", restart);
 
     if restart {
         // remove all connections
@@ -894,7 +913,7 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let ctx = Context::establish(Scope::User)
             .map_err(|e| format!("failed to establish context: {e}"))?;
-        log::debug!("Context established successfully.");
+        debug!("Context established successfully.");
 
         let mut readers_buf = [0; READERS_BUFFER_SIZE];
         // A failed enumeration is reported to the caller: returning Ok here
@@ -905,19 +924,22 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
             .map_err(|e| format!("failed to list readers: {e}"))?
             .count();
         if reader_count == 0 {
-            log::warn!("No readers found. Nothing to sync.");
+            warn!("No readers found. Nothing to sync.");
             return Ok(());
         }
-        log::debug!("Available readers found: {}", reader_count);
+        debug!("Available readers found: {}", reader_count);
 
         let mut reader_states = vec![
             // Listen for reader insertions/removals, if supported.
-            ReaderState::new(PNP_NOTIFICATION(), State::UNAWARE),
+            ReaderState::new(PNP_NOTIFICATION(), PcscState::UNAWARE),
         ];
 
         // setup readers states. Getting changes and other inits
         if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
-            log::error!("Failed to setup reader states: {:?}", e);
+            error!(
+                "Failed to list readers while updating manual sync states: {:?}",
+                e
+            );
         }
         // Waiting for the status change. A timeout is the normal outcome when
         // nothing changed since the states were seeded, and it must NOT skip
@@ -938,9 +960,9 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
     .await
     .map_err(|e| format!("manual_sync_cards: blocking task failed: {e}"))?
 }
-//////////////////////////////////////////////////
-/// CARD WRAPER //////////////////////////////////
-/// //////////////////////////////////////////////
+
+/// Owns a shared PCSC card handle, caches its ICCID, and manages APDU
+/// exchanges and reconnection using the selected protocol.
 #[derive(Clone)]
 pub struct ManagedCard {
     inner: Arc<Mutex<Card>>,
@@ -972,17 +994,8 @@ impl ManagedCard {
     }
 
     fn create_card(reader_name: &CStr, protocol: Protocols) -> DynResult<Card> {
-        let ctx = Context::establish(Scope::User).map_err(|err| {
-            log::error!("Failed to establish context: {}", err);
-            Box::<dyn StdError + Send + Sync>::from(err)
-        })?;
-
-        let card = ctx
-            .connect(reader_name, ShareMode::Shared, protocol)
-            .map_err(|err| {
-                log::error!("Failed to connect to card: {}", err);
-                Box::<dyn StdError + Send + Sync>::from(err)
-            })?;
+        let ctx = Context::establish(Scope::User)?;
+        let card = ctx.connect(reader_name, ShareMode::Shared, protocol)?;
 
         Ok(card)
     }
@@ -1203,7 +1216,7 @@ impl ManagedCard {
     /// On first call, reads it from the card; subsequent calls return the cached value.
     pub async fn get_iccid(&self) -> DynResult<String> {
         if let Some(cached) = self.iccid.get() {
-            log::debug!(
+            debug!(
                 "Returning cached ICCID for reader {}: {}",
                 self.reader_name.to_string_lossy(),
                 cached
@@ -1211,7 +1224,7 @@ impl ManagedCard {
             return Ok(cached.clone());
         }
 
-        log::debug!(
+        debug!(
             "get_iccid() started for reader: {}",
             self.reader_name.to_string_lossy()
         );
@@ -1254,7 +1267,7 @@ impl ManagedCard {
             .map(|b| format!("{:02X}", b))
             .collect::<String>();
 
-        log::debug!("Final ICCID: {}", iccid);
+        debug!("Final ICCID: {}", iccid);
 
         // Save ICCID, not got earlier
         let _ = self.iccid.set(iccid.clone());
