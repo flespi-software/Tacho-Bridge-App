@@ -580,10 +580,12 @@ pub(super) fn start_rack_watch(
     let watch_topic = rack_topic(rack_id, "watch");
     let watched_rack = rack_id.to_string();
     log::info!(
-        "{} [WATCH] status=armed interval={:?} cmd_bytes={}",
+        "{} [WATCH] status=armed interval={:?} cmd_bytes={} idle_ms={} deadline_ms={}",
         log_header,
         interval,
-        cmd_hex.len() / 2
+        cmd_hex.len() / 2,
+        idle.as_millis(),
+        deadline.as_millis()
     );
 
     let handle = async_runtime::spawn(async move {

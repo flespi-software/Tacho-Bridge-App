@@ -202,13 +202,19 @@ The whole envelope is executed atomically on the port: exchanges of the rack
 and of the card sessions of that rack queue up FIFO and interleave at envelope
 granularity.
 
+If stale bytes are buffered before a new envelope, TBA drains them and waits
+for 300 ms of silence (up to 1500 ms) before writing. If the line does not
+settle, it returns `no_reply` without sending the command. Pending bytes
+within the same envelope's poll loop are preserved as possible results.
+
 The response is published for **every** request, always in one shape:
 
 ```json
 { "serial_resp": "<hex>", "serial_err": "" }
 ```
 
-`serial_err` is `""` on success or one of: `no_reply` (device stayed silent),
+`serial_err` is `""` on success or one of: `no_reply` (no reply obtained, including
+a command skipped because stale traffic did not settle),
 `write_failed`, `bad_hex` (malformed envelope), `truncated` (reply hit the
 64 KB cap, or a nonempty read ended by deadline, EOF, shutdown or IO error;
 the partial hex is still supplied), and `card_busy` (slot ownership conflict). Only successful exchanges are

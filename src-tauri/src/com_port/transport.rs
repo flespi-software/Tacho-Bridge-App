@@ -92,7 +92,7 @@ impl SerialExchange {
     }
 }
 
-/// Bounds of the line resync that follows a failed operation: the rack answers a
+/// Bounds of line resync after a failed operation or stale bytes before TX: the rack answers a
 /// command it did not answer in time LATER, on its own, and those bytes would
 /// otherwise open the next read window and make two good frames decode as one
 /// broken one on the server. `QUIET` is the silence that ends the resync,
@@ -227,8 +227,8 @@ fn parse_envelope_fields(
     })
 }
 
-/// Initial / capped reconnect backoff for the rack's MQTT connection — same
-/// policy as the app and per-card connections.
+/// Takes a snapshot of the bytes currently buffered by the serial driver.
+/// A single drain does not imply that the device has finished sending.
 fn drain_buffered(port: &mut Box<dyn SerialPort>, log_header: &str) -> Vec<u8> {
     let pending = match port.bytes_to_read() {
         Ok(0) => return Vec::new(),
@@ -387,16 +387,18 @@ fn read_reply(
     (reply, truncated, end)
 }
 
-/// Drains the line until it goes quiet, after an operation that failed. The rack does
+/// Drains the line until it goes quiet after a failure or when stale bytes are found.
+/// Returns whether silence was observed within the recovery budget. The rack does
 /// answer a command it missed its deadline on - just late, on its own - and those bytes
 /// sit in the port buffer until the next read picks them up in front of the reply they
 /// do not belong to. The server then sees two valid frames glued into one buffer whose
 /// length does not match its header, i.e. a checksum mismatch, and the failure spreads
 /// from the operation that timed out to the ones after it.
-fn resync_line(port: &mut Box<dyn SerialPort>, log_header: &str) {
+fn resync_line(port: &mut Box<dyn SerialPort>, log_header: &str) -> bool {
     let started = std::time::Instant::now();
     let mut last_byte = started;
     let mut dropped = 0usize;
+    let mut quiet = false;
     loop {
         if started.elapsed() >= SERIAL_RESYNC_BUDGET || SHUTTING_DOWN.load(Ordering::SeqCst) {
             break;
@@ -404,6 +406,7 @@ fn resync_line(port: &mut Box<dyn SerialPort>, log_header: &str) {
         let late = drain_buffered(port, log_header);
         if late.is_empty() {
             if last_byte.elapsed() >= SERIAL_RESYNC_QUIET {
+                quiet = true;
                 break;
             }
             std::thread::sleep(SERIAL_RESYNC_SLICE);
@@ -414,11 +417,13 @@ fn resync_line(port: &mut Box<dyn SerialPort>, log_header: &str) {
     }
     if dropped > 0 {
         log::warn!(
-            "{} [SERIAL] resync dropped {} late bytes after a failed exchange",
+            "{} [SERIAL] resync dropped {} late bytes quiet={}",
             log_header,
-            dropped
+            dropped,
+            quiet
         );
     }
+    quiet
 }
 
 /// Listens for up to `interval` for a frame the rack pushes without being asked, and reads
@@ -494,6 +499,20 @@ fn exchange_once(
                 carry.len(),
                 hex::encode_upper(&carry)
             );
+            // The previous reply can still be arriving in chunks. Merely
+            // discarding its buffered prefix lets its tail become the next
+            // command's reply. Wait for quiet while holding the port lock;
+            // never do this inside a poll operation, where pending bytes
+            // may be the result we are waiting for.
+            log::warn!(
+                "{} [SERIAL] stale bytes before tx bytes={} action=resync",
+                log_header,
+                carry.len()
+            );
+            if !resync_line(port, log_header) {
+                log::warn!("{} [SERIAL] tx skipped reason=line_not_quiet", log_header);
+                return (SerialExchange::error(SERIAL_ERR_NO_REPLY), READ_END_DEADLINE);
+            }
         }
         Vec::new()
     } else {
@@ -666,6 +685,8 @@ pub(super) async fn execute_envelope(
 ) -> (SerialExchange, &'static str) {
     let port = port.clone();
     let log_header_blocking = log_header.to_string();
+    let idle_ms = env.idle.as_millis();
+    let deadline_ms = env.deadline.as_millis();
 
     let result = tokio::task::spawn_blocking(move || {
         let mut guard = port.blocking_lock();
@@ -684,23 +705,27 @@ pub(super) async fn execute_envelope(
     if exchange.is_ok() {
         if log_summary {
             log::info!(
-                "{} [SERIAL] op done polls={} pushes={} end={} rx bytes={}",
+                "{} [SERIAL] op done polls={} pushes={} end={} rx bytes={} idle_ms={} deadline_ms={}",
                 log_header,
                 polls,
                 pushes,
                 end,
-                exchange.resp_hex.len() / 2
+                exchange.resp_hex.len() / 2,
+                idle_ms,
+                deadline_ms
             );
         }
     } else {
         log::warn!(
-            "{} [SERIAL] op failed err={} end={} polls={} pushes={} partial_bytes={}",
+            "{} [SERIAL] op failed err={} end={} polls={} pushes={} partial_bytes={} idle_ms={} deadline_ms={}",
             log_header,
             exchange.err,
             end,
             polls,
             pushes,
-            exchange.resp_hex.len() / 2
+            exchange.resp_hex.len() / 2,
+            idle_ms,
+            deadline_ms
         );
     }
     (exchange, end)
@@ -1223,6 +1248,41 @@ mod tests {
         let (ex, _end) = exchange_once(&mut port, CMD, T_IDLE, T_DEADLINE, true, "TEST |");
 
         assert_eq!(ex.resp_hex, ACCEPTED);
+    }
+
+    #[test]
+    fn stale_reply_tail_is_drained_before_the_next_command() {
+        let port = ScriptedPort::new(&[(CMD, &[(10, ACCEPTED)])]).with_pending("DEAD");
+        // The prefix is already buffered, but the rest of the old reply
+        // arrives after the new command would previously have been sent.
+        port.state.lock().unwrap().scheduled.push((
+            std::time::Instant::now() + Duration::from_millis(50),
+            hex::decode("BEEF").unwrap(),
+        ));
+        let writes = port.writes.clone();
+        let mut port: Box<dyn SerialPort> = Box::new(port);
+        let (ex, _) = exchange_once(&mut port, CMD, T_IDLE, T_DEADLINE, true, "TEST |");
+        assert!(ex.is_ok());
+        assert_eq!(ex.resp_hex, ACCEPTED);
+        assert_eq!(*writes.lock().unwrap(), vec![CMD.to_string()]);
+    }
+
+    #[test]
+    fn busy_stale_line_does_not_receive_a_new_command() {
+        let port = ScriptedPort::new(&[(CMD, &[(10, ACCEPTED)])]).with_pending("DEAD");
+        let started = std::time::Instant::now();
+        for ms in (50..=2000).step_by(50) {
+            port.state.lock().unwrap().scheduled.push((
+                started + Duration::from_millis(ms),
+                vec![0xAB],
+            ));
+        }
+        let writes = port.writes.clone();
+        let mut port: Box<dyn SerialPort> = Box::new(port);
+        let (ex, end) = exchange_once(&mut port, CMD, T_IDLE, T_DEADLINE, true, "TEST |");
+        assert_eq!(ex.err, SERIAL_ERR_NO_REPLY);
+        assert_eq!(end, READ_END_DEADLINE);
+        assert!(writes.lock().unwrap().is_empty());
     }
 
     /// One-shot envelope (no poll spec) for the given command.
