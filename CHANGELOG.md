@@ -467,3 +467,10 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Improve Lisle rack reliability and preserve active card sessions during reconnection and discovery.
+
+### [0.8.0-rc.11] - 2026-09-11
+
+🆕 Features / Improvements
+
+- simplify registration and fix protocol logging.
+- Drain stale serial reply tails before new rack commands.
