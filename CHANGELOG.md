@@ -155,339 +155,40 @@ All notable changes to this project will be documented in this file.
 - Resilience to poisoned mutexes — the global app handle recovers its inner value instead of cascading a panic, so frontend event emission keeps working after an earlier panic. Event emitters were also migrated from println! to structured log calls.
 - Added unit test coverage across the config, APDU sniffer, MQTT, app-connection, and logger modules (atomic save round-trip, BER/DO'81 parsing, reconnect-delay math, topic rewrite, version ordering, and more).
 
-### [0.8.0] - 2026-07-10
+### [0.8.0-rc.13] - 2026-09-17
 
 🛠 Fixes
 
-- Fixed a bug with loading the backend and frontend sequence when starting the application.
-- Improved control over the current session with the server.
-- Updating the action config for Windows to avoid conflicts when building alpha test versions, etc.
-- Moved the blocking smart card monitor to a dedicated thread and guarded it against duplicate spawns, preventing potential UI and MQTT freezes.
-- Fixed a race condition in config.yaml writes that could silently drop card data, and moved config disk I/O off the UI and networking threads.
-- Fixed an event listener leak in the server configuration dialog.
-- Added reply size and timeout limits to card rack serial communication to prevent stalls and unbounded memory growth on a misbehaving device.
-- A single internal error can no longer cascade into a state where card connections and reader monitoring stop working until the app is restarted.
-- The card rack MQTT connection now recovers on its own: it waits for the server to be configured instead of giving up, and restarts automatically if its task dies — no more re-plugging the rack.
-- The app no longer crashes on startup in rare environment edge cases (window title failure, system clock set before 1970).
-- Disconnected card readers are now removed from the UI — a reader renamed by the OS after sleep/wake no longer leaves a stale duplicate row behind.
-- Logs are now compact and readable: one line per connection event instead of three, correct severity levels, 50 MB rotation, and a TBA_LOG environment variable for per-module debug verbosity.
-- Card reset after an authentication session no longer lets PC/SC silently renegotiate the communication protocol — the card is reconnected with the same T protocol it was opened with.
-- Fixed ci/cd action runner configuration for building applications.
-- Rack COM port no longer stays locked on Windows: a second app instance is blocked (the existing window is focused instead), and the port is explicitly released when the app window is closed.
-- An empty `cards:` key in config.yaml no longer fails the parse and resets the whole config (wiping the server host and card list).
-- Rack discovery log lines are emitted once per state change instead of every poll tick; "Access is denied" on port open now logs a hint that another process holds the port.
-- Reverted commit-hash version metadata and moved dev server to port 9314 (VS Code forwarding hijacked 9000 → white screen in dev).
+- Fixed the startup sequence between the backend and the frontend, and moved card bridging into the background so it no longer depends on the app window being loaded or visible.
+- Fixed the blocking smart card monitor freezing the UI and MQTT: it runs on a dedicated thread, is guarded against duplicate spawns, retries a failed PC/SC context with a growing backoff (5 s to 1 min) instead of spinning at full CPU, and explains a SecurityViolation as a pcscd/polkit access denial.
+- Fixed a race in config.yaml writes that could silently drop card data; config disk I/O now runs off the UI and networking threads, and an empty `cards:` key no longer resets the whole config.
+- Fixed session handling of physical cards: no more two MQTT connections for one card, no leaked session when a card is swapped faster than the monitor polls, no card reset by a manual sync during authentication, no stale cache answering a repeated authentication after a card reset, and one physical card can no longer be linked to two card entries.
+- Fixed card details being corrupted when the tachograph reads the identification file in several chunks, and a truncated ATR being saved as the card's communication protocol.
+- Fixed a newly linked company card staying offline until reinserted: the app now reconnects it itself, both in a PC/SC reader and in a rack slot.
+- Fixed disconnected or OS-renamed readers leaving stale duplicate rows in the UI, and the server connection icon staying grey after startup.
+- Fixed the card rack COM port staying locked on Windows: a second app instance is blocked (the existing window is focused), and the port is released when the window is closed. A busy port now shows a notification naming the port and the likely holder instead of silently retrying.
+- Fixed the card rack link recovering on its own: it waits for the server to be configured, restarts if its task dies, survives an internal error in discovery, and reopens correctly when the system exposes a second device name for the device.
+- Fixed cards moving between racks, slots and readers: no phantom sessions on empty slots, no stuck or greyed-out cards, safe session takeover when the server host is misconfigured, and a card removed from the configuration no longer keeps a session in the rack.
+- Fixed serial communication with the card rack under load: reply size and timeout limits prevent stalls and unbounded memory on a misbehaving device; waiting for the first reply byte uses the command's own deadline; a result that arrives between two reads is no longer lost; a reply cut short by a bound is reported as a transport error instead of a success; a late reply of a timed-out exchange is drained before the next command so it can no longer corrupt it; requests run in arrival order; and exchanges are preserved across server continuations without duplicate execution.
+- Fixed the rack card activity and scan indicators: the icon blinks steadily through the whole authentication (including the wait for the tracker) and stops reliably when the session ends, even without a closing message from the server; the scan indicator follows the server's scan state.
+- Fixed self-update edge cases: a pending update lost when the app closed mid-download, a manual install clashing with the automatic one, a false update notification on every launch of a pre-release, a pre-release still installing after switching back to the stable channel, a failing download being retried every five minutes instead of backing off, and a system clock change restarting the app during an authentication.
+- Fixed MQTT connections being dropped without a proper DISCONNECT: card removal, config change, server host change and app quit now close cleanly, so the server logs a normal close instead of an internal error.
+- Fixed silent failure reporting and data races in the UI: settings and card saves surface errors, the reader list survives a webview reload, and concurrent card metadata is no longer overwritten.
+- Fixed the app crashing on startup in rare environment edge cases (window title failure, system clock set before 1970), and a single internal error cascading into a state where card connections and reader monitoring stopped until restart.
+- Fixed the development server port being hijacked by VS Code port forwarding (white screen in dev builds), and CI builds on Windows failing on a Node/libuv shutdown crash after a successful frontend build.
 
 🆕 Features / Improvements
 
-- Changing the server address now reconnects all inserted cards automatically — no need to re-insert them or restart the app.
-- The UI has been improved. Everything is now smoother, more rounded, and more beautiful.
-- Support for working with serial devices via the COM port has been added.
-- Added visual display of connected lisle design rack to the current UI.
-- Added mqtt connection with the "Lisle" manufacturer name ident.
-- Added workflow action runner config for MacOS universal-apple-darwin.
-- The card communication protocol (T0/T1) is now a persisted per-card property: detected from the ATR on the first connection, stored in the configuration, reused on every connect and reset, and manually overridable in config.yaml.
-- Added communication_protocol.md describing the TBA <-> server communication protocol.
-- The app connection now publishes a one-shot settings report (application version, OS, architecture) to the server right after connecting — visible on the server as a read-only device setting.
-- The server can now request the card T protocol (T0/T1) per session: an optional "protocol" field in the session-start command reconnects the card with the requested protocol, and the reply reports the protocol actually in use next to the ATR. Mid-session protocol changes are ignored to protect the authentication state.
-- When the card rack is detected but its COM port is held by another application (e.g. other tachograph software), the app now shows a notification naming the busy port instead of silently retrying.
-
-### [0.8.0-alpha.7] - 2026-07-24
-
-🆕 Features / Improvements
-
-- Added application self-update: the app checks GitHub releases on startup or on demand, verifies the cryptographically signed update package (minisign) and installs it in one click with an automatic restart — NSIS on Windows, .app.tar.gz on macOS, AppImage on Linux.
-- Added update channels: stable-only by default, with an opt-in "Receive pre-release updates" toggle for alpha/beta builds.
-- Added a unified settings dialog behind the gear icon: server connection, theme switcher, update channel, forced update check and a built-in changelog viewer.
-- Added CI-managed versioning: every push auto-increments the version across all configs, builds signed installers for all three platforms and publishes the GitHub release automatically.
-- Added automatic changelog generation: the changelog and the release notes are assembled from commit messages on every release.
-- Added a minimum window size and a roomier default window so dialogs no longer feel cramped.
-
-### [0.8.0-alpha.8] - 2026-07-24
-
-🛠 Fixes
-
-- Fixed the release pipeline: updater artifacts uploaded in subdirectories (macOS .app.tar.gz) are now found by the manifest generator and attached to the release.
-
-🆕 Features / Improvements
-
-- Polished the 0.8.0-alpha.7 changelog [skip ci].
-- Added a bulleted changelog: entries render as a proper list with hanging indents in the app's changelog window, the changelog file was reformatted into grouped bullet style, and generated sections follow the same format.
-
-### [0.8.0-alpha.9] - 2026-07-24
-
-🛠 Fixes
-
-- Fixed release tags pointing at the default branch head: releases are now tagged on the exact commit that was built, restoring correct dates and ordering in the release list.
-
-🆕 Features / Improvements
-
-- Refactored recent additions: unified the change-guard mechanics in rack discovery, simplified theme handling in the settings dialog, and moved release-notes extraction into a standalone CI script.
-
-### [0.8.0-alpha.10] - 2026-07-24
-
-🛠 Fixes
-
-- Fixed the manual update check ignoring the on-screen channel toggle before Save, and made a channel without a published manifest report calmly instead of as an error.
-
-### [0.8.0-alpha.11] - 2026-07-25
-
-🛠 Fixes
-
-- Fixed Windows CI builds failing on a Node/libuv shutdown crash after a successful frontend build: the bundler now verifies fresh build output and continues instead of dying with the process.
-
-### [0.8.0-alpha.12] - 2026-07-26
-
-🛠 Fixes
-
-- Fixed authentication over the Lisle rack timing out on large commands: waiting for the rack's first reply byte now uses the command's own deadline, not the inter-byte silence window.
-
-### [0.8.0-alpha.13] - 2026-07-27
-
-🛠 Fixes
-
-- Fixed the lost card result over the Lisle rack: the app no longer stops listening — or throws away what arrived — between two reads of one operation.
-
-### [0.8.0-alpha.14] - 2026-07-30
-
-🆕 Features / Improvements
-
-- Added the fetch_logs server command: on request the app collects the last day, week or month of its log, packs it into a zip and uploads it to the server in chunks over the app connection.
-
-### [0.8.0-alpha.15] - 2026-07-30
-
-🛠 Fixes
-
-- Fixed a newly linked company card staying offline until physically reinserted: after assigning the number the app now reconnects the card itself — both in a PC/SC reader and in a rack slot.
-
-🆕 Features / Improvements
-
-- Log rotation now works at runtime: at 50 MB log.txt rotates into log.1.txt, older generations are zipped into the archive folder (10 newest kept); an oversized legacy log.1.txt is archived on launch.
-- Refactored the recent additions: log rotation no longer stalls logging while the displaced 50 MB generation is compressed (zipping moved to a background thread), shared helpers replaced duplicated zip/publish/rack-spawn code, and the log period is parsed generically for forward compatibility with future period values.
-
-### [0.8.0-beta.2] - 2026-07-30
-
-🆕 Features / Improvements
-
-- Unified rack log line format: every line is now 'RACK <serial> . / RACKCARD <number> . [AREA] key=value', prose fragments replaced with status/reason keys.
-
-### [unreleased]
-
-🛠 Fixes
-
-- Card and app MQTT connections are now closed with a proper MQTT DISCONNECT when a card is pulled from the reader, removed from the config, the server host changes or the app quits. Previously the socket was just dropped, and the server logged every such close as "internal error" (close_code=5); now it is a normal close.
-
-### [0.8.0-beta.3] - 2026-08-04
-
-🆕 Features / Improvements
-
-- Card and app MQTT connections now close with a proper MQTT DISCONNECT on card removal, config change and app quit: the server logs a normal close instead of 'internal error' (close_code=5); force-abort remains as a 2s fallback for offline or wedged connections.
-
-### [0.8.0-beta.4] - 2026-08-05
-
-🆕 Features / Improvements
-
-- Added system tray support: closing the window now hides the app to the tray while card bridging keeps running in the background; use Show Window to bring it back and Quit to exit.
-
-### [0.8.0-beta.5] - 2026-08-05
-
-🆕 Features / Improvements
-
-- Updated Rust dependencies to latest compatible versions.
-
-### [0.8.0-beta.6] - 2026-08-05
-
-🆕 Features / Improvements
-
-- Updated zip archive library to version 8.
-- code refactoring.
-
-### [0.8.0-beta.7] - 2026-08-05
-
-🛠 Fixes
-
-- Fixed silent failure reporting and data races in the UI: settings and card saves now surface errors, reader list survives a webview reload, concurrent card metadata is no longer overwritten.
-
-🆕 Features / Improvements
-
-- Internal: applied standard Rust code formatting across the backend.
-- Internal reliability refactoring: fixed resource leaks, data races and APDU retry safety across the Rust backend.
-
-### [0.8.0-beta.8] - 2026-08-06
-
-🆕 Features / Improvements
-
-- Added automatic update installation: an opt-in setting makes the app check hourly and install new versions on its own, waiting for a pause in card activity so an authentication is never interrupted.
-- Added launch at system startup: a new System setting registers the app to start on login, minimized to the tray.
-
-### [0.8.0-beta.9] - 2026-08-10
-
-🛠 Fixes
-
-- Fixed a card removed from the configuration keeping its session in the rack, which could later clash with the same card number being added again.
-- Fixed a truncated card ATR silently locking the wrong communication protocol into the configuration: an incomplete ATR is now used only for the current connection instead of being saved.
-- Fixed a repeated authentication request being answered from a stale cache after the card was reset, and a failed card exchange being retried instead of returning the cached failure.
-- Fixed a card that failed to report its serial number staying marked as busy until it was reinserted.
-- Fixed a pending update being lost when the application closed while it was downloading, and prevented a manual install from clashing with the automatic one.
-- Fixed a false update notification on every launch of a pre-release build.
-- Fixed saving the authentication result briefly pausing the card link, and made card rack discovery survive an internal error instead of stopping until restart.
-
-🆕 Features / Improvements
-
-- Reduced memory use when uploading logs to the server: the log slice is now compressed as it is read instead of being held in memory in full beforehand.
-
-### [0.8.0-beta.10] - 2026-08-10
-
-🛠 Fixes
-
-- Fixed the card rack scan indicator: it now runs for as long as the rack is being read and ends when the server reports the scan as finished, instead of stopping at the first card found or lingering after the last one.
-
-🆕 Features / Improvements
-
-- Added a live activity indicator to every card in a rack slot: the icon blinks steadily for the whole authentication, including the wait while the tracker responds.
-- Updated frontend dependencies to close known security advisories, including a prototype pollution issue in the UI framework.
-
-### [0.8.0-beta.11] - 2026-08-10
-
-🛠 Fixes
-
-- fix changelog.
-
-🆕 Features / Improvements
-
-- Internal cleanup of the rack card indicators: removed the timers and fallbacks that the server-driven signals made redundant, and unified the card status icons and topic parsing shared with the reader path.
-
-### [0.8.0-beta.12] - 2026-08-13
-
-🆕 Features / Improvements
-
-- Resize default window size.
-- Internal refactoring: split the card rack module into separate units for device discovery, serial transport, the rack connection, card sessions and interface state.
-
-### [0.8.0-beta.13] - 2026-08-17
-
-🆕 Features / Improvements
-
-- Added support for multiple card racks connected to one application instance.
-- Internal hardening of the multi-rack support: fixed stale card rows and session rebinding when a card moves between racks, and deduplicated the rack state handling.
-
-### [0.8.0-beta.14] - 2026-08-17
-
-🆕 Features / Improvements
-
-- Narrow eslint glob to src/ so the vite checker stops watching src-tauri/target and running out of memory.
-- Smart card monitor: retry context establish with growing backoff (5s to 1 minute) and explain SecurityViolation as a pcscd/polkit access denial.
-- Smart card monitor: apply the retry backoff to panics too, drop a stale PCSC context and rescan flag after failed passes, and remove unreachable error handling around process_reader_states.
-
-### [0.8.0-beta.15] - 2026-08-22
-
-🛠 Fixes
-
-- Fixed session conflicts and stuck cards when moving cards between racks, slots and readers, plus APDU error recovery, rack scan indicator and log upload fixes.
-
-### [0.8.0-rc.1] - 2026-08-24
-
-🛠 Fixes
-
-- Fixed edge cases in the rack and reader session handover: no more phantom rack sessions on empty slots, safer session takeover when the server host is misconfigured, and a reliable rack scanning indicator timeout.
-
-🆕 Features / Improvements
-
-- Added optional MQTT username/password authentication for the server connection, configurable in config.yaml.
-- Improved internal safety of the connection shutdown logic: shutdown reasons are now shared constants and the rack session takeover behavior is precisely documented.
-
-### [0.8.0-rc.2] - 2026-08-25
-
-🛠 Fixes
-
-- Fixed the card activity animation getting stuck on rack cards when the authentication session ends without a closing message from the server.
-
-### [0.8.0-rc.3] - 2026-08-27
-
-🛠 Fixes
-
-- Fixed rack and reader sessions being able to open two MQTT connections for the same card at once Fixed the old card's session leaking when a card is swapped in a reader faster than the monitor polls Fixed a manual sync running alongside the card monitor being able to reset a card during authentication Fixed corrupted card details being saved when the tachograph reads the identification file in several chunks Fixed one physical card being linkable to two card entries, which could authenticate it under the wrong number Fixed a pre-release update still being installed after switching back to the stable channel Fixed a failing update being re-downloaded every five minutes instead of backing off and giving up Fixed a system clock change being able to restart the application during an active authentication Added background card bridging that no longer depends on the app window being loaded.
-
-### [0.8.0-rc.4] - 2026-08-27
-
-🛠 Fixes
-
-- Fixed the card rack being torn down and failing to reopen when the system exposes a second device name for it.
-
-### [0.8.0-rc.5] - 2026-08-27
-
-🆕 Features / Improvements
-
-- Reduced duplicated code across the MQTT, rack and UI layers and added the first frontend test suite.
-
-### [0.8.0-rc.6] - 2026-08-28
-
-🛠 Fixes
-
-- Fixed the development server port being silently hijacked by VS Code port forwarding, which showed a white screen in dev builds.
-- Fixed a connected rack card turning grey for a couple of minutes when another card is removed from the rack.
-- Fixed the server connection icon staying grey after startup even though the connection was already established.
-
-### [0.8.0-rc.7] - 2026-08-28
-
-🆕 Features / Improvements
-
-- Added support for server slot LED signalling: envelopes without the finish flag are executed as plain serial exchanges without counting as authentication activity, and a live card session re-announces itself on a repeated connect so its slot repaints green after a rack reconnect.
-
-### [0.8.0-rc.8] - 2026-08-28
-
-🛠 Fixes
-
-- Fixed the reader monitor spinning at full CPU on a persistent PC/SC failure and the manual card sync doing nothing when a card was already in the reader.
-
-### [Unreleased]
-
-- Preserve live rack card identities across app reconnect and coordinate discovery with authentication through slot reservations (requires the matching server update).
-- Treat partial serial reads ending by deadline or IO failure as transport errors and drain their late tails, including pushed results.
-- Refresh the rack presence snapshot every 30 seconds so deferred discovery and unconfirmed removals recover even without a status change.
-
-🛠 Fixes
-
-- Fixed card detection and card sessions of a large rack breaking down under their own signalling: the rack link report of a live card session is now repeated only after a full re-discovery of its rack instead of on every card set, which on a rack of a hundred cards had put hundreds of LED frames a minute on the serial link ahead of the tracker exchanges.
-- Fixed a failed serial exchange corrupting the ones after it: a device that answers after its deadline had its late reply read at the head of the next exchange, where the two frames together decoded as a corrupt one. The line is now drained until it goes quiet before the port is released.
-- Serial reads now log why they ended (the device finished, or a bound cut the reply), so a reply cut short by a too-narrow timing is visible in the log instead of surfacing as a checksum error on the server.
-
-🆕 Features / Improvements
-
-- Card racks no longer open an MQTT connection of their own: a rack is served over the app connection under the `rack/<serial>/` topic prefix (link up/down, serial exchanges, presence watch), so no rack device appears on the server any more. The server now publishes the complete set of cards to serve per rack instead of per-card connect/disconnect notices, and TBA reconciles its rack card sessions with that set. The rack link report of a card session carries the rack serial. Requires the server protocol update that introduced the `rack/` topics; older servers are not supported by this version.
-
-### [0.8.0-rc.9] - 2026-09-08
-
-🆕 Features / Improvements
-
-- Changed the server communication scheme for card racks: a rack no longer opens an MQTT connection with an identifier of its own and shares the application connection instead, because a rack is a peripheral of the application like a card reader and must not appear on the server as a device; the server now sends the complete set of cards to serve per rack.
-
-### [0.8.0-rc.10] - 2026-09-09
-
-🆕 Features / Improvements
-
-- Improve Lisle rack reliability and preserve active card sessions during reconnection and discovery.
-
-### [0.8.0-rc.11] - 2026-09-11
-
-🆕 Features / Improvements
-
-- simplify registration and fix protocol logging.
-- Drain stale serial reply tails before new rack commands.
-
-### [0.8.0-rc.12] - 2026-09-15
-
-🛠 Fixes
-
-- fix: preserve serial exchanges across server continuations and prevent duplicate command execution.
-
-### [0.8.0-rc.13] - 2026-09-15
-
-🛠 Fixes
-
-- fix: run rack requests in arrival order to keep release ahead of the next hold.
-- fix tests.
-
-🆕 Features / Improvements
-
-- transport code refactoring.
+- Added support for tachograph card racks connected over a COM (serial) port, with several racks served by one application instance and a live view of every rack and its cards in the UI.
+- Card racks are served over the application's own MQTT connection under the `rack/<serial>/` topic prefix — a rack is a peripheral like a card reader and no longer appears on the server as a device. The server publishes the complete set of cards to serve per rack, and the app reconciles its rack card sessions with that set. Live card identities are preserved across reconnects, discovery is coordinated with authentication through slot reservations, and the rack presence snapshot is refreshed every 30 seconds. Requires the matching server update; older servers are not supported.
+- Added application self-update: the app checks GitHub releases on startup or on demand, verifies the signed update package (minisign) and installs it in one click with an automatic restart — NSIS on Windows, .app.tar.gz on macOS, AppImage on Linux. Includes an opt-in pre-release channel and an opt-in automatic installation that checks hourly and waits for a pause in card activity so an authentication is never interrupted.
+- Added a unified settings dialog behind the gear icon: server connection, optional MQTT username/password, theme switcher, update channel, forced update check, launch at system startup, and a built-in changelog viewer.
+- Added system tray support: closing the window hides the app to the tray while card bridging keeps running; Show Window brings it back, Quit exits.
+- Added the fetch_logs server command: on request the app collects the last day, week or month of its log, compresses it as it is read and uploads it to the server in chunks over the app connection.
+- Added a one-shot settings report (application version, OS, architecture) published to the server right after connecting, visible there as a read-only device setting.
+- The card communication protocol (T0/T1) is now a persisted per-card property: detected from the ATR on the first connection, stored in the configuration, reused on every connect and reset, and manually overridable. The server can also request a protocol per session; mid-session changes are ignored to protect the authentication state.
+- Changing the server address now reconnects all inserted cards automatically — no need to reinsert them or restart the app.
+- Logs are now compact and readable: one line per connection event, correct severity levels, a unified `RACK <serial> / RACKCARD <number> [AREA] key=value` line format for rack traffic, a `TBA_LOG` environment variable for per-module debug verbosity, and runtime rotation at 50 MB with older generations zipped into an archive folder (10 newest kept) without stalling logging.
+- Refreshed UI: smoother, more rounded design, a larger default window with a minimum size so dialogs are no longer cramped, extended card information in the list and a condensed view in the reader block.
+- CI-managed releases: every push auto-increments the version across all configs, builds signed installers for macOS (universal), Windows and Linux, generates the changelog and release notes from commit messages, and publishes the GitHub release automatically.
+- Internal: the card rack module split into units for device discovery, serial transport, the rack connection, card sessions and interface state; reduced duplicated code across the MQTT, rack and UI layers; standard Rust formatting applied; unit tests added across the backend and a first frontend test suite; updated Rust and frontend dependencies, including fixes for known security advisories.
