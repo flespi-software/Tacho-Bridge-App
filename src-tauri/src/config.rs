@@ -10,32 +10,61 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ───── External Crates ─────
-use serde::{Deserialize, Serialize};
-use serde_yaml;
 use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
 // ───── Local Modules ─────
 use crate::global_app_handle::emit_card_config_event;
 use crate::mqtt::remove_connections;
-// use crate::smart_card::manual_sync_cards;
 
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ConfigurationFile {
-    name: String,                           // The name of the application.
-    version: String,                        // The version of the application.
-    description: String,                    // A brief description of the application.
-    appearance: Option<AppearanceConfig>,   // Optional UI configuration settings.
-    ident: Option<String>,                  // Optional ident for the application.
-    server: Option<ServerConfig>,           // Optional server configuration settings.
-    cards: HashMap<String, CardConfig>,     // Hashmap of the cards with the CardConfig structure
+    name: String,                         // The name of the application.
+    version: String,                      // The version of the application.
+    description: String,                  // A brief description of the application.
+    appearance: Option<AppearanceConfig>, // Optional UI configuration settings.
+    ident: Option<String>,                // Optional ident for the application.
+    server: Option<ServerConfig>,         // Optional server configuration settings.
+    // `default` keeps a missing or empty `cards:` key (YAML null) from failing
+    // the whole config parse — a parse failure resets the file and wipes the
+    // user's server host and card list.
+    #[serde(default, deserialize_with = "cards_or_empty")]
+    cards: HashMap<String, CardConfig>, // Hashmap of the cards with the CardConfig structure
+    // Update channel: true → the app also offers pre-release (alpha/beta/rc)
+    // builds; false/absent → stable releases only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    beta_updates: Option<bool>,
+    // Unattended updates: true → a background loop periodically checks the
+    // selected channel and installs a found update on its own, waiting for a
+    // pause in card activity so a restart never interrupts an authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_install_updates: Option<bool>,
+}
+
+/// Treats an explicitly empty `cards:` key (YAML null) as an empty map instead
+/// of a type error, so a hand-emptied section can't nuke the whole config.
+fn cards_or_empty<'de, D>(deserializer: D) -> Result<HashMap<String, CardConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let maybe: Option<HashMap<String, CardConfig>> = Option::deserialize(deserializer)?;
+    Ok(maybe.unwrap_or_default())
 }
 
 // Server Configuration structure, part of ConfigurationFile that contains data about the server.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerConfig {
     pub host: String,
+    /// Optional MQTT authentication for the broker connection (flespi channels
+    /// accept a token as the username, password usually empty). No UI yet —
+    /// hand-edited in config.yaml for now; absent fields keep today's
+    /// anonymous connect and are not written back to the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 // Dark Theme enum, part of AppearanceConfig that contains data about the theme.
@@ -48,14 +77,15 @@ pub enum DarkTheme {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CardConfig {
-    pub iccid: String,                          // ICCID
-    pub expire: Option<u64>,                    // Expire date
-    pub name: Option<String>,                   // Custom card name (for ease of user identification)
-    pub card_type: Option<u8>,                  // typeOfTachographCardId: 1=Driver, 2=Workshop, 3=Control, 4=Company
-    pub structure_version: Option<(u8, u8)>,    // cardStructureVersion (major, minor): major 0x00=Gen1, 0x01=Gen2; minor = data-element revision
-    pub company_name: Option<String>,           // Company name (from EF_Identification, Company Card only)
-    pub company_address: Option<String>,        // Company address (from EF_Identification, Company Card only)
-    pub last_auth: Option<(u64, bool)>,         // Last completed authentication: (unix_timestamp, success_flag)
+    pub iccid: String,                       // ICCID
+    pub expire: Option<u64>,                 // Expire date
+    pub name: Option<String>,                // Custom card name (for ease of user identification)
+    pub t_protocol: Option<String>, // Card communication protocol "T0"/"T1"; auto-filled from ATR on first connection, may be overridden manually
+    pub card_type: Option<u8>, // typeOfTachographCardId: 1=Driver, 2=Workshop, 3=Control, 4=Company
+    pub structure_version: Option<(u8, u8)>, // cardStructureVersion (major, minor): major 0x00=Gen1, 0x01=Gen2; minor = data-element revision
+    pub company_name: Option<String>, // Company name (from EF_Identification, Company Card only)
+    pub company_address: Option<String>, // Company address (from EF_Identification, Company Card only)
+    pub last_auth: Option<(u64, bool)>, // Last completed authentication: (unix_timestamp, success_flag)
 }
 // UI Configuration structure, part of ConfigurationFile that contains data about how UI looks like.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -65,7 +95,7 @@ pub struct AppearanceConfig {
 
 /// Retrieves the configuration file path.
 /// This function constructs the path to the configuration file, creating the necessary directories if they do not exist.
-pub fn get_config_path() -> io::Result<PathBuf> {
+fn get_config_path() -> io::Result<PathBuf> {
     let mut config_path = PathBuf::new();
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -81,8 +111,7 @@ pub fn get_config_path() -> io::Result<PathBuf> {
         }
         Err(e) => {
             log::error!("Failed to get home directory environment variable: {}", e);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "Failed to get home directory environment variable",
             ));
         }
@@ -125,12 +154,12 @@ fn save_config(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let yaml = serde_yaml::to_string(config)?;
 
-    let parent = config_path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "config path has no parent directory")
-    })?;
-    let file_name = config_path.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "config path has no file name")
-    })?;
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| io::Error::other("config path has no parent directory"))?;
+    let file_name = config_path
+        .file_name()
+        .ok_or_else(|| io::Error::other("config path has no file name"))?;
 
     let mut tmp_path = parent.to_path_buf();
     let mut tmp_name = file_name.to_os_string();
@@ -158,11 +187,47 @@ fn update_card_config(
     card_number: &str,
     content: CardConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Serialize the whole read-modify-write against all other config writers.
+    let _guard = config_write_guard();
+
     let mut config = load_config(config_path)?;
     log::debug!("Loaded configuration: {:?}", config);
 
-    // let mut needs_restart = false;
+    // One physical card belongs to exactly one card number. Linking an ICCID
+    // that another entry already holds would make `find_card_number_by_iccid`
+    // ambiguous, so the card could authenticate under the wrong client_id and
+    // sniffed EF data could land on the wrong entry. Reject the link here — the
+    // frontend only disables entries that already carry an ICCID, so nothing
+    // stops the user from linking one physical card into two empty entries.
+    if !content.iccid.is_empty() {
+        if let Some((owner, _)) = config
+            .cards
+            .iter()
+            .find(|(number, card)| number.as_str() != card_number && card.iccid == content.iccid)
+        {
+            return Err(format!(
+                "ICCID {} is already linked to card {}; unlink it there before assigning it to {}",
+                content.iccid, owner, card_number
+            )
+            .into());
+        }
+    }
+
     let mut changed = false;
+
+    // Metadata fields are owned by the backend (APDU sniffer, auth recorder):
+    // the frontend form only owns `name` and `iccid`, and a save must not let
+    // an echoed snapshot clobber a concurrent backend write (e.g. `last_auth`
+    // persisted while the edit dialog was open). Same rule t_protocol always
+    // had: None means "not provided", never "clear it".
+    macro_rules! update_provided {
+        ($existing:ident, $field:ident) => {
+            if content.$field.is_some() && $existing.$field != content.$field {
+                $existing.$field = content.$field.clone();
+                changed = true;
+            }
+        };
+    }
 
     match config.cards.get_mut(card_number) {
         Some(existing_card) => {
@@ -174,47 +239,28 @@ fn update_card_config(
                     content.name,
                     content.expire
                 );
-                existing_card.iccid = content.iccid;
-                existing_card.expire = content.expire;
-                existing_card.name = content.name;
-                existing_card.card_type = content.card_type;
-                existing_card.structure_version = content.structure_version;
-                existing_card.company_name = content.company_name;
-                existing_card.company_address = content.company_address;
-                existing_card.last_auth = content.last_auth;
-                // needs_restart = true;
+                existing_card.iccid = content.iccid.clone();
+                existing_card.name = content.name.clone();
                 changed = true;
             } else {
-                // Update optional fields only (no restart required)
-                if existing_card.expire != content.expire
-                    || existing_card.name != content.name
-                    || existing_card.card_type != content.card_type
-                    || existing_card.structure_version != content.structure_version
-                    || existing_card.company_name != content.company_name
-                    || existing_card.company_address != content.company_address
-                    || existing_card.last_auth != content.last_auth
-                {
+                // Update the user-editable field (no restart required)
+                if existing_card.name != content.name {
                     log::debug!(
-                        "Updating optional fields for card {}: name = {:?}, expire = {:?}, card_type = {:?}, structure_version = {:?}, company_name = {:?}, company_address = {:?}, last_auth = {:?}",
+                        "Updating name for card {}: name = {:?}",
                         card_number,
-                        content.name,
-                        content.expire,
-                        content.card_type,
-                        content.structure_version,
-                        content.company_name,
-                        content.company_address,
-                        content.last_auth
+                        content.name
                     );
-                    existing_card.expire = content.expire;
-                    existing_card.name = content.name;
-                    existing_card.card_type = content.card_type;
-                    existing_card.structure_version = content.structure_version;
-                    existing_card.company_name = content.company_name;
-                    existing_card.company_address = content.company_address;
-                    existing_card.last_auth = content.last_auth;
+                    existing_card.name = content.name.clone();
                     changed = true;
                 }
             }
+            update_provided!(existing_card, expire);
+            update_provided!(existing_card, card_type);
+            update_provided!(existing_card, structure_version);
+            update_provided!(existing_card, company_name);
+            update_provided!(existing_card, company_address);
+            update_provided!(existing_card, last_auth);
+            update_provided!(existing_card, t_protocol);
         }
         None => {
             // Add new card entirely
@@ -245,7 +291,7 @@ fn update_card_config(
             emit_card_config_event(
                 "global-card-config-updated",
                 card_number.to_string(),
-                Some(card_config.clone())
+                Some(card_config.clone()),
             );
         }
 
@@ -259,52 +305,201 @@ fn update_card_config(
     Ok(())
 }
 
-/// Public function to update the configuration with a new card.
-/// This function is a Tauri command that updates the configuration file with a new card's ATR and card number.
-#[tauri::command]
-pub fn update_card(cardnumber: &str, content: CardConfig) -> bool {
-    let config_path = match get_config_path() {
-        Ok(path) => path,
-        Err(e) => {
-            log::error!("Failed to get config path: {}", e);
-            return false;
-        }
-    };
+/// Synchronous core of the full-content card update (file I/O + fsync under
+/// the global config lock). Blocking by design — call it from a blocking
+/// thread, never from an async task or the main thread.
+/// NOTE: a successful save may create a new ICCID -> card number association;
+/// callers must then trigger session reconciliation the way update_card does
+/// (smart_card::request_rescan + com_port::connect_pending_rack_cards).
+fn persist_card(card_number: &str, content: CardConfig) -> Result<(), String> {
+    let config_path = get_config_path().map_err(|e| {
+        log::error!("Failed to get config path: {}", e);
+        format!("configuration file is unavailable: {e}")
+    })?;
 
-    match update_card_config(&config_path, cardnumber, content) {
+    match update_card_config(&config_path, card_number, content) {
         Ok(_) => {
-            log::info!("The card, {} is added to the configuration!", cardnumber);
-            true
+            log::info!("The card, {} is added to the configuration!", card_number);
+            Ok(())
         }
         Err(e) => {
             log::error!("Failed to update config: {}", e);
-            false
+            Err(e.to_string())
         }
     }
 }
 
+/// Applies `mutate` to one card entry under the global config write lock:
+/// fresh load from disk → mutate → save → refresh cache → emit the frontend
+/// event. The closure returns whether it actually changed anything; when it
+/// returns false the save is skipped entirely.
+///
+/// This is the safe primitive for "change one field" writers (sniffer, auth
+/// results): mutating fresh file state under the lock means concurrent writers
+/// cannot revert each other's fields, which a cache-read + full-write would do.
+/// Outcome of `mutate_card_config`. "The card is not in the config" is a
+/// routine condition (a rack card whose ICCID is not linked to a number yet),
+/// not a failure — collapsing it into the same `false` as a failed write made
+/// every caller log a spurious ERROR for it, which in turn masked the real
+/// write failures the message was meant to surface.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CardMutation {
+    /// The mutation applied and the config was written.
+    Saved,
+    /// The card exists but the closure reported nothing to change; no write.
+    Unchanged,
+    /// No such card number in the config.
+    UnknownCard,
+    /// The config could not be read back or written.
+    Failed,
+}
+
+impl CardMutation {
+    /// True when the card's stored state now reflects the request — either it
+    /// was written or it already matched.
+    pub fn is_ok(&self) -> bool {
+        matches!(self, CardMutation::Saved | CardMutation::Unchanged)
+    }
+}
+
+/// Blocking (file I/O + fsync) — call from a blocking thread.
+pub fn mutate_card_config<F>(card_number: &str, mutate: F) -> CardMutation
+where
+    F: FnOnce(&mut CardConfig) -> bool,
+{
+    let config_path = match get_config_path() {
+        Ok(path) => path,
+        Err(e) => {
+            log::error!("Failed to get config path: {}", e);
+            return CardMutation::Failed;
+        }
+    };
+
+    let _guard = config_write_guard();
+
+    let mut config = match load_config(&config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            log::error!("mutate_card_config: failed to load config: {}", e);
+            return CardMutation::Failed;
+        }
+    };
+
+    let Some(card) = config.cards.get_mut(card_number) else {
+        log::debug!("mutate_card_config: unknown card_number {}", card_number);
+        return CardMutation::UnknownCard;
+    };
+
+    if !mutate(card) {
+        // Nothing changed against the authoritative file state — no write.
+        return CardMutation::Unchanged;
+    }
+    let updated = card.clone();
+
+    if let Err(e) = save_config(&config_path, &config) {
+        log::error!("mutate_card_config: failed to save config: {}", e);
+        return CardMutation::Failed;
+    }
+    if let Err(e) = load_config_to_cache(&config) {
+        log::error!("mutate_card_config: failed to refresh cache: {}", e);
+        return CardMutation::Failed;
+    }
+
+    emit_card_config_event(
+        "global-card-config-updated",
+        card_number.to_string(),
+        Some(updated),
+    );
+
+    CardMutation::Saved
+}
+
+/// Public function to update the configuration with a new card.
+/// This is a Tauri command: a thin async wrapper so the webview invoke never
+/// runs file I/O on the main thread — the blocking core goes to the blocking pool.
+/// Returns the reason on failure so the frontend can show it verbatim — a bare
+/// "refused" tells the user nothing about a rejected duplicate ICCID link.
+#[tauri::command]
+pub async fn update_card(cardnumber: String, content: CardConfig) -> Result<(), String> {
+    let updated = tauri::async_runtime::spawn_blocking(move || persist_card(&cardnumber, content))
+        .await
+        .unwrap_or_else(|e| {
+            log::error!("update_card: blocking task failed: {:?}", e);
+            Err("internal error while saving the card".to_string())
+        });
+
+    if updated.is_ok() {
+        // A card just linked to an inserted physical card has no MQTT session yet
+        // (its ICCID resolved to nothing when it was detected): wake the PCSC
+        // monitor to re-register reader-backed cards, and retry the rack cards
+        // the server reported before the ICCID was mapped to a number. Already
+        // connected cards are untouched: both paths skip cards with a live session.
+        crate::smart_card::request_rescan();
+        crate::com_port::connect_pending_rack_cards().await;
+    }
+
+    updated
+}
+
 /// Updates the server address in the configuration.
 /// This function updates the configuration file with a new server address.
-pub fn update_server_config(
+/// Maps the frontend's theme label to the config enum; unknown values fall back
+/// to Auto, mirroring the deserialization default.
+fn dark_theme_from_label(theme: &str) -> DarkTheme {
+    match theme {
+        "Auto" => DarkTheme::Auto,
+        "Dark" => DarkTheme::Dark,
+        "Light" => DarkTheme::Light,
+        _ => DarkTheme::Auto,
+    }
+}
+
+/// Persists only the appearance section; host/ident are untouched.
+fn update_appearance_config(
+    config_path: &Path,
+    theme: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Serialize the whole read-modify-write against all other config writers.
+    let _guard = config_write_guard();
+
+    let mut config = load_config(config_path)?;
+    config.appearance = Some(AppearanceConfig {
+        dark_theme: dark_theme_from_label(theme),
+    });
+    save_config(config_path, &config)?;
+    load_config_to_cache(&config)?;
+
+    Ok(())
+}
+
+fn update_server_config(
     config_path: &Path,
     host: &str,
     ident: &str,
     theme: &str,
+    beta_updates: bool,
+    auto_install_updates: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Serialize the whole read-modify-write against all other config writers.
+    let _guard = config_write_guard();
+
     let mut config = load_config(config_path)?;
 
+    // The settings dialog knows nothing about the MQTT credentials (no UI for
+    // them yet) — carry the hand-edited values over so saving the dialog does
+    // not silently strip authentication from the config.
+    let previous = config.server.take();
     config.server = Some(ServerConfig {
         host: host.to_string(),
+        username: previous.as_ref().and_then(|s| s.username.clone()),
+        password: previous.and_then(|s| s.password),
     });
     config.ident = Some(ident.to_string());
     config.appearance = Some(AppearanceConfig {
-        dark_theme: match theme {
-            "Auto" => DarkTheme::Auto,
-            "Dark" => DarkTheme::Dark,
-            "Light" => DarkTheme::Light,
-            _ => DarkTheme::Auto,
-        },
+        dark_theme: dark_theme_from_label(theme),
     });
+    config.beta_updates = Some(beta_updates);
+    config.auto_install_updates = Some(auto_install_updates);
 
     save_config(config_path, &config)?;
     load_config_to_cache(&config)?;
@@ -313,9 +508,7 @@ pub fn update_server_config(
 }
 
 #[tauri::command]
-pub async fn remove_card(
-    cardnumber: String,
-) -> Result<(), String> {
+pub async fn remove_card(cardnumber: String) -> Result<(), String> {
     let config_path = get_config_path().map_err(|e| {
         log::error!("Failed to get config path: {}", e);
         format!("Failed to get config path: {}", e)
@@ -328,41 +521,71 @@ pub async fn remove_card(
             format!("Failed to remove card from config: {}", e)
         })?;
 
-    log::info!("Card {} removed from config", &cardnumber);
+    log::info!("Card {} removed from config", cardnumber);
 
     Ok(())
 }
 
-pub async fn remove_card_from_config(
+async fn remove_card_from_config(
     config_path: &Path,
     card_number: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log::debug!("Loading configuration from {:?}", config_path);
-    let mut config = load_config(config_path)?;
-    log::debug!("Loaded configuration: {:?}", config);
+    let path = config_path.to_path_buf();
+    let number = card_number.to_string();
 
-    if config.cards.remove(card_number).is_some() {
-        save_config(config_path, &config)?;
-        log::debug!("Configuration saved successfully after removal");
+    // The file part (load-modify-save + cache refresh) is blocking — run it on
+    // the blocking pool, serialized with all other config writers by the lock.
+    let removed = tauri::async_runtime::spawn_blocking(
+        move || -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            let _guard = config_write_guard();
 
-        load_config_to_cache(&config)?;
-        log::debug!("Configuration loaded to cache successfully");
+            log::debug!("Loading configuration from {:?}", path);
+            let mut config = load_config(&path)?;
 
+            if config.cards.remove(&number).is_none() {
+                return Ok(false);
+            }
+
+            save_config(&path, &config)?;
+            log::debug!("Configuration saved successfully after removal");
+
+            load_config_to_cache(&config)?;
+            log::debug!("Configuration loaded to cache successfully");
+
+            Ok(true)
+        },
+    )
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("remove_card_from_config: blocking task failed: {}", e).into()
+    })??;
+
+    if removed {
         // Kill card task with the specified client_id (card number)
         remove_connections(vec![card_number.to_string()]).await;
         log::debug!("Removed connection for card {}", card_number);
 
+        // Reader-backed sessions live in TASK_POOL and are covered above; a
+        // rack-backed session for the same number lives in the rack module's
+        // own map and must be closed explicitly, or it keeps running with the
+        // removed card's MQTT client_id.
+        crate::com_port::disconnect_rack_card(card_number);
+
         emit_card_config_event("global-card-config-updated", card_number.to_string(), None);
 
-        #[cfg(target_os = "linux")] {
+        #[cfg(target_os = "linux")]
+        {
             // "Super hack" to reload card states and trigger an event to update readers.
 
+            use crate::smart_card::manual_sync_cards;
             use tokio::time::sleep;
             use tokio::time::Duration;
-            use crate::smart_card::manual_sync_cards;
 
             sleep(Duration::from_millis(100)).await;
-            manual_sync_cards(card_number.to_string(), false).await;
+            if let Err(e) = manual_sync_cards(card_number.to_string(), false).await {
+                // the removal itself succeeded; a failed rescan only delays the readers list refresh
+                log::warn!("remove_card: card rescan failed: {}", e);
+            }
         }
 
         Ok(())
@@ -376,27 +599,112 @@ pub async fn remove_card_from_config(
 }
 
 /// Public function to update the server address in the configuration.
-/// This function is a Tauri command that updates the configuration file with a new server address.
+/// This is a Tauri command: a thin async wrapper so the webview invoke never
+/// runs file I/O on the main thread — the blocking core goes to the blocking pool.
 #[tauri::command]
-pub fn update_server(host: &str, ident: &str, theme: &str) -> bool {
-    let config_path = match get_config_path() {
-        Ok(path) => path,
-        Err(e) => {
-            log::error!("Failed to get config path: {}", e);
-            return false;
-        }
-    };
+pub async fn update_server(
+    app: tauri::AppHandle,
+    host: String,
+    ident: String,
+    theme: String,
+    beta_updates: bool,
+    auto_install_updates: bool,
+) -> bool {
+    let old_host = get_from_cache(CacheSection::Server, "host");
+    let old_beta = get_from_cache(CacheSection::Updates, "beta_updates");
+    let old_auto_install = get_from_cache(CacheSection::Updates, "auto_install_updates");
 
-    match update_server_config(&config_path, host, ident, theme) {
-        Ok(_) => {
-            log::info!("The server address is updated to '{}'.", host);
-            true
+    let host_for_task = host.clone();
+    let updated = tauri::async_runtime::spawn_blocking(move || {
+        let config_path = match get_config_path() {
+            Ok(path) => path,
+            Err(e) => {
+                log::error!("Failed to get config path: {}", e);
+                return false;
+            }
+        };
+
+        match update_server_config(
+            &config_path,
+            &host_for_task,
+            &ident,
+            &theme,
+            beta_updates,
+            auto_install_updates,
+        ) {
+            Ok(_) => {
+                log::info!("The server address is updated to '{}'.", host_for_task);
+                true
+            }
+            Err(e) => {
+                log::error!("Failed to update server address: {}", e);
+                false
+            }
         }
-        Err(e) => {
-            log::error!("Failed to update server address: {}", e);
-            false
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::error!("update_server: blocking task failed: {:?}", e);
+        false
+    });
+
+    if updated {
+        // Re-emit the server config: the frontend's cached host/ident (and the
+        // header's "server configured" state) are fed by this event only —
+        // without it they stay stale until an app restart.
+        if let Err(e) = emit_global_config_server(&app) {
+            log::error!("Failed to emit global-config-server after update: {}", e);
+        }
+
+        // The rack card session loops resolve the broker host once at start;
+        // reader-backed cards migrate via manual_sync_cards, the racks need an
+        // explicit restart of their sessions.
+        if old_host != host {
+            crate::com_port::restart_rack_links("server_host_changed");
+        }
+
+        // Channel switched → re-check against the newly selected endpoint.
+        // Auto-install just enabled → check right away too, so the feature
+        // acts within seconds instead of waiting for the next background tick.
+        let auto_install_enabled =
+            auto_install_updates && old_auto_install != auto_install_updates.to_string();
+        if old_beta != beta_updates.to_string() || auto_install_enabled {
+            let updater_app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::updater::check_for_updates(updater_app).await;
+            });
         }
     }
+
+    updated
+}
+
+/// Persists the theme chosen with the header button — the only theme control,
+/// so it must not depend on the server dialog being saved.
+#[tauri::command]
+pub async fn update_theme(theme: String) -> bool {
+    tauri::async_runtime::spawn_blocking(move || {
+        let config_path = match get_config_path() {
+            Ok(path) => path,
+            Err(e) => {
+                log::error!("Failed to get config path: {}", e);
+                return false;
+            }
+        };
+
+        match update_appearance_config(&config_path, &theme) {
+            Ok(_) => true,
+            Err(e) => {
+                log::error!("Failed to update theme: {}", e);
+                false
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::error!("update_theme: blocking task failed: {:?}", e);
+        false
+    })
 }
 
 /*
@@ -412,6 +720,8 @@ pub struct CacheConfigData {
     pub server: Option<ServerConfig>,
     pub ident: Option<String>,
     pub appearance: Option<AppearanceConfig>,
+    pub beta_updates: Option<bool>,
+    pub auto_install_updates: Option<bool>,
 }
 
 lazy_static! {
@@ -421,133 +731,195 @@ lazy_static! {
     /// which can only be entered manually.
     static ref CACHE: Mutex<CacheConfigData> = Mutex::new(CacheConfigData::default());
 }
+
+/// Serializes every load-modify-save cycle on config.yaml. Without it,
+/// concurrent writers (frontend commands, the APDU sniffer, auth-result
+/// persistence) interleave: both load the same version and the last save
+/// silently drops the other's changes; they also share one tmp file, which
+/// breaks the atomic-rename guarantee. Held across the whole read-modify-write
+/// including the cache refresh, so cache order matches file order.
+static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquires the config write lock, recovering from poisoning (a panic in an
+/// earlier holder must not cascade into every future config write).
+fn config_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    match CONFIG_WRITE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("CONFIG_WRITE_LOCK was poisoned — recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Acquires the runtime cache lock, recovering from poisoning. The cache can
+/// never be left half-modified: reads don't mutate it and the only write
+/// replaces the whole struct in one assignment, so recovery is always safe.
+/// Panicking here instead (`.unwrap()`) would turn one panic — possibly
+/// swallowed silently by a tokio task — into a cascade that kills every card
+/// connection and the reader monitor until the app is restarted.
+fn cache_guard() -> std::sync::MutexGuard<'static, CacheConfigData> {
+    match CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("CACHE mutex was poisoned — recovering");
+            poisoned.into_inner()
+        }
+    }
+}
 #[derive(Debug)]
 pub enum CacheSection {
     Cards,
     Server,
     Ident,
-    Appearance
+    Appearance,
+    Updates,
 }
 
 /// Returns a clone of the CardConfig for the given card number from the runtime cache,
 /// or None if the card is not known yet.
 pub fn get_card_config_from_cache(card_number: &str) -> Option<CardConfig> {
-    let cache = CACHE.lock().unwrap();
+    let cache = cache_guard();
     cache.cards.get(card_number).cloned()
+}
+
+/// Returns the card number whose config holds the given ICCID, from the runtime cache.
+/// Used by the rack path: the server discovers cards by ICCID, but card sessions connect
+/// by the company card number only the local config knows.
+pub fn find_card_number_by_iccid(iccid: &str) -> Option<String> {
+    if iccid.is_empty() {
+        // never match a configured card whose ICCID has not been filled in yet
+        return None;
+    }
+    let cache = cache_guard();
+    let mut matches: Vec<&String> = cache
+        .cards
+        .iter()
+        .filter(|(_, card)| card.iccid == iccid)
+        .map(|(number, _)| number)
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    // `cards` is a HashMap, so `find` would return an arbitrary entry and could
+    // pick a different one from run to run. With two entries sharing an ICCID
+    // that means the physical card authenticates under a nondeterministic
+    // client_id — bridging the VU session to the wrong flespi identity and
+    // persisting sniffed EF data onto the wrong card. Sorting makes the choice
+    // stable, and the warning surfaces the misconfiguration that has to be
+    // fixed in the UI.
+    matches.sort();
+    if matches.len() > 1 {
+        log::warn!(
+            "Config error: ICCID {} is linked to {} card entries ({}). Using {} — remove the duplicate links.",
+            iccid,
+            matches.len(),
+            matches
+                .iter()
+                .map(|number| number.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            matches[0]
+        );
+    }
+    Some(matches[0].clone())
 }
 
 /// Records the final state of an authentication attempt in the card config:
 /// `success == true` → green "success" line in UI; `false` → red "fail".
 /// The processing state while auth is running is derived from Reader.authentication
 /// in the frontend and is NOT stored here (it's transient, lost on restart).
-pub fn record_auth_result(card_number: &str, success: bool) {
-    let Some(mut cfg) = get_card_config_from_cache(card_number) else {
-        log::warn!("record_auth_result: unknown card_number {}", card_number);
-        return;
-    };
+fn record_auth_result(card_number: &str, success: bool) {
     let ts = chrono::Utc::now().timestamp() as u64;
-    cfg.last_auth = Some((ts, success));
-    if !update_card(card_number, cfg) {
-        log::error!(
+    // Mutate fresh file state under the config lock instead of writing a full
+    // cache snapshot back — a stale snapshot would revert fields a concurrent
+    // writer (e.g. the sniffer) just persisted.
+    let outcome = mutate_card_config(card_number, |card| {
+        card.last_auth = Some((ts, success));
+        true
+    });
+    match outcome {
+        // A card that is not in the config has no last_auth to record — the
+        // normal case for an unlinked rack card, not a failure.
+        CardMutation::UnknownCard => log::debug!(
+            "record_auth_result: no config entry for card_number {}",
+            card_number
+        ),
+        CardMutation::Failed => log::error!(
             "record_auth_result: failed to persist last_auth for card_number {}",
             card_number
-        );
+        ),
+        CardMutation::Saved | CardMutation::Unchanged => {}
     }
 }
 
-/// Async-safe variant of `record_auth_result`.
-/// Offloads the blocking config write (disk I/O + sync mutexes) to a dedicated
-/// blocking thread so the caller's tokio worker is not stalled. Use this from
-/// async contexts such as the MQTT eventloop tasks.
-pub async fn record_auth_result_async(card_number: &str, success: bool) {
+/// Fire-and-forget variant of `record_auth_result` for async contexts (the MQTT
+/// eventloop tasks).
+///
+/// Deliberately does NOT await the write. `record_auth_result` takes the global
+/// config lock and fsyncs the file; awaiting it on the card's MQTT task would
+/// park the APDU bridge on disk I/O at the worst possible moment — right
+/// between the VU's `finish` and our reply — and a slow disk (antivirus scan on
+/// Windows, network home directory) would push the server past its command
+/// timeout. The timestamp is UI-only state, so nothing downstream needs it to
+/// have landed before the reply goes out.
+pub fn record_auth_result_detached(card_number: &str, success: bool) {
     let card_number = card_number.to_string();
-    if let Err(e) = tokio::task::spawn_blocking(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         record_auth_result(&card_number, success);
-    })
-    .await
-    {
-        log::error!("record_auth_result_async: spawn_blocking failed: {:?}", e);
-    }
+    });
 }
 
 /// Retrieves a value from the cache by key.
 /// This function locks the cache, retrieves the value for the given key, and returns it.
 pub fn get_from_cache(section: CacheSection, key: &str) -> String {
-    let cache = CACHE.lock().unwrap();
-
-    log::debug!("Accessing cache section: {:?}, key: {}", section, key);
-    log::debug!("Current cache state: {:?}", *cache); // Покажет всё, если у `CacheConfigData` реализован Debug
+    let cache = cache_guard();
 
     match section {
         CacheSection::Cards => {
-            log::debug!("Looking up by ICCID: {}", key);
-
+            // Reverse lookup: ICCID → card number.
             for (card_number, config) in &cache.cards {
-                log::debug!(
-                    "Cache entry -> card_number: {}, iccid: {}, expire: {:?}",
-                    card_number,
-                    config.iccid,
-                    config.expire
-                );
-
                 if config.iccid == key {
-                    log::debug!(
-                        "Match found: ICCID {} corresponds to card_number {}",
-                        key,
-                        card_number
-                    );
                     return card_number.clone();
                 }
             }
-
-            log::debug!("No ICCID match found for: {}", key);
+            log::debug!("cache: no card number for ICCID {}", key);
             "".to_string()
         }
 
-        CacheSection::Server => {
-            log::debug!("Accessing Server config");
-            if let Some(server) = &cache.server {
-                log::debug!("Server config: host = {}", server.host);
-                match key {
-                    "host" => server.host.clone(),
-                    _ => {
-                        log::debug!("Unknown key for server section: {}", key);
-                        "".to_string()
-                    }
-                }
-            } else {
-                log::debug!("No server config found");
+        CacheSection::Server => match (&cache.server, key) {
+            (Some(server), "host") => server.host.clone(),
+            // MQTT credentials; empty string = not configured (anonymous connect).
+            (Some(server), "username") => server.username.clone().unwrap_or_default(),
+            (Some(server), "password") => server.password.clone().unwrap_or_default(),
+            (Some(_), _) => {
+                log::debug!("cache: unknown key for server section: {}", key);
                 "".to_string()
             }
-        }
+            (None, _) => "".to_string(),
+        },
 
-        CacheSection::Ident => {
-            log::debug!("Accessing Ident config");
-            if let Some(ident) = &cache.ident {
-                log::debug!("Ident: {}", ident);
-                ident.clone()
-            } else {
-                log::debug!("No ident found");
-                "".to_string()
-            }
-        }
+        CacheSection::Ident => cache.ident.clone().unwrap_or_default(),
 
-        CacheSection::Appearance => {
-            log::debug!("Accessing Appearance config");
-            if let Some(appearance) = &cache.appearance {
-                log::debug!("Appearance config: {:?}", appearance);
-                match key {
-                    "dark_theme" => format!("{:?}", appearance.dark_theme),
-                    _ => {
-                        log::debug!("Unknown key for appearance section: {}", key);
-                        "".to_string()
-                    }
-                }
-            } else {
-                log::debug!("No appearance config found");
+        CacheSection::Appearance => match (&cache.appearance, key) {
+            (Some(appearance), "dark_theme") => format!("{:?}", appearance.dark_theme),
+            (Some(_), _) => {
+                log::debug!("cache: unknown key for appearance section: {}", key);
                 "".to_string()
             }
-        }
+            (None, _) => "".to_string(),
+        },
+
+        // "true"/"false"; absent flags read as "false" (stable channel,
+        // manual installs).
+        CacheSection::Updates => match key {
+            "beta_updates" => cache.beta_updates.unwrap_or(false).to_string(),
+            "auto_install_updates" => cache.auto_install_updates.unwrap_or(false).to_string(),
+            _ => {
+                log::debug!("cache: unknown key for updates section: {}", key);
+                "".to_string()
+            }
+        },
     }
 }
 
@@ -571,67 +943,55 @@ pub fn split_host_to_parts(host: &str) -> Result<(String, u16), String> {
 /// Loads the configuration file into the cache.
 /// This function reads the configuration file, parses it, and loads the cards into the global cache,
 /// which is used to synchronize the launch of asynchronous tasks for MQTT connection, as well as for display on the interface.
-pub fn load_config_to_cache(
+fn load_config_to_cache(
     config: &ConfigurationFile,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::debug!("load_config_to_cache");
 
-    let mut cache = CACHE.lock().unwrap();
+    let mut cache = cache_guard();
     *cache = CacheConfigData {
         cards: config.cards.clone(),
         server: config.server.clone(),
         ident: config.ident.clone(),
         appearance: config.appearance.clone(),
+        beta_updates: config.beta_updates,
+        auto_install_updates: config.auto_install_updates,
     };
-
-    // trace_cache(&*cache);
 
     Ok(())
 }
 
-// pub fn trace_cache(cache: &CacheConfigData) {
-//     log::debug!("HashMap: Company Card Number => Card Configuration ----------");
-//     for (card_number, card_config) in cache.cards.iter() {
-//         log::debug!(
-//             "CN: {:<16} | ICCID: {:<16} | Expire: {}",
-//             card_number,
-//             card_config.iccid,
-//             card_config.expire.unwrap_or(0)
-//         );
-//     }
-//     log::debug!("{}", "-".repeat(70));
-
-//     if let Some(ident) = &cache.ident {
-//         log::debug!("ident: {}", ident);
-//     }
-
-//     if let Some(server) = &cache.server {
-//         log::debug!("Server Host: {}", server.host);
-//     } else {
-//         log::warn!("No server configuration found.");
-//     }
-
-//     if let Some(appearance) = &cache.appearance {
-//         log::debug!("Appearance: {:?}", appearance);
-//     } else {
-//         log::warn!("No appearance configuration found.");
-//     }
-// }
-
 /// Generates a unique ident value based on the current time in microseconds.
 /// The ident value is in the format "TBA" followed by 13 digits.
 fn generate_ident() -> String {
-    let start = SystemTime::now();
-    let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
-    let micros = since_the_epoch.as_micros();
+    // A system clock set before 1970 makes duration_since fail; fall back to
+    // zero (ident "TBA0000000000000") instead of panicking at first launch —
+    // the user can always set their own ident in the settings dialog.
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or_else(|e| {
+            log::warn!("System clock is before UNIX epoch ({e}); using zero ident");
+            0
+        });
     format!("TBA{:013}", micros % 1_000_000_000_000u128)
 }
 
 /// Initializes the configuration file.
 /// This function creates a default configuration file if it does not exist, and loads it into the cache.
 pub fn init_config() -> io::Result<()> {
+    // Startup also participates in the write serialization: a card task could
+    // already be persisting by the time a repeated `frontend-loaded` re-inits.
+    let _guard = config_write_guard();
+
     let config_path = get_config_path()?;
     let config: ConfigurationFile;
+    // Whether the file on disk still matches what we would write. A config that
+    // parsed cleanly and needs no field change is left byte-for-byte alone:
+    // rewriting it round-trips through serde_yaml, which drops comments and
+    // reorders keys in a file the user is expected to hand-edit (the MQTT
+    // credentials have no UI). Only a real change earns a write.
+    let mut needs_save = true;
 
     if config_path.exists() {
         let mut contents = String::new();
@@ -639,11 +999,33 @@ pub fn init_config() -> io::Result<()> {
 
         match serde_yaml::from_str::<ConfigurationFile>(&contents) {
             Ok(mut loaded_config) => {
-                loaded_config.version = env!("CARGO_PKG_VERSION").to_string();
+                let version = env!("CARGO_PKG_VERSION");
+                needs_save = loaded_config.version != version;
+                loaded_config.version = version.to_string();
                 config = loaded_config;
             }
             Err(e) => {
-                log::error!("Config parse failed ({}). Resetting to default config.", e);
+                // The reset below persists a default config over this file —
+                // rescue the original first. Whatever made it unparseable
+                // (truncation, a cloud-sync half-write, a downgrade), it still
+                // holds the user's server host and card list, and overwriting
+                // it silently would destroy them beyond recovery.
+                let backup = config_path.with_extension(format!(
+                    "yaml.corrupt.{}",
+                    chrono::Local::now().format("%Y%m%d_%H%M%S")
+                ));
+                match fs::rename(&config_path, &backup) {
+                    Ok(()) => log::error!(
+                        "Config parse failed ({}). Original saved as {:?}, resetting to default config.",
+                        e,
+                        backup
+                    ),
+                    Err(rename_err) => log::error!(
+                        "Config parse failed ({}) and backup failed ({}). Resetting to default config.",
+                        e,
+                        rename_err
+                    ),
+                }
                 config = generate_default_config();
             }
         }
@@ -652,26 +1034,35 @@ pub fn init_config() -> io::Result<()> {
         config = generate_default_config();
     }
 
-    save_config(&config_path, &config)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    log::debug!("config: saved config");
-
-    /*
-        Send data of all cards in events one by one to the front.
-    */
-    for (card_number, card_config) in &config.cards {
-        emit_card_config_event(
-            "global-card-config-updated",
-            card_number.clone(),
-            Some(card_config.clone()),
-        );
+    if needs_save {
+        save_config(&config_path, &config).map_err(io::Error::other)?;
+        log::debug!("config: saved config");
+    } else {
+        log::debug!("config: unchanged on disk, left as-is");
     }
 
-    load_config_to_cache(&config)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    load_config_to_cache(&config).map_err(io::Error::other)?;
 
     Ok(())
+}
+
+/// Emits every known card config to the frontend. Called on each
+/// `frontend-loaded` so a (re)loaded webview gets the current card list —
+/// the backend initializes only once, but the frontend can reload many times.
+pub fn emit_all_card_configs() {
+    // Clone out under the lock, emit after releasing it.
+    let cards: Vec<(String, CardConfig)> = {
+        let cache = cache_guard();
+        cache
+            .cards
+            .iter()
+            .map(|(number, cfg)| (number.clone(), cfg.clone()))
+            .collect()
+    };
+
+    for (card_number, card_config) in cards {
+        emit_card_config_event("global-card-config-updated", card_number, Some(card_config));
+    }
 }
 
 // Default structure config
@@ -686,7 +1077,36 @@ fn generate_default_config() -> ConfigurationFile {
         ident: Some(generate_ident()),
         server: None,
         cards: HashMap::new(),
+        beta_updates: None,
+        auto_install_updates: None,
     }
+}
+
+/// Emits the server-related part of the config (host, ident, theme, update
+/// channel) to the frontend as the `global-config-server` event.
+pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
+    let host = get_from_cache(CacheSection::Server, "host");
+    let ident = get_from_cache(CacheSection::Ident, "ident");
+    let appearance = get_from_cache(CacheSection::Appearance, "dark_theme");
+
+    let mut config_app_payload = HashMap::new();
+    config_app_payload.insert("host", host);
+    config_app_payload.insert("ident", ident);
+    config_app_payload.insert("dark_theme", appearance);
+    config_app_payload.insert(
+        "beta_updates",
+        get_from_cache(CacheSection::Updates, "beta_updates"),
+    );
+    config_app_payload.insert(
+        "auto_install_updates",
+        get_from_cache(CacheSection::Updates, "auto_install_updates"),
+    );
+
+    if let Err(e) = app.emit("global-config-server", config_app_payload) {
+        return Err(Box::new(e));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -696,6 +1116,22 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn empty_or_missing_cards_key_does_not_fail_parse() {
+        // An empty `cards:` key is YAML null — before `cards_or_empty` this
+        // failed the whole parse and reset the config, wiping host and cards.
+        let with_null_cards = "name: tba\nversion: 1.0.0\ndescription: d\nserver:\n  host: example.com:1883\ncards:\n";
+        let parsed: ConfigurationFile =
+            serde_yaml::from_str(with_null_cards).expect("null cards must parse");
+        assert!(parsed.cards.is_empty());
+        assert_eq!(parsed.server.unwrap().host, "example.com:1883");
+
+        let without_cards = "name: tba\nversion: 1.0.0\ndescription: d\n";
+        let parsed: ConfigurationFile =
+            serde_yaml::from_str(without_cards).expect("missing cards must parse");
+        assert!(parsed.cards.is_empty());
+    }
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let pid = std::process::id();
@@ -718,6 +1154,7 @@ mod tests {
                 iccid: "1122334455667788".to_string(),
                 expire: Some(1_700_000_000),
                 name: Some("My Company Card".to_string()),
+                t_protocol: Some("T0".to_string()),
                 card_type: Some(4),
                 structure_version: Some((1, 0)),
                 company_name: Some("Acme Logistics".to_string()),
@@ -735,8 +1172,12 @@ mod tests {
             ident: Some("TBA0000000000001".to_string()),
             server: Some(ServerConfig {
                 host: "mqtt.example.com:8883".to_string(),
+                username: None,
+                password: None,
             }),
             cards,
+            beta_updates: None,
+            auto_install_updates: None,
         }
     }
 
@@ -758,6 +1199,64 @@ mod tests {
             loaded.server.as_ref().map(|s| s.host.as_str()),
             Some("mqtt.example.com:8883")
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_credentials_roundtrip_and_stay_optional() {
+        let dir = unique_tmp_dir("credentials");
+        let path = dir.join("config.yaml");
+
+        // Without credentials the file must not even mention the fields —
+        // existing configs stay byte-compatible.
+        save_config(&path, &sample_config()).expect("save without credentials");
+        let raw = fs::read_to_string(&path).expect("read yaml");
+        assert!(!raw.contains("username"), "absent username must not be written");
+        assert!(!raw.contains("password"), "absent password must not be written");
+        let loaded = load_config(&path).expect("load without credentials");
+        let server = loaded.server.expect("server section");
+        assert_eq!(server.username, None);
+        assert_eq!(server.password, None);
+
+        // Hand-edited credentials survive a save/load cycle.
+        let mut cfg = sample_config();
+        if let Some(server) = cfg.server.as_mut() {
+            server.username = Some("FlespiToken".to_string());
+            server.password = Some("secret".to_string());
+        }
+        save_config(&path, &cfg).expect("save with credentials");
+        let loaded = load_config(&path).expect("load with credentials");
+        let server = loaded.server.expect("server section");
+        assert_eq!(server.username.as_deref(), Some("FlespiToken"));
+        assert_eq!(server.password.as_deref(), Some("secret"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_server_config_preserves_hand_edited_credentials() {
+        // The settings dialog has no credentials UI: saving it goes through
+        // update_server_config, which must carry the hand-edited values over
+        // instead of stripping authentication from the config.
+        let dir = unique_tmp_dir("credentials_preserved");
+        let path = dir.join("config.yaml");
+
+        let mut cfg = sample_config();
+        if let Some(server) = cfg.server.as_mut() {
+            server.username = Some("FlespiToken".to_string());
+            server.password = Some("secret".to_string());
+        }
+        save_config(&path, &cfg).expect("save");
+
+        update_server_config(&path, "new.example.com:8883", "TBA0000000000001", "Auto", true, false)
+            .expect("update server config");
+
+        let loaded = load_config(&path).expect("load");
+        let server = loaded.server.expect("server section");
+        assert_eq!(server.host, "new.example.com:8883");
+        assert_eq!(server.username.as_deref(), Some("FlespiToken"));
+        assert_eq!(server.password.as_deref(), Some("secret"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -843,11 +1342,170 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_card_updates_do_not_lose_writes() {
+        // Regression for the read-modify-write race: without CONFIG_WRITE_LOCK
+        // two writers load the same version and the last save drops the other's
+        // card. Every thread adds unique cards; all must survive.
+        let dir = unique_tmp_dir("concurrent");
+        let path = dir.join("config.yaml");
+        save_config(&path, &sample_config()).expect("seed config");
+
+        const THREADS: usize = 8;
+        const UPDATES_PER_THREAD: usize = 10;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..UPDATES_PER_THREAD {
+                        let number = format!("THREAD{:02}CARD{:04}", t, i);
+                        let card = CardConfig {
+                            iccid: format!("{:016}", t * 1000 + i),
+                            expire: None,
+                            name: None,
+                            t_protocol: None,
+                            card_type: None,
+                            structure_version: None,
+                            company_name: None,
+                            company_address: None,
+                            last_auth: None,
+                        };
+                        update_card_config(&path, &number, card).expect("update");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+
+        let loaded = load_config(&path).expect("load");
+        assert_eq!(
+            loaded.cards.len(),
+            1 + THREADS * UPDATES_PER_THREAD,
+            "every concurrent update must be preserved"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_card_config_rejects_an_iccid_owned_by_another_card() {
+        let dir = unique_tmp_dir("dupiccid");
+        let path = dir.join("config.yaml");
+
+        // Two entries: one already linked to a physical card, one still empty.
+        let mut cfg = sample_config();
+        cfg.cards.insert(
+            "FEDCBA9876543210".to_string(),
+            CardConfig {
+                iccid: String::new(),
+                expire: None,
+                name: None,
+                t_protocol: None,
+                card_type: None,
+                structure_version: None,
+                company_name: None,
+                company_address: None,
+                last_auth: None,
+            },
+        );
+        save_config(&path, &cfg).expect("save");
+
+        // Linking the same physical card into the empty entry must be refused:
+        // a duplicate ICCID makes find_card_number_by_iccid ambiguous, so the
+        // card could authenticate under the wrong client_id.
+        let mut content = cfg
+            .cards
+            .get("FEDCBA9876543210")
+            .cloned()
+            .expect("second card");
+        content.iccid = "1122334455667788".to_string();
+        let err = update_card_config(&path, "FEDCBA9876543210", content)
+            .expect_err("duplicate ICCID must be rejected");
+        assert!(
+            err.to_string().contains("already linked"),
+            "unexpected error: {err}"
+        );
+
+        // The file is untouched: the second entry still has no ICCID.
+        let loaded = load_config(&path).expect("load");
+        assert_eq!(
+            loaded
+                .cards
+                .get("FEDCBA9876543210")
+                .expect("second card")
+                .iccid,
+            ""
+        );
+
+        // Re-saving the SAME card with its own ICCID stays allowed.
+        let own = loaded
+            .cards
+            .get("ABCDEF0123456789")
+            .cloned()
+            .expect("first card");
+        update_card_config(&path, "ABCDEF0123456789", own).expect("self-update must be allowed");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // `mutate_card_config` reports four distinct outcomes. Callers branch on
+    // them to decide the log level, and the whole point of the enum is that a
+    // missing card is NOT an error — an unlinked rack card hits that path on
+    // every sniffed field, and reporting it as a failure buried the real
+    // write failures. Pin the classification so it cannot silently collapse
+    // back into a bool.
+    #[test]
+    fn card_mutation_separates_missing_cards_from_failures() {
+        assert!(CardMutation::Saved.is_ok());
+        assert!(CardMutation::Unchanged.is_ok());
+        assert!(!CardMutation::UnknownCard.is_ok());
+        assert!(!CardMutation::Failed.is_ok());
+        // The two non-ok outcomes must stay distinguishable: callers log the
+        // first at debug and only the second at error.
+        assert_ne!(CardMutation::UnknownCard, CardMutation::Failed);
+    }
+
+    #[test]
+    fn update_card_config_preserves_t_protocol_when_not_provided() {
+        let dir = unique_tmp_dir("tproto");
+        let path = dir.join("config.yaml");
+        let card_number = "ABCDEF0123456789";
+
+        let cfg = sample_config();
+        save_config(&path, &cfg).expect("save");
+
+        // A frontend-style update carries no t_protocol - the stored value must survive.
+        let mut content = cfg.cards.get(card_number).cloned().expect("card");
+        content.t_protocol = None;
+        content.name = Some("Renamed".to_string());
+        update_card_config(&path, card_number, content).expect("update");
+
+        let loaded = load_config(&path).expect("load");
+        let card = loaded.cards.get(card_number).expect("card");
+        assert_eq!(card.name.as_deref(), Some("Renamed"));
+        assert_eq!(card.t_protocol.as_deref(), Some("T0"));
+
+        // An explicit value must overwrite the stored one.
+        let mut content = card.clone();
+        content.t_protocol = Some("T1".to_string());
+        update_card_config(&path, card_number, content).expect("update");
+
+        let loaded = load_config(&path).expect("load");
+        let card = loaded.cards.get(card_number).expect("card");
+        assert_eq!(card.t_protocol.as_deref(), Some("T1"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn card_config_yaml_roundtrip_preserves_optional_fields() {
         let card = CardConfig {
             iccid: "1234567890123456".to_string(),
             expire: None,
             name: None,
+            t_protocol: None,
             card_type: None,
             structure_version: None,
             company_name: None,
@@ -860,26 +1518,4 @@ mod tests {
         assert!(back.expire.is_none());
         assert!(back.last_auth.is_none());
     }
-}
-
-pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn Error>> {
-    // small note: the structure requires the clone trait because the configuration is passed by reference,
-    // so the value cannot be fully transferred to ownership.
-
-    // Gettting Host value from the "operation cahce" with the ServerConfig structure
-    let host = get_from_cache(CacheSection::Server, "host");
-    let ident = get_from_cache(CacheSection::Ident, "ident");
-    let appearance = get_from_cache(CacheSection::Appearance, "dark_theme");
-
-    let mut config_app_payload = HashMap::new();
-    config_app_payload.insert("host", host);
-    config_app_payload.insert("ident", ident);
-    config_app_payload.insert("dark_theme", appearance);
-
-    // Emit this data as a global event to update fornt-end fields
-    if let Err(e) = app.emit("global-config-server", config_app_payload) {
-        return Err(Box::new(e));
-    }
-
-    Ok(())
 }

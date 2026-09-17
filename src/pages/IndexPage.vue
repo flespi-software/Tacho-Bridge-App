@@ -1,5 +1,5 @@
 <template>
-  <q-page class="row items-center justify-evenly fit">
+  <q-page class="row justify-center q-pt-md q-px-sm">
     <TachoMainComponent />
   </q-page>
 </template>

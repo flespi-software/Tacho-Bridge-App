@@ -1,10 +1,12 @@
 <template>
   <div style="width: 600px; max-width: 100%">
-    <div class="rounded-borders" style="border: 1px solid #666">
-      <div v-if="state.readers.length === 0" class="q-pa-md text-grey text-h6">
-        No connected smart card readers
+    <div class="readers-container">
+      <div v-if="state.readers.length === 0" class="empty-state">
+        <q-icon name="mdi-card-search-outline" class="empty-state-icon" />
+        <div class="empty-state-title">No connected smart card readers</div>
+        <div class="empty-state-subtitle">Connect a smart card reader to get started</div>
       </div>
-      <div v-for="reader in state.readers" :key="reader.name" class="row reader">
+      <div v-for="reader in state.readers" :key="reader.name" class="row reader-row">
         <q-item class="col-6" style="min-height: 50px" dense>
           <q-item-section avatar>
             <q-icon name="mdi-usb-port" :color="reader.status !== 'UNKNOWN' ? 'green' : 'red'" />
@@ -23,8 +25,7 @@
             <q-item-label
               v-if="
                 reader.card_number &&
-                (authInProgress[reader.card_number] ||
-                  state.cards[reader.card_number]?.last_auth)
+                (authInProgress[reader.card_number] || state.cards[reader.card_number]?.last_auth)
               "
               caption
             >
@@ -41,7 +42,8 @@
                       ? 'text-green-8'
                       : 'text-red text-weight-medium'
                   "
-                >{{ state.cards[reader.card_number]?.last_auth?.[1] ? 'success' : 'fail' }}</span>)
+                  >{{ state.cards[reader.card_number]?.last_auth?.[1] ? 'success' : 'fail' }}</span
+                >)
               </template>
             </q-item-label>
           </q-item-section>
@@ -55,7 +57,13 @@
             <template v-if="!reader.card_number && reader.iccid">
               <q-item-label lines="1">UNKNOWN CARD</q-item-label>
               <q-item-label lines="1" caption>
-                <q-chip dense size="sm" color="grey" class="text-dark text-bold">
+                <q-chip
+                  dense
+                  size="sm"
+                  color="blue-grey-2"
+                  text-color="blue-grey-9"
+                  class="text-bold"
+                >
                   ICCID: {{ reader.iccid }}
                 </q-chip>
               </q-item-label>
@@ -110,6 +118,10 @@
         </q-item>
       </div>
     </div>
+    <!-- Card rack blocks, below the plain readers. One block per connected
+         rack (several racks on separate USB ports are all served), each rack
+         holding many cards. -->
+    <RackList v-for="r in racks" :key="r.id" :rack="r" @link="linkMode" />
     <SmartCardList
       ref="cardlist"
       :cards="state.cards"
@@ -119,57 +131,22 @@
     />
   </div>
 </template>
-
-<style scoped>
-.reader {
-  border-bottom: 1px solid #666;
-}
-.reader:last-child {
-  border-bottom: 0;
-}
-.blinking-icon {
-  animation: blink 1300ms infinite;
-}
-
-@keyframes blink {
-  0% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.37;
-  }
-  100% {
-    opacity: 1;
-  }
-}
-.toolbar-block {
-  margin-bottom: 8px;
-}
-.custom-font-size-reader {
-  font-size: 10px;
-}
-.header-flex-container {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding-right: 16px;
-}
-.card-number-dialog .q-card {
-  width: 300px; /* Window width */
-  max-width: 90vw; /* Maximum window width */
-  height: 160px; /* Window height */
-  max-height: 90vh; /* Maximum window height */
-}
-</style>
-
 <script setup lang="ts">
 import SmartCardList from './SmartCardList.vue'
-import type { SmartCard, Reader } from './models'
-import { formatStructureVersion, formatExpire, isExpired, formatAuthDate } from './cardFormatters'
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import RackList from './RackList.vue'
+import type { SmartCard, Reader, RackState } from './models'
+import {
+  formatStructureVersion,
+  formatExpire,
+  isExpired,
+  formatAuthDate,
+  cardStatusIcon,
+} from './cardFormatters'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { listen, emit, type UnlistenFn } from '@tauri-apps/api/event'
-import { Notify } from 'quasar'
+import { emit } from '@tauri-apps/api/event'
+import { useTauriListeners } from 'src/composables/useTauriListeners'
+import { notifyError, TOAST_LONG } from 'src/composables/notify'
 
 const cardlist = ref<null | {
   linkMode: (iccid: string) => void
@@ -177,15 +154,18 @@ const cardlist = ref<null | {
 }>(null)
 
 // reactive state for the readers and cards
-const state = reactive({
-  readers: [] as Reader[],
-  cards: {} as Record<string, SmartCard>,
+const state = reactive<{ readers: Reader[]; cards: Record<string, SmartCard> }>({
+  readers: [],
+  cards: {},
 })
 
+// Card rack states, pushed from the backend via `rack-state` as the full list
+// keyed by rack id. Empty until the backend reports a rack at least once;
+// racks that disconnect stay listed with connected=false.
+const racks = ref<RackState[]>([])
+
 // Registered Tauri listeners. Kept in an array so we can detach them all
-// in onUnmounted — leaking listeners across HMR/navigation would let stale
-// handlers keep mutating dead state and double-fire on remount.
-const unlistenFns: UnlistenFn[] = []
+const { on } = useTauriListeners()
 
 // Transient "authentication in progress" flag per card_number, derived from
 // the Reader.authentication field emitted by the backend via global-cards-sync.
@@ -233,9 +213,29 @@ function handleCardsSync(raw: unknown): void {
 
   const name = raw.reader_name
   const card_number = raw.card_number
-  // Split the status by the pipe character and get the second element
-  const splitted = (raw.card_state?.match(/\((.*)\)/i) ?? [])[1]?.split('|') ?? []
-  const status = splitted[1]?.trim() ?? splitted[0] ?? ''
+
+  // PC/SC reports UNKNOWN/IGNORE for a reader that is gone from the system —
+  // unplugged, or renamed by the OS after sleep/wake (the same physical reader
+  // often comes back under a new name). Remove the row instead of keeping a
+  // ghost entry forever; the reader's new name arrives as a separate event.
+  if (/\b(UNKNOWN|IGNORE)\b/.test(raw.card_state)) {
+    const goneIndex = state.readers.findIndex((reader) => reader.name === name)
+    if (goneIndex !== -1) {
+      state.readers.splice(goneIndex, 1)
+    }
+    return
+  }
+
+  // The PCSC monitor sends the bitflags Debug form "State(CHANGED | PRESENT)";
+  // the MQTT emitter sends a bare "PRESENT". Parse the parenthesized form and
+  // fall back to the raw string, then pick the first meaningful flag — the
+  // positional [1] this used to be broke on single-flag and no-CHANGED forms.
+  const inner = raw.card_state.match(/\(([^)]*)\)/)?.[1] ?? raw.card_state
+  const flags = inner
+    .split('|')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const status = flags.find((f) => f !== 'CHANGED') ?? flags[0] ?? ''
 
   const iccid = raw.iccid
   // Find the index of the reader with the same name
@@ -255,85 +255,62 @@ function handleCardsSync(raw: unknown): void {
   }
 }
 
+// Runtime guard for one rack in the rack-state payload — fail closed on a
+// malformed shape.
+function isRackStatePayload(raw: unknown): raw is RackState {
+  if (!raw || typeof raw !== 'object') return false
+  const p = raw as Record<string, unknown>
+  return (
+    typeof p.id === 'string' &&
+    typeof p.connected === 'boolean' &&
+    typeof p.name === 'string' &&
+    Array.isArray(p.cards)
+  )
+}
+
+function handleRackState(raw: unknown): void {
+  // The backend always sends the full rack list, so the local one is replaced
+  // wholesale — no delta merging.
+  if (!Array.isArray(raw) || !raw.every(isRackStatePayload)) {
+    console.warn('rack-state: ignoring malformed payload', raw)
+    return
+  }
+  racks.value = raw
+}
+
 ///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
 
 const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
-  // Find the index of the reader with the same iccid
-  const readerIndex = state.readers.findIndex((reader) => reader.iccid === content.iccid)
-
-  // Save the card number to the currentReader object
   console.log(`Card Number: ${cardNumber}, Card iccid: ${content.iccid}`)
 
-  // update the configuration with the new card number in the dynamic cache
-  const update_result = await invoke('update_card', {
-    cardnumber: cardNumber,
-    content: content,
+  // The backend reconnects the affected card itself after a successful save
+  // (PCSC rescan + pending rack cards), no explicit sync call is needed here.
+  // The local card list is NOT updated here: on success the backend emits
+  // `global-card-config-updated`, the single source of truth — an optimistic
+  // local write would show a "saved" card that a failed write never persisted.
+  try {
+    // The command rejects with a human-readable reason (e.g. an ICCID already
+    // linked to another card), so the message below can be shown verbatim.
+    await invoke('update_card', {
+      cardnumber: cardNumber,
+      content: content,
+    })
+    console.log('Card number updated successfully')
+  } catch (error) {
+    console.error(`Failed to update card ${cardNumber}:`, error)
+    notifyError(`Failed to save card ${cardNumber}`, error, TOAST_LONG)
+  }
+}
+
+// Status icon for a card in a reader, from the shared vocabulary the rack list
+// uses too. `iccid` present means a card is physically in the reader.
+const cardConnectedStatus = (reader: Reader) =>
+  cardStatusIcon({
+    present: !!reader.iccid,
+    linked: !!reader.card_number,
+    online: reader.online,
+    authentication: reader.authentication,
   })
-
-  // Update the card number in the state if configuration update was successful
-  if (update_result && readerIndex > -1) {
-    const reader = state.readers[readerIndex]
-    if (reader) {
-      // Run update only if reader definitely exists
-      await invoke('manual_sync_cards', {
-        readername: reader.name,
-        restart: false,
-      })
-
-      console.log('Card number updated successfully')
-    } else {
-      console.error(`Reader at index ${readerIndex} does not exist`)
-    }
-  }
-}
-
-// Function to change the color of the icon depending on the card status
-const cardConnectedStatus = (reader: Reader) => {
-  if (reader.iccid && reader.online) {
-    // If the card is connected and online
-
-    if (reader.authentication) {
-      // If the card is in the authentication process
-      return {
-        name: 'mdi-smart-card',
-        color: 'green',
-        size: '25px',
-        class: 'blinking-icon',
-      }
-    } else {
-      // If the card is not in the authentication process
-      return {
-        name: 'mdi-smart-card',
-        color: 'green',
-        size: '25px',
-      }
-    }
-  } else if (reader.iccid) {
-    // If the card is connected to the app but not online
-    if (reader.card_number) {
-      // Known card
-      return {
-        name: 'mdi-smart-card-outline',
-        color: 'grey',
-        size: '25px',
-      }
-    } else {
-      // unknown card
-      return {
-        name: 'mdi-card-plus-outline',
-        color: 'orange',
-        size: '25px',
-      }
-    }
-  } else {
-    // If the card is disconnected
-    return {
-      name: 'mdi-smart-card-off-outline',
-      color: 'grey',
-      size: '25px',
-    }
-  }
-}
 
 // SmartCardList handlers
 function linkMode(iccid: string) {
@@ -343,12 +320,10 @@ function linkMode(iccid: string) {
   }
 }
 async function addCard(number: string, data: SmartCard) {
-  state.cards[number] = data
   await saveCardNumber(number, data)
 }
 
 async function updateCard(number: string, data: SmartCard) {
-  state.cards[number] = data
   await saveCardNumber(number, data)
 }
 
@@ -359,12 +334,7 @@ const removeCard = async (cardNumber: string) => {
     console.log('Card removed:', cardNumber)
   } catch (error) {
     console.error('Failed to remove card:', error)
-    Notify.create({
-      message: `Failed to remove card ${cardNumber}: ${String(error)}`,
-      color: 'red',
-      position: 'bottom',
-      timeout: 8000,
-    })
+    notifyError(`Failed to remove card ${cardNumber}`, error, TOAST_LONG)
   }
 }
 
@@ -391,39 +361,19 @@ onMounted(async () => {
   // Register listeners BEFORE notifying the backend that we're loaded.
   // Otherwise the initial sync burst can race the channel registration and
   // arrive into the void, leaving the UI stuck on stale empty state.
-  try {
-    const unlisten = await listen('global-cards-sync', (event) => handleCardsSync(event.payload))
-    unlistenFns.push(unlisten)
-  } catch (error) {
-    console.error('Error listening to global-cards-sync:', error)
-  }
+  await on('global-cards-sync', handleCardsSync)
+  await on('global-card-config-updated', handleCardConfigUpdated)
+  await on('rack-state', handleRackState)
 
-  try {
-    const unlisten = await listen('global-card-config-updated', (event) =>
-      handleCardConfigUpdated(event.payload),
-    )
-    unlistenFns.push(unlisten)
-  } catch (error) {
-    console.error('Error listening to global-card-config-updated:', error)
-  }
-
-  // Now that both listeners are wired, tell the backend it can start
-  // emitting initial state.
+  // Now that the listeners are wired, tell the backend it can start
+  // emitting initial state. The replay bursts one event per EXISTING card and
+  // nothing for absent ones — clear the map first so the replay is
+  // authoritative and cards deleted while the webview was away don't linger.
+  state.cards = {}
   try {
     await emit('frontend-loaded', { message: 'Hello from frontend!' })
   } catch (error) {
     console.error('Error emitting frontend-loaded event:', error)
-  }
-})
-
-onUnmounted(() => {
-  while (unlistenFns.length > 0) {
-    const fn = unlistenFns.pop()
-    try {
-      fn?.()
-    } catch (e) {
-      console.error('Error detaching Tauri listener:', e)
-    }
   }
 })
 </script>

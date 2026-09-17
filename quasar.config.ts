@@ -59,7 +59,16 @@ export default defineConfig((/* ctx */) => {
       // polyfillModulePreload: true,
       // distDir
 
-      // extendViteConf (viteConf) {},
+      // Exclude the Rust build tree from Vite's file watcher. `src-tauri/target`
+      // holds ~40k build artifacts; watching them pins the dev server at several
+      // hundred % CPU. Tauri rebuilds the backend itself, so Vite must ignore it.
+      extendViteConf(viteConf) {
+        viteConf.server = viteConf.server || {}
+        viteConf.server.watch = {
+          ...(viteConf.server.watch || {}),
+          ignored: ['**/src-tauri/target/**', '**/src-tauri/gen/**'],
+        }
+      },
       // viteVuePluginOptions: {},
 
       vitePlugins: [
@@ -68,7 +77,14 @@ export default defineConfig((/* ctx */) => {
           {
             vueTsc: true,
             eslint: {
-              lintCommand: 'eslint -c ./eslint.config.js "./src*/**/*.{ts,js,mjs,cjs,vue}"',
+              // "./src/**", NOT "./src*/**": the checker worker feeds this glob
+              // straight into its own chokidar watcher (its only built-in ignore
+              // is node_modules), and `src*` would pull in src-tauri/target —
+              // tens of thousands of cargo artifacts rewritten on every rebuild,
+              // which balloons the worker until it dies with
+              // ERR_WORKER_OUT_OF_MEMORY. There is no lintable JS/TS in
+              // src-tauri anyway.
+              lintCommand: 'eslint -c ./eslint.config.js "./src/**/*.{ts,js,mjs,cjs,vue}"',
               useFlatConfig: true,
             },
           },
@@ -80,6 +96,18 @@ export default defineConfig((/* ctx */) => {
     // Full list of options: https://v2.quasar.dev/quasar-cli-vite/quasar-config-file#devserver
     devServer: {
       // https: true,
+      // Off the beaten path on purpose: 9000 is a popular default (VS Code
+      // port forwarding grabs 127.0.0.1:9000 and silently swallows webview
+      // requests -> white screen in `tauri dev`). Must match `build.devUrl`
+      // in src-tauri/tauri.conf.json.
+      port: 9314,
+      // Bind 127.0.0.1 explicitly, not the wildcard: the Tauri webview only
+      // ever loads via localhost, and with the wildcard bind the specific
+      // 127.0.0.1:<port> slot stays free for VS Code's remembered port
+      // forward to grab on every extension-host restart — it then shadows
+      // the dev server for all localhost traffic (white screen again).
+      // Holding the specific bind makes VS Code's grab fail instead.
+      host: 'localhost',
       open: false, // opens browser window automatically
     },
 

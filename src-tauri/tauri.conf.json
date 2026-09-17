@@ -1,20 +1,22 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "tba",
-  "version": "0.7.3",
+  "version": "0.8.0-rc.13",
   "identifier": "com.flespi.tba.dev",
   "build": {
     "frontendDist": "../dist/spa",
-    "devUrl": "http://localhost:9000",
+    "devUrl": "http://localhost:9314",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "npm run build:tauri"
   },
   "app": {
     "windows": [
       {
         "title": "tba",
         "width": 620,
-        "height": 400,
+        "height": 640,
+        "minWidth": 620,
+        "minHeight": 400,
         "resizable": true,
         "fullscreen": false
       }
@@ -23,9 +25,21 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ4MzU3RUZDM0FFNEIzNkQKUldSdHMrUTYvSDQxMktrdFFTbzB4NUFzRE4yZVlwUFIreHRpLzBkSHpqeHV5UjIyQlQwOS9RbkEK",
+      "endpoints": [
+        "https://github.com/flespi-software/Tacho-Bridge-App/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "targets": ["nsis", "app", "dmg", "deb", "rpm", "appimage"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
