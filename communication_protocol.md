@@ -338,12 +338,60 @@ too-narrow bound visible on the client side.
 ## 7. App connection
 
 The application-level connection identifies a running TBA instance (presence,
-diagnostics). It follows the same topic scheme. The only command it carries
-is the log fetch (below); everything under the `rack/` prefix belongs to the
-card racks (section 6) and does not collide with it.
+diagnostics). It follows the same topic scheme. It carries the application
+commands (`fetch_logs`, `debug_log`, `set_credentials`, `set_server`,
+`get_settings`, below); everything
+under the `rack/` prefix belongs to the card racks (section 6) and does not
+collide with them.
 
-The username/password fields of the MQTT CONNECT packet are reserved for
-future authorization and must not be used to carry anything else.
+Every application command is a JSON publish on `request/<request_id>/0` with
+a `name` field; `request_id` is the server's counter for the connection, shared
+by all application commands. Each command answers on its own topic. An unknown
+name is logged and dropped.
+
+| name              | purpose                                        | reply topic                     |
+|-------------------|------------------------------------------------|---------------------------------|
+| `fetch_logs`      | upload a slice of the log file                 | `logs/<request_id>/...`         |
+| `debug_log`       | switch the extended debug log on/off           | `debug/<request_id>/done`       |
+| `set_credentials` | set the MQTT authentication of the application | `credentials/<request_id>/done` |
+| `set_server`      | move the application to another server address | `server/<request_id>/done`      |
+| `get_settings`    | the settings report on demand                  | `settings/<request_id>/done`    |
+
+On the server `fetch_logs` is a device command; `debug_log`, `set_credentials`
+and `set_server` are driven by device settings of the app device ("Extended
+debug log" in the Diagnostics tab, "Authentication" and "Server address" in
+the Server tab): the set command of the setting sends the request, the `done`
+reply is its result. The get command of any of these settings (and of
+"Application Information") sends `get_settings`; the reply carries the full
+report and updates every setting in it.
+
+### Authentication
+
+TBA presents one username/password pair (Settings -> Server authentication,
+or pushed by `set_credentials`) in the MQTT CONNECT packet of **every**
+connection it opens: the app connection, every card connection and the
+legacy rack connection. With the switch off it connects anonymously.
+
+The server checks the CONNECT username and password against the
+**"Application authentication"** section (`credentials`: `username`,
+optional `password`) of the **channel configuration**, the same pair for
+every connection of every application on the channel:
+
+- the channel has the pair and the connect presents none or another one:
+  the connect is rejected with the channel error "credentials not set or
+  invalid", CONNACK reason code `0x87` (Not authorized); TBA raises the
+  "authentication rejected" notification on it;
+- the channel has no pair and the connect presents one: the server logs a
+  warning once per connection ("the application has authentication username
+  ... configured, but the channel does not require authentication") and the
+  connect goes on, so the switch can be turned on before the channel is
+  configured and nothing breaks;
+- no pair on either side: an anonymous connect, as before.
+
+The pair is not compared with the generic "Authenticate incoming MQTT
+connections" option of the channel, which the platform enforces on its own
+before the protocol runs; use the "Application authentication" section for
+the applications.
 
 ### Settings report
 
@@ -360,13 +408,34 @@ the format:
     "os": "Linux",
     "os_release": "6.1.0",
     "arch": "x86_64"
-  }
+  },
+  "debug_log": {"enabled": false, "until": 0},
+  "server": {"host": "mqtt.flespi.io:8883"},
+  "authentication": {"enabled": false, "username": "", "saved": false}
 }
 ```
 
 - `version` — application version (Cargo package version);
 - `os` / `os_release` — operating system type and release;
-- `arch` — CPU architecture the binary runs on.
+- `arch` — CPU architecture the binary runs on;
+- `debug_log` — the state of the extended debug log (see `debug_log` below),
+  the current value of the "Extended debug log" server setting;
+- `server` — the address the application is connected to, the current value
+  of the "Server address" server setting;
+- `authentication` — the switch, the username in effect and whether the pair
+  is saved in config.yaml; the password is never reported. The current value
+  of the "Authentication" server setting (its `credentials` group: `enabled`,
+  `username`, `save`; an anonymous state carries `enabled` only).
+
+The same object answers the `get_settings` command:
+
+```json
+{ "name": "get_settings" }
+```
+
+published to `request/<request_id>/0`; the reply goes to
+`settings/<request_id>/done` (or `{"error": ...}` there). The server sends it
+for the get of any application setting.
 
 The report is re-sent on every reconnect (the server tracks it per
 connection). On the server the values are exposed as a read-only "Application
@@ -409,11 +478,111 @@ Idempotency: while an upload is running, a re-sent `fetch_logs` with any
 `request_id` is dropped — the upload in flight produces the reply. Chunks of
 an abandoned exchange are discarded by the server via the `request_id` check.
 
+### Extended debug log (`debug_log`)
+
+Raises the verbosity of the TBA log for a window of time, so that a following
+`fetch_logs` carries what the server-side traffic dump does not have (port
+queueing, slot leases, card-set reconciliation, frame digests). Rack frames
+are never logged, they are identified by `first 8 hex digits of
+SHA-256(frame bytes)`.
+
+```json
+{ "name": "debug_log", "enable": true, "duration": 3600 }
+```
+
+- `enable` — default `true`; `false` switches the debug log off at once;
+- `duration` — seconds, default `0` = on until an explicit `enable: false`,
+  at most 604800 (7 days). A new command replaces the running window.
+
+Reply on `debug/<request_id>/done`:
+
+```json
+{ "name": "debug_log", "enabled": true, "until": 1758200000 }
+{ "error": "duration must be 0..=604800 seconds" }
+```
+
+`until` is the unix time the window expires at, `0` = no expiry. On the
+server the request is the set command of the "Extended debug log" setting
+(its `window` group: `enabled` and, when it is on, `duration`; the reported
+`until` is kept in the group as a hidden field), the reply is its result. The same switch is in Settings ->
+Diagnostics; a window opened from either side is visible to both. The absolute
+deadline is persisted (`debug_log_until` in config.yaml), so a restart inside
+the window resumes it.
+
+### Server authentication (`set_credentials`)
+
+Pushes the credentials of the "Authentication" section above. On the server
+this is the "Authentication" device setting of the app device (Server tab):
+the operator sets `enabled` and, when it is on, optionally `username`,
+`password` and `save` (the `credentials` group of the setting), and the
+server sends the request below. Without explicit values the server pushes
+the pair of the channel's "Application authentication" section; enabling
+without either is refused, since the application would be locked out.
+
+```json
+{ "name": "set_credentials", "enable": true, "username": "TBA0000000000001", "password": "...", "save": true }
+```
+
+- `enable` — default `true`; `false` switches to anonymous connects, the
+  stored pair is kept;
+- `username` — required to enable unless a pair is already in effect;
+- `password` — omitted keeps the current one;
+- `save` — default `true`; `false` keeps the pair in memory for this run only
+  and removes it from config.yaml.
+
+Reply on `credentials/<request_id>/done`, published on the connection the
+command arrived on **before** every connection is rebuilt with the new pair:
+
+```json
+{ "name": "set_credentials", "enabled": true, "saved": true }
+{ "error": "username is required to enable authentication" }
+```
+
+There is no rollback: what the server pushes is what the application uses
+from then on. A pair that does not match the channel configuration locks the
+application out until the fields are fixed in its settings dialog or on the
+channel.
+
+### Server address (`set_server`)
+
+Moves the application to another MQTT server. On the server this is the
+"Server address" device setting of the app device (Server tab, field `host`).
+
+```json
+{ "name": "set_server", "host": "mqtt.example.com:8883" }
+```
+
+- `host` — `host:port`, validated the way the settings dialog validates it.
+
+Reply on `server/<request_id>/done`, published on the connection the command
+arrived on **before** every connection is rebuilt against the new address:
+
+```json
+{ "name": "set_server", "host": "mqtt.example.com:8883" }
+{ "error": "Host doesn't correspond to the format 'host:port'" }
+```
+
+The address is persisted in `server.host` of config.yaml. There is no
+rollback: after the reply the application, its cards and racks reconnect to
+the new address and the old server hears nothing from them any more.
+
+### Command replies
+
+The `done` reply of `debug_log`, `set_credentials`, `set_server` and
+`get_settings` finishes the command in flight on the server only when its
+kind matches that command (the set of the matching setting, or the get of
+any application setting for the report) and its `request_id` is the one
+awaited; anything else is dropped with a warning, so a late reply of an
+expired command never closes the next one.
+
 ## 8. Configuration inputs
 
 What TBA needs to know locally to serve the protocol:
 
 - `server.host` — where to connect;
+- `server.auth_enabled`, `server.username`, `server.password` — the MQTT
+  authentication switch and the saved pair (see "Authentication");
+- `debug_log_until` — the extended debug log window deadline;
 - per-card entries in the config: company card number (used as the card
   connection `client_id`), ICCID (to match an inserted card to its number),
   `t_protocol` (see §5);

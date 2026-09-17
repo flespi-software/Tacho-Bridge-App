@@ -1053,6 +1053,23 @@ pub fn set_server_credentials(
     Ok(())
 }
 
+/// Persists a new server address (`host:port`, validated by the caller with
+/// `split_host_to_parts`). Blocking disk I/O under the config write lock -
+/// call from a blocking context. Reconnecting is the caller's job.
+pub fn set_server_host(host: &str) -> Result<(), String> {
+    let _guard = config_write_guard();
+    let config_path = get_config_path().map_err(|e| e.to_string())?;
+    let mut config = load_config(&config_path).map_err(|e| e.to_string())?;
+    let server = config
+        .server
+        .as_mut()
+        .ok_or_else(|| "server address is not configured".to_string())?;
+    server.host = host.to_string();
+    save_config(&config_path, &config).map_err(|e| e.to_string())?;
+    load_config_to_cache(&config).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// The credentials saved in the config, when both the switch and a username
 /// are set.
 pub fn saved_credentials() -> Option<(String, String)> {
@@ -1203,11 +1220,12 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
         "auto_install_updates",
         get_from_cache(CacheSection::Updates, "auto_install_updates"),
     );
-    // Authentication state for the settings dialog and the startup prompt.
-    // The password never goes to the webview.
+    // Authentication state for the settings dialog and the startup prompt,
+    // the password included: the dialog shows the pair in effect.
     let auth = crate::mqtt::auth_state();
     config_app_payload.insert("auth_enabled", auth.enabled.to_string());
     config_app_payload.insert("auth_username", auth.username);
+    config_app_payload.insert("auth_password", auth.password);
     config_app_payload.insert("auth_saved", auth.saved.to_string());
     config_app_payload.insert("auth_active", auth.active.to_string());
     // Extended debug log state for the settings dialog.

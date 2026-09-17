@@ -77,7 +77,6 @@
             v-model="authPassword"
             :type="authPasswordVisible ? 'text' : 'password'"
             autocomplete="new-password"
-            :placeholder="authActive && !credentialsDirty ? '(unchanged)' : ''"
             class="q-mb-sm"
             @update:model-value="credentialsDirty = true"
           >
@@ -308,14 +307,15 @@ const isIdentValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))
 
 const hostValue = ref('')
 
-// Server authentication. The password is never received from the backend:
-// the field starts empty and is sent only when the user typed into the
-// credentials (`credentialsDirty`), otherwise the pair in effect is kept.
+// Server authentication. The fields show the pair in effect (the password
+// too, masked until the eye icon is clicked); the pair is sent to the
+// backend only when the user typed into it (`credentialsDirty`), otherwise
+// the pair in effect is kept.
 const authEnabled = ref(false)
 const authUsername = ref('')
 const authPassword = ref('')
 const authPasswordVisible = ref(false)
-// Whether a pair is in effect (saved or for this run) — drives the placeholder.
+// Whether a pair is in effect (saved or for this run).
 const authActive = ref(false)
 // Checked (default): the pair goes to config.yaml. Unchecked: memory only,
 // asked again at the next launch.
@@ -458,6 +458,19 @@ const saveServerConfig = async () => {
   const theme = themeMode.value
   console.log(`server_address: ${hostValue.value}, ident: ${identInput.value}, theme: ${theme}`)
 
+  // Snapshot what the user typed before the first backend call: update_server
+  // re-emits `global-config-server` (with the pair still in effect), and that
+  // event may reach the listener below before this function resumes.
+  const credentials = {
+    enabled: authEnabled.value,
+    username: credentialsDirty.value ? authUsername.value : null,
+    password: credentialsDirty.value ? authPassword.value : null,
+    save: saveCredentials.value,
+  }
+  const debugLog = debugLogDirty.value
+    ? { enabled: debugLogEnabled.value, duration: debugLogDuration.value }
+    : null
+
   saving.value = true
   try {
     // update_server resolves with `false` on a persistence failure (read-only
@@ -477,21 +490,11 @@ const saveServerConfig = async () => {
     // The switch is persisted on every save; the pair only when the user
     // typed into it (null = keep what is in effect). The reconnect below
     // picks the new state up, so the backend does not reconnect here.
-    await invoke('apply_credentials', {
-      enabled: authEnabled.value,
-      username: credentialsDirty.value ? authUsername.value : null,
-      password: credentialsDirty.value ? authPassword.value : null,
-      save: saveCredentials.value,
-      reconnect: false,
-    })
+    await invoke('apply_credentials', { ...credentials, reconnect: false })
     credentialsDirty.value = false
-    authPassword.value = ''
 
-    if (debugLogDirty.value) {
-      await invoke('set_debug_log', {
-        enabled: debugLogEnabled.value,
-        duration: debugLogDuration.value,
-      })
+    if (debugLog) {
+      await invoke('set_debug_log', debugLog)
       debugLogDirty.value = false
     }
 
@@ -534,6 +537,7 @@ onMounted(async () => {
       auto_install_updates?: string
       auth_enabled?: string
       auth_username?: string
+      auth_password?: string
       auth_saved?: string
       auth_active?: string
       debug_log_enabled?: string
@@ -548,16 +552,21 @@ onMounted(async () => {
     ident.value = payload.ident.replace(/^TBA/i, '')
     betaUpdates.value = payload.beta_updates === 'true'
     autoInstallUpdates.value = payload.auto_install_updates === 'true'
-    authEnabled.value = payload.auth_enabled === 'true'
-    authUsername.value = payload.auth_username ?? ''
     authActive.value = payload.auth_active === 'true'
-    // A pair in effect that is not in the file was entered for this run only:
-    // reflect that, otherwise default to saving.
-    saveCredentials.value = !(authActive.value && payload.auth_saved !== 'true')
-    credentialsDirty.value = false
-    authPassword.value = ''
-    debugLogEnabled.value = payload.debug_log_enabled === 'true'
-    debugLogDirty.value = false
+    // The fields the user is editing stay as typed: the event fired by the
+    // save in progress (or by a reconnect) carries the pair still in effect,
+    // and reflecting it would drop the edit before it is applied.
+    if (!saving.value && !credentialsDirty.value) {
+      authEnabled.value = payload.auth_enabled === 'true'
+      authUsername.value = payload.auth_username ?? ''
+      authPassword.value = payload.auth_password ?? ''
+      // A pair in effect that is not in the file was entered for this run only:
+      // reflect that, otherwise default to saving.
+      saveCredentials.value = !(authActive.value && payload.auth_saved !== 'true')
+    }
+    if (!saving.value && !debugLogDirty.value) {
+      debugLogEnabled.value = payload.debug_log_enabled === 'true'
+    }
     const until = Number(payload.debug_log_until ?? '0')
     debugLogActiveHint.value = !debugLogEnabled.value
       ? ''

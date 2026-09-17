@@ -212,12 +212,15 @@ pub(crate) fn resolved_credentials() -> Option<(String, String)> {
         .or_else(crate::config::saved_credentials)
 }
 
-/// Authentication state as the webview needs it: the switch, the username to
-/// prefill, whether the pair is saved in the config, and whether any pair is
-/// in effect at all (saved or for this run). Never the password.
+/// Authentication state as the webview needs it: the switch, the pair to
+/// prefill (the settings dialog shows the password in effect), whether the
+/// pair is saved in the config, and whether any pair is in effect at all
+/// (saved or for this run). The settings report to the server takes the
+/// switch, the username and the saved flag from it, never the password.
 pub(crate) struct AuthState {
     pub enabled: bool,
     pub username: String,
+    pub password: String,
     pub saved: bool,
     pub active: bool,
 }
@@ -226,14 +229,15 @@ pub(crate) fn auth_state() -> AuthState {
     let enabled = get_from_cache(CacheSection::Server, "auth_enabled") == "true";
     let saved = crate::config::saved_credentials();
     let session = session_credentials().clone();
-    let username = session
+    let (username, password) = session
         .as_ref()
         .or(saved.as_ref())
-        .map(|(u, _)| u.clone())
+        .cloned()
         .unwrap_or_default();
     AuthState {
         enabled,
         username,
+        password,
         saved: saved.is_some(),
         active: enabled && (session.is_some() || saved.is_some()),
     }
