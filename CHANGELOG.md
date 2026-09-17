@@ -198,3 +198,10 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Consolidated the 0.8.0 changelog into a single section.
+
+### [0.8.0-rc.15] - 2026-09-17
+
+🆕 Features / Improvements
+
+- Clarified the card rack comments around slot indicator repaints.
+- Added MQTT authentication with a one-time sign-in mode and the set_credentials server command, an extended debug log switchable from the settings or by the debug_log server command, and a single router for server commands.
