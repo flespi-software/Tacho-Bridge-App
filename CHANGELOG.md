@@ -205,3 +205,9 @@ All notable changes to this project will be documented in this file.
 
 - Clarified the card rack comments around slot indicator repaints.
 - Added MQTT authentication with a one-time sign-in mode and the set_credentials server command, an extended debug log switchable from the settings or by the debug_log server command, and a single router for server commands.
+
+### [0.8.0-rc.16] - 2026-09-17
+
+🆕 Features / Improvements
+
+- Added set_server and get_settings server commands, the password in the settings dialog, and fixed the dialog losing edited credentials on save.
