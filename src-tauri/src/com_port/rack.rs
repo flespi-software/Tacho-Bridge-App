@@ -99,9 +99,9 @@ pub(super) fn app_link_is(generation: u64) -> bool {
 /// Racks whose next card set follows a `link up`, i.e. a full re-discovery of
 /// the server. Only such a set makes the live card sessions re-publish their
 /// rack link reports: the report is what re-binds a slot on a server instance
-/// that has just (re)built its card map, and it costs one serial LED frame per
+/// that has just (re)built its card map, and it costs one serial exchange per
 /// card. Doing it for EVERY card set is what buried a 100-card rack under
-/// hundreds of LED frames a minute, starving the discovery and the tracker
+/// hundreds of indicator repaints a minute, starving the discovery and the tracker
 /// exchanges queued behind them on the same port.
 static RACK_REBIND: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
     std::sync::Mutex::new(None);
@@ -547,7 +547,7 @@ fn parse_serial_control(json: &serde_json::Value) -> Result<SerialControl, &'sta
 
 /// Which slot ownership an envelope needs, as `(slot, discovery)`: a discovery step of the rack
 /// reserves its slot against authentications, an in-session command of a card holds the card's
-/// slot against discovery. Other envelopes (LED repaints, the closing message) need none.
+/// slot against discovery. Other envelopes (indicator repaints, the closing message) need none.
 fn slot_ownership(
     card: Option<(&str, &str, u16)>,
     discovery_slot: Option<u16>,
@@ -563,8 +563,8 @@ fn slot_ownership(
 /// Shows and records the authentication activity the `finish` flag of a card envelope tells.
 /// Authentication boundaries come from the server's flag alone — the same contract the PC/SC
 /// path uses (see `auth_process` in mqtt.rs); nothing is inferred from the traffic itself. An
-/// envelope without the flag is plain signalling on the same serial path (e.g. a slot LED
-/// repaint), never shown or recorded as authentication activity. The one gap — a closing
+/// envelope without the flag is plain signalling on the same serial path (e.g. a slot
+/// indicator repaint), never shown or recorded as authentication activity. The one gap — a closing
 /// `finish:true` that never arrives — is covered by the keep-alive PingResp reset in cards.rs.
 fn record_card_activity(iccid: &str, card_number: &str, finish: Option<bool>, log_header: &str) {
     match finish {

@@ -44,7 +44,7 @@ struct RackCardTask {
     /// card set that still lists this card ask the live session to re-publish
     /// its rack link report without disturbing the session itself — the server
     /// needs that report to know the card is still served (it repaints the
-    /// slot LED from it) after the application connection re-established and
+    /// slot indicator from it) after the application connection re-established and
     /// its discovery re-ran.
     client: Arc<OnceLock<AsyncClient>>,
 }
@@ -225,11 +225,11 @@ fn spawn_rack_card(
                 // The server re-ran discovery for a slot it already served —
                 // typically the application connection re-established while
                 // this card session stayed up. Such a discovery may paint the
-                // slot as unserved (red LED); re-publishing the link report
+                // slot as unserved; re-publishing the link report
                 // over the live session tells the server the card is still
                 // connected, which re-binds the slot and repaints it. Only
-                // after a `link up`, though: every report costs a serial LED
-                // frame, and a routine card set (one per discovery chain, and
+                // after a `link up`, though: every report costs an extra serial
+                // exchange, and a routine card set (one per discovery chain, and
                 // a chain runs on every card insertion or removal) would then
                 // put one frame per card of the rack on the wire, ahead of the
                 // tracker exchanges. Detached: publish() can park on a full
