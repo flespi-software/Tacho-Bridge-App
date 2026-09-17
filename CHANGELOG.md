@@ -192,3 +192,9 @@ All notable changes to this project will be documented in this file.
 - Refreshed UI: smoother, more rounded design, a larger default window with a minimum size so dialogs are no longer cramped, extended card information in the list and a condensed view in the reader block.
 - CI-managed releases: every push auto-increments the version across all configs, builds signed installers for macOS (universal), Windows and Linux, generates the changelog and release notes from commit messages, and publishes the GitHub release automatically.
 - Internal: the card rack module split into units for device discovery, serial transport, the rack connection, card sessions and interface state; reduced duplicated code across the MQTT, rack and UI layers; standard Rust formatting applied; unit tests added across the backend and a first frontend test suite; updated Rust and frontend dependencies, including fixes for known security advisories.
+
+### [0.8.0-rc.14] - 2026-09-17
+
+🆕 Features / Improvements
+
+- Consolidated the 0.8.0 changelog into a single section.
