@@ -29,6 +29,7 @@ log = "0.4"
 tauri-plugin-log = "2.0.0-rc"
 pcsc = "2.9.0"
 hex = "0.4.3"
+sha2 = "0.10" # frame digests in the debug log (already a transitive dependency)
 rumqttc = "0.25.1"
 fern = "0.7.1"
 chrono = "0.4.39"

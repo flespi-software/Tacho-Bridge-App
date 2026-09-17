@@ -42,6 +42,39 @@ fn detach_temp_path(dir: &Path) -> PathBuf {
     ))
 }
 
+/// Verbosity of the app's own modules while the extended debug log is off:
+/// `Info`, or the bare level of `TBA_LOG` when one is set. The fern dispatch
+/// lets our modules through at `Trace` unconditionally; what actually gets
+/// logged is decided by the global `log::set_max_level`, which is the one
+/// knob that can be turned at runtime. `debug_log.rs` raises it to `Debug`
+/// on the server's command and restores this baseline afterwards.
+static BASELINE_LEVEL: std::sync::OnceLock<log::LevelFilter> = std::sync::OnceLock::new();
+
+fn baseline_level() -> log::LevelFilter {
+    *BASELINE_LEVEL.get().unwrap_or(&log::LevelFilter::Info)
+}
+
+/// Turns the extended debug log on or off at runtime. On: every `debug!` of
+/// the app's modules is written (payload hex stays at `trace`, which the
+/// command never enables — raw rack frames must not land in users' log
+/// files). Off: back to the startup baseline. Idempotent and cheap: `log`
+/// checks the max level before formatting, so a disabled `debug!` costs one
+/// atomic load.
+pub fn set_extended_debug(on: bool) {
+    let level = if on {
+        baseline_level().max(log::LevelFilter::Debug)
+    } else {
+        baseline_level()
+    };
+    log::set_max_level(level);
+}
+
+/// Whether `debug!` lines are currently written (by the server's command or
+/// by a `TBA_LOG` baseline of `debug`/`trace`).
+pub fn extended_debug_is_on() -> bool {
+    log::max_level() >= log::LevelFilter::Debug
+}
+
 /// Parses a level name from the `TBA_LOG` spec ("debug", "warn", ...).
 fn parse_level(s: &str) -> Option<log::LevelFilter> {
     match s.trim().to_ascii_lowercase().as_str() {
@@ -421,33 +454,40 @@ pub fn setup_logging() {
                 message
             ))
         })
-        // Default: our code and dependencies at INFO.
-        .level(log::LevelFilter::Info);
+        // Dependencies at INFO; our own modules pass the dispatch at any level
+        // — their effective verbosity is the global max level (see
+        // `set_extended_debug`), so it can be raised at runtime.
+        .level(log::LevelFilter::Info)
+        .level_for("app_lib", log::LevelFilter::Trace);
 
     // TBA_LOG controls verbosity without a rebuild. Applies to our modules
     // only — dependencies stay at INFO. Examples:
     //   TBA_LOG=debug                       whole app at debug
     //   TBA_LOG=smart_card=debug,mqtt=warn  per-module overrides
+    // A bare level sets the runtime baseline; per-module overrides are fixed
+    // fern filters (they cap a module even while the extended debug is on).
     let mut level_spec = String::from("info");
+    let mut baseline = log::LevelFilter::Info;
     if let Ok(spec) = env::var("TBA_LOG") {
         for part in spec.split(',').filter(|p| !p.trim().is_empty()) {
             match part.split_once('=') {
                 Some((module, level)) => match parse_level(level) {
                     Some(level) => {
                         dispatch = dispatch.level_for(format!("app_lib::{}", module.trim()), level);
+                        // a module raised above the baseline must pass the global gate too
+                        baseline = baseline.max(level);
                     }
                     None => eprintln!("TBA_LOG: unknown level in '{}'", part),
                 },
                 None => match parse_level(part) {
-                    // Bare level: the whole app_lib tree (fern falls back from
-                    // app_lib::mqtt to app_lib when matching module levels).
-                    Some(level) => dispatch = dispatch.level_for("app_lib", level),
+                    Some(level) => baseline = level,
                     None => eprintln!("TBA_LOG: unknown level '{}'", part),
                 },
             }
         }
         level_spec = spec;
     }
+    let _ = BASELINE_LEVEL.set(baseline);
 
     dispatch = dispatch.chain(fern::Output::writer(Box::new(log_writer), "\n"));
 
@@ -461,6 +501,9 @@ pub fn setup_logging() {
     if let Err(e) = dispatch.apply() {
         eprintln!("Failed to initialize logging at {:?}: {}", dir, e);
     }
+    // `apply` raised the global max level to the loudest dispatch level
+    // (Trace); the baseline is what runs until the server asks for more.
+    log::set_max_level(baseline);
 
     // Log the application launch
     log::info!(

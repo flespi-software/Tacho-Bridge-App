@@ -49,6 +49,66 @@
       <q-separator inset />
 
       <q-card-section class="q-py-sm">
+        <div class="text-subtitle2 text-grey-7 q-mb-sm">Authentication</div>
+        <q-toggle v-model="authEnabled" label="Server authentication" dense class="q-mb-sm">
+          <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
+            Signs every connection to the server in with a username and password (a flespi token
+            goes into the username). Off: anonymous connection.
+          </q-tooltip>
+        </q-toggle>
+        <template v-if="authEnabled">
+          <q-input
+            label="Username"
+            outlined
+            dense
+            v-model="authUsername"
+            autocomplete="off"
+            class="q-mb-sm"
+            @update:model-value="credentialsDirty = true"
+          >
+            <template v-slot:prepend>
+              <q-icon name="mdi-account-key" size="xs" />
+            </template>
+          </q-input>
+          <q-input
+            label="Password"
+            outlined
+            dense
+            v-model="authPassword"
+            :type="authPasswordVisible ? 'text' : 'password'"
+            autocomplete="new-password"
+            :placeholder="authActive && !credentialsDirty ? '(unchanged)' : ''"
+            class="q-mb-sm"
+            @update:model-value="credentialsDirty = true"
+          >
+            <template v-slot:prepend>
+              <q-icon name="mdi-form-textbox-password" size="xs" />
+            </template>
+            <template v-slot:append>
+              <q-icon
+                :name="authPasswordVisible ? 'mdi-eye-off' : 'mdi-eye'"
+                class="cursor-pointer"
+                @click="authPasswordVisible = !authPasswordVisible"
+              />
+            </template>
+          </q-input>
+          <q-checkbox
+            v-model="saveCredentials"
+            label="Save to config and use for sign-in"
+            dense
+            class="q-mb-sm"
+          >
+            <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
+              Unchecked: the credentials are kept in memory for this run only and never written to
+              config.yaml. The application asks for them again at the next launch.
+            </q-tooltip>
+          </q-checkbox>
+        </template>
+      </q-card-section>
+
+      <q-separator inset />
+
+      <q-card-section class="q-py-sm">
         <div class="text-subtitle2 text-grey-7 q-mb-sm">Appearance</div>
         <q-btn-toggle
           :model-value="themeMode"
@@ -126,6 +186,40 @@
             label="Changelog"
             @click="openChangelog"
           />
+        </div>
+      </q-card-section>
+
+      <q-separator inset />
+
+      <q-card-section class="q-py-sm">
+        <div class="text-subtitle2 text-grey-7 q-mb-sm">Diagnostics</div>
+        <q-toggle
+          v-model="debugLogEnabled"
+          label="Extended debug log"
+          dense
+          class="q-mb-sm"
+          @update:model-value="debugLogDirty = true"
+        >
+          <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
+            Writes detailed card rack and connection diagnostics to the log file for the chosen
+            time, then switches itself off. The log grows faster while it is on.
+          </q-tooltip>
+        </q-toggle>
+        <div v-if="debugLogEnabled" class="row items-center q-gutter-sm">
+          <q-select
+            v-model="debugLogDuration"
+            :options="DEBUG_LOG_DURATIONS"
+            label="Duration"
+            outlined
+            dense
+            emit-value
+            map-options
+            style="min-width: 160px"
+            @update:model-value="debugLogDirty = true"
+          />
+          <div v-if="debugLogActiveHint && !debugLogDirty" class="text-caption text-grey-7">
+            {{ debugLogActiveHint }}
+          </div>
         </div>
       </q-card-section>
 
@@ -213,6 +307,36 @@ const identInput = computed({
 const isIdentValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))
 
 const hostValue = ref('')
+
+// Server authentication. The password is never received from the backend:
+// the field starts empty and is sent only when the user typed into the
+// credentials (`credentialsDirty`), otherwise the pair in effect is kept.
+const authEnabled = ref(false)
+const authUsername = ref('')
+const authPassword = ref('')
+const authPasswordVisible = ref(false)
+// Whether a pair is in effect (saved or for this run) — drives the placeholder.
+const authActive = ref(false)
+// Checked (default): the pair goes to config.yaml. Unchecked: memory only,
+// asked again at the next launch.
+const saveCredentials = ref(true)
+const credentialsDirty = ref(false)
+
+// Extended debug log — the same switch the server's `debug_log` command
+// drives, with the duration picked from a list (seconds). Applied on Save
+// only when touched, so re-saving other settings keeps a running window.
+const DEBUG_LOG_DURATIONS = [
+  { label: '1 hour', value: 3600 },
+  { label: '1 day', value: 86400 },
+  { label: '1 week', value: 604800 },
+  { label: 'Until switched off', value: 0 },
+]
+const debugLogEnabled = ref(false)
+const debugLogDuration = ref(3600)
+const debugLogDirty = ref(false)
+// Shown next to the duration while a window is running: when it ends.
+const debugLogActiveHint = ref('')
+
 // Update channel: off = stable releases only (default), on = pre-releases too.
 const betaUpdates = ref(false)
 // Unattended updates: the backend checks hourly and installs on its own,
@@ -350,6 +474,27 @@ const saveServerConfig = async () => {
       throw new Error('the backend could not persist the settings')
     }
 
+    // The switch is persisted on every save; the pair only when the user
+    // typed into it (null = keep what is in effect). The reconnect below
+    // picks the new state up, so the backend does not reconnect here.
+    await invoke('apply_credentials', {
+      enabled: authEnabled.value,
+      username: credentialsDirty.value ? authUsername.value : null,
+      password: credentialsDirty.value ? authPassword.value : null,
+      save: saveCredentials.value,
+      reconnect: false,
+    })
+    credentialsDirty.value = false
+    authPassword.value = ''
+
+    if (debugLogDirty.value) {
+      await invoke('set_debug_log', {
+        enabled: debugLogEnabled.value,
+        duration: debugLogDuration.value,
+      })
+      debugLogDirty.value = false
+    }
+
     notifySuccess('Settings have been updated.', TOAST_SHORT)
     emit('update:modelValue', false)
   } catch (error) {
@@ -387,6 +532,12 @@ onMounted(async () => {
       dark_theme?: string
       beta_updates?: string
       auto_install_updates?: string
+      auth_enabled?: string
+      auth_username?: string
+      auth_saved?: string
+      auth_active?: string
+      debug_log_enabled?: string
+      debug_log_until?: string
     }
     hostValue.value = payload.host
     // Seed the backing ref directly, NOT through the identInput setter: the
@@ -397,6 +548,22 @@ onMounted(async () => {
     ident.value = payload.ident.replace(/^TBA/i, '')
     betaUpdates.value = payload.beta_updates === 'true'
     autoInstallUpdates.value = payload.auto_install_updates === 'true'
+    authEnabled.value = payload.auth_enabled === 'true'
+    authUsername.value = payload.auth_username ?? ''
+    authActive.value = payload.auth_active === 'true'
+    // A pair in effect that is not in the file was entered for this run only:
+    // reflect that, otherwise default to saving.
+    saveCredentials.value = !(authActive.value && payload.auth_saved !== 'true')
+    credentialsDirty.value = false
+    authPassword.value = ''
+    debugLogEnabled.value = payload.debug_log_enabled === 'true'
+    debugLogDirty.value = false
+    const until = Number(payload.debug_log_until ?? '0')
+    debugLogActiveHint.value = !debugLogEnabled.value
+      ? ''
+      : until === 0
+        ? 'Active until switched off'
+        : `Active until ${new Date(until * 1000).toLocaleString()}`
     if (
       payload.dark_theme === 'Auto' ||
       payload.dark_theme === 'Light' ||

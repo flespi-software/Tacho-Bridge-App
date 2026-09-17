@@ -1,13 +1,47 @@
-//! Reporting TBA settings to the server.
+//! The server-command side of the application connection: the commands the
+//! server sends to TBA, and the settings TBA reports back.
+//!
+//! Commands are JSON publishes on `request/<request_id>/0` with a `name`
+//! field; `dispatch_request` routes each name to its handler module (which
+//! owns that command's state and reply topic):
+//!   * `fetch_logs`      → `logs_upload`
+//!   * `debug_log`       → `debug_log`
+//!   * `set_credentials` → `credentials`
+//! The contract of every command is written up in `changes.md`.
 //!
 //! Right after the app connection is established, TBA publishes a one-shot
 //! settings report so the server can populate the read-only device settings.
-//! The payload is a JSON object keyed by setting name (currently only
-//! `app_info`), so more settings can be reported later without changing the
-//! topic or the format.
+//! The payload is a JSON object keyed by setting name (`app_info`, and
+//! `debug_log` — the state of the extended debug log), so more settings can
+//! be reported later without changing the topic or the format.
 
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::AsyncClient;
+use serde_json::Value;
+
+/// Routes a JSON publish of the app connection to its command handler.
+/// Returns false when the publish is not a command (wrong topic shape or an
+/// unknown name) — the caller logs it as unsupported.
+pub fn dispatch_request(
+    client: &AsyncClient,
+    log_header: &str,
+    topic: &str,
+    payload: &Value,
+) -> bool {
+    let Some(request_id) = crate::mqtt::request_id_from_topic(topic) else {
+        return false;
+    };
+    let Some(name) = payload.get("name").and_then(Value::as_str) else {
+        return false;
+    };
+    match name {
+        "fetch_logs" => crate::logs_upload::handle(client, log_header, request_id, payload),
+        "debug_log" => crate::debug_log::handle(client, log_header, request_id, payload),
+        "set_credentials" => crate::credentials::handle(client, log_header, request_id, payload),
+        _ => return false,
+    }
+    true
+}
 
 /// Topic the settings report is published to.
 const SETTINGS_TOPIC: &str = "settings";
@@ -20,7 +54,8 @@ fn settings_report_payload() -> String {
             "os": sys_info::os_type().unwrap_or_else(|_| "Unknown".to_string()),
             "os_release": sys_info::os_release().unwrap_or_else(|_| "Unknown".to_string()),
             "arch": std::env::consts::ARCH,
-        }
+        },
+        "debug_log": crate::debug_log::status_json(),
     })
     .to_string()
 }
@@ -58,5 +93,8 @@ mod tests {
             .as_str()
             .expect("arch is a string")
             .is_empty());
+        let debug_log = &report["debug_log"];
+        assert!(debug_log["enabled"].is_boolean());
+        assert!(debug_log["until"].is_u64());
     }
 }

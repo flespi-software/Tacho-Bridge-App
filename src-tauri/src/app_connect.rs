@@ -27,6 +27,19 @@ use crate::smart_card::ProcessingCard;
 
 
 /// Ensures an MQTT connection for the specified client ID.
+/// Rebuilds every MQTT connection with the current settings — what the
+/// settings dialog does after a save, available to the backend for changes
+/// that arrive from the server (credentials). Each step on its own: a PC/SC
+/// failure must not keep the app connection from moving.
+pub async fn reconnect_everything(reason: &str) {
+    log::info!("[CONN] phase=reconnect_all reason={}", reason);
+    if let Err(e) = crate::smart_card::manual_sync_cards(String::new(), true).await {
+        log::warn!("[CONN] phase=reconnect_all step=cards status=failed err={}", e);
+    }
+    app_connection().await;
+    crate::com_port::restart_rack_links(reason);
+}
+
 #[tauri::command]
 pub async fn app_connection() {
     log::info!("[CONN] phase=app_connection status=start");
@@ -120,7 +133,9 @@ pub async fn app_connection() {
                         app_emit_event(true);
                     }
 
-                    log::debug!("App {} Notification: {:?}", log_header, notification);
+                    // The full notification embeds publish payloads (rack
+                    // envelopes included): trace only, never in the debug log.
+                    log::trace!("App {} Notification: {:?}", log_header, notification);
 
                     match notification {
                         Event::Incoming(Incoming::Publish(publish)) => {
@@ -135,6 +150,18 @@ pub async fn app_connection() {
                                     continue;
                                 }
                             };
+
+                            // Debug log: when the server sent it (its
+                            // `timestamp` user property) against when it got
+                            // here — the MQTT transit part of a slow exchange.
+                            log::debug!(
+                                "{} [MQTT] rx topic={} bytes={} pkid={} server_ts={}",
+                                log_header,
+                                topic,
+                                publish.payload.len(),
+                                publish.pkid,
+                                crate::debug_log::server_timestamp(&publish)
+                            );
 
                             // Rack traffic rides this connection under the
                             // `rack/<id>/` prefix; its payloads are handled as
@@ -151,12 +178,13 @@ pub async fn app_connection() {
                             match serde_json::from_slice::<Value>(&publish.payload) {
                                 Ok(json_payload) => {
                                     log::debug!("Parsed JSON payload: {:?}", json_payload);
-                                    if !crate::logs_upload::dispatch_request(
+                                    let handled = crate::commands_settings::dispatch_request(
                                         &mqtt_client_for_task,
                                         &log_header,
                                         topic,
                                         &json_payload,
-                                    ) {
+                                    );
+                                    if !handled {
                                         log::warn!(
                                             "{} unsupported publish topic={} payload={:?}",
                                             log_header,

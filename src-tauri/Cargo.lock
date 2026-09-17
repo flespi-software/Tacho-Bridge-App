@@ -3933,6 +3933,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "serialport",
+ "sha2",
  "sys-info",
  "tauri",
  "tauri-build",

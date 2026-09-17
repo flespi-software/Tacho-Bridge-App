@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use serialport::SerialPort;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::debug_log::frame_digest;
+
 use super::SHUTTING_DOWN;
 
 pub(super) type SharedPort = Arc<AsyncMutex<Box<dyn SerialPort>>>;
@@ -42,9 +44,16 @@ impl SerialLease {
     /// bound, and the lifetime of the operation starts once the port is acquired.
     pub(super) async fn acquire(port: &SharedPort, id: u64, ms: u64) -> Result<Self, &'static str> {
         let duration = Duration::from_millis(ms.clamp(1, 10_000));
+        let queued = Instant::now();
         let guard = tokio::time::timeout(duration, port.clone().lock_owned())
             .await
             .map_err(|_| SERIAL_ERR_QUEUE_TIMEOUT)?;
+        log::debug!(
+            "SERIAL lease id={} status=acquired queue_ms={} hold_ms={}",
+            id,
+            queued.elapsed().as_millis(),
+            duration.as_millis()
+        );
         let until = Instant::now() + duration;
         let port = Arc::new(std::sync::Mutex::new(Some(guard)));
         tokio::spawn(expire_lease(Arc::downgrade(&port), until));
@@ -65,15 +74,18 @@ impl SerialLease {
                 resync_line(&mut port, &log);
                 return SerialExchange::error(SERIAL_ERR_TRANSACTION_EXPIRED);
             }
+            let started = Instant::now();
             let outcome = run_envelope_inner(&mut port, &env, first, Budget::until(until), &log);
             log::info!(
-                "{} [SERIAL] retained exchange polls={} pushes={} end={} err={} rx_bytes={}",
+                "{} [SERIAL] retained exchange polls={} pushes={} end={} err={} rx_bytes={} wire_ms={} lease_left_ms={}",
                 log,
                 outcome.polls,
                 outcome.pushes,
                 outcome.end,
                 outcome.exchange.err,
-                outcome.exchange.resp_hex.len() / 2
+                outcome.exchange.resp_hex.len() / 2,
+                started.elapsed().as_millis(),
+                until.saturating_duration_since(Instant::now()).as_millis()
             );
             // the port stays retained only after a successful exchange inside the lifetime
             if outcome.exchange.is_ok() && Instant::now() < until {
@@ -578,13 +590,14 @@ fn wait_for_push(
     let reply = read_reply(port, Vec::new(), interval, idle, deadline, log_header);
     if !reply.is_empty() {
         log::debug!(
-            "{} [SERIAL] rx pushed bytes={} truncated={} end={} hex={}",
+            "{} [SERIAL] rx pushed bytes={} truncated={} end={} digest={}",
             log_header,
             reply.bytes.len(),
             reply.truncated,
             reply.end,
-            reply.hex()
+            frame_digest(&reply.hex())
         );
+        log::trace!("{} [SERIAL] rx pushed hex={}", log_header, reply.hex());
     }
     reply
 }
@@ -611,9 +624,14 @@ fn settle_line(
     if !purge_stale {
         if !pending.is_empty() {
             log::debug!(
-                "{} [SERIAL] carrying {} pushed bytes into this exchange hex={}",
+                "{} [SERIAL] carrying {} pushed bytes into this exchange digest={}",
                 log_header,
                 pending.len(),
+                frame_digest(&hex::encode(&pending))
+            );
+            log::trace!(
+                "{} [SERIAL] carried hex={}",
+                log_header,
                 hex::encode_upper(&pending)
             );
         }
@@ -623,9 +641,14 @@ fn settle_line(
         return Ok(Vec::new());
     }
     log::debug!(
-        "{} [SERIAL] dropped {} stale bytes before tx hex={}",
+        "{} [SERIAL] dropped {} stale bytes before tx digest={}",
         log_header,
         pending.len(),
+        frame_digest(&hex::encode(&pending))
+    );
+    log::trace!(
+        "{} [SERIAL] dropped hex={}",
+        log_header,
         hex::encode_upper(&pending)
     );
     log::warn!(
@@ -668,11 +691,13 @@ fn exchange_once(
     };
 
     log::debug!(
-        "{} [SERIAL] tx bytes={} hex={}",
+        "{} [SERIAL] tx bytes={} digest={}",
         log_header,
         bytes.len(),
-        cmd_hex
+        frame_digest(cmd_hex)
     );
+    log::trace!("{} [SERIAL] tx hex={}", log_header, cmd_hex);
+    let write_started = Instant::now();
     if let Err(e) = port.write_all(&bytes) {
         log::error!("{} [SERIAL] write failed: {}", log_header, e);
         return (SerialExchange::error(SERIAL_ERR_WRITE_FAILED), READ_END_ERROR);
@@ -683,13 +708,15 @@ fn exchange_once(
     let end = reply.end;
     let exchange = reply.into_exchange();
     log::debug!(
-        "{} [SERIAL] rx bytes={} err={} end={} hex={}",
+        "{} [SERIAL] rx bytes={} err={} end={} digest={} since_tx_ms={}",
         log_header,
         exchange.resp_hex.len() / 2,
         exchange.err,
         end,
-        exchange.resp_hex
+        frame_digest(&exchange.resp_hex),
+        write_started.elapsed().as_millis()
     );
+    log::trace!("{} [SERIAL] rx hex={}", log_header, exchange.resp_hex);
     (exchange, end)
 }
 
@@ -885,21 +912,32 @@ pub(super) async fn execute_envelope(
     let idle_ms = env.idle.as_millis();
     let deadline_ms = env.deadline.as_millis();
 
-    let outcome = tokio::task::spawn_blocking(move || {
+    let queued = Instant::now();
+    let (outcome, queue_ms, wire_ms) = tokio::task::spawn_blocking(move || {
+        // how long this operation waited behind the other sessions of the
+        // same rack — the part of a slow exchange the server's timings never
+        // see, and the first suspect when a deadline cuts a reply short
         let mut guard = port.blocking_lock();
-        run_envelope(&mut guard, &env, &log_header_blocking)
+        let queue_ms = queued.elapsed().as_millis();
+        let started = Instant::now();
+        let outcome = run_envelope(&mut guard, &env, &log_header_blocking);
+        (outcome, queue_ms, started.elapsed().as_millis())
     })
     .await
     // A join error means the blocking closure panicked before producing a
     // result — no reply was obtained, report it as such.
     .unwrap_or_else(|e| {
         log::error!("{} [SERIAL] exchange task failed: {}", log_header, e);
-        EnvelopeOutcome {
-            exchange: SerialExchange::error(SERIAL_ERR_NO_REPLY),
-            polls: 0,
-            pushes: 0,
-            end: READ_END_ERROR,
-        }
+        (
+            EnvelopeOutcome {
+                exchange: SerialExchange::error(SERIAL_ERR_NO_REPLY),
+                polls: 0,
+                pushes: 0,
+                end: READ_END_ERROR,
+            },
+            0,
+            0,
+        )
     });
 
     let EnvelopeOutcome {
@@ -912,19 +950,31 @@ pub(super) async fn execute_envelope(
     if exchange.is_ok() {
         if log_summary {
             log::info!(
-                "{} [SERIAL] op done polls={} pushes={} end={} rx bytes={} idle_ms={} deadline_ms={}",
+                "{} [SERIAL] op done polls={} pushes={} end={} rx bytes={} idle_ms={} deadline_ms={} queue_ms={} wire_ms={}",
                 log_header,
                 polls,
                 pushes,
                 end,
                 exchange.resp_hex.len() / 2,
                 idle_ms,
-                deadline_ms
+                deadline_ms,
+                queue_ms,
+                wire_ms
+            );
+        } else {
+            // the silenced summary (watch loop) still leaves a debug trace
+            log::debug!(
+                "{} [SERIAL] op done end={} rx bytes={} queue_ms={} wire_ms={}",
+                log_header,
+                end,
+                exchange.resp_hex.len() / 2,
+                queue_ms,
+                wire_ms
             );
         }
     } else {
         log::warn!(
-            "{} [SERIAL] op failed err={} end={} polls={} pushes={} partial_bytes={} idle_ms={} deadline_ms={}",
+            "{} [SERIAL] op failed err={} end={} polls={} pushes={} partial_bytes={} idle_ms={} deadline_ms={} queue_ms={} wire_ms={}",
             log_header,
             exchange.err,
             end,
@@ -932,7 +982,9 @@ pub(super) async fn execute_envelope(
             pushes,
             exchange.resp_hex.len() / 2,
             idle_ms,
-            deadline_ms
+            deadline_ms,
+            queue_ms,
+            wire_ms
         );
     }
     (exchange, end)

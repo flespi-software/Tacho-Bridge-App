@@ -28,6 +28,7 @@
           <q-tooltip>Settings</q-tooltip>
         </q-btn>
         <ServerConfigDialog v-model="configOpen" />
+        <CredentialsPromptDialog v-model="credentialsPromptOpen" />
       </q-toolbar>
     </q-header>
 
@@ -45,6 +46,7 @@ import { TBA_IDENT_REGEXP } from 'src/components/models'
 import { invoke } from '@tauri-apps/api/core'
 import 'animate.css'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
+import CredentialsPromptDialog from 'src/components/CredentialsPromptDialog.vue'
 
 defineOptions({
   name: 'MainLayout',
@@ -52,6 +54,10 @@ defineOptions({
 
 const $q = useQuasar()
 const configOpen = ref(false)
+// Startup sign-in: shown once per webview load when authentication is on but
+// no credentials are in effect (they were entered for a previous run only).
+const credentialsPromptOpen = ref(false)
+let credentialsPromptShown = false
 const appConnected = ref(false)
 const serverHost = ref('')
 const serverIdent = ref('')
@@ -123,6 +129,17 @@ const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
       timeout: 999000,
     }),
 
+  // The broker refused the credentials (or requires some): the message names
+  // which; the settings dialog is where to fix it.
+  auth_rejected: (message) =>
+    Notify.create({
+      message: message || 'The server rejected the authentication.',
+      color: 'red',
+      position: 'bottom',
+      timeout: 15000,
+      actions: [{ label: 'Settings', color: 'white', handler: () => (configOpen.value = true) }],
+    }),
+
   // Use the backend-provided message verbatim — it contains the new
   // version string and the download URL.
   version: (message) =>
@@ -136,13 +153,28 @@ const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
 }
 
 function handleGlobalConfigServer(raw: unknown): void {
-  const payload = raw as { dark_theme?: string; host?: string; ident?: string }
+  const payload = raw as {
+    dark_theme?: string
+    host?: string
+    ident?: string
+    auth_enabled?: string
+    auth_active?: string
+  }
   if (payload.dark_theme === 'Dark') $q.dark.set(true)
   else if (payload.dark_theme === 'Auto') $q.dark.set('auto')
   else if (payload.dark_theme === 'Light') $q.dark.set(false)
   // empty/unknown (old config without an appearance section): keep the current mode
   serverHost.value = payload.host ?? ''
   serverIdent.value = payload.ident ?? ''
+  if (
+    payload.auth_enabled === 'true' &&
+    payload.auth_active !== 'true' &&
+    !credentialsPromptShown &&
+    !configOpen.value
+  ) {
+    credentialsPromptShown = true
+    credentialsPromptOpen.value = true
+  }
 }
 
 function handleGlobalNotification(raw: unknown): void {

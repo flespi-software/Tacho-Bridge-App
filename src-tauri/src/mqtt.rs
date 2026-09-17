@@ -152,6 +152,15 @@ pub(crate) fn log_connection_failure(
     retry_in_secs: u64,
 ) {
     let (kind, expected) = classify_connection_error(e);
+    if let ConnectionError::ConnectionRefused(code) = e {
+        use rumqttc::v5::mqttbytes::v5::ConnectReturnCode;
+        if matches!(
+            code,
+            ConnectReturnCode::BadUserNamePassword | ConnectReturnCode::NotAuthorized
+        ) {
+            report_auth_rejection(log_header, &format!("{:?}", code));
+        }
+    }
     if expected {
         log::warn!(
             "{} [{}] state={} kind={} retry_in={}s",
@@ -174,13 +183,62 @@ pub(crate) fn log_connection_failure(
     }
 }
 
-/// Applies the optional MQTT credentials from the config's `server` section to
-/// freshly built connection options. flespi authenticates a channel connection
-/// with a username (typically a flespi token; password usually empty). No UI
-/// for these yet — they are hand-edited in config.yaml; an absent or empty
-/// username keeps today's anonymous connect. Shared by all four MQTT loops
-/// (app, per-card, rack, rack-card) so authentication can never be enabled for
-/// one transport and forgotten for another.
+/// Credentials entered for this run only ("Save to config" unchecked): they
+/// live here and nowhere on disk, and are gone with the process. Take
+/// precedence over the saved pair while set.
+static SESSION_CREDENTIALS: std::sync::Mutex<Option<(String, String)>> =
+    std::sync::Mutex::new(None);
+
+fn session_credentials() -> std::sync::MutexGuard<'static, Option<(String, String)>> {
+    SESSION_CREDENTIALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Replaces (or clears, with `None`) the in-memory credentials.
+pub(crate) fn set_session_credentials(pair: Option<(String, String)>) {
+    *session_credentials() = pair;
+}
+
+/// The username/password every new MQTT connection will use, or `None` for
+/// an anonymous connect: the switch is off, or it is on but no credentials
+/// have been provided yet (the startup prompt is still open).
+pub(crate) fn resolved_credentials() -> Option<(String, String)> {
+    if get_from_cache(CacheSection::Server, "auth_enabled") != "true" {
+        return None;
+    }
+    session_credentials()
+        .clone()
+        .or_else(crate::config::saved_credentials)
+}
+
+/// Authentication state as the webview needs it: the switch, the username to
+/// prefill, whether the pair is saved in the config, and whether any pair is
+/// in effect at all (saved or for this run). Never the password.
+pub(crate) struct AuthState {
+    pub enabled: bool,
+    pub username: String,
+    pub saved: bool,
+    pub active: bool,
+}
+
+pub(crate) fn auth_state() -> AuthState {
+    let enabled = get_from_cache(CacheSection::Server, "auth_enabled") == "true";
+    let saved = crate::config::saved_credentials();
+    let session = session_credentials().clone();
+    let username = session
+        .as_ref()
+        .or(saved.as_ref())
+        .map(|(u, _)| u.clone())
+        .unwrap_or_default();
+    AuthState {
+        enabled,
+        username,
+        saved: saved.is_some(),
+        active: enabled && (session.is_some() || saved.is_some()),
+    }
+}
+
 /// Keep-alive for every MQTT connection the app opens. The broker drops a
 /// silent client after roughly 1.5× this, so it also bounds how long a dead
 /// link goes unnoticed.
@@ -208,15 +266,59 @@ pub(crate) fn build_mqtt_client(
     AsyncClient::new(mqtt_options, MQTT_CHANNEL_CAPACITY)
 }
 
+/// Applies the MQTT credentials to freshly built connection options — see
+/// `resolved_credentials`. Shared by all four MQTT loops (app, per-card,
+/// rack, rack-card) so authentication can never be enabled for one transport
+/// and forgotten for another.
 pub(crate) fn apply_mqtt_credentials(mqtt_options: &mut MqttOptions) {
-    let username = get_from_cache(CacheSection::Server, "username");
-    if username.is_empty() {
+    match resolved_credentials() {
+        Some((username, password)) => {
+            // The values themselves must never reach the log file.
+            log::debug!("[CONN] mqtt credentials applied (username set)");
+            mqtt_options.set_credentials(username, password);
+        }
+        None if get_from_cache(CacheSection::Server, "auth_enabled") == "true" => {
+            log::warn!("[CONN] authentication is enabled but no credentials are set: connecting anonymously");
+        }
+        None => {}
+    }
+}
+
+/// Last time the "authentication rejected" notification was raised: every
+/// MQTT loop retries on its own schedule, and each retry is refused again —
+/// one toast per minute is enough for the user to act on.
+static AUTH_REJECTED_NOTIFIED: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Surfaces a CONNACK that refused the credentials: an explicit log line and
+/// a UI notification naming the cause, instead of the generic offline state.
+fn report_auth_rejection(log_header: &str, code: &str) {
+    let enabled = get_from_cache(CacheSection::Server, "auth_enabled") == "true";
+    log::error!(
+        "{} [CONN] status=auth_rejected code={} auth_enabled={}",
+        log_header,
+        code,
+        enabled
+    );
+    let mut last = AUTH_REJECTED_NOTIFIED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
         return;
     }
-    let password = get_from_cache(CacheSection::Server, "password");
-    // The values themselves must never reach the log file.
-    log::debug!("[CONN] mqtt credentials applied (username set)");
-    mqtt_options.set_credentials(username, password);
+    *last = Some(std::time::Instant::now());
+    let message = if enabled {
+        "The server rejected the authentication: the credentials are not set or invalid. Check Settings → Server authentication."
+    } else {
+        "The server requires authentication. Enable it in Settings → Server authentication and enter the credentials."
+    };
+    crate::global_app_handle::emit_notification_event(
+        "global-notification",
+        crate::global_app_handle::NotificationPayload {
+            notification_type: "auth_rejected".to_string(),
+            message: message.to_string(),
+        },
+    );
 }
 
 /// Rewrites a `request/...` topic to its matching `response/...` topic.

@@ -41,6 +41,12 @@ pub struct ConfigurationFile {
     // pause in card activity so a restart never interrupts an authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auto_install_updates: Option<bool>,
+    // Extended debug log requested by the server (`debug_log` command): the
+    // unix time it expires at, `0` = until switched off. Persisted so a crash
+    // or restart inside the window resumes it (see `debug_log.rs`); absent =
+    // off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    debug_log_until: Option<u64>,
 }
 
 /// Treats an explicitly empty `cards:` key (YAML null) as an empty map instead
@@ -54,17 +60,34 @@ where
 }
 
 // Server Configuration structure, part of ConfigurationFile that contains data about the server.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ServerConfig {
     pub host: String,
-    /// Optional MQTT authentication for the broker connection (flespi channels
-    /// accept a token as the username, password usually empty). No UI yet —
-    /// hand-edited in config.yaml for now; absent fields keep today's
-    /// anonymous connect and are not written back to the file.
+    /// MQTT authentication of every broker connection (see `mqtt.rs`):
+    /// `true` → connect with the credentials below (or the ones entered for
+    /// this run only, kept in memory — then the two fields are absent here);
+    /// `false`/absent → anonymous connect, whatever the fields hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_enabled: Option<bool>,
+    /// Saved credentials (flespi channels accept a token as the username,
+    /// password usually empty). Absent fields are not written back to the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+}
+
+/// Hand-written so a `{:?}` of the config anywhere (there are several at
+/// debug level) can never put the password into the log file.
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("host", &self.host)
+            .field("auth_enabled", &self.auth_enabled)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 // Dark Theme enum, part of AppearanceConfig that contains data about the theme.
@@ -168,6 +191,13 @@ fn save_config(
 
     {
         let mut tmp_file = File::create(&tmp_path)?;
+        // The file may hold the broker credentials: owner-only on unix. Set
+        // before the rename so no window exposes a readable copy.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
         tmp_file.write_all(yaml.as_bytes())?;
         tmp_file.sync_all()?;
     }
@@ -491,6 +521,7 @@ fn update_server_config(
     let previous = config.server.take();
     config.server = Some(ServerConfig {
         host: host.to_string(),
+        auth_enabled: previous.as_ref().and_then(|s| s.auth_enabled),
         username: previous.as_ref().and_then(|s| s.username.clone()),
         password: previous.and_then(|s| s.password),
     });
@@ -722,6 +753,7 @@ pub struct CacheConfigData {
     pub appearance: Option<AppearanceConfig>,
     pub beta_updates: Option<bool>,
     pub auto_install_updates: Option<bool>,
+    pub debug_log_until: Option<u64>,
 }
 
 lazy_static! {
@@ -892,6 +924,8 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
             // MQTT credentials; empty string = not configured (anonymous connect).
             (Some(server), "username") => server.username.clone().unwrap_or_default(),
             (Some(server), "password") => server.password.clone().unwrap_or_default(),
+            // "true"/"false"; absent = anonymous connect
+            (Some(server), "auth_enabled") => server.auth_enabled.unwrap_or(false).to_string(),
             (Some(_), _) => {
                 log::debug!("cache: unknown key for server section: {}", key);
                 "".to_string()
@@ -956,9 +990,76 @@ fn load_config_to_cache(
         appearance: config.appearance.clone(),
         beta_updates: config.beta_updates,
         auto_install_updates: config.auto_install_updates,
+        debug_log_until: config.debug_log_until,
     };
 
     Ok(())
+}
+
+/// The persisted extended-debug window: `Some(0)` = on until switched off,
+/// `Some(ts)` = on until that unix time, `None` = off.
+pub fn debug_log_until() -> Option<u64> {
+    cache_guard().debug_log_until
+}
+
+/// Persists the extended-debug window (see `debug_log_until`). Blocking disk
+/// I/O under the config write lock — call from a blocking context.
+pub fn set_debug_log_until(until: Option<u64>) -> Result<(), String> {
+    let _guard = config_write_guard();
+    let config_path = get_config_path().map_err(|e| e.to_string())?;
+    let mut config = load_config(&config_path).map_err(|e| e.to_string())?;
+    if config.debug_log_until == until {
+        // nothing to write: keep the hand-edited file byte-for-byte
+        return Ok(());
+    }
+    config.debug_log_until = until;
+    save_config(&config_path, &config).map_err(|e| e.to_string())?;
+    load_config_to_cache(&config).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Persists the authentication switch and, when `save` is set, the
+/// credentials; with `save` unset the saved credentials are removed from the
+/// file (the caller keeps the pair in memory for this run only). `None`
+/// values leave the stored field as it is. Blocking disk I/O under the config
+/// write lock — call from a blocking context.
+pub fn set_server_credentials(
+    enabled: bool,
+    username: Option<&str>,
+    password: Option<&str>,
+    save: bool,
+) -> Result<(), String> {
+    let _guard = config_write_guard();
+    let config_path = get_config_path().map_err(|e| e.to_string())?;
+    let mut config = load_config(&config_path).map_err(|e| e.to_string())?;
+    let server = config
+        .server
+        .as_mut()
+        .ok_or_else(|| "server address is not configured".to_string())?;
+    server.auth_enabled = Some(enabled);
+    if save {
+        if let Some(username) = username {
+            server.username = Some(username.to_string());
+        }
+        if let Some(password) = password {
+            server.password = Some(password.to_string());
+        }
+    } else {
+        server.username = None;
+        server.password = None;
+    }
+    save_config(&config_path, &config).map_err(|e| e.to_string())?;
+    load_config_to_cache(&config).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The credentials saved in the config, when both the switch and a username
+/// are set.
+pub fn saved_credentials() -> Option<(String, String)> {
+    let cache = cache_guard();
+    let server = cache.server.as_ref()?;
+    let username = server.username.clone().filter(|u| !u.is_empty())?;
+    Some((username, server.password.clone().unwrap_or_default()))
 }
 
 /// Generates a unique ident value based on the current time in microseconds.
@@ -1079,6 +1180,7 @@ fn generate_default_config() -> ConfigurationFile {
         cards: HashMap::new(),
         beta_updates: None,
         auto_install_updates: None,
+        debug_log_until: None,
     }
 }
 
@@ -1100,6 +1202,23 @@ pub fn emit_global_config_server(app: &tauri::AppHandle) -> Result<(), Box<dyn E
     config_app_payload.insert(
         "auto_install_updates",
         get_from_cache(CacheSection::Updates, "auto_install_updates"),
+    );
+    // Authentication state for the settings dialog and the startup prompt.
+    // The password never goes to the webview.
+    let auth = crate::mqtt::auth_state();
+    config_app_payload.insert("auth_enabled", auth.enabled.to_string());
+    config_app_payload.insert("auth_username", auth.username);
+    config_app_payload.insert("auth_saved", auth.saved.to_string());
+    config_app_payload.insert("auth_active", auth.active.to_string());
+    // Extended debug log state for the settings dialog.
+    let debug = crate::debug_log::status_json();
+    config_app_payload.insert(
+        "debug_log_enabled",
+        debug["enabled"].as_bool().unwrap_or(false).to_string(),
+    );
+    config_app_payload.insert(
+        "debug_log_until",
+        debug["until"].as_u64().unwrap_or(0).to_string(),
     );
 
     if let Err(e) = app.emit("global-config-server", config_app_payload) {
@@ -1172,12 +1291,14 @@ mod tests {
             ident: Some("TBA0000000000001".to_string()),
             server: Some(ServerConfig {
                 host: "mqtt.example.com:8883".to_string(),
+                auth_enabled: None,
                 username: None,
                 password: None,
             }),
             cards,
             beta_updates: None,
             auto_install_updates: None,
+            debug_log_until: None,
         }
     }
 

@@ -89,6 +89,11 @@ pub(super) fn app_generation() -> u64 {
     APP_GENERATION.load(Ordering::SeqCst)
 }
 
+/// Whether the application connection is online right now.
+pub(super) fn app_is_online() -> bool {
+    APP_ONLINE.load(Ordering::SeqCst)
+}
+
 /// True while the application connection is online and still the generation
 /// a publish was dispatched in: the server instance that sent the request is
 /// the one that will hear the reply.
@@ -248,9 +253,9 @@ pub fn handle_app_publish(client: &AsyncClient, topic: &str, payload: &[u8]) -> 
         topic,
         payload.len()
     );
-    // Full command text only at debug: the rack protocol must not end up in
-    // users' log files at INFO level.
-    log::debug!(
+    // Full command text only at trace: the rack protocol must not end up in
+    // users' log files, not even with the extended debug log on.
+    log::trace!(
         "{} [MQTT] command_text={}",
         log_header,
         String::from_utf8_lossy(payload)
@@ -626,7 +631,15 @@ pub(super) async fn run_serial_request(
         return None;
     }
     match idempotency.replay(req_id, payload) {
-        Some(Replay::Cached(reply)) => return reply.map(|reply| (resp_topic, reply)),
+        Some(Replay::Cached(reply)) => {
+            log::debug!(
+                "{} [XCHG] req={} status=replayed_from_cache has_reply={}",
+                log_header,
+                req_id.unwrap_or(0),
+                reply.is_some()
+            );
+            return reply.map(|reply| (resp_topic, reply));
+        }
         Some(Replay::Conflict) => return failure(&resp_topic, SERIAL_ERR_REQUEST_CONFLICT),
         Some(Replay::Stale) => return failure(&resp_topic, SERIAL_ERR_STALE_REQUEST),
         None => {}
@@ -636,6 +649,7 @@ pub(super) async fn run_serial_request(
         return None;
     };
 
+    let started = std::time::Instant::now();
     let exchange = match parsed {
         Ok(envelope) => {
             let discovery_slot = json
@@ -643,8 +657,30 @@ pub(super) async fn run_serial_request(
                 .and_then(|v| v.as_u64())
                 .filter(|s| (1..=240).contains(s))
                 .map(|s| s as u16);
+            // Debug log identity of this exchange, taken before the envelope
+            // is consumed: what the server can match against its own copy.
+            let cmd_len = envelope.cmd_hex.len() / 2;
+            let cmd_digest = crate::debug_log::frame_digest(&envelope.cmd_hex);
+            let expect_digest = envelope
+                .expect_hex
+                .as_deref()
+                .map(crate::debug_log::frame_digest)
+                .unwrap_or_else(|| "-".to_string());
+            let finish = envelope.finish;
+            let slot = card
+                .map(|(_, _, slot)| slot)
+                .or(discovery_slot)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".to_string());
             if let Some((slot, discovery)) = slot_ownership(card, discovery_slot, envelope.finish) {
                 if !super::access::acquire(serial_port, slot, discovery, req_id.unwrap_or(0)).await {
+                    log::debug!(
+                        "{} [XCHG] req={} slot={} status=refused reason=card_busy discovery={}",
+                        log_header,
+                        req_id.unwrap_or(0),
+                        slot,
+                        discovery
+                    );
                     return failure(&resp_topic, SERIAL_ERR_CARD_BUSY);
                 }
             }
@@ -668,6 +704,23 @@ pub(super) async fn run_serial_request(
                     super::access::release(serial_port, slot, false, None);
                 }
             }
+            // One line per exchange with everything the server's own log
+            // lacks; the digests are how the two logs are joined.
+            log::debug!(
+                "{} [XCHG] req={} ctl={:?} slot={} finish={:?} cmd_len={} cmd_digest={} expect_digest={} resp_len={} resp_digest={} err={} total_ms={}",
+                log_header,
+                req_id.unwrap_or(0),
+                control,
+                slot,
+                finish,
+                cmd_len,
+                cmd_digest,
+                expect_digest,
+                exchange.resp_hex.len() / 2,
+                crate::debug_log::frame_digest(&exchange.resp_hex),
+                if exchange.err.is_empty() { "-" } else { exchange.err },
+                started.elapsed().as_millis()
+            );
             exchange
         }
         Err(code) => SerialExchange::error(code),

@@ -80,6 +80,55 @@ pub(super) fn inventory(rack_id: &str) -> serde_json::Value {
     serde_json::Value::Array(cards)
 }
 
+/// Writes every rack card session and UI row to the log — part of the state
+/// snapshot the extended debug log starts with.
+pub(super) fn log_sessions_snapshot() {
+    let sessions: Vec<String> = {
+        let tasks = lock(&RACK_CARD_TASKS);
+        let mut rows: Vec<_> = tasks
+            .iter()
+            .map(|(iccid, task)| {
+                format!(
+                    "{}/{}:{}:{}:{}",
+                    task.rack_id,
+                    task.slot,
+                    task.card_number,
+                    iccid,
+                    if task.handle.inner().is_finished() { "finished" } else { "live" }
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    log::info!(
+        "[DEBUG] snapshot=card_sessions count={} sessions={}",
+        sessions.len(),
+        sessions.join(",")
+    );
+    let rows: Vec<String> = {
+        let ui = lock(&RACK_CARDS_UI);
+        let mut rows: Vec<_> = ui
+            .iter()
+            .flat_map(|(rack_id, list)| {
+                list.iter().map(move |card| {
+                    format!(
+                        "{}/{}:{}:online={:?}:auth={:?}",
+                        rack_id,
+                        card.slot,
+                        card.iccid.as_deref().unwrap_or("-"),
+                        card.online,
+                        card.authentication
+                    )
+                })
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    log::info!("[DEBUG] snapshot=ui_rows count={} rows={}", rows.len(), rows.join(","));
+}
+
 /// Opens rack-backed sessions for discovered cards that currently have none.
 /// Covers two situations the server will not retry on its own (it repeats the
 /// card set only when the rack content changes):
@@ -438,7 +487,20 @@ async fn rack_card_mqtt_loop(
                             publish.payload.len(),
                             publish.qos,
                         );
+                        // when the server sent it vs. when it got here: the
+                        // MQTT transit part of a slow exchange
                         log::debug!(
+                            "{} [MQTT] rx pkid={} server_ts={} rack={} slot={}",
+                            log_header,
+                            publish.pkid,
+                            crate::debug_log::server_timestamp(&publish),
+                            rack_id,
+                            slot
+                        );
+                        // Full command text only at trace: the rack protocol
+                        // must not end up in users' log files, not even with
+                        // the extended debug log on.
+                        log::trace!(
                             "{} [MQTT] command_text={}",
                             log_header,
                             String::from_utf8_lossy(&publish.payload)
@@ -923,6 +985,15 @@ pub(super) async fn handle_cards_set(
         log_header,
         cards.len(),
         rebind
+    );
+    log::debug!(
+        "{} [CARDS] set={}",
+        log_header,
+        cards
+            .iter()
+            .map(|(slot, iccid)| format!("{}:{}", slot, iccid))
+            .collect::<Vec<_>>()
+            .join(",")
     );
     let listed = |slot: u16, iccid: &str| cards.iter().any(|(s, i)| *s == slot && i == iccid);
 

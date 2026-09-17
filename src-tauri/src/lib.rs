@@ -5,6 +5,8 @@ mod backoff; // Shared exponential reconnect backoff.
 mod com_port; // Card rack over the COM (serial) port.
 mod commands_settings; // Settings reporting to the server.
 mod config; // Configuration handling.
+mod credentials; // MQTT credentials: settings/prompt command and the set_credentials server command.
+mod debug_log; // Extended debug log switched by the server (debug_log command).
 mod global_app_handle; // Global access to app state and emitters.
 mod logger; // Logging functionality.
 mod logs_upload; // Log upload to the server (fetch_logs command).
@@ -102,6 +104,10 @@ fn initialize_backend(app_handle: tauri::AppHandle) {
         Ok(_) => log::info!("Config initialized successfully."),
         Err(e) => log::error!("Failed to initialize config: {}", e),
     }
+
+    // Resume an extended debug window a previous run was inside of (the
+    // server asked for it, then the app was restarted or crashed).
+    debug_log::restore_from_config();
 
     // The smart-card monitor is a blocking PC/SC loop (get_status_change parks
     // its thread until a card event), so it runs on the blocking pool, not on
@@ -294,6 +300,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             config::update_card,           // update list of cards from the frontend
             config::update_server,         // update server config from the frontend
+            credentials::apply_credentials, // authentication switch + credentials from the dialogs
+            debug_log::set_debug_log,      // extended debug log switch from the settings dialog
             config::update_theme,          // persist theme from the header button
             config::remove_card,           // remove card from config
             smart_card::manual_sync_cards, // manual sync cards from the frontend

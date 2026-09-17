@@ -92,6 +92,38 @@ lazy_static::lazy_static! {
         std::sync::Mutex::new(HashMap::new());
 }
 
+/// Writes the whole rack-side state to the log at INFO: linked racks and
+/// their device nodes, the application link, every card session, UI row and
+/// slot lease. The extended debug log starts with it (see `debug_log.rs`) so
+/// an upload has a known starting point to read the per-exchange lines from.
+pub fn log_state_snapshot() {
+    let racks: Vec<String> = {
+        let ports = lock(&RACK_ACTIVE_PORTS);
+        let mut rows: Vec<_> = lock(&RACKS)
+            .iter()
+            .map(|(rack_id, rack)| {
+                format!(
+                    "{}:port={}:port_ptr={:p}",
+                    rack_id,
+                    ports.get(rack_id).map(String::as_str).unwrap_or("-"),
+                    std::sync::Arc::as_ptr(&rack.port)
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    log::info!(
+        "[DEBUG] snapshot=racks count={} app_online={} app_generation={} racks={}",
+        racks.len(),
+        rack::app_is_online(),
+        rack::app_generation(),
+        racks.join(",")
+    );
+    cards::log_sessions_snapshot();
+    access::log_leases_snapshot();
+}
+
 /// Device nodes currently held open by this app.
 pub(super) fn active_rack_ports() -> std::collections::HashSet<String> {
     lock(&RACK_ACTIVE_PORTS).values().cloned().collect()

@@ -57,22 +57,8 @@ impl Drop for ActiveRequestReset {
     }
 }
 
-/// Handles a `fetch_logs` request published on the app connection; any other
-/// publish is left to the caller (returns false). If more app-level commands
-/// appear, promote the topic/name parsing to the connection layer and keep
-/// only the fetch_logs handling here.
-pub fn dispatch_request(
-    client: &AsyncClient,
-    log_header: &str,
-    topic: &str,
-    payload: &Value,
-) -> bool {
-    let Some(request_id) = crate::mqtt::request_id_from_topic(topic) else {
-        return false;
-    };
-    if payload.get("name").and_then(Value::as_str) != Some("fetch_logs") {
-        return false;
-    }
+/// Handles a `fetch_logs` command (routed here by `commands_settings`).
+pub fn handle(client: &AsyncClient, log_header: &str, request_id: u64, payload: &Value) {
     let period = payload
         .get("period")
         .and_then(Value::as_str)
@@ -90,7 +76,7 @@ pub fn dispatch_request(
                     log_header,
                     request_id
                 );
-                return true;
+                return;
             }
             // A DIFFERENT id is a new command, and the running upload only
             // publishes under its own id — silently dropping this one would
@@ -114,7 +100,7 @@ pub fn dispatch_request(
                 )
                 .await;
             });
-            return true;
+            return;
         }
         *active = Some(request_id);
     }
@@ -139,7 +125,6 @@ pub fn dispatch_request(
         let _reset = reset;
         run_upload(&client, &log_header, request_id, period).await;
     });
-    true
 }
 
 /// Collects, zips and publishes the log slice; reports failures to the server

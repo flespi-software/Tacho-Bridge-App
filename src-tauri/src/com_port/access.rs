@@ -26,12 +26,15 @@ impl Slots {
             .insert(slot, (discovery, now + Duration::from_secs(65), token));
         true
     }
-    fn release(&mut self, slot: u16, discovery: bool, token: Option<u64>) {
+    /// Returns whether a lease was actually removed.
+    fn release(&mut self, slot: u16, discovery: bool, token: Option<u64>) -> bool {
         if self.leases.get(&slot).is_some_and(|(owner, _, current)| {
             *owner == discovery && token.is_none_or(|token| token == *current)
         }) {
             self.leases.remove(&slot);
+            return true;
         }
+        false
     }
 }
 type Registry = Vec<(PortWeak, Arc<Mutex<Slots>>)>;
@@ -53,27 +56,73 @@ fn slots(port: &SharedPort) -> Arc<Mutex<Slots>> {
 pub(super) async fn acquire(port: &SharedPort, slot: u16, discovery: bool, token: u64) -> bool {
     let slots = slots(port);
     let started = Instant::now();
-    loop {
+    let granted = loop {
         if slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .acquire(slot, discovery, Instant::now(), token)
         {
-            return true;
+            break true;
         }
         // Discovery defers an active card; a new tracker waits for the short
         // discovery transaction to finish without taking the serial port lock.
         if discovery || started.elapsed() >= Duration::from_secs(65) {
-            return false;
+            break false;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
+    // Debug log: who holds which slot is what tells a "card busy" refusal
+    // from a command that went to the wrong slot.
+    log::debug!(
+        "SLOT {} owner={} token={} status={} waited_ms={}",
+        slot,
+        if discovery { "discovery" } else { "auth" },
+        token,
+        if granted { "acquired" } else { "refused" },
+        started.elapsed().as_millis()
+    );
+    granted
 }
 pub(super) fn release(port: &SharedPort, slot: u16, discovery: bool, token: Option<u64>) {
-    slots(port)
+    let released = slots(port)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .release(slot, discovery, token);
+    log::debug!(
+        "SLOT {} owner={} token={} status={}",
+        slot,
+        if discovery { "discovery" } else { "auth" },
+        token.map(|t| t.to_string()).unwrap_or_else(|| "any".to_string()),
+        if released { "released" } else { "release_ignored" }
+    );
+}
+
+/// Every live slot lease — part of the state snapshot the extended debug log
+/// starts with.
+pub(super) fn log_leases_snapshot() {
+    let registry = REGISTRY
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    let mut rows = Vec::new();
+    for (port, slots) in registry.iter().filter(|(port, _)| port.strong_count() > 0) {
+        let slots = slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (slot, (discovery, until, token)) in slots.leases.iter() {
+            rows.push(format!(
+                "{:p}/{}:{}:token={}:left_ms={}",
+                port.as_ptr(),
+                slot,
+                if *discovery { "discovery" } else { "auth" },
+                token,
+                until.saturating_duration_since(now).as_millis()
+            ));
+        }
+    }
+    rows.sort();
+    log::info!("[DEBUG] snapshot=slot_leases count={} leases={}", rows.len(), rows.join(","));
 }
 pub(super) fn cancel_discovery() {
     let mut registry = REGISTRY
