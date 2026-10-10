@@ -20,7 +20,7 @@ use pcsc::{
 };
 
 // ───── Local Modules ─────
-use crate::config::{get_card_config_from_cache, get_from_cache, mutate_card_config, CacheSection};
+use crate::config::{get_card_config_from_cache, mutate_card_config};
 use crate::global_app_handle::card_emit_event;
 use crate::mqtt::{ensure_connection, remove_connections_all};
 
@@ -83,7 +83,11 @@ impl ApduError {
     /// recreating the handle and re-sending the same APDU is safe. Replaying a
     /// command the card may already have executed would run a stateful APDU
     /// twice and corrupt the authentication state.
-    fn is_retriable(&self) -> bool {
+    ///
+    /// `RemovedCard` is deliberately not here: the card that held the session
+    /// is gone, and the one now in the reader may be a different card with the
+    /// same ATR (see `send_apdu`).
+    pub(crate) fn is_retriable(&self) -> bool {
         match self {
             // Nothing was sent, but a retry with the same bytes fails the same way.
             ApduError::BadRequest(_) => false,
@@ -91,10 +95,14 @@ impl ApduError {
                 e,
                 pcsc::Error::InvalidHandle
                     | pcsc::Error::ResetCard
-                    | pcsc::Error::RemovedCard
                     | pcsc::Error::ReaderUnavailable
                     | pcsc::Error::NoService
                     | pcsc::Error::ServiceStopped
+                    // the card had no power / never answered / was absent:
+                    // nothing was executed
+                    | pcsc::Error::UnpoweredCard
+                    | pcsc::Error::UnresponsiveCard
+                    | pcsc::Error::NoSmartcard
             ),
             // A cancelled blocking task never started (spawn_blocking closures
             // cannot be interrupted once running), and the only panic sites sit
@@ -256,7 +264,18 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) {
             continue;
         };
 
-        let atr = hex::encode(rs.atr());
+        // A reader that is gone (unplugged → UNKNOWN/IGNORE) keeps the last
+        // ATR in its reused ReaderState, and `setup_reader_states` drops it on
+        // the next pass: report it as emptied now, or its card session would
+        // be reconciled as unchanged and stay "online" for good.
+        let gone = rs
+            .event_state()
+            .intersects(PcscState::UNKNOWN | PcscState::IGNORE | PcscState::EMPTY);
+        let atr = if gone {
+            String::new()
+        } else {
+            hex::encode(rs.atr())
+        };
         let atr_protocol = parse_atr_and_get_protocol(&atr);
         let card_state_string = format!("{:?}", rs.event_state());
         debug!("card_state_string {}", card_state_string);
@@ -336,7 +355,9 @@ async fn register_card(
         }
     };
     info!("ICCID: {}", iccid);
-    let card_number = get_from_cache(CacheSection::Cards, &iccid);
+    // The same deterministic lookup the rack path uses (duplicate ICCID
+    // links resolve to the same entry on every run and are warned about).
+    let card_number = crate::config::find_card_number_by_iccid(&iccid).unwrap_or_default();
 
     // The config entry is known only after reading the ICCID, so open with
     // the ATR-derived protocol first and then apply the configured protocol.
@@ -452,6 +473,46 @@ pub async fn reconcile_reader_event(reader_name: &str, atr: &str) -> CardProcess
     CardProcessingResult::Ignore
 }
 
+/// Ends the sessions of cards whose reader is no longer listed. A fresh pass
+/// starts from UNAWARE with only the readers present now, so a reader that was
+/// unplugged (or re-enumerated under another name) while no context was alive
+/// — a failed pass's backoff, a pcscd restart — never reports a removal: its
+/// card would stay "online" with a dead handle for good, and keep the rack
+/// from serving the same card number.
+async fn evict_vanished_readers(present: &[String]) {
+    let _sweep = READER_SWEEP.lock().await;
+    let stale: Vec<ProcessingCard> = {
+        let mut pool = TASK_POOL.lock().await;
+        let (stale, keep) = std::mem::take(&mut *pool).into_iter().partition(|c| {
+            c.reader_name
+                .as_ref()
+                .is_some_and(|name| !present.contains(name))
+        });
+        *pool = keep;
+        stale
+    };
+    if stale.is_empty() {
+        return;
+    }
+    for card in &stale {
+        warn!(
+            "Reader {} is gone: ending the session of card {}",
+            card.reader_name.as_deref().unwrap_or("unknown"),
+            card.client_id
+        );
+        card_emit_event(
+            "global-cards-sync",
+            String::new(),
+            card.reader_name.clone().unwrap_or_default(),
+            format!("{:?}", PcscState::UNKNOWN),
+            String::new(),
+            None,
+            None,
+        );
+    }
+    tauri::async_runtime::spawn(crate::mqtt::shutdown_connections(stale, "reader_gone"));
+}
+
 /// Check if the reader is a virtual reader. This usually only applies to Windows.
 fn is_virtual_reader(reader_name: &CStr) -> bool {
     // Convert the reader name to a lowercase string
@@ -500,7 +561,13 @@ pub fn sc_monitor() {
                 retry_delay = MONITOR_RETRY_MIN;
                 continue;
             }
-            Ok(Ok(PassEnd::Failed)) => {
+            Ok(Ok(PassEnd::Failed { was_healthy })) => {
+                // A pass that watched readers normally (for days, maybe)
+                // before failing starts the backoff over: only consecutive
+                // failures should push it towards the maximum.
+                if was_healthy {
+                    retry_delay = MONITOR_RETRY_MIN;
+                }
                 // The pass gave up early. Fall through to the backoff sleep:
                 // the fault (PCSC daemon down, reader enumeration refusing the
                 // buffer) is usually persistent, and restarting immediately
@@ -559,8 +626,10 @@ enum PassEnd {
     /// pass should start immediately.
     Rescan,
     /// The pass could not do its job and gave up early. Back off before
-    /// retrying so a permanent fault does not spin.
-    Failed,
+    /// retrying so a permanent fault does not spin. `was_healthy`: at least
+    /// one wait completed normally before the failure, which resets the
+    /// backoff.
+    Failed { was_healthy: bool },
 }
 
 /// One pass of the reader monitor: establish a PCSC context, watch reader
@@ -592,6 +661,11 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
 
     // How this pass ended; only an explicit failure downgrades it.
     let mut outcome = PassEnd::Rescan;
+    // Whether a `get_status_change` has completed normally in this pass.
+    let mut was_healthy = false;
+    // The stale-session sweep below runs once per pass, on its first
+    // successful reader enumeration.
+    let mut swept_vanished = false;
 
     loop {
         // These repeat every poll timeout (30s), so they live at trace to
@@ -604,8 +678,17 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
             );
             // A failing enumeration is usually persistent (daemon down, buffer
             // too small): report it as a failed pass so the caller backs off.
-            outcome = PassEnd::Failed;
+            outcome = PassEnd::Failed { was_healthy };
             break; // Exit the inner loop to re-establish context
+        }
+        if !swept_vanished {
+            swept_vanished = true;
+            let present: Vec<String> = reader_states
+                .iter()
+                .filter(|rs| rs.name() != PNP_NOTIFICATION())
+                .filter_map(|rs| rs.name().to_str().ok().map(str::to_owned))
+                .collect();
+            block_on(evict_vanished_readers(&present));
         }
         trace!(
             "Reader states: {:?}",
@@ -619,8 +702,9 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
             Some(Duration::from_secs(MONITOR_POLL_TIMEOUT_SECS)),
             &mut reader_states[..],
         ) {
-            Ok(()) => {}
+            Ok(()) => was_healthy = true,
             Err(pcsc::Error::Timeout) => {
+                was_healthy = true;
                 // Nothing changed within the poll window — check for a
                 // rescan request that missed the cancel(), keep waiting.
                 if RESCAN_REQUESTED.swap(false, Ordering::SeqCst) {
@@ -645,7 +729,7 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
                 // Small backoff prevents a tight reconnect loop if the PCSC
                 // service is repeatedly returning errors (e.g. daemon down).
                 std::thread::sleep(Duration::from_secs(1));
-                outcome = PassEnd::Failed;
+                outcome = PassEnd::Failed { was_healthy };
                 break;
             }
         }
@@ -965,7 +1049,11 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
 /// exchanges and reconnection using the selected protocol.
 #[derive(Clone)]
 pub struct ManagedCard {
-    inner: Arc<Mutex<Card>>,
+    /// `None` only between disconnecting a handle and connecting its
+    /// replacement (see `replace_handle`), or when that reconnect failed: a
+    /// transmit then fails with `InvalidHandle`, which is retriable and
+    /// recreates the handle.
+    inner: Arc<Mutex<Option<Card>>>,
     reader_name: Arc<CStr>,
     protocol: Protocols,
     pub iccid: OnceCell<String>,
@@ -986,7 +1074,7 @@ impl ManagedCard {
         );
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(card)),
+            inner: Arc::new(Mutex::new(Some(card))),
             reader_name: Arc::from(reader_name.to_owned()),
             protocol,
             iccid: OnceCell::new(),
@@ -998,6 +1086,71 @@ impl ManagedCard {
         let card = ctx.connect(reader_name, ShareMode::Shared, protocol)?;
 
         Ok(card)
+    }
+
+    /// `SCardReconnect` on the current handle, run on the blocking pool: a
+    /// cold reset takes hundreds of ms and can block for much longer on a
+    /// wedged reader, which must not stall an async worker (and with it the
+    /// MQTT event loops of every other card).
+    async fn reconnect_handle(
+        &self,
+        protocol: Protocols,
+        disposition: Disposition,
+    ) -> DynResult<()> {
+        let inner = Arc::clone(&self.inner);
+        tauri::async_runtime::spawn_blocking(move || -> DynResult<()> {
+            let mut slot = inner.blocking_lock();
+            let card = slot.as_mut().ok_or("no card handle")?;
+            card.reconnect(ShareMode::Shared, protocol, disposition)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("reconnect task died: {e}"))?
+    }
+
+    /// Replaces the card handle with a freshly connected one, on the blocking
+    /// pool. The old handle is disconnected with `old_disposition` — dropping
+    /// it would always reset the card (pcsc's `Drop` hard-codes ResetCard).
+    ///
+    /// A reset through the old handle flags every other handle to the card as
+    /// reset, so with `ResetCard` the old handle goes first and the new one is
+    /// connected afterwards: in the other order the fresh handle's first
+    /// transmit would fail with `ResetCard`. Any other disposition connects
+    /// first and keeps the old handle if that fails.
+    async fn replace_handle(
+        &self,
+        protocol: Protocols,
+        old_disposition: Disposition,
+    ) -> DynResult<()> {
+        let inner = Arc::clone(&self.inner);
+        let reader_name = Arc::clone(&self.reader_name);
+        tauri::async_runtime::spawn_blocking(move || -> DynResult<()> {
+            let disconnect = |old: Card| {
+                if let Err((_, e)) = old.disconnect(old_disposition) {
+                    // the handle is dropped (and the card reset) on the way out anyway
+                    debug!(
+                        "Disconnecting the old card handle for reader {} failed: {}",
+                        reader_name.to_string_lossy(),
+                        e
+                    );
+                }
+            };
+            let mut slot = inner.blocking_lock();
+            if old_disposition == Disposition::ResetCard {
+                if let Some(old) = slot.take() {
+                    disconnect(old);
+                }
+                *slot = Some(Self::create_card(&reader_name, protocol)?);
+            } else {
+                let new_card = Self::create_card(&reader_name, protocol)?;
+                if let Some(old) = slot.replace(new_card) {
+                    disconnect(old);
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("recreate task died: {e}"))?
     }
 
     /// Switches the card to another T protocol: reconnects the underlying PCSC
@@ -1016,32 +1169,38 @@ impl ManagedCard {
             self.reader_name.to_string_lossy()
         );
 
-        let reconnect_result = {
-            let mut card = self.inner.lock().await;
-            card.reconnect(ShareMode::Shared, protocol, Disposition::ResetCard)
-        };
-
-        match reconnect_result {
-            Ok(_) => self.protocol = protocol,
+        match self
+            .reconnect_handle(protocol, Disposition::ResetCard)
+            .await
+        {
+            Ok(()) => self.protocol = protocol,
             Err(e) => {
                 warn!(
-                    "Failed to switch card protocol to {} for reader {}: {:?}. Will try to recreate.",
+                    "Failed to switch card protocol to {} for reader {}: {}. Will try to recreate.",
                     protocol_to_str(protocol),
                     self.reader_name.to_string_lossy(),
                     e
                 );
-                match Self::create_card(&self.reader_name, protocol) {
-                    Ok(new_card) => {
-                        *self.inner.lock().await = new_card;
-                        self.protocol = protocol;
+                match self.replace_handle(protocol, Disposition::ResetCard).await {
+                    Ok(()) => self.protocol = protocol,
+                    Err(e) => {
+                        error!(
+                            "Failed to recreate card with protocol {} for reader {}: {}. Keeping {}.",
+                            protocol_to_str(protocol),
+                            self.reader_name.to_string_lossy(),
+                            e,
+                            protocol_to_str(self.protocol)
+                        );
+                        // The old handle was already disconnected: bring one
+                        // back with the protocol we keep.
+                        if let Err(e) = self.recreate(Disposition::LeaveCard).await {
+                            error!(
+                                "Failed to reopen card for reader {}: {}",
+                                self.reader_name.to_string_lossy(),
+                                e
+                            );
+                        }
                     }
-                    Err(e) => error!(
-                        "Failed to recreate card with protocol {} for reader {}: {}. Keeping {}.",
-                        protocol_to_str(protocol),
-                        self.reader_name.to_string_lossy(),
-                        e,
-                        protocol_to_str(self.protocol)
-                    ),
                 }
             }
         }
@@ -1058,15 +1217,13 @@ impl ManagedCard {
             self.reader_name.to_string_lossy()
         );
 
-        let reconnect_result = {
-            let mut card = self.inner.lock().await;
-            // Reconnect with the same protocol the card was opened with (stored or
-            // ATR-derived) - ANY would let PCSC renegotiate and silently change it.
-            card.reconnect(ShareMode::Shared, self.protocol, Disposition::ResetCard)
-        };
-
-        match reconnect_result {
-            Ok(_) => {
+        // Reconnect with the same protocol the card was opened with (stored or
+        // ATR-derived) - ANY would let PCSC renegotiate and silently change it.
+        match self
+            .reconnect_handle(self.protocol, Disposition::ResetCard)
+            .await
+        {
+            Ok(()) => {
                 debug!(
                     "Card reconnected successfully for reader: {}",
                     self.reader_name.to_string_lossy()
@@ -1074,12 +1231,14 @@ impl ManagedCard {
             }
             Err(e) => {
                 warn!(
-                    "Failed to reconnect card: {:?} for reader: {}. Will try to recreate.",
+                    "Failed to reconnect card: {} for reader: {}. Will try to recreate.",
                     e,
                     self.reader_name.to_string_lossy()
                 );
 
-                if let Err(e) = self.recreate().await {
+                // The reset the failed reconnect owed is done by disposing of
+                // the old handle with ResetCard.
+                if let Err(e) = self.recreate(Disposition::ResetCard).await {
                     error!(
                         "Failed to recreate card after reconnect failure for reader {}: {}",
                         self.reader_name.to_string_lossy(),
@@ -1090,10 +1249,10 @@ impl ManagedCard {
         }
     }
 
-    pub async fn recreate(&self) -> DynResult<()> {
-        let new_card = Self::create_card(&self.reader_name, self.protocol)?;
-        let mut lock = self.inner.lock().await;
-        *lock = new_card;
+    /// Replaces the card handle with a freshly connected one; the old handle
+    /// is disconnected with `old_disposition` (see `replace_handle`).
+    pub async fn recreate(&self, old_disposition: Disposition) -> DynResult<()> {
+        self.replace_handle(self.protocol, old_disposition).await?;
 
         info!(
             "Successfully recreated card object for reader: {}",
@@ -1122,6 +1281,10 @@ impl ManagedCard {
             let mut rapdu_buf = vec![0u8; pcsc::MAX_BUFFER_SIZE_EXTENDED];
 
             let locked = card.blocking_lock();
+            let Some(locked) = locked.as_ref() else {
+                // a previous reset-recreate could not reconnect: retriable
+                return Err(pcsc::Error::InvalidHandle);
+            };
 
             match locked.transmit(&apdu, &mut rapdu_buf) {
                 Ok(response) => Ok(hex::encode(response)),
@@ -1155,12 +1318,12 @@ impl ManagedCard {
     /// server's retry reaches the card again (same rule the rack path applies
     /// via `SerialExchange::is_ok()`).
     pub async fn send_apdu(&self, apdu_hex: &str, client_id: &str) -> Result<String, ApduError> {
-        debug!("{} Sending APDU command: {}", client_id, apdu_hex);
+        log::trace!("{} Sending APDU command: {}", client_id, apdu_hex);
 
         // First attempt
         match self.apdu_transmit(apdu_hex).await {
             Ok(response) => {
-                debug!("{} APDU response: {:?}", client_id, response);
+                log::trace!("{} APDU response: {:?}", client_id, response);
                 return Ok(response);
             }
             Err(err) => {
@@ -1170,6 +1333,10 @@ impl ManagedCard {
                 // anything else the card may already have executed it —
                 // recreating resets the card (destroying the SM auth state)
                 // and replaying a stateful APDU would run it twice.
+                if matches!(err, ApduError::Pcsc(pcsc::Error::RemovedCard)) {
+                    self.handle_removed_card(client_id).await;
+                    return Err(err);
+                }
                 if !err.is_retriable() {
                     error!(
                         "{} Failed to send APDU: {}. Not retried: the command may have reached the card.",
@@ -1184,8 +1351,9 @@ impl ManagedCard {
             }
         }
 
-        // recreate attempt
-        if let Err(e) = self.recreate().await {
+        // recreate attempt; the retry must reach the card in its current
+        // state, so the old handle leaves it as it is
+        if let Err(e) = self.recreate(Disposition::LeaveCard).await {
             error!(
                 "{} Failed to recreate card after APDU failure: {}",
                 client_id, e
@@ -1196,9 +1364,10 @@ impl ManagedCard {
         // Second attempt
         match self.apdu_transmit(apdu_hex).await {
             Ok(response) => {
-                debug!(
+                log::trace!(
                     "{} APDU response (after recreate): {:?}",
-                    client_id, response
+                    client_id,
+                    response
                 );
                 Ok(response)
             }
@@ -1210,6 +1379,55 @@ impl ManagedCard {
                 Err(retry_err)
             }
         }
+    }
+
+    /// The card behind the session was removed. Its security state is gone,
+    /// so the APDU is not replayed; what is left to decide is whether the card
+    /// now in the reader is the same one. PC/SC folds a fast swap into one
+    /// PRESENT event, and cards of one product share an ATR, so the monitor can
+    /// miss a swap entirely — this session would then keep running against the
+    /// other card, answering the VU with it and saving its data under this
+    /// card's config entry. A different (or unreadable) card ends the session
+    /// and asks the monitor to rescan, which registers whatever is inserted.
+    async fn handle_removed_card(&self, client_id: &str) {
+        let reader = self.reader_name.to_string_lossy().into_owned();
+        // LeaveCard: the removed card has nothing to reset, and a reset here
+        // would flag the fresh handle.
+        let current = match self.recreate(Disposition::LeaveCard).await {
+            Ok(()) => self.read_iccid().await.ok(),
+            Err(e) => {
+                warn!(
+                    "{} Card removed from reader {} and not reopened: {}",
+                    client_id, reader, e
+                );
+                None
+            }
+        };
+        let expected = self.iccid.get();
+        if current.is_some() && current.as_ref() == expected {
+            info!(
+                "{} Card in reader {} was reinserted (same ICCID); the session continues after a reset",
+                client_id, reader
+            );
+            return;
+        }
+        warn!(
+            "{} Card in reader {} changed (ICCID {:?} → {:?}): ending the session and rescanning",
+            client_id, reader, expected, current
+        );
+        let stale: Vec<ProcessingCard> = {
+            let mut pool = TASK_POOL.lock().await;
+            let (stale, keep) = std::mem::take(&mut *pool).into_iter().partition(|c| {
+                c.client_id == client_id && c.reader_name.as_deref() == Some(reader.as_str())
+            });
+            *pool = keep;
+            stale
+        };
+        if !stale.is_empty() {
+            // Detached: this very task is one of those being shut down.
+            tauri::async_runtime::spawn(crate::mqtt::shutdown_connections(stale, "card_swapped"));
+        }
+        request_rescan();
     }
 
     /// Returns the card ICCID using lazy caching.
@@ -1224,8 +1442,16 @@ impl ManagedCard {
             return Ok(cached.clone());
         }
 
+        let iccid = self.read_iccid().await?;
+        // Save ICCID, not got earlier
+        let _ = self.iccid.set(iccid.clone());
+        Ok(iccid)
+    }
+
+    /// Reads the ICCID from the card itself, bypassing the cache.
+    async fn read_iccid(&self) -> DynResult<String> {
         debug!(
-            "get_iccid() started for reader: {}",
+            "read_iccid() started for reader: {}",
             self.reader_name.to_string_lossy()
         );
 
@@ -1269,9 +1495,6 @@ impl ManagedCard {
 
         debug!("Final ICCID: {}", iccid);
 
-        // Save ICCID, not got earlier
-        let _ = self.iccid.set(iccid.clone());
-
         Ok(iccid)
     }
 }
@@ -1279,6 +1502,35 @@ impl ManagedCard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_retriable_only_for_undelivered_commands() {
+        let pcsc = |e| ApduError::Pcsc(e);
+        for e in [
+            pcsc::Error::InvalidHandle,
+            pcsc::Error::ResetCard,
+            pcsc::Error::ReaderUnavailable,
+            pcsc::Error::NoService,
+            pcsc::Error::ServiceStopped,
+            pcsc::Error::UnpoweredCard,
+            pcsc::Error::UnresponsiveCard,
+            pcsc::Error::NoSmartcard,
+        ] {
+            assert!(pcsc(e).is_retriable(), "{e:?} must be retried");
+        }
+        // The command may have reached the card, or the card is a different one.
+        for e in [
+            pcsc::Error::RemovedCard,
+            pcsc::Error::Timeout,
+            pcsc::Error::CommError,
+            pcsc::Error::UnknownError,
+        ] {
+            assert!(!pcsc(e).is_retriable(), "{e:?} must not be retried");
+        }
+        assert!(!ApduError::BadRequest(String::new()).is_retriable());
+        assert!(!ApduError::RecreateFailed(String::new()).is_retriable());
+        assert!(ApduError::TaskDied(String::new()).is_retriable());
+    }
 
     #[test]
     fn protocol_str_roundtrip() {

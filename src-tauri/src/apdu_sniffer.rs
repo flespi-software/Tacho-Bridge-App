@@ -107,7 +107,9 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
         return;
     };
 
-    let Some(data) = extract_plain_body(&resp) else {
+    // CLA bits b4-b3 = 11: the command (and so its response) is SM-wrapped.
+    let secure_messaging = cmd.first().is_some_and(|cla| cla & 0x0C == 0x0C);
+    let Some(data) = extract_plain_body(&resp, secure_messaging) else {
         return;
     };
 
@@ -164,7 +166,7 @@ fn read_binary_offset(cmd: &[u8]) -> Option<u16> {
 /// did not report full success: a warning status such as 6282 ("end of file
 /// reached before reading Le bytes") returns FEWER bytes than asked for, and
 /// the fixed-offset parsers would read past the data into whatever follows.
-fn extract_plain_body(resp: &[u8]) -> Option<Vec<u8>> {
+fn extract_plain_body(resp: &[u8], secure_messaging: bool) -> Option<Vec<u8>> {
     if resp.len() < 2 {
         return None;
     }
@@ -188,8 +190,11 @@ fn extract_plain_body(resp: &[u8]) -> Option<Vec<u8>> {
         return body.get(start..end).map(<[u8]>::to_vec);
     }
 
-    // SM with encrypted body (DO'87) — cannot decode without session keys
-    if body[0] == 0x87 {
+    // An SM response carries its data in DO'81 only. Anything else is
+    // DO'87 (encrypted, cannot be decoded without session keys) or a
+    // status-only body (DO'99 + DO'8E) — read as plain data, its first bytes
+    // would be persisted as file fields.
+    if secure_messaging || body[0] == 0x87 {
         return None;
     }
 
@@ -244,7 +249,11 @@ fn persist_sniffed(
                 what
             ),
             crate::config::CardMutation::Failed => {
-                log::error!("sniffer: failed to persist {} fields for {}", what, client_id)
+                log::error!(
+                    "sniffer: failed to persist {} fields for {}",
+                    what,
+                    client_id
+                )
             }
             crate::config::CardMutation::Saved | crate::config::CardMutation::Unchanged => {}
         }
@@ -274,6 +283,11 @@ fn version_is_higher(current: Option<(u8, u8)>, candidate: (u8, u8)) -> bool {
     }
 }
 
+/// Size of EF_Identification on a company card: CardIdentification (65) +
+/// companyName (36) + companyAddress (36) + preferred language (2). Driver,
+/// workshop and control cards carry a different holder block at offset 65
+/// (on a driver card: the holder's surname and first names).
+const COMPANY_EF_IDENTIFICATION_LEN: usize = 65 + 36 + 36 + 2;
 
 /// Parses EF_Identification (Annex 1C §2.24 CardIdentification + holder block).
 /// Logs all fields and persists the subset we track (expire, company_name,
@@ -305,7 +319,8 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
     }
 
     // Company Card holder block
-    if data.len() >= 65 + 74 {
+    let company_layout = data.len() == COMPANY_EF_IDENTIFICATION_LEN;
+    if company_layout {
         if let Some(b) = slice(data, 65, 36) {
             log::info!("  companyName: {}", name_str(b));
         }
@@ -337,8 +352,17 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
             Some(ts as u64)
         }
     });
-    let new_company_name = slice(data, 65, 36).map(extract_name);
-    let new_company_address = slice(data, 101, 36).map(extract_name);
+    // The holder block is the company's only on a company card: the card type
+    // sniffed from EF_Application_Identification decides, the file size when
+    // that has not been seen yet. Anything else would store a driver's name.
+    let is_company = match cfg.card_type {
+        Some(card_type) => card_type == 4,
+        None => company_layout,
+    };
+    let new_company_name = slice(data, 65, 36).filter(|_| is_company).map(extract_name);
+    let new_company_address = slice(data, 101, 36)
+        .filter(|_| is_company)
+        .map(extract_name);
 
     let would_change = new_expire.as_ref().is_some_and(|v| &cfg.expire != v)
         || new_company_name
@@ -396,11 +420,9 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
         return;
     };
 
-    let new_card_type = if !data.is_empty() {
-        Some(data[0])
-    } else {
-        None
-    };
+    // typeOfTachographCardId is 1..=4 (driver, workshop, control, company);
+    // any other value means the bytes are not this file's.
+    let new_card_type = data.first().copied().filter(|t| (1..=4).contains(t));
     let new_structure_version = if data.len() >= 3 {
         Some((data[1], data[2]))
     } else {
@@ -528,7 +550,10 @@ mod tests {
 
         // Same value: no write, no change reported.
         set_if_changed(&mut card.expire, Some(Some(42)), &mut changed);
-        assert!(!changed, "re-reading an unchanged EF must not dirty the config");
+        assert!(
+            !changed,
+            "re-reading an unchanged EF must not dirty the config"
+        );
 
         // Different value: written and reported.
         set_if_changed(&mut card.expire, Some(Some(99)), &mut changed);
@@ -556,7 +581,10 @@ mod tests {
         set_if_changed(&mut card.company_name, Some(Some("A".into())), &mut changed);
         assert!(changed);
         set_if_changed(&mut card.company_address, None, &mut changed);
-        assert!(changed, "an earlier change must not be reset by a later no-op");
+        assert!(
+            changed,
+            "an earlier change must not be reset by a later no-op"
+        );
     }
 
     #[test]
@@ -566,8 +594,14 @@ mod tests {
         assert!(version_is_higher(None, (0, 0)), "first read always stores");
         assert!(version_is_higher(Some((0, 0)), (1, 0)));
         assert!(version_is_higher(Some((1, 0)), (1, 1)));
-        assert!(!version_is_higher(Some((1, 0)), (0, 0)), "Gen1 must not overwrite Gen2");
-        assert!(!version_is_higher(Some((1, 1)), (1, 1)), "same version is not higher");
+        assert!(
+            !version_is_higher(Some((1, 0)), (0, 0)),
+            "Gen1 must not overwrite Gen2"
+        );
+        assert!(
+            !version_is_higher(Some((1, 1)), (1, 1)),
+            "same version is not higher"
+        );
         assert!(!version_is_higher(Some((1, 2)), (1, 1)));
     }
 
@@ -606,7 +640,10 @@ mod tests {
     fn extract_plain_body_strips_sw() {
         // Plain response: 12 34 56  + SW 90 00
         let resp = [0x12, 0x34, 0x56, 0x90, 0x00];
-        assert_eq!(extract_plain_body(&resp), Some(vec![0x12, 0x34, 0x56]));
+        assert_eq!(
+            extract_plain_body(&resp, false),
+            Some(vec![0x12, 0x34, 0x56])
+        );
     }
 
     #[test]
@@ -615,13 +652,16 @@ mod tests {
         let resp = [
             0x81, 0x03, 0xAA, 0xBB, 0xCC, 0x8E, 0x02, 0xFF, 0xFF, 0x90, 0x00,
         ];
-        assert_eq!(extract_plain_body(&resp), Some(vec![0xAA, 0xBB, 0xCC]));
+        assert_eq!(
+            extract_plain_body(&resp, false),
+            Some(vec![0xAA, 0xBB, 0xCC])
+        );
     }
 
     #[test]
     fn extract_plain_body_refuses_encrypted_do87() {
         let resp = [0x87, 0x02, 0xAA, 0xBB, 0x90, 0x00];
-        assert_eq!(extract_plain_body(&resp), None);
+        assert_eq!(extract_plain_body(&resp, false), None);
     }
 
     #[test]
@@ -631,7 +671,7 @@ mod tests {
         // plain `<= body.len()` bound check, panicking on the slice; the
         // checked add must reject it on every target instead.
         let resp = [0x81, 0x84, 0xFF, 0xFF, 0xFF, 0xFF, 0xAA, 0x90, 0x00];
-        assert_eq!(extract_plain_body(&resp), None);
+        assert_eq!(extract_plain_body(&resp, false), None);
     }
 
     #[test]
@@ -639,7 +679,7 @@ mod tests {
         // Ordinary truncation: the declared length is larger than what is
         // actually present.
         let resp = [0x81, 0x08, 0xAA, 0xBB, 0x90, 0x00];
-        assert_eq!(extract_plain_body(&resp), None);
+        assert_eq!(extract_plain_body(&resp, false), None);
     }
 
     #[test]
@@ -654,11 +694,21 @@ mod tests {
     }
 
     #[test]
+    fn extract_plain_body_refuses_sm_response_without_do81() {
+        // Status-only SM body: DO'99 (SW) + DO'8E (MAC), outer 90 00.
+        let resp = [0x99, 0x02, 0x6A, 0x82, 0x8E, 0x02, 0xFF, 0xFF, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp, true), None);
+        // The same DO'81 body is still extracted from an SM response.
+        let resp = [0x81, 0x01, 0x04, 0x8E, 0x02, 0xFF, 0xFF, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp, true), Some(vec![0x04]));
+    }
+
+    #[test]
     fn extract_plain_body_handles_too_short() {
-        assert_eq!(extract_plain_body(&[]), None);
-        assert_eq!(extract_plain_body(&[0x90]), None);
+        assert_eq!(extract_plain_body(&[], false), None);
+        assert_eq!(extract_plain_body(&[0x90], false), None);
         // Only SW, no payload
-        assert_eq!(extract_plain_body(&[0x90, 0x00]), None);
+        assert_eq!(extract_plain_body(&[0x90, 0x00], false), None);
     }
 
     #[test]
@@ -667,10 +717,10 @@ mod tests {
         // short, so parsing it at fixed offsets would read past the real
         // content — the whole response must be rejected.
         let resp = [0x12, 0x34, 0x56, 0x62, 0x82];
-        assert_eq!(extract_plain_body(&resp), None);
+        assert_eq!(extract_plain_body(&resp, false), None);
         // A DO'81-wrapped body under a non-9000 status is rejected too.
         let sm = [0x81, 0x03, 0xAA, 0xBB, 0xCC, 0x62, 0x82];
-        assert_eq!(extract_plain_body(&sm), None);
+        assert_eq!(extract_plain_body(&sm, true), None);
     }
 
     #[test]
