@@ -3,6 +3,7 @@
 //! This module provides functionality for creating and managing MQTT connections.
 
 // ───── Std Lib ─────
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration; // For specifying time durations.
 
 // ───── MQTT Client Library (rumqttc) ─────
@@ -25,8 +26,16 @@ use crate::config::CacheSection; // Enum for cache sections for getting data fro
 use crate::global_app_handle::app_emit_event; // Emits app connection status to the frontend.
 use crate::smart_card::ProcessingCard;
 
+/// Session id of the app connection currently in charge. A replaced loop can
+/// still be alive for a moment (its shutdown is detached and may race its own
+/// CONNECT): only the current one may register its client with the racks,
+/// report the status to the UI, or announce the racks on CONNACK.
+static CURRENT_APP_SESSION: AtomicU64 = AtomicU64::new(0);
 
-/// Ensures an MQTT connection for the specified client ID.
+fn is_current_app_session(session_id: u64) -> bool {
+    CURRENT_APP_SESSION.load(Ordering::SeqCst) == session_id
+}
+
 /// Rebuilds every MQTT connection with the current settings — what the
 /// settings dialog does after a save, available to the backend for changes
 /// that arrive from the server (credentials). Each step on its own: a PC/SC
@@ -34,12 +43,17 @@ use crate::smart_card::ProcessingCard;
 pub async fn reconnect_everything(reason: &str) {
     log::info!("[CONN] phase=reconnect_all reason={}", reason);
     if let Err(e) = crate::smart_card::manual_sync_cards(String::new(), true).await {
-        log::warn!("[CONN] phase=reconnect_all step=cards status=failed err={}", e);
+        log::warn!(
+            "[CONN] phase=reconnect_all step=cards status=failed err={}",
+            e
+        );
     }
     app_connection().await;
     crate::com_port::restart_rack_links(reason);
 }
 
+/// (Re)establishes the application-level MQTT connection with the current
+/// settings, replacing the running one.
 #[tauri::command]
 pub async fn app_connection() {
     log::info!("[CONN] phase=app_connection status=start");
@@ -74,6 +88,11 @@ pub async fn app_connection() {
     // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
 
+    // Take over before the predecessor is told to close, so its teardown
+    // already sees itself superseded.
+    let session_id = crate::smart_card::next_session_id();
+    CURRENT_APP_SESSION.store(session_id, Ordering::SeqCst);
+
     // The app-level connection is the only pool entry without a reader. If one
     // already exists (possibly stuck deep in reconnect backoff, or registered
     // under a previous ident), replace it: close the old task and start fresh,
@@ -102,7 +121,8 @@ pub async fn app_connection() {
         host,
         port
     );
-    let (mqtt_client, mut eventloop) = crate::mqtt::build_mqtt_client(client_id.clone(), &host, port);
+    let (mqtt_client, mut eventloop) =
+        crate::mqtt::build_mqtt_client(client_id.clone(), &host, port);
     // The racks publish through the app connection (`rack/<id>/...`): hand
     // them the new client right away, so a rack linking before the first
     // CONNACK queues its report into the right connection.
@@ -122,6 +142,25 @@ pub async fn app_connection() {
         loop {
             match eventloop.poll().await {
                 Ok(notification) => {
+                    if !is_current_app_session(session_id) {
+                        // Replaced: the successor owns the broker session, the
+                        // racks' client and the UI status, so nothing here is
+                        // acted on. Keep polling until the detached shutdown's
+                        // DISCONNECT is flushed — unless this loop has just
+                        // won a CONNECT, which would take the session over
+                        // from its successor: drop it right away then.
+                        match notification {
+                            Event::Outgoing(rumqttc::Outgoing::Disconnect)
+                            | Event::Incoming(Incoming::ConnAck(..)) => {
+                                log::info!(
+                                    "{} [CONN] phase=shutdown status=superseded",
+                                    log_header
+                                );
+                                break;
+                            }
+                            _ => continue,
+                        }
+                    }
                     if !is_online {
                         is_online = true;
                         // Successful poll → reset backoff for the next failure.
@@ -177,7 +216,14 @@ pub async fn app_connection() {
                             // server command requests come as JSON publishes on request/<id>/0
                             match serde_json::from_slice::<Value>(&publish.payload) {
                                 Ok(json_payload) => {
-                                    log::debug!("Parsed JSON payload: {:?}", json_payload);
+                                    // Never the payload itself: set_credentials carries
+                                    // the password, and the log file is uploaded by
+                                    // fetch_logs.
+                                    log::debug!(
+                                        "{} server command name={}",
+                                        log_header,
+                                        json_payload.get("name").unwrap_or(&Value::Null)
+                                    );
                                     let handled = crate::commands_settings::dispatch_request(
                                         &mqtt_client_for_task,
                                         &log_header,
@@ -186,10 +232,11 @@ pub async fn app_connection() {
                                     );
                                     if !handled {
                                         log::warn!(
-                                            "{} unsupported publish topic={} payload={:?}",
+                                            "{} unsupported publish topic={} name={} bytes={}",
                                             log_header,
                                             topic,
-                                            json_payload
+                                            json_payload.get("name").unwrap_or(&Value::Null),
+                                            publish.payload.len()
                                         );
                                     }
                                 }
@@ -232,18 +279,40 @@ pub async fn app_connection() {
                                 "{} [CONN] phase=shutdown status=disconnect_sent",
                                 log_header
                             );
+                            if is_current_app_session(session_id) {
+                                // Closed without a successor (yet): the racks
+                                // must hold their reports, and the UI must
+                                // not show a closed link as online.
+                                crate::com_port::on_app_offline();
+                                if is_online {
+                                    app_emit_event(false);
+                                }
+                            }
                             break;
                         }
                         _ => {} // This handles any other events that you haven't explicitly matched above
                     }
                 }
                 Err(e) => {
+                    if !is_current_app_session(session_id) {
+                        // A replaced connection has nothing to reconnect for.
+                        log::info!(
+                            "{} [CONN] phase=shutdown status=superseded err={}",
+                            log_header,
+                            e
+                        );
+                        break;
+                    }
                     let transition = if is_online {
                         "ONLINE->OFFLINE"
                     } else {
                         "OFFLINE"
                     };
-                    if is_online {
+                    // The cached status too: a manual reconnect replaces an
+                    // online connection without an offline report, and this
+                    // fresh loop has never been online — the UI would keep
+                    // showing the old "online" through every failed retry.
+                    if is_online || crate::global_app_handle::get_app_connection_status() {
                         is_online = false;
                         app_emit_event(false);
                     }
@@ -270,7 +339,7 @@ pub async fn app_connection() {
 
     task_pool.push(ProcessingCard {
         client_id,
-        session_id: crate::smart_card::next_session_id(),
+        session_id,
         reader_name: None,
         atr: None,
         mqtt_client: mqtt_clinet_cloned,
@@ -293,4 +362,3 @@ pub async fn app_connection() {
         );
     }
 }
-

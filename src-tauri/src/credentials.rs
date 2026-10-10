@@ -16,25 +16,27 @@
 //! connection is rebuilt with the new pair; there is no rollback — what the
 //! server pushes is what the device uses from then on.
 
-use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::AsyncClient;
 use serde_json::{json, Value};
 use tauri::async_runtime;
 
 /// Applies the switch and the credentials. `username`/`password` `None` keep
 /// what is in effect (config or session); `save` decides between the config
-/// file and memory. Returns the state the webview should show.
+/// file and memory. An empty username counts as not given: a pair without
+/// one would make every connection sign in anonymously behind an enabled
+/// switch.
 fn apply(
     enabled: bool,
     username: Option<&str>,
     password: Option<&str>,
     save: bool,
 ) -> Result<(), String> {
+    let username = username.filter(|u| !u.is_empty());
     if enabled && !save {
         // For this run only: resolve the pair now (a field left untouched in
         // the dialog keeps its current value) and keep it in memory. The
         // saved copy, if any, is removed from the file below.
-        let current = crate::mqtt::resolved_credentials();
+        let current = crate::mqtt::known_credentials();
         let username = username
             .map(str::to_string)
             .or_else(|| current.as_ref().map(|(u, _)| u.clone()))
@@ -46,29 +48,41 @@ fn apply(
         if username.is_empty() {
             return Err("username is empty".to_string());
         }
-        crate::config::set_server_credentials(true, None, None, false)?;
+        // Install the in-memory pair before the saved one leaves the file: a
+        // connection built in between (a card inserted, a rack relinking)
+        // would otherwise find the switch on and no pair anywhere, and sign
+        // in anonymously.
+        let previous = crate::mqtt::take_session_credentials();
         crate::mqtt::set_session_credentials(Some((username, password)));
+        if let Err(e) = crate::config::set_server_credentials(true, None, None, false) {
+            crate::mqtt::set_session_credentials(previous);
+            return Err(e);
+        }
     } else {
         // Saved, or the switch turned off: the file is the single source, the
         // in-memory pair (if any) is retired.
         if enabled && save {
             // a pair entered for this run and now saved: carry it over when
             // the dialog did not re-enter it
-            let session = crate::mqtt::resolved_credentials();
+            let session = crate::mqtt::known_credentials();
             let username = username
                 .map(str::to_string)
-                .or_else(|| session.as_ref().map(|(u, _)| u.clone()));
+                .or_else(|| session.as_ref().map(|(u, _)| u.clone()))
+                .ok_or_else(|| "username is empty".to_string())?;
             let password = password
                 .map(str::to_string)
                 .or_else(|| session.map(|(_, p)| p));
             crate::config::set_server_credentials(
                 true,
-                username.as_deref(),
+                Some(&username),
                 password.as_deref(),
                 true,
             )?;
-        } else {
+        } else if save {
             crate::config::set_server_credentials(false, username, password, true)?;
+        } else {
+            // Switched off and nothing to save: the stored pair stays as it is.
+            crate::config::set_server_credentials(false, None, None, true)?;
         }
         crate::mqtt::set_session_credentials(None);
     }
@@ -95,6 +109,7 @@ pub async fn apply_credentials(
     save: bool,
     reconnect: bool,
 ) -> Result<(), String> {
+    let before = crate::mqtt::resolved_credentials();
     async_runtime::spawn_blocking(move || {
         apply(enabled, username.as_deref(), password.as_deref(), save)
     })
@@ -105,6 +120,11 @@ pub async fn apply_credentials(
     }
     if reconnect {
         crate::app_connect::reconnect_everything("credentials_changed").await;
+    } else if crate::mqtt::resolved_credentials() != before {
+        // The caller rebuilds the app connection and the reader-backed cards
+        // itself, but the rack card sessions build their client once at
+        // spawn: without a restart they keep connecting with the old pair.
+        crate::com_port::restart_rack_links("credentials_changed");
     }
     Ok(())
 }
@@ -134,7 +154,7 @@ pub fn handle(client: &AsyncClient, log_header: &str, request_id: u64, payload: 
         let password = str_field("password")?;
         if enable
             && username.as_deref().is_none_or(str::is_empty)
-            && crate::mqtt::resolved_credentials().is_none()
+            && crate::mqtt::known_credentials().is_none()
         {
             return Err("username is required to enable authentication".to_string());
         }
@@ -167,27 +187,13 @@ pub fn handle(client: &AsyncClient, log_header: &str, request_id: u64, payload: 
                 }
             }
         };
-        let is_error = reply.get("error").is_some();
-        // The reply must reach the server on THIS connection: after the
-        // reconnect below the server hears from a new session only.
-        if let Err(e) = client
-            .publish(&done_topic, QoS::AtLeastOnce, false, reply.to_string())
-            .await
-        {
-            log::error!(
-                "{} [CONN] status=set_credentials_reply_failed err={:?}",
-                log_header,
-                e
-            );
-        }
-        if is_error {
-            return;
-        }
-        if let Some(app) = crate::global_app_handle::get_app_handle() {
-            if let Err(e) = crate::config::emit_global_config_server(&app) {
-                log::warn!("{} [CONN] status=config_emit_failed err={}", log_header, e);
-            }
-        }
-        crate::app_connect::reconnect_everything("set_credentials_command").await;
+        crate::commands_settings::reply_then_reconnect(
+            &client,
+            &log_header,
+            &done_topic,
+            reply,
+            "set_credentials_command",
+        )
+        .await;
     });
 }

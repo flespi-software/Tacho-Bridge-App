@@ -195,6 +195,11 @@ fn session_credentials() -> std::sync::MutexGuard<'static, Option<(String, Strin
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Removes and returns the in-memory credentials.
+pub(crate) fn take_session_credentials() -> Option<(String, String)> {
+    session_credentials().take()
+}
+
 /// Replaces (or clears, with `None`) the in-memory credentials.
 pub(crate) fn set_session_credentials(pair: Option<(String, String)>) {
     *session_credentials() = pair;
@@ -207,6 +212,13 @@ pub(crate) fn resolved_credentials() -> Option<(String, String)> {
     if get_from_cache(CacheSection::Server, "auth_enabled") != "true" {
         return None;
     }
+    known_credentials()
+}
+
+/// The pair the switch would put in effect: the one entered for this run,
+/// else the saved one. Unlike `resolved_credentials` it ignores the switch,
+/// so turning authentication back on can reuse a pair already in the file.
+pub(crate) fn known_credentials() -> Option<(String, String)> {
     session_credentials()
         .clone()
         .or_else(crate::config::saved_credentials)
@@ -244,9 +256,14 @@ pub(crate) fn auth_state() -> AuthState {
 }
 
 /// Keep-alive for every MQTT connection the app opens. The broker drops a
-/// silent client after roughly 1.5× this, so it also bounds how long a dead
-/// link goes unnoticed.
-const MQTT_KEEP_ALIVE_SECS: u64 = 120;
+/// silent client after roughly 1.5× this, and the client notices a half-open
+/// link (no PINGRESP) after about twice this — so it bounds how long VU
+/// requests can vanish into a dead link after a resume or a network switch.
+const MQTT_KEEP_ALIVE_SECS: u64 = 60;
+
+/// The standard MQTT-over-TLS port. A host configured with it gets a TLS
+/// transport: a plain CONNECT sent to a TLS listener fails forever.
+const MQTT_TLS_PORT: u16 = 8883;
 
 /// Capacity of the event loop's internal request channel.
 const MQTT_CHANNEL_CAPACITY: usize = 10;
@@ -266,8 +283,46 @@ pub(crate) fn build_mqtt_client(
     let mut mqtt_options = MqttOptions::new(client_id.into(), host, port);
     apply_mqtt_credentials(&mut mqtt_options);
     mqtt_options.set_keep_alive(Duration::from_secs(MQTT_KEEP_ALIVE_SECS));
+    if port == MQTT_TLS_PORT {
+        match tls_transport() {
+            Some(transport) => {
+                mqtt_options.set_transport(transport);
+            }
+            None => log::error!(
+                "[CONN] TLS port {} configured but TLS is unavailable: connecting without TLS",
+                port
+            ),
+        }
+    }
     // No Debug dump of mqtt_options anywhere: it would print the credentials.
     AsyncClient::new(mqtt_options, MQTT_CHANNEL_CAPACITY)
+}
+
+/// TLS transport with the system root certificates, built once and shared by
+/// every connection. `None` when it cannot be built.
+///
+/// rumqttc's default config panics on any unreadable system certificate and
+/// uses rustls' process-default crypto provider, which is ambiguous here (two
+/// providers are compiled in) — so the provider is installed explicitly and
+/// the build runs under `catch_unwind`.
+fn tls_transport() -> Option<rumqttc::Transport> {
+    static TRANSPORT: std::sync::OnceLock<Option<rumqttc::Transport>> = std::sync::OnceLock::new();
+    TRANSPORT
+        .get_or_init(|| {
+            use rumqttc::tokio_rustls::rustls;
+            // Err only when a provider is installed already — fine either way.
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            match std::panic::catch_unwind(rumqttc::Transport::tls_with_default_config) {
+                Ok(transport) => Some(transport),
+                Err(_) => {
+                    log::error!(
+                        "[CONN] building the TLS configuration failed (system certificates)"
+                    );
+                    None
+                }
+            }
+        })
+        .clone()
 }
 
 /// Applies the MQTT credentials to freshly built connection options — see
@@ -365,16 +420,54 @@ fn emit_card_sync_event(
     );
 }
 
-async fn publish_ack(
+/// True when the pool no longer holds this session's entry. A busy pool lock
+/// answers `false` (the caller then behaves as a live session): waiting for
+/// it could deadlock against a holder awaiting this very task.
+fn session_retired(session_id: u64) -> bool {
+    match crate::smart_card::TASK_POOL.try_lock() {
+        Ok(pool) => !pool.iter().any(|card| card.session_id == session_id),
+        Err(_) => false,
+    }
+}
+
+/// Upper bound of one card operation (an APDU exchange, a reset, a protocol
+/// switch) run from the card's poll loop. A reader or driver wedged inside
+/// PC/SC would otherwise stop the loop from polling: keep-alives lapse, the
+/// broker drops the session, and the card stays dead until it is pulled.
+const CARD_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs a card operation under `CARD_IO_TIMEOUT`; `None` when it expired.
+async fn card_io<T>(
+    op: impl std::future::Future<Output = T>,
+    log_header: &str,
+    what: &str,
+) -> Option<T> {
+    match tokio::time::timeout(CARD_IO_TIMEOUT, op).await {
+        Ok(value) => Some(value),
+        Err(_) => {
+            log::error!(
+                "{} card operation {} timed out after {}s",
+                log_header,
+                what,
+                CARD_IO_TIMEOUT.as_secs()
+            );
+            None
+        }
+    }
+}
+
+/// Queues a card reply without waiting. Called from inside the card's poll
+/// loop: an awaited `publish` parks while the bounded request channel is
+/// full, and only that same loop's `poll()` drains it — a permanent deadlock.
+/// A reply dropped on a full channel is recovered by the server's retry (the
+/// idempotency cache answers it without touching the card).
+fn publish_ack(
     mqtt_client: &AsyncClient,
     topic_ack: String,
     payload_ack: String,
     log_header: &str,
 ) {
-    if let Err(e) = mqtt_client
-        .publish(topic_ack, QoS::AtLeastOnce, false, payload_ack)
-        .await
-    {
+    if let Err(e) = mqtt_client.try_publish(topic_ack, QoS::AtLeastOnce, false, payload_ack) {
         log::error!("{} MQTT publish failed: {:?}", log_header, e);
     } else {
         log::debug!("{} MQTT response published successfully", log_header);
@@ -505,14 +598,14 @@ pub async fn ensure_connection(
 
     let mut is_online: bool = false; // flag to control the card connection (to the server) status
     let mut was_online = false; // Flag to track the previous connection status
-    // Two distinct pieces of state that used to share one flag:
-    //  * `auth_process` — the card has been driven mid-authentication and its
-    //    security state is dirty, so a new session must reset it first. Only a
-    //    real card exchange sets it; only an explicit session boundary
-    //    (`finish`, or the reset at session start) clears it.
-    //  * `busy_announced` — whether the frontend has already been told this
-    //    session is active. Purely cosmetic, and cleared by the keep-alive
-    //    self-heal, which must NOT make the card look clean to the reset gate.
+                                // Two distinct pieces of state that used to share one flag:
+                                //  * `auth_process` — the card has been driven mid-authentication and its
+                                //    security state is dirty, so a new session must reset it first. Only a
+                                //    real card exchange sets it; only an explicit session boundary
+                                //    (`finish`, or the reset at session start) clears it.
+                                //  * `busy_announced` — whether the frontend has already been told this
+                                //    session is active. Purely cosmetic, and cleared by the keep-alive
+                                //    self-heal, which must NOT make the card look clean to the reset gate.
     let mut auth_process: bool = false;
     let mut busy_announced: bool = false;
     let mut reconnect_delay_secs: u64 = RECONNECT_DELAY_INITIAL_SECS; // exponential backoff state
@@ -622,7 +715,7 @@ pub async fn ensure_connection(
                         }
                     }
 
-                    log::debug!("{} Notification: {:?}", log_header, notification);
+                    log::trace!("{} Notification: {:?}", log_header, notification);
 
                     match notification {
                         Event::Incoming(Incoming::Publish(publish)) => {
@@ -672,8 +765,7 @@ pub async fn ensure_connection(
                                             topic_ack.clone(),
                                             cached.clone(),
                                             &log_header,
-                                        )
-                                        .await;
+                                        );
                                         continue;
                                     }
                                     Some(_) => {
@@ -700,7 +792,7 @@ pub async fn ensure_connection(
                             // serializable data to interpret it as json
                             match serde_json::from_slice::<Value>(&publish.payload) {
                                 Ok(json_payload) => {
-                                    log::debug!("Parsed JSON payload: {:?}", json_payload);
+                                    log::trace!("Parsed JSON payload: {:?}", json_payload);
 
                                     let mut payload_ack = String::new();
                                     // Set when the card exchange itself failed (send_apdu
@@ -764,7 +856,12 @@ pub async fn ensure_connection(
                                             );
 
                                             // Reset the card to its original state
-                                            managed_card.reconnect().await;
+                                            let reset = card_io(
+                                                managed_card.reconnect(),
+                                                &log_header,
+                                                "reconnect",
+                                            )
+                                            .await;
                                             // The card lost its security state: nothing captured
                                             // before this point may be replayed from cache.
                                             card_generation = card_generation.wrapping_add(1);
@@ -773,8 +870,10 @@ pub async fn ensure_connection(
 
                                             // Session closed cleanly and the card was just reset:
                                             // it holds no session state, and the UI indicator is
-                                            // cleared by the emit above.
-                                            auth_process = false;
+                                            // cleared by the emit above. A reset that did not
+                                            // complete leaves it dirty: the next session start
+                                            // resets it again.
+                                            auth_process = reset.is_none();
                                             busy_announced = false;
 
                                         // handle the case when finish == true
@@ -785,7 +884,7 @@ pub async fn ensure_connection(
                                             if let Some(hex_value) =
                                                 json_payload.get("payload").and_then(|v| v.as_str())
                                             {
-                                                log::debug!(
+                                                log::trace!(
                                                     "{} TRACKER: Payload hex value: {}",
                                                     log_header,
                                                     hex_value
@@ -812,12 +911,17 @@ pub async fn ensure_connection(
                                                             false,
                                                         );
                                                         // Reset the card to its original state
-                                                        managed_card.reconnect().await;
+                                                        let reset = card_io(
+                                                            managed_card.reconnect(),
+                                                            &log_header,
+                                                            "reconnect",
+                                                        )
+                                                        .await;
                                                         card_generation =
                                                             card_generation.wrapping_add(1);
                                                         // The card is clean again; the fresh session
                                                         // below re-announces itself on its first APDU.
-                                                        auth_process = false;
+                                                        auth_process = reset.is_none();
                                                         busy_announced = false;
                                                     }
 
@@ -826,9 +930,16 @@ pub async fn ensure_connection(
                                                     // Session-scoped by design - not persisted to the config,
                                                     // the server owns the value per tracker.
                                                     if let Some(protocol) = requested_protocol {
-                                                        managed_card
-                                                            .switch_protocol(protocol)
-                                                            .await;
+                                                        if card_io(
+                                                            managed_card.switch_protocol(protocol),
+                                                            &log_header,
+                                                            "switch_protocol",
+                                                        )
+                                                        .await
+                                                        .is_none()
+                                                        {
+                                                            auth_process = true;
+                                                        }
                                                         // A protocol switch physically resets the
                                                         // card, same as a reconnect.
                                                         card_generation =
@@ -876,11 +987,17 @@ pub async fn ensure_connection(
                                                         );
                                                     }
 
-                                                    let rapdu = match managed_card
-                                                        .send_apdu(hex_value, &client_id_cloned)
-                                                        .await
-                                                    {
-                                                        Ok(rapdu) => {
+                                                    let exchange = card_io(
+                                                        managed_card.send_apdu(
+                                                            hex_value,
+                                                            &client_id_cloned,
+                                                        ),
+                                                        &log_header,
+                                                        "send_apdu",
+                                                    )
+                                                    .await;
+                                                    let rapdu = match exchange {
+                                                        Some(Ok(rapdu)) => {
                                                             // Passive sniffer: extract plaintext EF
                                                             // data from SM'd responses. Only a real
                                                             // card reply is worth parsing — feeding
@@ -893,14 +1010,26 @@ pub async fn ensure_connection(
                                                             );
                                                             rapdu
                                                         }
-                                                        Err(_) => {
+                                                        failed => {
                                                             // Transport failure (already logged by
-                                                            // send_apdu): substitute the technical-
-                                                            // problem status on the wire and keep
-                                                            // this reply out of the idempotency
-                                                            // cache so the server's retry reaches
-                                                            // the card again.
+                                                            // send_apdu) or a timed-out exchange:
+                                                            // substitute the technical-problem
+                                                            // status on the wire and keep this
+                                                            // reply out of the idempotency cache so
+                                                            // the server's retry reaches the card
+                                                            // again.
                                                             exchange_failed = true;
+                                                            // The command may have reached the card
+                                                            // (a timeout, or an error that does not
+                                                            // prove otherwise): its state is unknown,
+                                                            // so the next session start resets it.
+                                                            let undelivered = matches!(
+                                                                &failed,
+                                                                Some(Err(e)) if e.is_retriable()
+                                                            );
+                                                            if !undelivered {
+                                                                auth_process = true;
+                                                            }
                                                             SW_TECHNICAL_PROBLEM.to_string()
                                                         }
                                                     };
@@ -952,7 +1081,7 @@ pub async fn ensure_connection(
                                                 );
                                             }
 
-                                            log::debug!(
+                                            log::trace!(
                                                 "{} CARD: Payload hex value: {}",
                                                 log_header,
                                                 payload_ack
@@ -988,8 +1117,7 @@ pub async fn ensure_connection(
                                             topic_ack,
                                             payload_ack,
                                             &log_header,
-                                        )
-                                        .await;
+                                        );
                                     } else {
                                         log::error!(
                                             "{} Finish parameter not found or is not a boolean",
@@ -1063,6 +1191,19 @@ pub async fn ensure_connection(
                     }
                 }
                 Err(e) => {
+                    // Taken out of the pool already (card removed, reader
+                    // gone, entry replaced): the connection failure is the
+                    // teardown itself. Emitting here would resurrect the row
+                    // the monitor just deleted, and reconnecting would only
+                    // compete with a successor under the same client_id.
+                    if session_retired(session_id) {
+                        log::info!(
+                            "{} [CONN] phase=shutdown status=retired err={}",
+                            log_header,
+                            e
+                        );
+                        break;
+                    }
                     // Send the global-cards-sync event to the frontend that card is connected
                     emit_card_sync_event(
                         &iccid,
