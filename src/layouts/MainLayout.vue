@@ -42,7 +42,11 @@
 import { useQuasar, Notify } from 'quasar'
 import { ref, computed, onMounted } from 'vue'
 import { useTauriListeners } from 'src/composables/useTauriListeners'
-import { TBA_IDENT_REGEXP } from 'src/components/models'
+import {
+  TBA_IDENT_REGEXP,
+  parseThemeMode,
+  type GlobalConfigServerPayload,
+} from 'src/components/models'
 import { invoke } from '@tauri-apps/api/core'
 import 'animate.css'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
@@ -153,17 +157,9 @@ const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
 }
 
 function handleGlobalConfigServer(raw: unknown): void {
-  const payload = raw as {
-    dark_theme?: string
-    host?: string
-    ident?: string
-    auth_enabled?: string
-    auth_active?: string
-  }
-  if (payload.dark_theme === 'Dark') $q.dark.set(true)
-  else if (payload.dark_theme === 'Auto') $q.dark.set('auto')
-  else if (payload.dark_theme === 'Light') $q.dark.set(false)
-  // empty/unknown (old config without an appearance section): keep the current mode
+  const payload = raw as GlobalConfigServerPayload
+  const theme = parseThemeMode(payload.dark_theme)
+  if (theme) $q.dark.set(theme === 'Auto' ? 'auto' : theme === 'Dark')
   serverHost.value = payload.host ?? ''
   serverIdent.value = payload.ident ?? ''
   if (

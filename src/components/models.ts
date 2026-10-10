@@ -61,3 +61,29 @@ export interface RackState {
 /// reconnect gate and the settings dialog's validation cannot drift apart on
 /// what counts as a valid identity.
 export const TBA_IDENT_REGEXP = /^TBA\d{13}$/
+
+// Payload of the `global-config-server` event (config.rs
+// `emit_global_config_server`): every value is a string, booleans as
+// "true"/"false", timestamps as decimal unix seconds.
+export interface GlobalConfigServerPayload {
+  host?: string
+  ident?: string
+  dark_theme?: string
+  beta_updates?: string
+  auto_install_updates?: string
+  auth_enabled?: string
+  auth_username?: string
+  auth_password?: string
+  auth_saved?: string
+  auth_active?: string
+  debug_log_enabled?: string
+  debug_log_until?: string
+}
+
+export type ThemeMode = 'Auto' | 'Light' | 'Dark'
+
+/// Narrows the persisted `dark_theme` value; empty/unknown (an old config
+/// without an appearance section) yields null so callers keep the current mode.
+export function parseThemeMode(value: string | undefined): ThemeMode | null {
+  return value === 'Auto' || value === 'Light' || value === 'Dark' ? value : null
+}

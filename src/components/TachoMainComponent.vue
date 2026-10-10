@@ -125,8 +125,8 @@
     <SmartCardList
       ref="cardlist"
       :cards="state.cards"
-      @add-card="addCard"
-      @update-card="updateCard"
+      @add-card="saveCardNumber"
+      @update-card="saveCardNumber"
       @delete-card="removeCard"
     />
   </div>
@@ -209,7 +209,7 @@ function handleCardsSync(raw: unknown): void {
     console.warn('global-cards-sync: ignoring malformed payload', raw)
     return
   }
-  console.log('event payload: ', raw)
+  console.debug('event payload: ', raw)
 
   const name = raw.reader_name
   const card_number = raw.card_number
@@ -319,13 +319,6 @@ function linkMode(iccid: string) {
     cardlist.value?.openAddDialog()
   }
 }
-async function addCard(number: string, data: SmartCard) {
-  await saveCardNumber(number, data)
-}
-
-async function updateCard(number: string, data: SmartCard) {
-  await saveCardNumber(number, data)
-}
 
 // remove card func from the config
 const removeCard = async (cardNumber: string) => {
@@ -348,7 +341,7 @@ function handleCardConfigUpdated(raw: unknown): void {
     console.warn('global-card-config-updated: missing card_number', raw)
     return
   }
-  console.log('event payload: ', raw)
+  console.debug('event payload: ', raw)
 
   if (payload.content && typeof payload.content === 'object') {
     state.cards[payload.card_number] = { ...(payload.content as SmartCard) }

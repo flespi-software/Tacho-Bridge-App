@@ -257,9 +257,11 @@ const dialogCardName = ref<string>('')
 const dialogCardICCID = ref<string>('')
 const cardNumberError = ref<string>('')
 
-// Watcher for Validation
+// Validate as the user types. The flush: 'sync' watcher on the open dialog
+// only — opening it resets the number and must not flag the empty field
+// before the user typed anything.
 watch(dialogCardNumber, () => {
-  validateCardNumber()
+  if (isDialogOpen.value) validateCardNumber()
 })
 
 // Methods

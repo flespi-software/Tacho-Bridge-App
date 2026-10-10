@@ -23,7 +23,7 @@
           v-model="identInput"
           autofocus
           maxlength="16"
-          @keyup.enter="$emit('update:modelValue', false)"
+          @keyup.enter="saveServerConfig"
           :error="!isIdentValid"
           error-message="Must be TBA + 13 digits, e.g. TBA0000000000001"
           hide-bottom-space
@@ -38,7 +38,7 @@
           outlined
           dense
           v-model="hostValue"
-          @keyup.enter="$emit('update:modelValue', false)"
+          @keyup.enter="saveServerConfig"
         >
           <template v-slot:prepend>
             <q-icon name="mdi-server-network" size="xs" />
@@ -64,6 +64,9 @@
             v-model="authUsername"
             autocomplete="off"
             class="q-mb-sm"
+            :error="!isUsernameValid"
+            error-message="Username is required"
+            hide-bottom-space
             @update:model-value="credentialsDirty = true"
           >
             <template v-slot:prepend>
@@ -233,6 +236,7 @@
           label="Save"
           color="primary"
           :loading="saving"
+          :disable="!canSave"
           @click="saveServerConfig"
         />
       </q-card-actions>
@@ -281,7 +285,12 @@ import { ref, computed, watch, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useTauriListeners } from 'src/composables/useTauriListeners'
 import { notifyError, notifyWarn, notifySuccess, TOAST_SHORT } from 'src/composables/notify'
-import { TBA_IDENT_REGEXP } from 'src/components/models'
+import {
+  TBA_IDENT_REGEXP,
+  parseThemeMode,
+  type GlobalConfigServerPayload,
+  type ThemeMode,
+} from 'src/components/models'
 
 const props = defineProps<{
   modelValue: boolean
@@ -315,12 +324,15 @@ const authEnabled = ref(false)
 const authUsername = ref('')
 const authPassword = ref('')
 const authPasswordVisible = ref(false)
-// Whether a pair is in effect (saved or for this run).
-const authActive = ref(false)
 // Checked (default): the pair goes to config.yaml. Unchecked: memory only,
 // asked again at the next launch.
 const saveCredentials = ref(true)
 const credentialsDirty = ref(false)
+// A typed pair needs a username: the backend would save "" and every
+// connection would then be rejected.
+const isUsernameValid = computed(
+  () => !(authEnabled.value && credentialsDirty.value && authUsername.value.trim() === ''),
+)
 
 // Extended debug log — the same switch the server's `debug_log` command
 // drives, with the duration picked from a list (seconds). Applied on Save
@@ -364,10 +376,21 @@ async function onAutostartToggled(value: boolean) {
     notifyError(`Failed to ${value ? 'enable' : 'disable'} launch at startup`, error)
   }
 }
+
+// The last `global-config-server` payload. The form is (re)seeded from it on
+// every open, so edits abandoned by Cancel never resurface on the next open
+// and never ride along with a later, unrelated Save.
+let lastPayload: GlobalConfigServerPayload | null = null
+
 watch(
   () => props.modelValue,
   (open) => {
-    if (open) void refreshAutostartState()
+    if (!open) return
+    credentialsDirty.value = false
+    debugLogDirty.value = false
+    authPasswordVisible.value = false
+    if (lastPayload) seedFromPayload(lastPayload, true)
+    void refreshAutostartState()
   },
 )
 
@@ -377,7 +400,6 @@ const $q = useQuasar()
 // the old header button did). Persistence hangs off the control's update
 // event — not a watcher — so seeding the ref from the config on mount cannot
 // trigger a redundant re-persist.
-type ThemeMode = 'Auto' | 'Light' | 'Dark'
 const themeMode = ref<ThemeMode>('Auto')
 function onThemeSelected(mode: ThemeMode) {
   themeMode.value = mode
@@ -454,7 +476,11 @@ const openChangelog = async () => {
 }
 
 const saving = ref(false)
+const canSave = computed(
+  () => isIdentValid.value && hostValue.value.trim() !== '' && isUsernameValid.value,
+)
 const saveServerConfig = async () => {
+  if (saving.value || !canSave.value) return
   const theme = themeMode.value
   console.log(`server_address: ${hostValue.value}, ident: ${identInput.value}, theme: ${theme}`)
 
@@ -470,6 +496,16 @@ const saveServerConfig = async () => {
   const debugLog = debugLogDirty.value
     ? { enabled: debugLogEnabled.value, duration: debugLogDuration.value }
     : null
+  // Only a change of what the connections are built from earns a reconnect:
+  // it drops every card session, so a save that only switched the theme or
+  // the update channel must not abort an authentication in progress.
+  const before = lastPayload
+  const connectionChanged =
+    !before ||
+    (before.host ?? '') !== hostValue.value ||
+    (before.ident ?? '') !== identInput.value ||
+    (before.auth_enabled === 'true') !== credentials.enabled ||
+    credentialsDirty.value
 
   saving.value = true
   try {
@@ -486,27 +522,46 @@ const saveServerConfig = async () => {
     if (!ok) {
       throw new Error('the backend could not persist the settings')
     }
+  } catch (error) {
+    saving.value = false
+    console.error('Error updating server configuration:', error)
+    notifyError('Failed to update settings', error)
+    return
+  }
 
+  // The server settings are persisted from here on, so the reconnect below
+  // must run whatever happens next: a failed credentials or debug-log step is
+  // reported on its own and keeps the dialog open, but must not leave the app
+  // on the old broker.
+  let complete = true
+  try {
     // The switch is persisted on every save; the pair only when the user
     // typed into it (null = keep what is in effect). The reconnect below
     // picks the new state up, so the backend does not reconnect here.
     await invoke('apply_credentials', { ...credentials, reconnect: false })
     credentialsDirty.value = false
-
-    if (debugLog) {
+  } catch (error) {
+    complete = false
+    console.error('Applying credentials failed:', error)
+    notifyWarn('Settings saved, but the credentials were not applied', error)
+  }
+  if (debugLog) {
+    try {
       await invoke('set_debug_log', debugLog)
       debugLogDirty.value = false
+    } catch (error) {
+      complete = false
+      console.error('Switching the debug log failed:', error)
+      notifyWarn('Settings saved, but the debug log was not switched', error)
     }
-
+  }
+  saving.value = false
+  if (complete) {
     notifySuccess('Settings have been updated.', TOAST_SHORT)
     emit('update:modelValue', false)
-  } catch (error) {
-    console.error('Error updating server configuration:', error)
-    notifyError('Failed to update settings', error)
-    return
-  } finally {
-    saving.value = false
   }
+
+  if (!connectionChanged) return
 
   // Reconnect steps run after a confirmed save, each on its own: a PCSC sync
   // failure (e.g. the smart-card service is down) must not prevent the app
@@ -527,60 +582,54 @@ const saveServerConfig = async () => {
 
 const { on } = useTauriListeners()
 
-onMounted(async () => {
-  await on('global-config-server', (raw) => {
-    const payload = raw as {
-      host: string
-      ident: string
-      dark_theme?: string
-      beta_updates?: string
-      auto_install_updates?: string
-      auth_enabled?: string
-      auth_username?: string
-      auth_password?: string
-      auth_saved?: string
-      auth_active?: string
-      debug_log_enabled?: string
-      debug_log_until?: string
-    }
-    hostValue.value = payload.host
+// Copies the backend state into the form. `force` (dialog opening) seeds
+// everything; otherwise the dialog is open and only what the user is not
+// editing follows the backend, so a server command or reconnect arriving
+// mid-edit cannot replace a field under the cursor.
+function seedFromPayload(payload: GlobalConfigServerPayload, force: boolean) {
+  if (force) {
+    hostValue.value = payload.host ?? ''
     // Seed the backing ref directly, NOT through the identInput setter: the
     // setter strips dashes/non-digits, so a non-conforming persisted ident
     // would be silently rewritten here and the next Save would persist the
     // mangled identity of a device already registered on the server. The
     // faithful value renders as-is and isIdentValid flags it instead.
-    ident.value = payload.ident.replace(/^TBA/i, '')
+    ident.value = (payload.ident ?? '').replace(/^TBA/i, '')
     betaUpdates.value = payload.beta_updates === 'true'
     autoInstallUpdates.value = payload.auto_install_updates === 'true'
-    authActive.value = payload.auth_active === 'true'
-    // The fields the user is editing stay as typed: the event fired by the
-    // save in progress (or by a reconnect) carries the pair still in effect,
-    // and reflecting it would drop the edit before it is applied.
-    if (!saving.value && !credentialsDirty.value) {
-      authEnabled.value = payload.auth_enabled === 'true'
-      authUsername.value = payload.auth_username ?? ''
-      authPassword.value = payload.auth_password ?? ''
-      // A pair in effect that is not in the file was entered for this run only:
-      // reflect that, otherwise default to saving.
-      saveCredentials.value = !(authActive.value && payload.auth_saved !== 'true')
-    }
-    if (!saving.value && !debugLogDirty.value) {
-      debugLogEnabled.value = payload.debug_log_enabled === 'true'
-    }
-    const until = Number(payload.debug_log_until ?? '0')
-    debugLogActiveHint.value = !debugLogEnabled.value
+  }
+  // The fields the user is editing stay as typed: the event fired by the
+  // save in progress (or by a reconnect) carries the pair still in effect,
+  // and reflecting it would drop the edit before it is applied.
+  if (force || (!saving.value && !credentialsDirty.value)) {
+    authEnabled.value = payload.auth_enabled === 'true'
+    authUsername.value = payload.auth_username ?? ''
+    authPassword.value = payload.auth_password ?? ''
+    // A pair in effect that is not in the file was entered for this run only:
+    // reflect that, otherwise default to saving.
+    const authActive = payload.auth_active === 'true'
+    saveCredentials.value = !(authActive && payload.auth_saved !== 'true')
+  }
+  if (force || (!saving.value && !debugLogDirty.value)) {
+    debugLogEnabled.value = payload.debug_log_enabled === 'true'
+  }
+  // The hint describes the window actually running, not the toggle being edited.
+  const until = Number(payload.debug_log_until ?? '0')
+  debugLogActiveHint.value =
+    payload.debug_log_enabled !== 'true'
       ? ''
       : until === 0
         ? 'Active until switched off'
         : `Active until ${new Date(until * 1000).toLocaleString()}`
-    if (
-      payload.dark_theme === 'Auto' ||
-      payload.dark_theme === 'Light' ||
-      payload.dark_theme === 'Dark'
-    ) {
-      // Reflect the persisted mode; no watcher, so nothing re-persists.
-      themeMode.value = payload.dark_theme
-    }
+  const theme = parseThemeMode(payload.dark_theme)
+  // Reflect the persisted mode; no watcher, so nothing re-persists.
+  if (theme) themeMode.value = theme
+}
+
+onMounted(async () => {
+  await on('global-config-server', (raw) => {
+    lastPayload = raw as GlobalConfigServerPayload
+    seedFromPayload(lastPayload, !props.modelValue)
   })
 })
 </script>

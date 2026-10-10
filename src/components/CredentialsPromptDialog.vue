@@ -3,6 +3,7 @@
     :model-value="modelValue"
     persistent
     @update:model-value="$emit('update:modelValue', $event)"
+    @hide="reset"
   >
     <q-card style="width: 440px; max-width: 95vw">
       <q-card-section class="row items-center q-pb-sm">
@@ -73,7 +74,7 @@
           label="Connect"
           color="primary"
           :loading="connecting"
-          :disable="username.length === 0"
+          :disable="username.trim().length === 0"
           @click="connect"
         />
       </q-card-actions>
@@ -101,10 +102,16 @@ const passwordVisible = ref(false)
 const save = ref(true)
 const connecting = ref(false)
 
+// Skip/close must not leave the typed secret in memory for the next open.
+function reset() {
+  password.value = ''
+  passwordVisible.value = false
+}
+
 // Applies the pair and rebuilds every server connection with it. On failure
 // the dialog stays open with the error so the user can correct and retry.
 async function connect() {
-  if (username.value.length === 0) return
+  if (connecting.value || username.value.trim().length === 0) return
   connecting.value = true
   try {
     await invoke('apply_credentials', {
@@ -115,7 +122,6 @@ async function connect() {
       reconnect: true,
     })
     notifySuccess('Connecting with the entered credentials.', TOAST_SHORT)
-    password.value = ''
     emit('update:modelValue', false)
   } catch (error) {
     console.error('Failed to apply credentials:', error)
