@@ -324,13 +324,34 @@ fn open_optional(path: &Path) -> std::io::Result<Option<std::fs::File>> {
 
 /// Returns the timestamp of the first timestamped line of the reader,
 /// None when it is empty or holds no timestamped lines.
-fn first_entry_timestamp<R: BufRead>(reader: R) -> std::io::Result<Option<NaiveDateTime>> {
-    for line in reader.lines() {
-        if let Some(ts) = line_timestamp(&line?) {
+fn first_entry_timestamp<R: BufRead>(mut reader: R) -> std::io::Result<Option<NaiveDateTime>> {
+    let mut buf = Vec::new();
+    while let Some(line) = next_lossy_line(&mut reader, &mut buf)? {
+        if let Some(ts) = line_timestamp(&line) {
             return Ok(Some(ts));
         }
     }
     Ok(None)
+}
+
+/// Reads the next line without its terminator, decoding it lossily. A torn
+/// multi-byte character (a crash mid-write of a Cyrillic company name) must
+/// not make the whole generation unreadable, which `BufRead::lines` does.
+fn next_lossy_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    buf.clear();
+    if reader.read_until(b'\n', buf)? == 0 {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    Ok(Some(String::from_utf8_lossy(buf).into_owned()))
 }
 
 /// Writes the log lines at or after `cutoff` into `out`, returning how many
@@ -339,15 +360,15 @@ fn first_entry_timestamp<R: BufRead>(reader: R) -> std::io::Result<Option<NaiveD
 /// the cap counts plaintext, which is what a runaway debug log actually
 /// produces, not the deflated result.
 fn filter_log_lines<W: Write>(
-    reader: impl BufRead,
+    mut reader: impl BufRead,
     cutoff: NaiveDateTime,
     out: &mut W,
     already_written: usize,
 ) -> std::io::Result<usize> {
     let mut include = false;
     let mut written = 0usize;
-    for line in reader.lines() {
-        let line = line?;
+    let mut buf = Vec::new();
+    while let Some(line) = next_lossy_line(&mut reader, &mut buf)? {
         if let Some(ts) = line_timestamp(&line) {
             include = ts >= cutoff;
         }
@@ -442,6 +463,26 @@ mod tests {
         assert!(out.contains("new entry"));
         assert!(out.contains("new continuation"));
         assert!(out.contains("newer entry"));
+    }
+
+    #[test]
+    fn filter_survives_a_torn_utf8_sequence() {
+        let mut input = b"2026-07-08 10:00:00.000 INFO  [a] first\n".to_vec();
+        // A Cyrillic letter cut in half by a crash mid-write.
+        input.extend_from_slice(b"2026-07-08 11:00:00.000 INFO  [a] torn \xD0\n");
+        input.extend_from_slice(b"2026-07-08 12:00:00.000 INFO  [a] last\r\n");
+        let mut out = Vec::new();
+        filter_log_lines(
+            Cursor::new(input),
+            ts("2026-07-08 10:30:00.000"),
+            &mut out,
+            0,
+        )
+        .expect("lossy read");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("torn \u{FFFD}"));
+        assert!(text.ends_with("last\n"));
+        assert!(!text.contains("first"));
     }
 
     #[test]

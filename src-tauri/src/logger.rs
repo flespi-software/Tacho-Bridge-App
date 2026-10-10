@@ -88,8 +88,46 @@ fn parse_level(s: &str) -> Option<log::LevelFilter> {
     }
 }
 
+/// The directory logging actually ended up in: the preferred one, or the
+/// temp-dir fallback when that was not writable (see `setup_logging`).
+static ACTIVE_LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Set when the preferred log directory was not writable, so the warning can
+/// be replayed to a webview that loaded after it was emitted.
+static LOG_ACCESS_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Resolves the directory holding the application log files.
 fn log_dir() -> PathBuf {
+    if let Some(dir) = ACTIVE_LOG_DIR.get() {
+        return dir.clone();
+    }
+    preferred_log_dir()
+}
+
+/// Re-emits the "cannot write the log" warning: the startup emit usually
+/// fires before the webview is listening. Called on `frontend-loaded`.
+pub fn replay_access_warning() {
+    if LOG_ACCESS_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+        emit_access_warning();
+    }
+}
+
+fn emit_access_warning() {
+    emit_notification_event(
+        "global-notification",
+        NotificationPayload {
+            notification_type: "access".to_string(),
+            message: format!(
+                "No permission to write the log in {:?}; logging to {:?} instead",
+                preferred_log_dir(),
+                log_dir()
+            ),
+        },
+    );
+}
+
+/// The directory the log belongs in: `~/Documents/tba`.
+fn preferred_log_dir() -> PathBuf {
     let mut log_path = PathBuf::new();
 
     // Resolve the home directory without panicking if the env var is missing —
@@ -286,27 +324,42 @@ fn archive_log_generation(dir: &Path, archived: &Path, keep: usize) -> std::io::
     let archive_dir = dir.join("archive");
     std::fs::create_dir_all(&archive_dir)?;
 
-    // several generations can be archived within one second (startup sweep):
-    // pick a free destination name instead of truncating an existing archive
+    // Several generations can be archived within one second, by two threads
+    // even (the startup sweep and a rotation): pick a free destination name
+    // and claim it through its `.part` file with `create_new`, so neither
+    // truncates an existing archive nor the other thread's work in progress.
+    //
+    // The archive is deflated into the `.part` file and renamed into place
+    // only when complete: a mid-stream failure (disk full while compressing
+    // 50 MB) must not leave a truncated `.zip` that prune_archives would count
+    // against the retention window and a reader could not open.
     let base = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    let mut dest = archive_dir.join(format!("log_{}.zip", base));
-    let mut suffix = 1;
-    while dest.exists() {
-        dest = archive_dir.join(format!("log_{}_{}.zip", base, suffix));
+    let mut suffix = 0;
+    let (dest, part, part_file) = loop {
+        let name = if suffix == 0 {
+            format!("log_{}.zip", base)
+        } else {
+            format!("log_{}_{}.zip", base, suffix)
+        };
         suffix += 1;
-    }
-
-    // Deflate into a `.part` file and rename into place only when complete:
-    // a mid-stream failure (disk full while compressing 50 MB) must not leave
-    // a truncated `.zip` that prune_archives would count against the retention
-    // window and a reader could not open.
-    let part = archive_dir.join(format!(
-        "{}.part",
-        dest.file_name().unwrap_or_default().to_string_lossy()
-    ));
+        let dest = archive_dir.join(&name);
+        if dest.exists() {
+            continue;
+        }
+        let part = archive_dir.join(format!("{}.part", name));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+        {
+            Ok(file) => break (dest, part, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && suffix < 1000 => continue,
+            Err(e) => return Err(e),
+        }
+    };
     let zip_result = zip_log_entry(
         &mut File::open(archived)?,
-        std::io::BufWriter::new(File::create(&part)?),
+        std::io::BufWriter::new(part_file),
     )
     .and_then(|mut sink| sink.flush());
     if let Err(e) = zip_result {
@@ -392,6 +445,34 @@ fn prune_archives(archive_dir: &Path, keep: usize) {
     }
 }
 
+/// Routes panics into the log file as well. The default hook prints to
+/// stderr only, which a GUI build has nowhere to show: a panicking background
+/// task would otherwise vanish without a trace. The previous hook still runs.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let thread = std::thread::current();
+        log::error!(
+            "PANIC in thread '{}' at {}: {}\n{}",
+            thread.name().unwrap_or("<unnamed>"),
+            location,
+            message,
+            std::backtrace::Backtrace::force_capture()
+        );
+        previous(info);
+    }));
+}
+
 /// Sets up logging for the application.
 ///
 /// This function configures the logging system using the `fern` crate. It sets the log file path
@@ -402,11 +483,37 @@ fn prune_archives(archive_dir: &Path, keep: usize) {
 /// * On macOS, the log file is created in the `~/Documents/tba` directory.
 /// * On Windows, the log file is created in the `%USERPROFILE%\Documents\tba` directory.
 pub fn setup_logging() {
-    let dir = log_dir();
+    install_panic_hook();
 
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("Failed to create log directory {:?}: {}", dir, e);
+    // A log directory that cannot be written (permissions, a read-only or
+    // not-yet-synced Documents folder) must not leave the app with no log at
+    // all — that is exactly when diagnostics are needed. Fall back to the
+    // temp dir and tell the user.
+    let preferred = preferred_log_dir();
+    let fallback = env::temp_dir().join("tba");
+    let mut opened = None;
+    for dir in [preferred.clone(), fallback] {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("Failed to create log directory {:?}: {}", dir, e);
+            continue;
+        }
+        match RotatingLogWriter::new(dir.clone(), LOG_ROTATE_BYTES, LOG_ARCHIVE_KEEP) {
+            Ok(writer) => {
+                opened = Some((dir, writer));
+                break;
+            }
+            Err(e) => eprintln!("Failed to create log file in {:?}: {}", dir, e),
+        }
+    }
+    let Some((dir, log_writer)) = opened else {
+        LOG_ACCESS_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+        emit_access_warning();
         return;
+    };
+    let _ = ACTIVE_LOG_DIR.set(dir.clone());
+    if dir != preferred {
+        LOG_ACCESS_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+        emit_access_warning();
     }
 
     // An oversized log.1.txt (left by the legacy startup-only rotation) is
@@ -420,25 +527,6 @@ pub fn setup_logging() {
             archive_detached_generations(&sweep_dir, &detached, LOG_ARCHIVE_KEEP)
         });
     }
-
-    // Runtime-rotating sink: rotation triggers on size while the app runs, so
-    // an instance living for months keeps rotating without a restart. An
-    // oversized log.txt left by a previous run rotates on the first write.
-    let log_writer = match RotatingLogWriter::new(dir.clone(), LOG_ROTATE_BYTES, LOG_ARCHIVE_KEEP) {
-        Ok(writer) => writer,
-        Err(e) => {
-            eprintln!("Failed to create log file: {}", e);
-            log::warn!("No permission to write log file at: {:?}", dir);
-
-            let payload = NotificationPayload {
-                notification_type: "access".to_string(),
-                message: "No permission to write log file".to_string(),
-            };
-            emit_notification_event("global-notification", payload);
-
-            return;
-        }
-    };
 
     let mut dispatch = fern::Dispatch::new()
         .format(|out, message, record| {

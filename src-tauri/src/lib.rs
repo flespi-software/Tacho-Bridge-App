@@ -125,9 +125,7 @@ fn initialize_backend(app_handle: tauri::AppHandle) {
     // Background task for the card rack on the COM port. Runs concurrently with
     // the PCSC reader monitor — a plugged-in reader and a connected rack work
     // in parallel.
-    async_runtime::spawn(async {
-        com_port::rack_connection().await;
-    });
+    supervise("rack_connection", com_port::rack_connection);
 
     // One-shot update check against the release endpoint.
     let updater_handle = app_handle.clone();
@@ -138,8 +136,31 @@ fn initialize_backend(app_handle: tauri::AppHandle) {
     // Unattended update loop: idle while the setting is off, otherwise checks
     // hourly and installs during a pause in card activity (an install restarts
     // the app).
+    supervise("auto_update_loop", move || {
+        updater::auto_update_loop(app_handle.clone())
+    });
+}
+
+/// Runs a long-lived background loop and restarts it after a panic, so one
+/// unexpected panic cannot silently switch a subsystem off until the next app
+/// launch. A normal return ends the supervision (e.g. the app is shutting
+/// down).
+fn supervise<F, Fut>(name: &'static str, make: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     async_runtime::spawn(async move {
-        updater::auto_update_loop(app_handle).await;
+        loop {
+            match tokio::spawn(make()).await {
+                Ok(()) => return,
+                Err(e) if e.is_panic() => {
+                    log::error!("{name}: background task panicked, restarting in 5 s");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(_) => return,
+            }
+        }
     });
 }
 
@@ -182,9 +203,14 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // Must be the first registered plugin. A second instance cannot work
+        // Must be the first registered plugin, so a second instance exits
+        // before any other plugin initializes. A second instance cannot work
         // anyway (exclusive COM port, duplicate MQTT client_ids kicking each
         // other) — surface the existing window instead of starting one.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            log::warn!("Second instance launch blocked; focusing the existing window.");
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Launch-at-login support; the `--minimized` argument makes an
         // auto-started instance stay in the tray instead of opening a window.
@@ -192,10 +218,6 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
         ))
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            log::warn!("Second instance launch blocked; focusing the existing window.");
-            show_main_window(app);
-        }))
         .setup(move |app| {
             // Obtain a lightweight reference to the app for convenient interaction
             let app_handle = app.app_handle();
@@ -216,11 +238,9 @@ pub fn run() {
 
             // System tray: with it active, closing the window hides the app
             // to the tray and card bridging keeps running in the background.
-            // Logging is not initialized yet at this point, so eprintln is
-            // the best we have for a failure.
             match setup_tray(app) {
                 Ok(()) => TRAY_ACTIVE.store(true, Ordering::SeqCst),
-                Err(e) => eprintln!("Tray icon unavailable, window close will quit the app: {e}"),
+                Err(e) => log::error!("Tray icon unavailable, window close will quit the app: {e}"),
             }
 
             if let Some(window) = app.get_webview_window("main") {
@@ -239,10 +259,9 @@ pub fn run() {
                 // Form new Title with the version
                 let title = format!("v{}", version);
                 // Set new title to the window. A failure here is cosmetic —
-                // not worth panicking the whole app over (logging is not yet
-                // initialized at this point, so eprintln is the best we have).
+                // not worth panicking the whole app over.
                 if let Err(e) = window.set_title(&title) {
-                    eprintln!("Failed to set window title: {e}");
+                    log::error!("Failed to set window title: {e}");
                 }
 
                 let front_app_handle = app_handle.clone();
@@ -272,6 +291,10 @@ pub fn run() {
                     // have fired with no listener.
                     global_app_handle::emit_current_app_connection();
 
+                    // Notifications raised before the webview listened.
+                    logger::replay_access_warning();
+                    async_runtime::spawn(updater::replay_pending_update());
+
                     // Reader state has no replay of its own: the PCSC monitor only
                     // emits on card-state CHANGES, so a reloaded webview would show
                     // "no readers" forever while a card sits inserted. A rescan from
@@ -299,20 +322,20 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            config::update_card,           // update list of cards from the frontend
-            config::update_server,         // update server config from the frontend
+            config::update_card,            // update list of cards from the frontend
+            config::update_server,          // update server config from the frontend
             credentials::apply_credentials, // authentication switch + credentials from the dialogs
-            debug_log::set_debug_log,      // extended debug log switch from the settings dialog
-            config::update_theme,          // persist theme from the header button
-            config::remove_card,           // remove card from config
-            smart_card::manual_sync_cards, // manual sync cards from the frontend
-            app_connect::app_connection,   // App connection to the MQTT broker
+            debug_log::set_debug_log,       // extended debug log switch from the settings dialog
+            config::update_theme,           // persist theme from the header button
+            config::remove_card,            // remove card from config
+            smart_card::manual_sync_cards,  // manual sync cards from the frontend
+            app_connect::app_connection,    // App connection to the MQTT broker
             global_app_handle::get_app_connection_status, // cached connection status for a late-mounting webview
-            updater::install_update,       // download + install the pending update
-            updater::check_updates_now,    // forced update check from the settings dialog
-            updater::get_changelog,        // bundled CHANGELOG.md for the settings dialog
-            autostart_get,                 // is the app registered to start at login
-            autostart_set,                 // register/unregister launch at login
+            updater::install_update,                      // download + install the pending update
+            updater::check_updates_now, // forced update check from the settings dialog
+            updater::get_changelog,     // bundled CHANGELOG.md for the settings dialog
+            autostart_get,              // is the app registered to start at login
+            autostart_set,              // register/unregister launch at login
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

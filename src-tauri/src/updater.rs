@@ -108,10 +108,14 @@ async fn perform_check(
         app.updater_builder()
             .endpoints(vec![url])
             .map_err(|e| e.to_string())?
+            .timeout(CHECK_TIMEOUT)
             .build()
             .map_err(|e| e.to_string())?
     } else {
-        app.updater().map_err(|e| e.to_string())?
+        app.updater_builder()
+            .timeout(CHECK_TIMEOUT)
+            .build()
+            .map_err(|e| e.to_string())?
     };
 
     log::info!(
@@ -119,7 +123,17 @@ async fn perform_check(
         if beta { "beta" } else { "stable" }
     );
 
-    match updater.check().await {
+    // The request timeout covers a stalled transfer; this outer bound also
+    // covers DNS/TLS setup hanging on a half-open link after sleep, which
+    // would otherwise park the auto-update loop for the life of the process.
+    let checked = match tokio::time::timeout(CHECK_TIMEOUT * 2, updater.check()).await {
+        Ok(result) => result,
+        Err(_) => {
+            log::warn!("{TAG} phase=check status=failed err=timeout");
+            return Err("update check timed out".to_string());
+        }
+    };
+    match checked {
         Ok(Some(update)) => {
             let version = update.version.clone();
             log::info!(
@@ -127,22 +141,25 @@ async fn perform_check(
                 env!("CARGO_PKG_VERSION"),
                 version
             );
-            let message = format!(
-                "Version {version} is available. Install it now? The application will restart."
-            );
-            *PENDING_UPDATE.lock().await = Some(PendingUpdate {
-                update,
-                beta,
-                failed_attempts: 0,
-                last_failure: None,
-            });
-            emit_notification_event(
-                "global-notification",
-                NotificationPayload {
-                    notification_type: "update".to_string(),
-                    message,
-                },
-            );
+            let already_announced = {
+                let mut guard = PENDING_UPDATE.lock().await;
+                let already_announced = guard
+                    .as_ref()
+                    .is_some_and(|pending| pending.update.version == version);
+                *guard = Some(PendingUpdate {
+                    update,
+                    beta,
+                    failed_attempts: 0,
+                    last_failure: None,
+                });
+                already_announced
+            };
+            // The toast is sticky with its own Install button: announcing the
+            // same version again on every hourly or manual check would stack
+            // duplicates on screen.
+            if !already_announced {
+                announce_update(&version);
+            }
             Ok(CheckResult {
                 status: "update_available",
                 version,
@@ -199,6 +216,13 @@ const AUTO_CHECK_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// gaps, so one silent minute means no session is in progress.
 const AUTO_INSTALL_QUIET_SECS: u64 = 60;
 
+/// Bound of one manifest request; a check runs at most twice this long.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bound of the whole artifact download. A stalled one would otherwise keep
+/// `INSTALL_IN_PROGRESS` set and block every later install for good.
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// Unattended update loop, spawned once at startup and running for the whole
 /// app lifetime. Does nothing while the `auto_install_updates` setting is off.
 /// When on: re-checks the channel manifest at most once an hour, and installs
@@ -239,10 +263,9 @@ pub async fn auto_update_loop(app: AppHandle) {
         // The channel the user is on right now. A parked update from the other
         // channel is discarded rather than installed: flipping beta off must
         // not leave a pre-release queued for unattended install.
-        let beta_now = crate::config::get_from_cache(
-            crate::config::CacheSection::Updates,
-            "beta_updates",
-        ) == "true";
+        let beta_now =
+            crate::config::get_from_cache(crate::config::CacheSection::Updates, "beta_updates")
+                == "true";
         let (version, prior_attempts) = {
             let mut guard = PENDING_UPDATE.lock().await;
             let Some(pending) = guard.as_ref() else {
@@ -278,6 +301,17 @@ pub async fn auto_update_loop(app: AppHandle) {
             continue;
         }
 
+        // Credentials entered "for this run only" live in memory: an
+        // unattended restart would bring the app back unable to connect until
+        // someone types them in again. Leave the install to the user.
+        let auth = crate::mqtt::auth_state();
+        if auth.enabled && auth.active && !auth.saved {
+            log::info!(
+                "{TAG} phase=auto_install status=postponed version={version} reason=session_only_credentials"
+            );
+            continue;
+        }
+
         log::info!(
             "{TAG} phase=auto_install status=starting version={version} attempt={}",
             prior_attempts + 1
@@ -296,8 +330,9 @@ pub async fn auto_update_loop(app: AppHandle) {
                 },
             );
         }
-        // On success this restarts the app and never returns; on failure the
-        // update stays parked and the next tick retries after a backoff.
+        // On success the app is restarting (the restart is only requested, so
+        // this returns Ok); on failure the update stays parked and the next
+        // tick retries after a backoff.
         if let Err(e) = install_update(app.clone()).await {
             log::error!("{TAG} phase=auto_install status=failed version={version} err={e}");
             let mut guard = PENDING_UPDATE.lock().await;
@@ -372,29 +407,55 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
         update.version
     );
 
+    refuse_while_card_active()?;
+
     let mut downloaded: usize = 0;
     let mut last_logged_pct: u64 = 0;
-    if let Err(e) = update
-        .download_and_install(
-            move |chunk, total| {
-                downloaded += chunk;
-                if let Some(total) = total {
-                    let pct = (downloaded as u64 * 100) / total.max(1);
-                    // One log line per ~25% keeps the log readable.
-                    if pct >= last_logged_pct + 25 {
-                        last_logged_pct = pct;
-                        log::info!("{TAG} phase=install status=downloading progress={pct}%");
-                    }
+    let download = update.download(
+        move |chunk, total| {
+            downloaded += chunk;
+            if let Some(total) = total {
+                let pct = (downloaded as u64 * 100) / total.max(1);
+                // One log line per ~25% keeps the log readable.
+                if pct >= last_logged_pct + 25 {
+                    last_logged_pct = pct;
+                    log::info!("{TAG} phase=install status=downloading progress={pct}%");
                 }
-            },
-            || log::info!("{TAG} phase=install status=downloaded"),
-        )
-        .await
-    {
-        log::error!("{TAG} phase=install status=failed err={e}");
-        // The update stays parked (we only cloned it), so a transient download
-        // failure leaves it available: the user can retry from the notification
-        // and the auto-loop picks it up on its next tick.
+            }
+        },
+        || log::info!("{TAG} phase=install status=downloaded"),
+    );
+    // The update stays parked on any failure (we only cloned it), so a
+    // transient download failure leaves it available: the user can retry from
+    // the notification and the auto-loop picks it up on its next tick.
+    let bytes = match tokio::time::timeout(DOWNLOAD_TIMEOUT, download).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            log::error!("{TAG} phase=install status=failed err={e}");
+            return Err(e.to_string());
+        }
+        Err(_) => {
+            log::error!("{TAG} phase=install status=failed err=download_timeout");
+            return Err("the update download timed out".to_string());
+        }
+    };
+
+    // The download can take minutes on a slow link: an authentication that
+    // started meanwhile must not be cut by the restart. The next tick (or the
+    // user's retry) downloads again once the link is quiet.
+    refuse_while_card_active()?;
+
+    // Release the rack's serial port and close the broker sessions before
+    // installing: on Windows the NSIS install exits the process from inside
+    // `install`, so the regular exit cleanup never runs there.
+    crate::com_port::shutdown();
+    crate::mqtt::remove_connections_all().await;
+
+    if let Err(e) = update.install(bytes) {
+        log::error!("{TAG} phase=install status=failed step=install err={e}");
+        // Bring back what was torn down for the install.
+        crate::com_port::resume();
+        crate::app_connect::reconnect_everything("update_install_failed").await;
         return Err(e.to_string());
     }
 
@@ -403,9 +464,53 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
     *PENDING_UPDATE.lock().await = None;
 
     log::info!("{TAG} phase=install status=installed action=restart");
-    // Release the rack's serial port before the restart, same as window close.
-    crate::com_port::shutdown();
-    app.restart();
+    // `request_restart` goes through the regular exit path on the main
+    // thread. `restart()` called from here would park this tokio worker for
+    // good while the exit cleanup `block_on`s the MQTT flush — on a
+    // single-worker runtime nothing would be left to drive it.
+    app.request_restart();
+    Ok(())
+}
+
+fn announce_update(version: &str) {
+    emit_notification_event(
+        "global-notification",
+        NotificationPayload {
+            notification_type: "update".to_string(),
+            message: format!(
+                "Version {version} is available. Install it now? The application will restart."
+            ),
+        },
+    );
+}
+
+/// Re-announces a parked update to a freshly loaded webview: the startup
+/// check usually finishes before the frontend listens for notifications.
+pub async fn replay_pending_update() {
+    let version = PENDING_UPDATE
+        .lock()
+        .await
+        .as_ref()
+        .map(|pending| pending.update.version.clone());
+    if let Some(version) = version {
+        announce_update(&version);
+    }
+}
+
+/// An install restarts the app; a card authentication in flight would be cut
+/// mid-way and fail on the VU side.
+fn refuse_while_card_active() -> Result<(), String> {
+    let quiet_for = crate::mqtt::seconds_since_card_activity();
+    if quiet_for < AUTO_INSTALL_QUIET_SECS {
+        log::info!(
+            "{TAG} phase=install status=postponed reason=card_activity quiet_secs={quiet_for}"
+        );
+        return Err(format!(
+            "a card authentication is in progress; retry in {} seconds",
+            AUTO_INSTALL_QUIET_SECS - quiet_for
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

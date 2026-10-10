@@ -19,7 +19,6 @@
 //! The window is persisted in config.yaml (`debug_log_until`) so a crash or
 //! restart inside it resumes the debug log for the remainder.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,15 +32,27 @@ use tauri::async_runtime;
 /// Longest window a single command can ask for; `0` still means "no expiry".
 const MAX_DURATION_SECS: u64 = 7 * 24 * 3600;
 
-/// The active window: `Some(0)` = on until switched off, `Some(ts)` = on until
-/// that unix time, `None` = off. Mirrors the persisted config value.
-static WINDOW: Mutex<Option<u64>> = Mutex::new(None);
+/// The active window and its generation, under one lock so an expiry timer
+/// can check "still my window" and switch it off atomically.
+struct Window {
+    /// `Some(0)` = on until switched off, `Some(ts)` = on until that unix
+    /// time, `None` = off. Mirrors the persisted config value.
+    until: Option<u64>,
+    /// Bumped on every switch so an expiry timer of an earlier window, still
+    /// sleeping, finds itself outdated instead of switching off the newer one.
+    generation: u64,
+}
 
-/// Bumped on every switch so an expiry timer of an earlier window, still
-/// sleeping, finds itself outdated instead of switching off the newer one.
-static TIMER_GENERATION: AtomicU64 = AtomicU64::new(0);
+static WINDOW: Mutex<Window> = Mutex::new(Window {
+    until: None,
+    generation: 0,
+});
 
-fn window() -> std::sync::MutexGuard<'static, Option<u64>> {
+/// Serializes `persist` so the last write to run always stores the latest
+/// window: two quick switches persist from two blocking tasks in any order.
+static PERSIST_LOCK: Mutex<()> = Mutex::new(());
+
+fn window() -> std::sync::MutexGuard<'static, Window> {
     WINDOW
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -56,7 +67,7 @@ fn now_unix() -> u64 {
 
 /// Current state for the settings report: `{"enabled":bool,"until":ts}`.
 pub fn status_json() -> Value {
-    let until = *window();
+    let until = window().until;
     json!({
         "enabled": until.is_some() || crate::logger::extended_debug_is_on(),
         "until": until.unwrap_or(0),
@@ -104,7 +115,7 @@ pub fn restore_from_config() {
                 "[DEBUG] status=expired_while_down until={} action=cleared",
                 until
             );
-            persist(None);
+            persist();
         }
     }
 }
@@ -167,7 +178,7 @@ pub fn set_window(enable: bool, duration: u64, source: &str) {
         (true, secs) => Some(now_unix() + secs),
     };
     apply(until, source);
-    async_runtime::spawn_blocking(move || persist(until));
+    drop(async_runtime::spawn_blocking(persist));
 }
 
 /// Tauri command behind Settings → Diagnostics: the same switch the server
@@ -192,8 +203,19 @@ fn status_json_named() -> Value {
 
 /// Switches the debug log to the given window and arms its expiry timer.
 fn apply(until: Option<u64>, source: &str) {
-    let generation = TIMER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    *window() = until;
+    let generation = {
+        let mut window = window();
+        window.generation += 1;
+        window.until = until;
+        window.generation
+    };
+    switched(until, generation, source);
+}
+
+/// Side effects of a switch already recorded in `WINDOW`: the logger gate,
+/// the log line, the expiry timer, and a refresh of the settings dialog
+/// (a server command or an expiry must not leave its toggle stale).
+fn switched(until: Option<u64>, generation: u64, source: &str) {
     match until {
         None => {
             crate::logger::set_extended_debug(false);
@@ -209,21 +231,49 @@ fn apply(until: Option<u64>, source: &str) {
             );
             crate::com_port::log_state_snapshot();
             if expiry > 0 {
-                let remaining = Duration::from_secs(expiry.saturating_sub(now_unix()));
                 async_runtime::spawn(async move {
-                    tokio::time::sleep(remaining).await;
-                    if TIMER_GENERATION.load(Ordering::SeqCst) != generation {
-                        return; // a later command replaced this window
+                    // Wall-clock expiry checked in bounded steps: the tokio
+                    // timer stops while the machine sleeps, so one long sleep
+                    // would overrun the window by the whole suspend time.
+                    loop {
+                        let remaining = expiry.saturating_sub(now_unix());
+                        if remaining == 0 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(remaining.min(60))).await;
+                        if window().generation != generation {
+                            return; // a later command replaced this window
+                        }
                     }
-                    apply(None, "expired");
-                    let _ = async_runtime::spawn_blocking(|| persist(None));
+                    let generation = {
+                        let mut window = window();
+                        if window.generation != generation {
+                            return; // a later command replaced this window
+                        }
+                        window.generation += 1;
+                        window.until = None;
+                        window.generation
+                    };
+                    switched(None, generation, "expired");
+                    drop(async_runtime::spawn_blocking(persist));
                 });
             }
         }
     }
+    if let Some(app) = crate::global_app_handle::get_app_handle() {
+        if let Err(e) = crate::config::emit_global_config_server(&app) {
+            log::warn!("[DEBUG] status=config_emit_failed err={}", e);
+        }
+    }
 }
 
-fn persist(until: Option<u64>) {
+/// Persists the window in effect at the time of the write (not the one at
+/// the time of the switch), so racing persists cannot resurrect an old one.
+fn persist() {
+    let _guard = PERSIST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let until = window().until;
     if let Err(e) = crate::config::set_debug_log_until(until) {
         log::error!("[DEBUG] status=persist_failed err={}", e);
     }
@@ -268,10 +318,10 @@ mod tests {
 
     #[test]
     fn status_reports_the_window() {
-        *window() = Some(42);
+        window().until = Some(42);
         let status = status_json();
         assert_eq!(status["enabled"], true);
         assert_eq!(status["until"], 42);
-        *window() = None;
+        window().until = None;
     }
 }
