@@ -1,11 +1,16 @@
 <template>
   <div style="width: 600px; max-width: 100%">
     <div class="readers-container">
-      <div v-if="state.readers.length === 0" class="empty-state">
-        <q-icon name="mdi-card-search-outline" class="empty-state-icon" />
-        <div class="empty-state-title">No connected smart card readers</div>
-        <div class="empty-state-subtitle">Connect a smart card reader to get started</div>
-      </div>
+      <!-- Collapsed to a single row while no reader is connected; the block
+           grows with the reader rows once one is plugged in. -->
+      <q-item v-if="state.readers.length === 0" class="empty-readers" dense>
+        <q-item-section avatar>
+          <q-icon name="mdi-card-search-outline" />
+        </q-item-section>
+        <q-item-section>
+          <q-item-label>No connected smart card readers</q-item-label>
+        </q-item-section>
+      </q-item>
       <div v-for="reader in state.readers" :key="reader.name" class="row reader-row">
         <q-item class="col-6" style="min-height: 50px" dense>
           <q-item-section avatar>
