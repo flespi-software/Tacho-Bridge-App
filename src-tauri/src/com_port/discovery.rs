@@ -224,6 +224,33 @@ static DISCOVERY_DUPLICATES: ChangeGuard = ChangeGuard::new();
 /// small as the number of connected devices.
 static BUSY_PORT_NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// Last logged open failure per port. The monitor retries a failed open on
+/// every poll tick, so a port held by another application would otherwise
+/// write the same ERROR line every 2 s for as long as it stays held. Repeats
+/// go to debug; an entry is dropped when the port opens or leaves the bus.
+static OPEN_FAILURES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Last logged USB enumeration failure (Windows), same rule: "" once it works.
+#[cfg(windows)]
+static USB_ENUM_FAILURE: ChangeGuard = ChangeGuard::new();
+
+/// Records the open failure of a port and reports whether it is new (a
+/// different error, or the first one of this episode).
+fn open_failure_is_new(port_name: &str, err: &str) -> bool {
+    let mut failures = super::lock(&OPEN_FAILURES);
+    match failures.iter_mut().find(|(port, _)| port == port_name) {
+        Some((_, last)) if last == err => false,
+        Some((_, last)) => {
+            err.clone_into(last);
+            true
+        }
+        None => {
+            failures.push((port_name.to_string(), err.to_string()));
+            true
+        }
+    }
+}
+
 /// One-line description of an enumerated port for the inventory log. USB ports
 /// carry the metadata discovery matches on; other transports just get their
 /// kind, so field reports show why a device was not considered a rack.
@@ -247,8 +274,9 @@ fn describe_port(p: &serialport::SerialPortInfo) -> String {
 /// Find every supported device on the bus. Runs all matching passes for every
 /// profile, then orders the result deterministically (serial, then port name)
 /// and drops rack id duplicates — so which device is "first" never depends
-/// on OS enumeration order, which can change across reboots.
-pub(super) fn find_racks() -> Vec<RackInfo> {
+/// on OS enumeration order, which can change across reboots. `None` when the
+/// OS port enumeration itself failed — not the same as "no rack present".
+pub(super) fn find_racks() -> Option<Vec<RackInfo>> {
     let ports = match serialport::available_ports() {
         Ok(ports) => ports,
         Err(e) => {
@@ -256,7 +284,7 @@ pub(super) fn find_racks() -> Vec<RackInfo> {
             if PORT_INVENTORY.changed(&snapshot) {
                 log::error!("RACK | phase=discovery status=enumeration_failed err={e}");
             }
-            return Vec::new();
+            return None;
         }
     };
 
@@ -326,8 +354,9 @@ pub(super) fn find_racks() -> Vec<RackInfo> {
     // Busy notices only survive for ports still matched: a device that left
     // the bus notifies again on its next busy episode.
     super::lock(&BUSY_PORT_NOTICES).retain(|p| racks.iter().any(|r| r.port_name == *p));
+    super::lock(&OPEN_FAILURES).retain(|(p, _)| racks.iter().any(|r| r.port_name == *p));
 
-    racks
+    Some(racks)
 }
 
 /// Deterministic ordering: by serial, then port name.
@@ -442,9 +471,17 @@ fn collect_by_usb_descriptor(
     use nusb::MaybeFuture;
 
     let devices = match nusb::list_devices().wait() {
-        Ok(devices) => devices,
+        Ok(devices) => {
+            USB_ENUM_FAILURE.changed("");
+            devices
+        }
         Err(e) => {
-            log::warn!("RACK | phase=discovery status=usb_enum_failed err={e}");
+            let err = e.to_string();
+            if USB_ENUM_FAILURE.changed(&err) {
+                log::warn!("RACK | phase=discovery status=usb_enum_failed err={err}");
+            } else {
+                log::debug!("RACK | phase=discovery status=usb_enum_failed err={err}");
+            }
             return;
         }
     };
@@ -572,6 +609,7 @@ pub(super) fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPor
             );
             // The busy episode of this port (if any) is over.
             super::lock(&BUSY_PORT_NOTICES).retain(|p| p != &rack.port_name);
+            super::lock(&OPEN_FAILURES).retain(|(p, _)| p != &rack.port_name);
             Some(port)
         }
         Err(e) => {
@@ -587,12 +625,20 @@ pub(super) fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPor
             } else {
                 ""
             };
-            log::error!(
-                "RACK | phase=open status=failed port={} err={}{}",
-                rack.port_name,
-                e,
-                hint
-            );
+            if open_failure_is_new(&rack.port_name, &e.to_string()) {
+                log::error!(
+                    "RACK | phase=open status=failed port={} err={}{}",
+                    rack.port_name,
+                    e,
+                    hint
+                );
+            } else {
+                log::debug!(
+                    "RACK | phase=open status=failed port={} err={} repeated=true",
+                    rack.port_name,
+                    e
+                );
+            }
             if busy {
                 notify_port_busy(&rack.port_name);
             }
@@ -690,7 +736,10 @@ mod tests {
     // The rack id rides the `rack/<id>/...` topics of the application
     // connection: it must be non-empty and free of MQTT topic syntax.
     fn is_topic_safe(id: &str) -> bool {
-        !id.is_empty() && id.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
     }
 
     #[test]
@@ -703,11 +752,11 @@ mod tests {
     fn rack_id_is_always_topic_safe() {
         for serial in [
             Some("SC1234"),
-            Some("sc1234"),      // lowercase gets uppercased
-            Some("SC-12/34"),    // punctuation stripped
-            Some("SC+12#34"),    // MQTT wildcards stripped
-            Some(""),            // empty serial
-            None,                // no serial at all
+            Some("sc1234"),   // lowercase gets uppercased
+            Some("SC-12/34"), // punctuation stripped
+            Some("SC+12#34"), // MQTT wildcards stripped
+            Some(""),         // empty serial
+            None,             // no serial at all
             Some("VERYLONGSERIALNUMBER123"),
         ] {
             let id = build_rack_id(serial);
@@ -816,10 +865,7 @@ mod tests {
 
         super::super::set_active_rack_port_for_test(&rack_id, Some(live_port));
 
-        let mut racks = vec![
-            info("/dev/cu.usbserial-3", serial),
-            info(live_port, serial),
-        ];
+        let mut racks = vec![info("/dev/cu.usbserial-3", serial), info(live_port, serial)];
         sort_racks(&mut racks);
         dedupe_by_rack_id(&mut racks);
 
@@ -831,10 +877,7 @@ mod tests {
 
         // With nothing open, the deterministic sort order decides as before.
         super::super::set_active_rack_port_for_test(&rack_id, None);
-        let mut racks = vec![
-            info("/dev/cu.usbserial-3", serial),
-            info(live_port, serial),
-        ];
+        let mut racks = vec![info("/dev/cu.usbserial-3", serial), info(live_port, serial)];
         sort_racks(&mut racks);
         dedupe_by_rack_id(&mut racks);
         assert_eq!(racks.len(), 1);

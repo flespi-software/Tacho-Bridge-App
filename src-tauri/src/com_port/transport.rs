@@ -19,13 +19,82 @@ use super::SHUTTING_DOWN;
 
 pub(super) type SharedPort = Arc<AsyncMutex<Box<dyn SerialPort>>>;
 
+/// Transport health of one open port, keyed by `port_key`.
+#[derive(Default)]
+struct PortHealth {
+    /// The operation running now hit an I/O error (cleared by a good read).
+    op_faulted: bool,
+    /// Consecutive operations that ended with an I/O error.
+    failed_ops: u32,
+}
+
+lazy_static::lazy_static! {
+    /// Health of every linked port. A USB brown-out or a cable reseat inside
+    /// one presence poll brings the device back under the SAME name, so the
+    /// monitor sees no change while our handle is dead: every write fails
+    /// from then on. Counting the I/O errors per port is what lets the monitor
+    /// notice and reopen it (see `port_failed_ops`). Plain timeouts are not
+    /// faults — a silent device is a protocol matter, not a dead handle.
+    static ref PORT_HEALTH: std::sync::Mutex<std::collections::HashMap<usize, PortHealth>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
+}
+
+/// Identity of an open port for `PORT_HEALTH`: the address of the boxed port
+/// object, stable for as long as the port stays open. Computable both from the
+/// box before it is shared and from a locked guard.
+pub(super) fn port_key(port: &dyn SerialPort) -> usize {
+    port as *const dyn SerialPort as *const () as usize
+}
+
+/// Starts tracking a freshly opened port. Only registered ports are counted,
+/// so a fault recorded after `untrack_port` cannot leave a stale entry for an
+/// address a later port may reuse.
+pub(super) fn track_port(key: usize) {
+    super::lock(&PORT_HEALTH).insert(key, PortHealth::default());
+}
+
+pub(super) fn untrack_port(key: usize) {
+    super::lock(&PORT_HEALTH).remove(&key);
+}
+
+/// Consecutive operations on this port that failed with an I/O error.
+pub(super) fn port_failed_ops(key: usize) -> u32 {
+    super::lock(&PORT_HEALTH)
+        .get(&key)
+        .map_or(0, |health| health.failed_ops)
+}
+
+fn note_io_fault(port: &dyn SerialPort) {
+    if let Some(health) = super::lock(&PORT_HEALTH).get_mut(&port_key(port)) {
+        health.op_faulted = true;
+    }
+}
+
+fn note_io_ok(port: &dyn SerialPort) {
+    if let Some(health) = super::lock(&PORT_HEALTH).get_mut(&port_key(port)) {
+        health.op_faulted = false;
+        health.failed_ops = 0;
+    }
+}
+
+/// Closes the bookkeeping of one operation; called under the port lock, so
+/// operations of one port never interleave here.
+fn finish_op(port: &dyn SerialPort) {
+    if let Some(health) = super::lock(&PORT_HEALTH).get_mut(&port_key(port)) {
+        if std::mem::take(&mut health.op_faulted) {
+            health.failed_ops = health.failed_ops.saturating_add(1);
+        }
+    }
+}
+
 /// The port lock of a retained operation, parked between the exchanges that run under it.
 type PortGuard = tokio::sync::OwnedMutexGuard<Box<dyn SerialPort>>;
 type HeldPort = Arc<std::sync::Mutex<Option<PortGuard>>>;
 
 /// Locks the cell of a retained port, recovering from poisoning: the guard inside is safe to reuse.
 fn held(cell: &HeldPort) -> std::sync::MutexGuard<'_, Option<PortGuard>> {
-    cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    cell.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// An opaque serial operation retained across server round trips, scoped to one MQTT owner.
@@ -62,7 +131,12 @@ impl SerialLease {
 
     /// Runs one envelope under the retained port. `first` tells whether pending bytes are
     /// leftovers of an earlier operation (purged) or belong to this one (carried into the reply).
-    pub(super) async fn execute(&mut self, env: SerialEnvelope, first: bool, log: &str) -> SerialExchange {
+    pub(super) async fn execute(
+        &mut self,
+        env: SerialEnvelope,
+        first: bool,
+        log: &str,
+    ) -> SerialExchange {
         let Some(mut port) = held(&self.port).take() else {
             return SerialExchange::error(SERIAL_ERR_TRANSACTION_EXPIRED);
         };
@@ -76,6 +150,7 @@ impl SerialLease {
             }
             let started = Instant::now();
             let outcome = run_envelope_inner(&mut port, &env, first, Budget::until(until), &log);
+            finish_op(&**port);
             log::info!(
                 "{} [SERIAL] retained exchange polls={} pushes={} end={} err={} rx_bytes={} wire_ms={} lease_left_ms={}",
                 log,
@@ -116,7 +191,11 @@ async fn expire_lease(cell: std::sync::Weak<std::sync::Mutex<Option<PortGuard>>>
     };
     let taken = held(&cell).take();
     if let Some(mut port) = taken {
-        let _ = tokio::task::spawn_blocking(move || resync_line(&mut port, "SERIAL lease expired")).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            resync_line(&mut port, "SERIAL lease expired");
+            finish_op(&**port);
+        })
+        .await;
     }
 }
 
@@ -156,6 +235,10 @@ pub(super) const SERIAL_ERR_BAD_CONTROL: &str = "bad_serial_control";
 pub(super) const SERIAL_ERR_TRANSACTION_EXPIRED: &str = "serial_transaction_expired";
 pub(super) const SERIAL_ERR_TRANSACTION_ACTIVE: &str = "serial_transaction_active";
 pub(super) const SERIAL_ERR_QUEUE_TIMEOUT: &str = "serial_queue_timeout";
+
+/// Longest wait for the port behind the other operations of the same rack.
+/// Kept under the MQTT keep-alive of the waiting session (see `mqtt.rs`).
+const SERIAL_QUEUE_WAIT_MAX: Duration = Duration::from_secs(60);
 
 /// Why one serial read ended. Log-only (the server never sees these), but the
 /// distinction is what tells a reply cut by the inter-byte silence from one cut
@@ -380,24 +463,32 @@ impl Reply {
 
 /// Takes a snapshot of the bytes currently buffered by the serial driver.
 /// A single drain does not imply that the device has finished sending.
-fn drain_buffered(port: &mut Box<dyn SerialPort>, log_header: &str) -> Vec<u8> {
+/// `None` when the port itself failed (a dead handle), as opposed to an empty
+/// buffer.
+fn drain_buffered(port: &mut Box<dyn SerialPort>, log_header: &str) -> Option<Vec<u8>> {
     let pending = match port.bytes_to_read() {
-        Ok(0) => return Vec::new(),
+        Ok(0) => return Some(Vec::new()),
         Ok(n) => (n as usize).min(SERIAL_REPLY_MAX_BYTES),
         Err(e) => {
             log::warn!("{} [SERIAL] bytes_to_read failed: {}", log_header, e);
-            return Vec::new();
+            note_io_fault(&**port);
+            return None;
         }
     };
     let mut buf = vec![0u8; pending];
     match port.read(&mut buf) {
         Ok(n) => {
             buf.truncate(n);
-            buf
+            if n > 0 {
+                note_io_ok(&**port);
+            }
+            Some(buf)
         }
+        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => Some(Vec::new()),
         Err(e) => {
             log::warn!("{} [SERIAL] drain read failed: {}", log_header, e);
-            Vec::new()
+            note_io_fault(&**port);
+            None
         }
     }
 }
@@ -503,6 +594,7 @@ fn read_reply(
                 break;
             }
             Ok(n) => {
+                note_io_ok(&**port);
                 if first_byte_pending {
                     // reply started: from here on the read is bounded by line silence.
                     // The elapsed time is logged because a first byte arriving later
@@ -527,6 +619,7 @@ fn read_reply(
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(e) => {
                 log::warn!("{} [SERIAL] read error: {}", log_header, e);
+                note_io_fault(&**port);
                 reply.end = READ_END_ERROR;
                 break;
             }
@@ -550,7 +643,11 @@ fn resync_line(port: &mut Box<dyn SerialPort>, log_header: &str) -> bool {
         if started.elapsed() >= SERIAL_RESYNC_BUDGET || SHUTTING_DOWN.load(Ordering::SeqCst) {
             break;
         }
-        let late = drain_buffered(port, log_header);
+        // A port that fails outright will not go quiet by waiting: give up
+        // at once instead of repeating the failing call for the whole budget.
+        let Some(late) = drain_buffered(port, log_header) else {
+            break;
+        };
         if late.is_empty() {
             if last_byte.elapsed() >= SERIAL_RESYNC_QUIET {
                 quiet = true;
@@ -613,6 +710,7 @@ fn wait_for_push(
 ///     card result on its own as soon as the card is done, without waiting to be polled.
 ///     Those bytes ARE this operation's result; they are carried into the reply and the
 ///     server's multi-frame parser picks the outcome frame out of the concatenation.
+///
 /// Blind-clearing on every write is what ate the result of every card operation slow
 /// enough to finish between two read windows, after which the slot reports plain idle.
 fn settle_line(
@@ -620,7 +718,13 @@ fn settle_line(
     purge_stale: bool,
     log_header: &str,
 ) -> Result<Vec<u8>, (SerialExchange, &'static str)> {
-    let pending = drain_buffered(port, log_header);
+    let Some(pending) = drain_buffered(port, log_header) else {
+        // the port failed: writing to it would fail the same way
+        return Err((
+            SerialExchange::error(SERIAL_ERR_WRITE_FAILED),
+            READ_END_ERROR,
+        ));
+    };
     if !purge_stale {
         if !pending.is_empty() {
             log::debug!(
@@ -658,7 +762,10 @@ fn settle_line(
     );
     if !resync_line(port, log_header) {
         log::warn!("{} [SERIAL] tx skipped reason=line_not_quiet", log_header);
-        return Err((SerialExchange::error(SERIAL_ERR_NO_REPLY), READ_END_DEADLINE));
+        return Err((
+            SerialExchange::error(SERIAL_ERR_NO_REPLY),
+            READ_END_DEADLINE,
+        ));
     }
     Ok(Vec::new())
 }
@@ -700,7 +807,11 @@ fn exchange_once(
     let write_started = Instant::now();
     if let Err(e) = port.write_all(&bytes) {
         log::error!("{} [SERIAL] write failed: {}", log_header, e);
-        return (SerialExchange::error(SERIAL_ERR_WRITE_FAILED), READ_END_ERROR);
+        note_io_fault(&**port);
+        return (
+            SerialExchange::error(SERIAL_ERR_WRITE_FAILED),
+            READ_END_ERROR,
+        );
     }
     let _ = port.flush();
 
@@ -733,8 +844,9 @@ impl Budget {
 
     /// `limit` cut down to what is left of the retained operation.
     fn remaining(self, limit: Duration) -> Duration {
-        self.0
-            .map_or(limit, |until| limit.min(until.saturating_duration_since(Instant::now())))
+        self.0.map_or(limit, |until| {
+            limit.min(until.saturating_duration_since(Instant::now()))
+        })
     }
 
     /// True when nothing is left of `limit` under this budget.
@@ -913,14 +1025,33 @@ pub(super) async fn execute_envelope(
     let deadline_ms = env.deadline.as_millis();
 
     let queued = Instant::now();
+    // The port is queued for on the async side: an aborted session (card
+    // moved, rack restart) then leaves the queue without ever writing its
+    // command, and holds no port reference that would keep the rack from
+    // being closed. A blocking-side wait could not be cancelled.
+    // Bounded like `SerialLease::acquire`: a session parked here does not
+    // poll its MQTT event loop, and a wait longer than the broker keep-alive
+    // would cost it the connection (and the reply) anyway.
+    let Ok(mut guard) = tokio::time::timeout(SERIAL_QUEUE_WAIT_MAX, port.lock_owned()).await else {
+        log::warn!(
+            "{} [SERIAL] op failed err={} queue_ms={}",
+            log_header,
+            SERIAL_ERR_QUEUE_TIMEOUT,
+            queued.elapsed().as_millis()
+        );
+        return (
+            SerialExchange::error(SERIAL_ERR_QUEUE_TIMEOUT),
+            READ_END_DEADLINE,
+        );
+    };
+    // how long this operation waited behind the other sessions of the
+    // same rack — the part of a slow exchange the server's timings never
+    // see, and the first suspect when a deadline cuts a reply short
+    let queue_ms = queued.elapsed().as_millis();
     let (outcome, queue_ms, wire_ms) = tokio::task::spawn_blocking(move || {
-        // how long this operation waited behind the other sessions of the
-        // same rack — the part of a slow exchange the server's timings never
-        // see, and the first suspect when a deadline cuts a reply short
-        let mut guard = port.blocking_lock();
-        let queue_ms = queued.elapsed().as_millis();
         let started = Instant::now();
         let outcome = run_envelope(&mut guard, &env, &log_header_blocking);
+        finish_op(&**guard);
         (outcome, queue_ms, started.elapsed().as_millis())
     })
     .await
@@ -993,6 +1124,37 @@ pub(super) async fn execute_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_health_counts_failed_operations_until_a_good_read() {
+        // Any boxed port works as a key holder; the counter itself is what is tested.
+        let port: Box<dyn SerialPort> = Box::new(ScriptedPort::new(&[]));
+        let key = port_key(&*port);
+        // untracked ports are ignored
+        note_io_fault(&*port);
+        finish_op(&*port);
+        assert_eq!(port_failed_ops(key), 0);
+
+        track_port(key);
+        // several faults inside one operation count once
+        note_io_fault(&*port);
+        note_io_fault(&*port);
+        finish_op(&*port);
+        assert_eq!(port_failed_ops(key), 1);
+        // an operation without faults leaves the count alone (timeouts are not faults)
+        finish_op(&*port);
+        assert_eq!(port_failed_ops(key), 1);
+        note_io_fault(&*port);
+        finish_op(&*port);
+        assert_eq!(port_failed_ops(key), 2);
+        // a byte received proves the handle alive
+        note_io_ok(&*port);
+        finish_op(&*port);
+        assert_eq!(port_failed_ops(key), 0);
+
+        untrack_port(key);
+        assert_eq!(port_failed_ops(key), 0);
+    }
     use std::time::Duration;
 
     // ── Response envelope (contract v2): both fields always present, one shape ──
@@ -1109,8 +1271,7 @@ mod tests {
     #[test]
     fn envelope_without_finish_is_backward_compatible() {
         // Older server: no flag at all — the idle-timer fallback takes over.
-        let json: serde_json::Value =
-            serde_json::from_str(r#"{"serial_cmd":"C0DE01"}"#).unwrap();
+        let json: serde_json::Value = serde_json::from_str(r#"{"serial_cmd":"C0DE01"}"#).unwrap();
         let env = parse_envelope(&json)
             .expect("is an envelope")
             .expect("parses");
@@ -1158,18 +1319,40 @@ mod tests {
 
     #[test]
     fn reply_classification_follows_the_response_contract() {
-        let finished = Reply { bytes: vec![0x12, 0x34], truncated: false, end: READ_END_SILENCE };
+        let finished = Reply {
+            bytes: vec![0x12, 0x34],
+            truncated: false,
+            end: READ_END_SILENCE,
+        };
         assert_eq!(finished.into_exchange(), SerialExchange::ok("1234".into()));
         // cut by a bound: the partial bytes travel with the error code
-        let cut = Reply { bytes: vec![0x12], truncated: false, end: READ_END_DEADLINE };
+        let cut = Reply {
+            bytes: vec![0x12],
+            truncated: false,
+            end: READ_END_DEADLINE,
+        };
         assert_eq!(
             cut.into_exchange(),
-            SerialExchange { resp_hex: "12".into(), err: SERIAL_ERR_TRUNCATED }
+            SerialExchange {
+                resp_hex: "12".into(),
+                err: SERIAL_ERR_TRUNCATED
+            }
         );
-        let capped = Reply { bytes: vec![0x12], truncated: true, end: READ_END_CAP };
+        let capped = Reply {
+            bytes: vec![0x12],
+            truncated: true,
+            end: READ_END_CAP,
+        };
         assert_eq!(capped.into_exchange().err, SERIAL_ERR_TRUNCATED);
-        let silent = Reply { bytes: Vec::new(), truncated: false, end: READ_END_DEADLINE };
-        assert_eq!(silent.into_exchange(), SerialExchange::error(SERIAL_ERR_NO_REPLY));
+        let silent = Reply {
+            bytes: Vec::new(),
+            truncated: false,
+            end: READ_END_DEADLINE,
+        };
+        assert_eq!(
+            silent.into_exchange(),
+            SerialExchange::error(SERIAL_ERR_NO_REPLY)
+        );
     }
 
     #[test]
@@ -1556,10 +1739,11 @@ mod tests {
         let port = ScriptedPort::new(&[(CMD, &[(10, ACCEPTED)])]).with_pending("DEAD");
         let started = std::time::Instant::now();
         for ms in (50..=2000).step_by(50) {
-            port.state.lock().unwrap().scheduled.push((
-                started + Duration::from_millis(ms),
-                vec![0xAB],
-            ));
+            port.state
+                .lock()
+                .unwrap()
+                .scheduled
+                .push((started + Duration::from_millis(ms), vec![0xAB]));
         }
         let writes = port.writes.clone();
         let mut port: Box<dyn SerialPort> = Box::new(port);
@@ -1625,14 +1809,24 @@ mod tests {
 
     #[test]
     fn partial_pushed_result_is_not_reported_as_success() {
-        let port = ScriptedPort::new(&[(CMD, &[
-            (10, ACCEPTED), (60, "AB"), (90, "CD"), (120, "EF"), (150, "12"), (400, "345678"),
-        ])]);
+        // Timings scaled x3 from the original script: at 10 ms granularity the push was
+        // swallowed into the first window whenever the test thread was scheduled late.
+        let port = ScriptedPort::new(&[(
+            CMD,
+            &[
+                (30, ACCEPTED),
+                (180, "AB"),
+                (270, "CD"),
+                (360, "EF"),
+                (450, "12"),
+                (1200, "345678"),
+            ],
+        )]);
         let mut port: Box<dyn SerialPort> = Box::new(port);
         let mut env = two_phase_envelope();
-        env.idle = Duration::from_millis(40);
-        env.deadline = Duration::from_millis(110);
-        env.poll.as_mut().unwrap().interval = Duration::from_millis(100);
+        env.idle = Duration::from_millis(120);
+        env.deadline = Duration::from_millis(330);
+        env.poll.as_mut().unwrap().interval = Duration::from_millis(300);
         let first = run_envelope(&mut port, &env, "TEST |");
         assert_eq!(first.exchange.err, SERIAL_ERR_TRUNCATED);
         assert_eq!(first.end, READ_END_DEADLINE);
@@ -1680,12 +1874,17 @@ mod tests {
         assert_eq!(first.resp_hex, "DEAD");
         assert!(port.try_lock().is_err());
         tokio::time::sleep(Duration::from_millis(450)).await;
-        let second = lease.execute(one_shot_envelope(POLL_CMD), false, "TEST").await;
+        let second = lease
+            .execute(one_shot_envelope(POLL_CMD), false, "TEST")
+            .await;
         assert_eq!(second.resp_hex, format!("{RESULT}{IDLE_STATUS}"));
         assert!(port.try_lock().is_err());
         drop(lease);
         assert!(port.try_lock().is_ok());
-        assert_eq!(*writes.lock().unwrap(), vec![CMD.to_string(), POLL_CMD.to_string()]);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![CMD.to_string(), POLL_CMD.to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1694,7 +1893,9 @@ mod tests {
         let writes = scripted.writes.clone();
         let port: SharedPort = Arc::new(AsyncMutex::new(Box::new(scripted)));
         let mut lease = SerialLease::acquire(&port, 7, 50).await.unwrap();
-        let guard = tokio::time::timeout(Duration::from_secs(2), port.lock()).await.unwrap();
+        let guard = tokio::time::timeout(Duration::from_secs(2), port.lock())
+            .await
+            .unwrap();
         drop(guard);
         let reply = lease.execute(one_shot_envelope(CMD), false, "TEST").await;
         assert_eq!(reply.err, SERIAL_ERR_TRANSACTION_EXPIRED);
@@ -1708,19 +1909,81 @@ mod tests {
         let writes = scripted.writes.clone();
         let port: SharedPort = Arc::new(AsyncMutex::new(Box::new(scripted)));
         let mut state = IdempotencySlot::default();
-        let body = serde_json::json!({"serial_cmd": CMD, "idle_ms": 100, "serial_hold_ms": 3000}).to_string();
-        let first = run_serial_request("request/7", body.as_bytes(), &port, "TEST", &mut state, None).await;
-        let duplicate = run_serial_request("request/7", body.as_bytes(), &port, "TEST", &mut state, None).await;
+        let body = serde_json::json!({"serial_cmd": CMD, "idle_ms": 100, "serial_hold_ms": 3000})
+            .to_string();
+        let first = run_serial_request(
+            "request/7",
+            body.as_bytes(),
+            &port,
+            "TEST",
+            &mut state,
+            None,
+        )
+        .await;
+        let duplicate = run_serial_request(
+            "request/7",
+            body.as_bytes(),
+            &port,
+            "TEST",
+            &mut state,
+            None,
+        )
+        .await;
         assert_eq!(first, duplicate);
-        let conflict = run_serial_request("request/7", b"{\"serial_cmd\":\"00\"}", &port, "TEST", &mut state, None).await.unwrap();
+        let conflict = run_serial_request(
+            "request/7",
+            b"{\"serial_cmd\":\"00\"}",
+            &port,
+            "TEST",
+            &mut state,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(conflict.1.contains("request_conflict"));
-        let _ = run_serial_request("request/7", b"{\"serial_release\":7}", &port, "TEST", &mut state, None).await;
-        let _ = run_serial_request("request/8", body.as_bytes(), &port, "TEST", &mut state, None).await;
-        let _ = run_serial_request("request/7", b"{\"serial_release\":7}", &port, "TEST", &mut state, None).await;
+        let _ = run_serial_request(
+            "request/7",
+            b"{\"serial_release\":7}",
+            &port,
+            "TEST",
+            &mut state,
+            None,
+        )
+        .await;
+        let _ = run_serial_request(
+            "request/8",
+            body.as_bytes(),
+            &port,
+            "TEST",
+            &mut state,
+            None,
+        )
+        .await;
+        let _ = run_serial_request(
+            "request/7",
+            b"{\"serial_release\":7}",
+            &port,
+            "TEST",
+            &mut state,
+            None,
+        )
+        .await;
         assert!(port.try_lock().is_err());
-        let stale = run_serial_request("request/7", body.as_bytes(), &port, "TEST", &mut state, None).await.unwrap();
+        let stale = run_serial_request(
+            "request/7",
+            body.as_bytes(),
+            &port,
+            "TEST",
+            &mut state,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(stale.1.contains("stale_request"));
-        assert_eq!(*writes.lock().unwrap(), vec![CMD.to_string(), CMD.to_string()]);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![CMD.to_string(), CMD.to_string()]
+        );
         state.reset();
         assert!(port.try_lock().is_ok());
     }
@@ -1732,36 +1995,84 @@ mod tests {
         let writes = scripted.writes.clone();
         let port: SharedPort = Arc::new(AsyncMutex::new(Box::new(scripted)));
         let mut state = IdempotencySlot::default();
-        let body = serde_json::json!({"serial_cmd": CMD, "idle_ms": 100, "serial_hold_ms": 3000}).to_string();
-        let first = run_serial_request("request/7", body.as_bytes(), &port, "TEST", &mut state, None).await.unwrap();
+        let body = serde_json::json!({"serial_cmd": CMD, "idle_ms": 100, "serial_hold_ms": 3000})
+            .to_string();
+        let first = run_serial_request(
+            "request/7",
+            body.as_bytes(),
+            &port,
+            "TEST",
+            &mut state,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(first.1.contains("\"serial_err\":\"\""));
         let state = Arc::new(AsyncMutex::new(state));
         let requests = request_queue();
         let (release_gate, wait_release) = tokio::sync::oneshot::channel();
         let release_port = port.clone();
         let release_state = state.clone();
-        assert!(requests.send(Box::pin(async move {
-            wait_release.await.unwrap();
-            let mut state = release_state.lock().await;
-            assert!(run_serial_request("request/7", b"{\"serial_release\":7}", &release_port, "TEST", &mut state, None).await.is_none());
-        })).is_ok());
+        assert!(requests
+            .send(Box::pin(async move {
+                wait_release.await.unwrap();
+                let mut state = release_state.lock().await;
+                assert!(run_serial_request(
+                    "request/7",
+                    b"{\"serial_release\":7}",
+                    &release_port,
+                    "TEST",
+                    &mut state,
+                    None
+                )
+                .await
+                .is_none());
+            }))
+            .is_ok());
         let next_port = port.clone();
         let next_state = state.clone();
         let (done, mut result) = tokio::sync::oneshot::channel();
-        assert!(requests.send(Box::pin(async move {
-            let mut state = next_state.lock().await;
-            let reply = run_serial_request("request/8", body.as_bytes(), &next_port, "TEST", &mut state, None).await;
-            done.send(reply).unwrap();
-        })).is_ok());
+        assert!(requests
+            .send(Box::pin(async move {
+                let mut state = next_state.lock().await;
+                let reply = run_serial_request(
+                    "request/8",
+                    body.as_bytes(),
+                    &next_port,
+                    "TEST",
+                    &mut state,
+                    None,
+                )
+                .await;
+                done.send(reply).unwrap();
+            }))
+            .is_ok());
         let other_rack = request_queue();
         let (other_done, other_result) = tokio::sync::oneshot::channel();
-        assert!(other_rack.send(Box::pin(async move { other_done.send(()).unwrap(); })).is_ok());
-        tokio::time::timeout(Duration::from_secs(1), other_result).await.unwrap().unwrap();
-        assert!(matches!(result.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(other_rack
+            .send(Box::pin(async move {
+                other_done.send(()).unwrap();
+            }))
+            .is_ok());
+        tokio::time::timeout(Duration::from_secs(1), other_result)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         release_gate.send(()).unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(2), result).await.unwrap().unwrap().unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), result)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert!(reply.1.contains("\"serial_err\":\"\""));
-        assert_eq!(*writes.lock().unwrap(), vec![CMD.to_string(), CMD.to_string()]);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![CMD.to_string(), CMD.to_string()]
+        );
         state.lock().await.reset();
         assert!(port.try_lock().is_ok());
     }
@@ -1774,11 +2085,26 @@ mod tests {
         let port: SharedPort = Arc::new(AsyncMutex::new(Box::new(scripted)));
         let mut state = IdempotencySlot::default();
         let body = serde_json::json!({"serial_cmd": CMD, "deadline_ms": 10}).to_string();
-        let first = run_serial_request("request/7", body.as_bytes(), &port, "TEST", &mut state, None).await;
-        let duplicate = run_serial_request("request/7", body.as_bytes(), &port, "TEST", &mut state, None).await;
+        let first = run_serial_request(
+            "request/7",
+            body.as_bytes(),
+            &port,
+            "TEST",
+            &mut state,
+            None,
+        )
+        .await;
+        let duplicate = run_serial_request(
+            "request/7",
+            body.as_bytes(),
+            &port,
+            "TEST",
+            &mut state,
+            None,
+        )
+        .await;
         assert_eq!(first, duplicate);
         assert!(first.unwrap().1.contains("no_reply"));
         assert_eq!(*writes.lock().unwrap(), vec![CMD.to_string()]);
     }
-
 }

@@ -71,6 +71,8 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 #[derive(Clone)]
 struct LinkedRack {
     port: SharedPort,
+    /// `transport::port_key` of the port: its I/O-fault counter.
+    io_key: usize,
     idempotency: Arc<AsyncMutex<IdempotencySlot>>,
     requests: tokio::sync::mpsc::UnboundedSender<rack::RackRequest>,
 }
@@ -191,12 +193,26 @@ fn reset_all_rack_idempotency() {
 }
 
 /// Registers a rack whose port just opened and tells the server about it.
-fn link_rack(rack_id: String, port: SharedPort) -> Vec<(String, bool)> {
+fn link_rack(rack_id: String, port: SharedPort, io_key: usize) -> Vec<(String, bool)> {
+    let mut racks = lock(&RACKS);
+    // Re-checked under the RACKS lock: `shutdown` sets the flag before taking
+    // this lock, so either it sees this rack in the map or this sees the flag.
+    // The check in `on_rack_connected` alone leaves a window in which the rack
+    // is linked after `stop_all_racks` ran, keeping the COM port open.
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        log::info!(
+            "RACK {} | [LINK] status=skipped reason=app_shutdown",
+            rack_id
+        );
+        return Vec::new();
+    }
     log::info!("RACK {} | [LINK] phase=start", rack_id);
-    lock(&RACKS).insert(
+    transport::track_port(io_key);
+    racks.insert(
         rack_id.clone(),
         LinkedRack {
             port,
+            io_key,
             idempotency: Arc::new(AsyncMutex::new(IdempotencySlot::default())),
             requests: rack::request_queue(),
         },
@@ -238,6 +254,18 @@ pub fn shutdown() {
     log::info!("RACK | phase=shutdown status=ports_released");
 }
 
+/// Undoes `shutdown()` when the exit it prepared for did not happen (a failed
+/// update install): clears the flag and starts the monitor again, which
+/// rediscovers and relinks the racks on its first tick. Harmless while the
+/// old monitor is still winding down — it then simply keeps running.
+pub fn resume() {
+    if !SHUTTING_DOWN.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    log::info!("RACK | phase=resume");
+    tauri::async_runtime::spawn(rack_connection());
+}
+
 /// Unlinks one rack: its presence watch and card sessions go with it (without
 /// the rack there is no transport to its cards), and the server gets its
 /// `link down` — queued into `links`, so the caller can publish it in order
@@ -255,6 +283,7 @@ fn unlink_rack(rack_id: &str, links: &mut Vec<(String, bool)>) -> Option<SharedP
     lock(&RACK_ACTIVE_PORTS).remove(rack_id);
     let port = lock(&RACKS).remove(rack_id).map(|rack| {
         log::info!("RACK {} | [LINK] phase=stop", rack_id);
+        transport::untrack_port(rack.io_key);
         rack.port
     });
     stop_rack_watch(rack_id);
@@ -388,8 +417,9 @@ fn on_rack_connected(rack: &RackInfo, port: Box<dyn SerialPort>) {
 
     // Link the rack to the server: from now on its `rack/<id>/request/...`
     // envelopes are written straight to this port.
+    let io_key = transport::port_key(&*port);
     let shared_port: SharedPort = Arc::new(AsyncMutex::new(port));
-    links.extend(link_rack(rack_id, shared_port));
+    links.extend(link_rack(rack_id, shared_port, io_key));
     announce_links(links);
 }
 
@@ -429,6 +459,15 @@ pub async fn rack_connection() {
         log::debug!("RACK | phase=rack_connection status=already_running");
         return;
     }
+    // Clears the flag however the loop ends — a shutdown return or a panic —
+    // so a supervisor or `resume()` can start the monitor again.
+    struct RunningGuard;
+    impl Drop for RunningGuard {
+        fn drop(&mut self) {
+            MONITOR_RUNNING.store(false, Ordering::SeqCst);
+        }
+    }
+    let _running = RunningGuard;
 
     log::info!(
         "RACK | phase=rack_connection status=start poll_secs={}",
@@ -447,9 +486,15 @@ pub async fn rack_connection() {
         // blocking USB scan on Windows) that can take hundreds of ms — run it
         // on the blocking pool so this 2s tick never stalls the async workers
         // driving the MQTT event loops.
-        let found: HashMap<String, RackInfo> = tokio::task::spawn_blocking(find_racks)
-            .await
-            .unwrap_or_default()
+        // A failed scan (enumeration error, or a panic in the USB scan) says
+        // nothing about the racks: skip the tick instead of reading it as
+        // "every rack unplugged", which would abort every card session —
+        // authentications in progress included — only to rebuild them 2 s later.
+        let Ok(Some(scanned)) = tokio::task::spawn_blocking(find_racks).await else {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        };
+        let found: HashMap<String, RackInfo> = scanned
             .into_iter()
             .map(|rack| (rack.rack_id(), rack))
             .collect();
@@ -470,6 +515,22 @@ pub async fn rack_connection() {
 
         for (id, rack) in &found {
             let prev = current.get(id).cloned();
+            // Same device node, but our handle to it went dead (the device
+            // dropped off the bus and came back between two polls): reopen
+            // it exactly like a renamed port.
+            let prev = prev.map(|prev| {
+                if port_handle_is_dead(id) {
+                    log::warn!(
+                        "RACK {} | phase=presence status=port_dead failed_ops={} action=reopen port={}",
+                        id,
+                        PORT_DEAD_AFTER_FAILED_OPS,
+                        prev.port_name
+                    );
+                    (prev, true)
+                } else {
+                    (prev, false)
+                }
+            });
             match prev {
                 // Newly appeared.
                 None => {
@@ -480,8 +541,9 @@ pub async fn rack_connection() {
                     // If open failed, leave it out of `current` and retry next tick.
                 }
                 // Still present, but with different attributes (e.g. a port
-                // rename after replug): treat as disconnect + reconnect.
-                Some(prev) if prev != *rack => {
+                // rename after replug) or a dead handle: treat as disconnect +
+                // reconnect.
+                Some((prev, dead)) if dead || prev != *rack => {
                     // The old and the new descriptor can name the SAME physical
                     // device (macOS exposes a rack as both /dev/cu.usbserial-<serial>
                     // and /dev/cu.usbserial-<N>), so the reopen below competes with
@@ -502,6 +564,19 @@ pub async fn rack_connection() {
 
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Consecutive operations that must fail with an I/O error before the port
+/// handle is considered dead. More than one: a single glitch must not tear
+/// down every card session of the rack.
+const PORT_DEAD_AFTER_FAILED_OPS: u32 = 3;
+
+/// True when the linked port of this rack keeps failing at the I/O level.
+fn port_handle_is_dead(rack_id: &str) -> bool {
+    let Some(io_key) = lock(&RACKS).get(rack_id).map(|rack| rack.io_key) else {
+        return false;
+    };
+    transport::port_failed_ops(io_key) >= PORT_DEAD_AFTER_FAILED_OPS
 }
 
 /// `open_rack` moved to the blocking pool: opening a busy COM port can block,

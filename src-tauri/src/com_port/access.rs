@@ -92,8 +92,14 @@ pub(super) fn release(port: &SharedPort, slot: u16, discovery: bool, token: Opti
         "SLOT {} owner={} token={} status={}",
         slot,
         if discovery { "discovery" } else { "auth" },
-        token.map(|t| t.to_string()).unwrap_or_else(|| "any".to_string()),
-        if released { "released" } else { "release_ignored" }
+        token
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "any".to_string()),
+        if released {
+            "released"
+        } else {
+            "release_ignored"
+        }
     );
 }
 
@@ -122,7 +128,11 @@ pub(super) fn log_leases_snapshot() {
         }
     }
     rows.sort();
-    log::info!("[DEBUG] snapshot=slot_leases count={} leases={}", rows.len(), rows.join(","));
+    log::info!(
+        "[DEBUG] snapshot=slot_leases count={} leases={}",
+        rows.len(),
+        rows.join(",")
+    );
 }
 pub(super) fn cancel_discovery() {
     let mut registry = REGISTRY

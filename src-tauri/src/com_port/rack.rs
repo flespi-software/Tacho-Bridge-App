@@ -32,8 +32,7 @@ use super::transport::{
     SERIAL_ERR_TRANSACTION_EXPIRED,
 };
 use super::{
-    linked_rack, linked_rack_ids, lock, rack_port_is_live, reset_all_rack_idempotency,
-    LinkedRack,
+    linked_rack, linked_rack_ids, lock, rack_port_is_live, reset_all_rack_idempotency, LinkedRack,
 };
 
 /// Topic prefix of every rack publish on the application connection; the rack
@@ -43,11 +42,18 @@ pub(super) const RACK_TOPIC_PREFIX: &str = "rack/";
 pub(super) type RackRequest = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// Execute one rack's requests in MQTT arrival order without blocking the event loop.
+/// Each request runs as its own task, awaited before the next one starts: a
+/// panic inside one is logged and costs that request only, instead of ending
+/// the queue — and with it every later request of the rack until a replug.
 pub(super) fn request_queue() -> tokio::sync::mpsc::UnboundedSender<RackRequest> {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<RackRequest>();
     async_runtime::spawn(async move {
         while let Some(request) = receiver.recv().await {
-            request.await;
+            if let Err(e) = tokio::spawn(request).await {
+                if e.is_panic() {
+                    log::error!("RACK | [MQTT] status=request_panicked err={}", e);
+                }
+            }
         }
     });
     sender
@@ -185,7 +191,12 @@ pub(super) fn announce_links(links: Vec<(String, bool)>) {
             }
             .to_string();
             match client
-                .publish(rack_topic(&rack_id, "link"), QoS::AtLeastOnce, false, payload)
+                .publish(
+                    rack_topic(&rack_id, "link"),
+                    QoS::AtLeastOnce,
+                    false,
+                    payload,
+                )
                 .await
             {
                 Ok(()) => {
@@ -279,32 +290,59 @@ pub fn handle_app_publish(client: &AsyncClient, topic: &str, payload: &[u8]) -> 
     if tail.starts_with("request/") {
         // Enqueue before yielding so a new hold cannot overtake its preceding release.
         let requests = rack.requests.clone();
-        if requests.send(Box::pin(handle_rack_request(
-            client.clone(),
-            generation,
-            rack_id.to_string(),
-            tail.to_string(),
-            payload.to_vec(),
-            rack,
-            log_header,
-        ))).is_err() {
-            log::warn!("RACK {} | [MQTT] status=ignored reason=request_queue_closed", rack_id);
+        if requests
+            .send(Box::pin(handle_rack_request(
+                client.clone(),
+                generation,
+                rack_id.to_string(),
+                tail.to_string(),
+                payload.to_vec(),
+                rack,
+                log_header,
+            )))
+            .is_err()
+        {
+            log::warn!(
+                "RACK {} | [MQTT] status=ignored reason=request_queue_closed",
+                rack_id
+            );
         }
     } else if tail == "release" {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(payload) {
             if let Some(slot) = json
                 .get("slot")
                 .and_then(|v| v.as_u64())
-                .filter(|s| (1..=240).contains(s)) {
+                .filter(|s| (1..=240).contains(s))
+            {
                 if let Some(request_id) = json.get("request_id").and_then(|v| v.as_u64()) {
-                    super::access::release(&rack.port, slot as u16, true, Some(request_id));
+                    // Queued behind the rack's requests: a release that answers
+                    // a request still waiting in the queue must run after it,
+                    // or it finds no lease yet and the lease that request then
+                    // takes is never released.
+                    let port = rack.port.clone();
+                    let release = async move {
+                        super::access::release(&port, slot as u16, true, Some(request_id));
+                    };
+                    if rack.requests.send(Box::pin(release)).is_err() {
+                        log::warn!(
+                            "RACK {} | [MQTT] status=ignored reason=request_queue_closed",
+                            rack_id
+                        );
+                    }
                 }
             }
         }
     } else if tail == "watch" {
         // arm/re-arm this rack's card presence watch with the server-supplied
         // bytes; its reports go back on the same rack topic
-        start_rack_watch(payload, generation, rack_id, &rack.port, client, &log_header);
+        start_rack_watch(
+            payload,
+            generation,
+            rack_id,
+            &rack.port,
+            client,
+            &log_header,
+        );
     } else if tail == "cards" {
         // the set of cards of this rack to serve: reconcile the card sessions
         async_runtime::spawn(handle_cards_set(
@@ -348,7 +386,7 @@ async fn handle_rack_request(
         &payload,
         &rack.port,
         &log_header,
-        &mut *slot,
+        &mut slot,
         // the rack's own exchanges serve no single card
         None,
     )
@@ -395,7 +433,10 @@ pub(super) async fn publish_reply(
     payload: String,
     log_header: &str,
 ) {
-    if let Err(e) = client.publish(topic, QoS::AtLeastOnce, false, payload).await {
+    if let Err(e) = client
+        .publish(topic, QoS::AtLeastOnce, false, payload)
+        .await
+    {
         log::error!(
             "{} [MQTT] status=reply_publish_failed err={:?}",
             log_header,
@@ -479,7 +520,8 @@ impl IdempotencySlot {
                 self.lease = None;
                 execute_envelope(port, envelope, log_header, true).await.0
             }
-            SerialControl::Continue(id) => match self.lease.as_mut().filter(|lease| lease.id == id) {
+            SerialControl::Continue(id) => match self.lease.as_mut().filter(|lease| lease.id == id)
+            {
                 Some(lease) => lease.execute(envelope, false, log_header).await,
                 None => SerialExchange::error(SERIAL_ERR_TRANSACTION_EXPIRED),
             },
@@ -529,7 +571,11 @@ fn parse_serial_control(json: &serde_json::Value) -> Result<SerialControl, &'sta
     for (value, key) in values.iter_mut().zip(KEYS) {
         *value = match json.get(key) {
             None => None,
-            Some(v) => Some(v.as_u64().filter(|n| *n > 0).ok_or(SERIAL_ERR_BAD_CONTROL)?),
+            Some(v) => Some(
+                v.as_u64()
+                    .filter(|n| *n > 0)
+                    .ok_or(SERIAL_ERR_BAD_CONTROL)?,
+            ),
         };
     }
     let controls = values.iter().flatten().count();
@@ -539,7 +585,10 @@ fn parse_serial_control(json: &serde_json::Value) -> Result<SerialControl, &'sta
         .get("serial_cmd")
         .and_then(|v| v.as_str())
         .is_none_or(str::is_empty);
-    if controls > 1 || (release.is_some() && has_cmd) || (controls > 0 && release.is_none() && empty_cmd) {
+    if controls > 1
+        || (release.is_some() && has_cmd)
+        || (controls > 0 && release.is_none() && empty_cmd)
+    {
         return Err(SERIAL_ERR_BAD_CONTROL);
     }
     Ok(match (hold, cont, release) {
@@ -589,7 +638,10 @@ fn record_card_activity(iccid: &str, card_number: &str, finish: Option<bool>, lo
 
 /// A reply with an error code and no data, ready to publish on `resp_topic`.
 fn failure(resp_topic: &str, code: &'static str) -> Option<(String, String)> {
-    Some((resp_topic.to_string(), SerialExchange::error(code).to_payload()))
+    Some((
+        resp_topic.to_string(),
+        SerialExchange::error(code).to_payload(),
+    ))
 }
 
 /// Handles one `request/<n>...` publish addressed to a rack port — a rack's own
@@ -673,7 +725,8 @@ pub(super) async fn run_serial_request(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "-".to_string());
             if let Some((slot, discovery)) = slot_ownership(card, discovery_slot, envelope.finish) {
-                if !super::access::acquire(serial_port, slot, discovery, req_id.unwrap_or(0)).await {
+                if !super::access::acquire(serial_port, slot, discovery, req_id.unwrap_or(0)).await
+                {
                     log::debug!(
                         "{} [XCHG] req={} slot={} status=refused reason=card_busy discovery={}",
                         log_header,
@@ -692,7 +745,11 @@ pub(super) async fn run_serial_request(
                 // The closing message carries no command (`serial_cmd` empty) — it
                 // exists only to mark the end of the session, so there is nothing to
                 // put on the wire. Running it as an exchange would write a zero-byte
-                // frame to the rack and come back `no_reply`.
+                // frame to the rack and come back `no_reply`. Like any plain exchange
+                // it ends a port this owner still retains (`serial_hold_ms` with no
+                // `serial_release`), or every other card of the rack waits out the
+                // hold.
+                idempotency.lease = None;
                 SerialExchange::ok(String::new())
             } else {
                 idempotency
@@ -744,7 +801,10 @@ mod tests {
 
     #[test]
     fn serial_control_accepts_one_control_with_a_command() {
-        assert_eq!(parse_serial_control(&json(r#"{"serial_cmd":"AB"}"#)), Ok(SerialControl::Plain));
+        assert_eq!(
+            parse_serial_control(&json(r#"{"serial_cmd":"AB"}"#)),
+            Ok(SerialControl::Plain)
+        );
         assert_eq!(
             parse_serial_control(&json(r#"{"serial_cmd":"AB","serial_hold_ms":500}"#)),
             Ok(SerialControl::Hold(500))
@@ -769,7 +829,11 @@ mod tests {
             r#"{"serial_hold_ms":500}"#,
             r#"{"serial_cmd":"","serial_continue":7}"#,
         ] {
-            assert_eq!(parse_serial_control(&json(text)), Err(SERIAL_ERR_BAD_CONTROL), "{text}");
+            assert_eq!(
+                parse_serial_control(&json(text)),
+                Err(SERIAL_ERR_BAD_CONTROL),
+                "{text}"
+            );
         }
     }
 
@@ -778,7 +842,9 @@ mod tests {
         let mut slot = IdempotencySlot::default();
         assert!(slot.replay(Some(3), b"a").is_none());
         slot.remember(3, b"a", "reply");
-        assert!(matches!(slot.replay(Some(3), b"a"), Some(Replay::Cached(Some(reply))) if reply == "reply"));
+        assert!(
+            matches!(slot.replay(Some(3), b"a"), Some(Replay::Cached(Some(reply))) if reply == "reply")
+        );
         assert!(matches!(slot.replay(Some(3), b"b"), Some(Replay::Conflict)));
         assert!(matches!(slot.replay(Some(2), b"a"), Some(Replay::Stale)));
         assert!(slot.replay(Some(4), b"a").is_none());
@@ -810,8 +876,14 @@ mod tests {
             parse_rack_topic("rack/SC1799/request/5"),
             Some(("SC1799", "request/5"))
         );
-        assert_eq!(parse_rack_topic("rack/SC1799/watch"), Some(("SC1799", "watch")));
-        assert_eq!(parse_rack_topic("rack/SC1799/cards"), Some(("SC1799", "cards")));
+        assert_eq!(
+            parse_rack_topic("rack/SC1799/watch"),
+            Some(("SC1799", "watch"))
+        );
+        assert_eq!(
+            parse_rack_topic("rack/SC1799/cards"),
+            Some(("SC1799", "cards"))
+        );
     }
 
     #[test]

@@ -27,8 +27,7 @@ use super::transport::{
     SERIAL_READ_DEADLINE, SERIAL_REPLY_TIMEOUT,
 };
 use super::{
-    linked_rack_ports, lock, next_reconnect_delay, rack_port_is_live,
-    RECONNECT_DELAY_INITIAL_SECS,
+    linked_rack_ports, lock, next_reconnect_delay, rack_port_is_live, RECONNECT_DELAY_INITIAL_SECS,
 };
 
 /// One rack-backed card session: the running task plus the identity it was
@@ -66,13 +65,37 @@ lazy_static::lazy_static! {
     /// rack id.
     pub(super) static ref RACK_CARDS_UI: std::sync::Mutex<HashMap<String, Vec<RackCard>>> =
         std::sync::Mutex::new(HashMap::new());
+
+    /// Card-set epoch of each rack: bumped by every server card set and every
+    /// teardown of the rack's sessions. Card sets run as separate tasks and
+    /// yield between their spawns (each waits for the PC/SC pool lock), so an
+    /// older set can resume after a newer one completed — e.g. the set that
+    /// still listed a card that has since been pulled. A spawn or a UI row
+    /// carries the epoch its set started under and is dropped once a newer
+    /// one exists. Lock order: taken last, under `RACK_CARD_TASKS` at most.
+    static ref RACK_CARD_EPOCH: std::sync::Mutex<HashMap<String, u64>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+/// Starts a new card-set epoch of the rack and returns it.
+fn bump_card_epoch(rack_id: &str) -> u64 {
+    let mut epochs = lock(&RACK_CARD_EPOCH);
+    let epoch = epochs.entry(rack_id.to_string()).or_insert(0);
+    *epoch += 1;
+    *epoch
+}
+
+/// The current card-set epoch of the rack.
+fn card_epoch(rack_id: &str) -> u64 {
+    lock(&RACK_CARD_EPOCH).get(rack_id).copied().unwrap_or(0)
 }
 
 /// Live card identities survive an application MQTT reconnect. The server uses
 /// this snapshot to preserve sessions while validating the rack again.
 pub(super) fn inventory(rack_id: &str) -> serde_json::Value {
     let tasks = lock(&RACK_CARD_TASKS);
-    let mut cards: Vec<_> = tasks.iter()
+    let mut cards: Vec<_> = tasks
+        .iter()
         .filter(|(_, task)| task.rack_id == rack_id && !task.handle.inner().is_finished())
         .map(|(iccid, task)| serde_json::json!({"slot": task.slot, "iccid": iccid}))
         .collect();
@@ -94,7 +117,11 @@ pub(super) fn log_sessions_snapshot() {
                     task.slot,
                     task.card_number,
                     iccid,
-                    if task.handle.inner().is_finished() { "finished" } else { "live" }
+                    if task.handle.inner().is_finished() {
+                        "finished"
+                    } else {
+                        "live"
+                    }
                 )
             })
             .collect();
@@ -126,7 +153,11 @@ pub(super) fn log_sessions_snapshot() {
         rows.sort();
         rows
     };
-    log::info!("[DEBUG] snapshot=ui_rows count={} rows={}", rows.len(), rows.join(","));
+    log::info!(
+        "[DEBUG] snapshot=ui_rows count={} rows={}",
+        rows.len(),
+        rows.join(",")
+    );
 }
 
 /// Opens rack-backed sessions for discovered cards that currently have none.
@@ -143,6 +174,10 @@ pub async fn connect_pending_rack_cards() {
     if ports.is_empty() {
         return; // no rack connected
     }
+
+    // Epochs before the rows: a card set or a teardown that lands after this
+    // point makes the snapshot below stale, and its spawns are dropped.
+    let epochs: HashMap<String, u64> = lock(&RACK_CARD_EPOCH).clone();
 
     // UI rows first, live-session filter second — the two locks are taken
     // sequentially, never nested (abort paths lock them in the other order).
@@ -179,6 +214,10 @@ pub async fn connect_pending_rack_cards() {
         let Some((_, port)) = ports.iter().find(|(id, _)| *id == rack_id) else {
             continue; // that rack is gone
         };
+        let epoch = epochs.get(&rack_id).copied().unwrap_or(0);
+        if card_epoch(&rack_id) != epoch {
+            continue; // a newer card set of this rack owns its rows now
+        }
         log::info!(
             "RACK | [SPAWN] status=pending_card_resolved rack={} slot={} iccid={} card={}",
             rack_id,
@@ -194,38 +233,46 @@ pub async fn connect_pending_rack_cards() {
             rack_id.clone(),
             port.clone(),
             "RACK |",
-            // a replay of cached UI rows: must not displace a live session
-            false,
-            // no server discovery behind it: nothing to re-bind
-            false,
+            SpawnOrigin::Replay { epoch },
         )
         .await;
     }
 }
 
+/// What drives a rack card spawn.
+#[derive(Clone, Copy)]
+enum SpawnOrigin {
+    /// A fresh server card set: the server just read the card's ICCID in that
+    /// slot — ground truth, so it may relocate a live session to another
+    /// rack/slot. `rebind` tells whether a card already served must re-publish
+    /// its rack link report — true only for the card set that follows a
+    /// `link up` (see `rack::take_rebind`).
+    ///
+    /// Every origin carries the card-set epoch of the rack it was decided
+    /// under (see `RACK_CARD_EPOCH`).
+    ServerSet { rebind: bool, epoch: u64 },
+    /// A local replay of cached UI rows (`connect_pending_rack_cards`). A
+    /// replayed row can be stale, and rebinding a working session to it would
+    /// funnel the card's APDUs into a port where the card no longer sits; with
+    /// no server discovery behind it there is nothing to re-bind either.
+    Replay { epoch: u64 },
+}
+
 /// Starts the rack-backed MQTT session of one card, deduplicating by ICCID and
 /// by card number (two slots mapped to the same number in the config must not
 /// open two MQTT connections with the same client_id).
-///
-/// `from_server` tells whether this spawn is driven by a fresh server card set
-/// (the server just read the card's ICCID in that slot — ground truth) or by a
-/// local replay of cached UI rows (`connect_pending_rack_cards`). Only the
-/// former may relocate a live session to another rack/slot: a replayed row can
-/// be stale, and rebinding a working session to it would funnel the card's
-/// APDUs into a port where the card no longer sits.
-///
-/// `rebind` tells whether a card already served must re-publish its rack link
-/// report — true only for the card set that follows a `link up` (see
-/// `rack::take_rebind`).
 fn spawn_rack_card(
     card_number: String,
     iccid: String,
     slot: u16,
     rack_id: String,
     serial_port: SharedPort,
-    from_server: bool,
-    rebind: bool,
+    origin: SpawnOrigin,
 ) {
+    let (from_server, rebind, epoch) = match origin {
+        SpawnOrigin::ServerSet { rebind, epoch } => (true, rebind, epoch),
+        SpawnOrigin::Replay { epoch } => (false, false, epoch),
+    };
     // The rack may have been torn down while the caller was awaiting between
     // its dedup check and this spawn (config-change path racing the monitor).
     // A session installed after the teardown would hold the stale serial port
@@ -241,6 +288,18 @@ fn spawn_rack_card(
     }
 
     let mut tasks = lock(&RACK_CARD_TASKS);
+    // Checked under the task lock, which every teardown also takes after its
+    // bump: a spawn either sees the newer epoch here or lands before the
+    // teardown that reaps it.
+    if card_epoch(&rack_id) != epoch {
+        log::info!(
+            "RACK | [SPAWN] card={} rack={} slot={} status=skipped reason=stale_card_set",
+            card_number,
+            rack_id,
+            slot
+        );
+        return;
+    }
     // A different card now occupies this slot of this rack: the previous
     // occupant's session is dead weight (its card is gone) — evict it. Scoped
     // to the rack: slot numbers repeat across racks (every rack has a slot 1).
@@ -287,7 +346,10 @@ fn spawn_rack_card(
                     let card = existing.card_number.clone();
                     let report = link_report(&iccid, slot, &rack_id);
                     async_runtime::spawn(async move {
-                        match client.publish("rack", QoS::AtLeastOnce, false, report).await {
+                        match client
+                            .publish("rack", QoS::AtLeastOnce, false, report)
+                            .await
+                        {
                             Ok(()) => log::info!(
                                 "RACKCARD {} | [MQTT] status=link_report_republished slot={}",
                                 card,
@@ -309,7 +371,7 @@ fn spawn_rack_card(
             }
             // A live session elsewhere, but this spawn is a local replay of a
             // cached UI row — that row may be the stale duplicate, so it must
-            // not displace a working session (see `from_server` above).
+            // not displace a working session (see `SpawnOrigin::Replay`).
             if !from_server {
                 log::warn!(
                     "RACK | [SPAWN] card={} rack={} slot={} status=skipped reason=live_session_elsewhere",
@@ -654,8 +716,12 @@ pub(super) fn start_rack_watch(
     let handle = async_runtime::spawn(async move {
         let mut last: Option<String> = None;
         let mut last_report = std::time::Instant::now();
+        // Consecutive failed exchanges: the poll slows down while they last,
+        // so a rack that stopped answering (or a port being reopened) does not
+        // put a failing frame and a WARN line on the wire every interval.
+        let mut failures: u32 = 0;
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(watch_delay(interval, failures)).await;
             let envelope = SerialEnvelope {
                 cmd_hex: cmd_hex.clone(),
                 expect_hex: None,
@@ -669,16 +735,23 @@ pub(super) fn start_rack_watch(
                 execute_envelope(&serial_port, envelope, &log_header, false).await;
             if !exchange.is_ok() {
                 // transport errors are already logged by execute_envelope; the rack presence
-                // monitor handles a truly gone device, so just keep trying
+                // monitor handles a truly gone device, so just keep trying (slower)
+                failures = failures.saturating_add(1);
                 continue;
             }
-            if last.as_deref() == Some(exchange.resp_hex.as_str()) && last_report.elapsed() < refresh {
+            failures = 0;
+            if last.as_deref() == Some(exchange.resp_hex.as_str())
+                && last_report.elapsed() < refresh
+            {
                 continue;
             }
             // The link went down while the exchange ran: this watch is being
             // stopped, and the server must not hear from the old port life.
             if !rack_port_is_live(&watched_rack, &serial_port) {
-                log::debug!("{} [WATCH] status=report_dropped reason=link_down", log_header);
+                log::debug!(
+                    "{} [WATCH] status=report_dropped reason=link_down",
+                    log_header
+                );
                 continue;
             }
             // The application connection changed under this watch: the server
@@ -726,6 +799,16 @@ pub(super) fn start_rack_watch(
     if let Some(old) = lock(&RACK_WATCH_TASKS).insert(rack_id.to_string(), handle) {
         old.abort();
     }
+}
+
+/// Ceiling of the watch poll interval while its exchanges keep failing.
+const WATCH_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// The pause before the next watch exchange: the armed interval, doubled per
+/// consecutive failure up to `WATCH_BACKOFF_MAX` (never below the interval).
+fn watch_delay(interval: Duration, failures: u32) -> Duration {
+    let backoff = interval.saturating_mul(1u32 << failures.min(10));
+    backoff.min(WATCH_BACKOFF_MAX.max(interval))
 }
 
 /// Stops one rack's card presence watch task, if armed.
@@ -884,6 +967,8 @@ pub fn disconnect_rack_card(card_number: &str) {
 /// when that rack disconnects or its MQTT/serial stack is restarted — without
 /// the rack there is no transport to those cards.
 pub(super) fn stop_rack_cards(rack_id: &str) {
+    // before the abort: a card set still running for this rack stops spawning
+    bump_card_epoch(rack_id);
     abort_rack_sessions_where(|task| task.rack_id == rack_id, "rack_gone", false);
     let cleared = {
         let mut ui = lock(&RACK_CARDS_UI);
@@ -899,6 +984,9 @@ pub(super) fn stop_rack_cards(rack_id: &str) {
 /// Aborts every rack-backed card session and clears the whole UI card list.
 /// Shutdown backstop: reaps sessions whose rack entry was already removed.
 pub(super) fn stop_all_rack_cards() {
+    for epoch in lock(&RACK_CARD_EPOCH).values_mut() {
+        *epoch += 1;
+    }
     {
         let mut tasks = lock(&RACK_CARD_TASKS);
         for (_iccid, task) in tasks.drain() {
@@ -969,14 +1057,11 @@ pub(super) async fn handle_cards_set(
     let cards = match parse_cards_set(&payload) {
         Ok(cards) => cards,
         Err(reason) => {
-            log::warn!(
-                "{} [CARDS] status=ignored reason={}",
-                log_header,
-                reason
-            );
+            log::warn!("{} [CARDS] status=ignored reason={}", log_header, reason);
             return;
         }
     };
+    let epoch = bump_card_epoch(&rack_id);
     // a set that follows a `link up` closes a full re-discovery: the sessions it
     // lists re-publish their link reports, every other set leaves them alone
     let rebind = take_rebind(&rack_id);
@@ -1026,7 +1111,11 @@ pub(super) async fn handle_cards_set(
         let mut ui = lock(&RACK_CARDS_UI);
         ui.get_mut(&rack_id).and_then(|list| {
             let before = list.len();
-            list.retain(|c| c.iccid.as_deref().is_some_and(|iccid| listed(c.slot, iccid)));
+            list.retain(|c| {
+                c.iccid
+                    .as_deref()
+                    .is_some_and(|iccid| listed(c.slot, iccid))
+            });
             (list.len() != before).then(|| list.clone())
         })
     };
@@ -1037,6 +1126,15 @@ pub(super) async fn handle_cards_set(
     // Every listed card lands in this rack's UI section, configured or not,
     // and the configured ones get a session unless one already serves them.
     for (slot, iccid) in &cards {
+        // A newer set (or a teardown) took over while this one was waiting:
+        // its rows and sessions are the truth, ours are outdated.
+        if card_epoch(&rack_id) != epoch {
+            log::info!(
+                "{} [CARDS] status=superseded reason=newer_card_set",
+                log_header
+            );
+            return;
+        }
         // one INFO line per card: the rack inventory is readable straight from the trace
         let card_number = crate::config::find_card_number_by_iccid(iccid);
         match &card_number {
@@ -1065,9 +1163,7 @@ pub(super) async fn handle_cards_set(
             rack_id.clone(),
             serial_port.clone(),
             &log_header,
-            // a fresh server set: allowed to relocate a moved card's session
-            true,
-            rebind,
+            SpawnOrigin::ServerSet { rebind, epoch },
         )
         .await;
     }
@@ -1081,7 +1177,7 @@ pub(super) async fn handle_cards_set(
 /// Final spawn step shared by the card set handler and the pending-card retry:
 /// a reader-backed session for the same card number wins — never open a second
 /// connection with the same client_id (the server treats that as an ident
-/// collision). `from_server` — see `spawn_rack_card`.
+/// collision).
 async fn spawn_rack_card_checked(
     card_number: String,
     iccid: String,
@@ -1089,8 +1185,7 @@ async fn spawn_rack_card_checked(
     rack_id: String,
     port: SharedPort,
     log_header: &str,
-    from_server: bool,
-    rebind: bool,
+    origin: SpawnOrigin,
 ) {
     // INVARIANT: the TASK_POOL guard is held across both the served-by-reader
     // check and the RACK_CARD_TASKS insert inside `spawn_rack_card`. Releasing
@@ -1111,7 +1206,7 @@ async fn spawn_rack_card_checked(
         return;
     }
 
-    spawn_rack_card(card_number, iccid, slot, rack_id, port, from_server, rebind);
+    spawn_rack_card(card_number, iccid, slot, rack_id, port, origin);
     drop(pool);
 }
 
@@ -1145,9 +1240,9 @@ mod tests {
             r#"{"iccid":"x","slot":1}"#.to_string(), // an object, not an array
             format!(r#"[{{"iccid":"{A}","slot":0}}]"#), // slot below the range
             format!(r#"[{{"iccid":"{A}","slot":241}}]"#), // slot above the range
-            r#"[{"iccid":"","slot":1}]"#.to_string(),  // empty ICCID
-            r#"[{"slot":1}]"#.to_string(),             // no ICCID
-            format!(r#"[{{"iccid":"{A}"}}]"#),          // no slot
+            r#"[{"iccid":"","slot":1}]"#.to_string(), // empty ICCID
+            r#"[{"slot":1}]"#.to_string(),           // no ICCID
+            format!(r#"[{{"iccid":"{A}"}}]"#),       // no slot
             format!(r#"[{{"iccid":"{A}","slot":1}},{{"iccid":"{B}","slot":1}}]"#), // slot twice
             format!(r#"[{{"iccid":"{A}","slot":1}},{{"iccid":"{A}","slot":2}}]"#), // ICCID twice
         ];
@@ -1160,9 +1255,20 @@ mod tests {
     }
 
     #[test]
+    fn watch_delay_backs_off_on_failures_and_caps() {
+        let interval = Duration::from_millis(1000);
+        assert_eq!(watch_delay(interval, 0), interval);
+        assert_eq!(watch_delay(interval, 1), Duration::from_secs(2));
+        assert_eq!(watch_delay(interval, 3), Duration::from_secs(8));
+        assert_eq!(watch_delay(interval, 50), WATCH_BACKOFF_MAX);
+        // a server interval above the cap is kept as is
+        let slow = Duration::from_secs(60);
+        assert_eq!(watch_delay(slow, 4), slow);
+    }
+
+    #[test]
     fn link_report_carries_slot_iccid_and_rack() {
-        let report: serde_json::Value =
-            serde_json::from_str(&link_report(A, 7, "SC1799")).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&link_report(A, 7, "SC1799")).unwrap();
         assert_eq!(report["iccid"], A);
         assert_eq!(report["slot"], 7);
         assert_eq!(report["rack"], "SC1799");
