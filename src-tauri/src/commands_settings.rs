@@ -9,7 +9,8 @@
 //!   * `set_credentials` → `credentials`
 //!   * `set_server`      → `server_address`
 //!   * `get_settings`    → the settings report on demand (below)
-//! The contract of every command is written up in `changes.md`.
+//!
+//! The contract of every command is written up in `communication_protocol.md`.
 //!
 //! Right after the app connection is established, TBA publishes a one-shot
 //! settings report so the server can populate the read-only device settings.
@@ -48,6 +49,41 @@ pub fn dispatch_request(
         _ => return false,
     }
     true
+}
+
+/// Tail shared by the commands that move the application to new connection
+/// settings (`set_credentials`, `set_server`): publishes `reply` on the
+/// connection the command arrived on, then — unless the reply is an error —
+/// refreshes the settings dialog and rebuilds every connection. The reply goes
+/// first: after the reconnect the server hears from a new session only (or,
+/// for a new address, from nobody at all).
+pub(crate) async fn reply_then_reconnect(
+    client: &AsyncClient,
+    log_header: &str,
+    done_topic: &str,
+    reply: Value,
+    reason: &'static str,
+) {
+    if let Err(e) = client
+        .publish(done_topic, QoS::AtLeastOnce, false, reply.to_string())
+        .await
+    {
+        log::error!(
+            "{} [CONN] status=reply_failed topic={} err={:?}",
+            log_header,
+            done_topic,
+            e
+        );
+    }
+    if reply.get("error").is_some() {
+        return;
+    }
+    if let Some(app) = crate::global_app_handle::get_app_handle() {
+        if let Err(e) = crate::config::emit_global_config_server(&app) {
+            log::warn!("{} [CONN] status=config_emit_failed err={}", log_header, e);
+        }
+    }
+    crate::app_connect::reconnect_everything(reason).await;
 }
 
 /// Topic the settings report is published to.

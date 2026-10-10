@@ -9,7 +9,6 @@
 //! No rollback, as with `set_credentials`: what the server pushes is what the
 //! application uses; the settings dialog is where a wrong address gets fixed.
 
-use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::AsyncClient;
 use serde_json::{json, Value};
 use tauri::async_runtime;
@@ -19,9 +18,7 @@ pub fn handle(client: &AsyncClient, log_header: &str, request_id: u64, payload: 
     let done_topic = format!("server/{}/done", request_id);
 
     let parsed = match payload.get("host") {
-        Some(Value::String(host)) => {
-            crate::config::split_host_to_parts(host).map(|_| host.clone())
-        }
+        Some(Value::String(host)) => crate::config::split_host_to_parts(host).map(|_| host.clone()),
         Some(_) => Err("host must be a string".to_string()),
         None => Err("host is required".to_string()),
     };
@@ -57,27 +54,13 @@ pub fn handle(client: &AsyncClient, log_header: &str, request_id: u64, payload: 
                 }
             }
         };
-        let is_error = reply.get("error").is_some();
-        // The reply must reach the server on THIS connection: after the
-        // reconnect below the application talks to the new address only.
-        if let Err(e) = client
-            .publish(&done_topic, QoS::AtLeastOnce, false, reply.to_string())
-            .await
-        {
-            log::error!(
-                "{} [CONN] status=set_server_reply_failed err={:?}",
-                log_header,
-                e
-            );
-        }
-        if is_error {
-            return;
-        }
-        if let Some(app) = crate::global_app_handle::get_app_handle() {
-            if let Err(e) = crate::config::emit_global_config_server(&app) {
-                log::warn!("{} [CONN] status=config_emit_failed err={}", log_header, e);
-            }
-        }
-        crate::app_connect::reconnect_everything("set_server_command").await;
+        crate::commands_settings::reply_then_reconnect(
+            &client,
+            &log_header,
+            &done_topic,
+            reply,
+            "set_server_command",
+        )
+        .await;
     });
 }

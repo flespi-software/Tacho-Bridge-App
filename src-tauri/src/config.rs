@@ -21,9 +21,14 @@ use crate::mqtt::remove_connections;
 /// Represents the configuration settings for the application.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ConfigurationFile {
-    name: String,                         // The name of the application.
-    version: String,                      // The version of the application.
-    description: String,                  // A brief description of the application.
+    // `default` on the descriptive fields: a hand-prepared config with only
+    // `server:` and `cards:` must not fail the parse (which resets the file).
+    #[serde(default)]
+    name: String, // The name of the application.
+    #[serde(default)]
+    version: String, // The version of the application.
+    #[serde(default)]
+    description: String, // A brief description of the application.
     appearance: Option<AppearanceConfig>, // Optional UI configuration settings.
     ident: Option<String>,                // Optional ident for the application.
     server: Option<ServerConfig>,         // Optional server configuration settings.
@@ -55,8 +60,96 @@ fn cards_or_empty<'de, D>(deserializer: D) -> Result<HashMap<String, CardConfig>
 where
     D: serde::Deserializer<'de>,
 {
-    let maybe: Option<HashMap<String, CardConfig>> = Option::deserialize(deserializer)?;
-    Ok(maybe.unwrap_or_default())
+    let maybe: Option<serde_yaml::Mapping> = Option::deserialize(deserializer)?;
+    Ok(maybe.map(cards_from_mapping).unwrap_or_default())
+}
+
+/// Converts the `cards:` mapping entry by entry, so one malformed card (a
+/// hand-typed `expire: "2026-01-01"`, a numeric card-number key) costs only
+/// that card instead of failing the whole parse — which would reset the file
+/// and wipe the server host, every other card and the device ident.
+fn cards_from_mapping(mapping: serde_yaml::Mapping) -> HashMap<String, CardConfig> {
+    let mut cards = HashMap::with_capacity(mapping.len());
+    for (key, value) in mapping {
+        let card_number = match &key {
+            serde_yaml::Value::String(s) => s.clone(),
+            serde_yaml::Value::Number(n) => n.to_string(),
+            other => {
+                log::error!("config: skipping a card with an invalid key {:?}", other);
+                continue;
+            }
+        };
+        // A key with no value (`CARD123:`) is a card typed in by hand.
+        let value = if value.is_null() {
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+        } else {
+            value
+        };
+        match serde_yaml::from_value::<CardConfig>(value.clone()) {
+            Ok(card) => {
+                cards.insert(card_number, card);
+            }
+            Err(e) => {
+                // The entry is lost on the next save: keep it in the log so it
+                // can be restored by hand.
+                log::error!(
+                    "config: skipping malformed card {} ({}): {}",
+                    card_number,
+                    e,
+                    serde_yaml::to_string(&value).unwrap_or_default().trim()
+                );
+            }
+        }
+    }
+    cards
+}
+
+/// An unknown or mistyped theme falls back to Auto instead of failing the
+/// whole config parse.
+fn dark_theme_lenient<'de, D>(deserializer: D) -> Result<DarkTheme, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+    Ok(dark_theme_from_label(value.as_str().unwrap_or_default()))
+}
+
+fn default_dark_theme() -> DarkTheme {
+    DarkTheme::Auto
+}
+
+/// Rescues what it can from a config that failed to parse as a whole (a YAML
+/// that is still a mapping but has a mistyped field somewhere): the device
+/// ident, the server block and the cards. Everything else falls back to the
+/// defaults. Above all the ident is kept — a new one makes the device a
+/// different identity on the platform.
+fn salvage_config(contents: &str) -> ConfigurationFile {
+    let mut config = generate_default_config();
+    let Ok(serde_yaml::Value::Mapping(root)) = serde_yaml::from_str::<serde_yaml::Value>(contents)
+    else {
+        return config;
+    };
+    if let Some(ident) = root.get("ident").and_then(|v| v.as_str()) {
+        if !ident.is_empty() {
+            config.ident = Some(ident.to_string());
+        }
+    }
+    if let Some(server) = root.get("server").cloned() {
+        match serde_yaml::from_value::<ServerConfig>(server) {
+            Ok(server) => config.server = Some(server),
+            Err(e) => log::error!("config: server section not recoverable: {}", e),
+        }
+    }
+    if let Some(serde_yaml::Value::Mapping(cards)) = root.get("cards").cloned() {
+        config.cards = cards_from_mapping(cards);
+    }
+    for (key, slot) in [
+        ("beta_updates", &mut config.beta_updates),
+        ("auto_install_updates", &mut config.auto_install_updates),
+    ] {
+        *slot = root.get(key).and_then(|v| v.as_bool());
+    }
+    config
 }
 
 // Server Configuration structure, part of ConfigurationFile that contains data about the server.
@@ -84,7 +177,8 @@ impl std::fmt::Debug for ServerConfig {
         f.debug_struct("ServerConfig")
             .field("host", &self.host)
             .field("auth_enabled", &self.auth_enabled)
-            .field("username", &self.username)
+            // usually a flespi token: as secret as the password
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -100,7 +194,8 @@ pub enum DarkTheme {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CardConfig {
-    pub iccid: String,                       // ICCID
+    #[serde(default)] // a card typed in by hand before its ICCID is known
+    pub iccid: String, // ICCID
     pub expire: Option<u64>,                 // Expire date
     pub name: Option<String>,                // Custom card name (for ease of user identification)
     pub t_protocol: Option<String>, // Card communication protocol "T0"/"T1"; auto-filled from ATR on first connection, may be overridden manually
@@ -113,6 +208,10 @@ pub struct CardConfig {
 // UI Configuration structure, part of ConfigurationFile that contains data about how UI looks like.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppearanceConfig {
+    #[serde(
+        default = "default_dark_theme",
+        deserialize_with = "dark_theme_lenient"
+    )]
     pub dark_theme: DarkTheme,
 }
 
@@ -190,9 +289,14 @@ fn save_config(
     tmp_path.push(tmp_name);
 
     {
-        let mut tmp_file = File::create(&tmp_path)?;
-        // The file may hold the broker credentials: owner-only on unix. Set
-        // before the rename so no window exposes a readable copy.
+        // The file may hold the broker credentials: owner-only on unix, from
+        // creation on (`mode` covers a fresh file, `set_permissions` a
+        // leftover one from a crash), so no window exposes a readable copy.
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut tmp_file = options.open(&tmp_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -202,12 +306,45 @@ fn save_config(
         tmp_file.sync_all()?;
     }
 
-    if let Err(e) = fs::rename(&tmp_path, config_path) {
+    if let Err(e) = rename_with_retry(&tmp_path, config_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(Box::new(e));
     }
 
+    // Make the rename itself durable: without it a power loss can bring back
+    // the previous file (or, on some filesystems, an empty one).
+    #[cfg(unix)]
+    if let Some(parent) = config_path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
     Ok(())
+}
+
+/// `fs::rename` that rides out transient locks. On Windows, antivirus,
+/// OneDrive (the config lives in Documents) or an editor briefly holding the
+/// target make the replace fail with access denied / sharing violation, and
+/// the change being saved would be lost.
+fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    const ATTEMPTS: u32 = if cfg!(windows) { 6 } else { 1 };
+    let mut attempt = 1;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            // 32 = ERROR_SHARING_VIOLATION
+            Err(e)
+                if attempt < ATTEMPTS
+                    && (e.kind() == io::ErrorKind::PermissionDenied
+                        || e.raw_os_error() == Some(32)) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt)));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Updates the configuration with a new card.
@@ -510,6 +647,13 @@ fn update_server_config(
     beta_updates: bool,
     auto_install_updates: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The dialog validates too; this guards the device identity and the
+    // broker address against any other caller.
+    split_host_to_parts(host)?;
+    if !is_valid_ident(ident) {
+        return Err(format!("invalid app ident '{}'", ident).into());
+    }
+
     // Serialize the whole read-modify-write against all other config writers.
     let _guard = config_write_guard();
 
@@ -801,7 +945,6 @@ fn cache_guard() -> std::sync::MutexGuard<'static, CacheConfigData> {
 }
 #[derive(Debug)]
 pub enum CacheSection {
-    Cards,
     Server,
     Ident,
     Appearance,
@@ -908,17 +1051,6 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
     let cache = cache_guard();
 
     match section {
-        CacheSection::Cards => {
-            // Reverse lookup: ICCID → card number.
-            for (card_number, config) in &cache.cards {
-                if config.iccid == key {
-                    return card_number.clone();
-                }
-            }
-            log::debug!("cache: no card number for ICCID {}", key);
-            "".to_string()
-        }
-
         CacheSection::Server => match (&cache.server, key) {
             (Some(server), "host") => server.host.clone(),
             // MQTT credentials; empty string = not configured (anonymous connect).
@@ -957,21 +1089,24 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
     }
 }
 
-/// Splits a host string into host and port components.
-///
-/// This function takes a string containing a host and port separated by a colon (e.g., "example.com:8080"),
-/// and splits it into two separate strings: the host and the port. If the input string does not contain a colon,
-/// it returns an error.
+/// Splits a `host:port` string (e.g. "example.com:8080") into its host and
+/// port. Also the validator for every address the app accepts (settings
+/// dialog, `set_server`): an empty host or port 0 would leave the device
+/// unable to connect, with no remote way back.
 pub fn split_host_to_parts(host: &str) -> Result<(String, u16), String> {
-    let parts: Vec<&str> = host.split(':').collect();
-    if parts.len() == 2 {
-        let port = parts[1]
-            .parse::<u16>()
-            .map_err(|_| "Invalid port number".to_string())?;
-        Ok((parts[0].to_string(), port))
-    } else {
-        Err("Host doesn't correspond to the format 'host:port'".to_string())
+    let format_err = || "Host doesn't correspond to the format 'host:port'".to_string();
+    let (name, port) = host.split_once(':').ok_or_else(format_err)?;
+    let name = name.trim();
+    if name.is_empty() || port.contains(':') {
+        return Err(format_err());
     }
+    let port = port
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| "Invalid port number".to_string())?;
+    Ok((name.to_string(), port))
 }
 
 /// Loads the configuration file into the cache.
@@ -1079,6 +1214,12 @@ pub fn saved_credentials() -> Option<(String, String)> {
     Some((username, server.password.clone().unwrap_or_default()))
 }
 
+/// The app identity format the server registers devices under: "TBA" + 13
+/// digits (mirrors `TBA_IDENT_REGEXP` in the frontend).
+fn is_valid_ident(ident: &str) -> bool {
+    ident.len() == 16 && ident.starts_with("TBA") && ident[3..].bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Generates a unique ident value based on the current time in microseconds.
 /// The ident value is in the format "TBA" followed by 13 digits.
 fn generate_ident() -> String {
@@ -1111,7 +1252,20 @@ pub fn init_config() -> io::Result<()> {
     // credentials have no UI). Only a real change earns a write.
     let mut needs_save = true;
 
-    if config_path.exists() {
+    // Only a definite "not found" means a first run. `Path::exists()` is also
+    // false on any metadata error (permissions, a cloud-sync placeholder not
+    // hydrated yet at login), and treating that as "missing" would write a
+    // default config over the real one with no backup.
+    let exists = match fs::metadata(&config_path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => {
+            log::error!("Config file {:?} is not accessible: {}", config_path, e);
+            return Err(e);
+        }
+    };
+
+    if exists {
         let mut contents = String::new();
         File::open(&config_path)?.read_to_string(&mut contents)?;
 
@@ -1132,19 +1286,27 @@ pub fn init_config() -> io::Result<()> {
                     "yaml.corrupt.{}",
                     chrono::Local::now().format("%Y%m%d_%H%M%S")
                 ));
-                match fs::rename(&config_path, &backup) {
-                    Ok(()) => log::error!(
-                        "Config parse failed ({}). Original saved as {:?}, resetting to default config.",
+                // A rename fails when another process holds the file (cloud
+                // sync, antivirus on Windows); a copy usually still works.
+                let backed_up = fs::rename(&config_path, &backup)
+                    .or_else(|_| fs::copy(&config_path, &backup).map(|_| ()));
+                if let Err(backup_err) = backed_up {
+                    // Never overwrite a file that has no copy: leave it for
+                    // the user to repair and run without a config.
+                    log::error!(
+                        "Config parse failed ({}) and backup failed ({}). Leaving {:?} untouched.",
                         e,
-                        backup
-                    ),
-                    Err(rename_err) => log::error!(
-                        "Config parse failed ({}) and backup failed ({}). Resetting to default config.",
-                        e,
-                        rename_err
-                    ),
+                        backup_err,
+                        config_path
+                    );
+                    return Err(io::Error::other(format!("config parse failed: {}", e)));
                 }
-                config = generate_default_config();
+                log::error!(
+                    "Config parse failed ({}). Original saved as {:?}, recovering what parses.",
+                    e,
+                    backup
+                );
+                config = salvage_config(&contents);
             }
         }
     } else {
@@ -1351,8 +1513,14 @@ mod tests {
         // existing configs stay byte-compatible.
         save_config(&path, &sample_config()).expect("save without credentials");
         let raw = fs::read_to_string(&path).expect("read yaml");
-        assert!(!raw.contains("username"), "absent username must not be written");
-        assert!(!raw.contains("password"), "absent password must not be written");
+        assert!(
+            !raw.contains("username"),
+            "absent username must not be written"
+        );
+        assert!(
+            !raw.contains("password"),
+            "absent password must not be written"
+        );
         let loaded = load_config(&path).expect("load without credentials");
         let server = loaded.server.expect("server section");
         assert_eq!(server.username, None);
@@ -1388,8 +1556,15 @@ mod tests {
         }
         save_config(&path, &cfg).expect("save");
 
-        update_server_config(&path, "new.example.com:8883", "TBA0000000000001", "Auto", true, false)
-            .expect("update server config");
+        update_server_config(
+            &path,
+            "new.example.com:8883",
+            "TBA0000000000001",
+            "Auto",
+            true,
+            false,
+        )
+        .expect("update server config");
 
         let loaded = load_config(&path).expect("load");
         let server = loaded.server.expect("server section");
@@ -1459,6 +1634,13 @@ mod tests {
     #[test]
     fn split_host_to_parts_bad_port() {
         assert!(split_host_to_parts("mqtt.flespi.io:notaport").is_err());
+        assert!(split_host_to_parts("mqtt.flespi.io:0").is_err());
+    }
+
+    #[test]
+    fn split_host_to_parts_rejects_empty_host_and_extra_colons() {
+        assert!(split_host_to_parts(":1883").is_err());
+        assert!(split_host_to_parts("a:b:1883").is_err());
     }
 
     #[test]
@@ -1656,5 +1838,65 @@ mod tests {
         assert_eq!(back.iccid, "1234567890123456");
         assert!(back.expire.is_none());
         assert!(back.last_auth.is_none());
+    }
+
+    #[test]
+    fn malformed_card_or_theme_does_not_fail_the_parse() {
+        let yaml = r#"
+ident: TBA1234567890123
+server:
+  host: mqtt.flespi.io
+appearance:
+  dark_theme: auto
+cards:
+  GOODCARD00000001:
+    iccid: "1111"
+    expire: 1700000000
+  BADCARD000000002:
+    iccid: "2222"
+    expire: "2026-01-01"
+  1234567890123456:
+    iccid: "3333"
+  EMPTYCARD0000003:
+"#;
+        let cfg: ConfigurationFile = serde_yaml::from_str(yaml).expect("lenient parse");
+        assert_eq!(cfg.ident.as_deref(), Some("TBA1234567890123"));
+        assert!(matches!(
+            cfg.appearance.as_ref().map(|a| &a.dark_theme),
+            Some(DarkTheme::Auto)
+        ));
+        assert!(cfg.cards.contains_key("GOODCARD00000001"));
+        assert!(!cfg.cards.contains_key("BADCARD000000002"));
+        assert_eq!(cfg.cards["1234567890123456"].iccid, "3333");
+        assert!(cfg.cards.contains_key("EMPTYCARD0000003"));
+    }
+
+    #[test]
+    fn salvage_keeps_ident_server_and_cards() {
+        let yaml = r#"
+ident: TBA1234567890123
+debug_log_until: "soon"
+server:
+  host: mqtt.flespi.io
+cards:
+  GOODCARD00000001:
+    iccid: "1111"
+"#;
+        assert!(serde_yaml::from_str::<ConfigurationFile>(yaml).is_err());
+        let cfg = salvage_config(yaml);
+        assert_eq!(cfg.ident.as_deref(), Some("TBA1234567890123"));
+        assert_eq!(
+            cfg.server.map(|s| s.host).as_deref(),
+            Some("mqtt.flespi.io")
+        );
+        assert!(cfg.cards.contains_key("GOODCARD00000001"));
+        assert!(cfg.debug_log_until.is_none());
+    }
+
+    #[test]
+    fn salvage_of_garbage_is_the_default() {
+        let cfg = salvage_config(":::\n\t{[");
+        assert!(cfg.cards.is_empty());
+        assert!(cfg.ident.is_some());
     }
 }
