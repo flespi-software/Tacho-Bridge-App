@@ -211,3 +211,18 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Added set_server and get_settings server commands, the password in the settings dialog, and fixed the dialog losing edited credentials on save.
+
+### [0.8.0-rc.17] - 2026-10-11
+
+🛠 Fixes
+
+- Fixed config resets: a malformed card or setting no longer wipes the server, the card list and the device ident.
+- Fixed card reader sessions: a swapped card no longer answers for the previous one, unplugged readers no longer stay online, and card resets no longer stall other cards.
+- Fixed MQTT reconnection: card exchanges time out instead of hanging, a failed reconnect shows offline, rack cards pick up new credentials, and TLS is used on port 8883.
+- Fixed card rack recovery after a USB reset under the same port name, and stale card sets or late releases blocking rack slots.
+- Fixed saving settings interrupting card authentications when no connection setting changed.
+
+🆕 Features / Improvements
+
+- Improved update and logging reliability: update checks time out, installs wait for card activity to end, crashed background tasks restart, and log upload tolerates damaged lines.
+- Improved the main window: the smart card readers block collapses to a single line while no reader is connected.
