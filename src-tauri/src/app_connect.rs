@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration; // For specifying time durations.
 
 // ───── MQTT Client Library (rumqttc) ─────
-use rumqttc::v5::{Event, Incoming}; // Core MQTT event types.
+use rumqttc::v5::mqttbytes::v5::Publish;
+use rumqttc::v5::{AsyncClient, Event, Incoming}; // Core MQTT event types.
+use std::panic::AssertUnwindSafe;
 
 // ───── Smart Card ─────
 use crate::smart_card::TASK_POOL; // Task pool for managing MQTT connections.
@@ -19,7 +21,7 @@ use tauri::async_runtime::{self, JoinHandle}; // Async runtime and task join han
 use serde_json::Value; // For working with JSON data structures.
 
 // ───── Local Modules ─────
-use crate::backoff::{next_reconnect_delay, RECONNECT_DELAY_INITIAL_SECS};
+use crate::backoff::Backoff;
 use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
 use crate::config::split_host_to_parts; // Function to split the host into parts for MQTT connection.
 use crate::config::CacheSection; // Enum for cache sections for getting data from cache.
@@ -135,7 +137,7 @@ pub async fn app_connection() {
     // create async task for the mqtt client
     let handle: JoinHandle<()> = async_runtime::spawn(async move {
         let mut is_online = false;
-        let mut reconnect_delay_secs: u64 = RECONNECT_DELAY_INITIAL_SECS;
+        let mut backoff = Backoff::new();
 
         log::info!("{} [CONN] phase=eventloop status=started", log_header);
 
@@ -163,8 +165,8 @@ pub async fn app_connection() {
                     }
                     if !is_online {
                         is_online = true;
-                        // Successful poll → reset backoff for the next failure.
-                        reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
+                        // Successful poll: the backoff resets once the link holds.
+                        backoff.connected();
                         log::info!(
                             "{} [CONN] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
                             log_header
@@ -178,75 +180,17 @@ pub async fn app_connection() {
 
                     match notification {
                         Event::Incoming(Incoming::Publish(publish)) => {
-                            let topic = match std::str::from_utf8(&publish.topic) {
-                                Ok(topic) => topic,
-                                Err(e) => {
-                                    log::error!(
-                                        "{} invalid UTF-8 in publish topic: {:?}",
-                                        log_header,
-                                        e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            // Debug log: when the server sent it (its
-                            // `timestamp` user property) against when it got
-                            // here — the MQTT transit part of a slow exchange.
-                            log::debug!(
-                                "{} [MQTT] rx topic={} bytes={} pkid={} server_ts={}",
-                                log_header,
-                                topic,
-                                publish.payload.len(),
-                                publish.pkid,
-                                crate::debug_log::server_timestamp(&publish)
-                            );
-
-                            // Rack traffic rides this connection under the
-                            // `rack/<id>/` prefix; its payloads are handled as
-                            // raw bytes by the rack module.
-                            if crate::com_port::handle_app_publish(
-                                &mqtt_client_for_task,
-                                topic,
-                                &publish.payload,
-                            ) {
-                                continue;
-                            }
-
-                            // server command requests come as JSON publishes on request/<id>/0
-                            match serde_json::from_slice::<Value>(&publish.payload) {
-                                Ok(json_payload) => {
-                                    // Never the payload itself: set_credentials carries
-                                    // the password, and the log file is uploaded by
-                                    // fetch_logs.
-                                    log::debug!(
-                                        "{} server command name={}",
-                                        log_header,
-                                        json_payload.get("name").unwrap_or(&Value::Null)
-                                    );
-                                    let handled = crate::commands_settings::dispatch_request(
-                                        &mqtt_client_for_task,
-                                        &log_header,
-                                        topic,
-                                        &json_payload,
-                                    );
-                                    if !handled {
-                                        log::warn!(
-                                            "{} unsupported publish topic={} name={} bytes={}",
-                                            log_header,
-                                            topic,
-                                            json_payload.get("name").unwrap_or(&Value::Null),
-                                            publish.payload.len()
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!(
-                                        "{} parsing JSON payload issue: {:?}",
-                                        log_header,
-                                        e
-                                    );
-                                }
+                            // Server input is handled inline in this loop, and
+                            // nothing restarts the loop: a panic must cost that
+                            // one message, not the connection.
+                            let handled = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                handle_publish(&mqtt_client_for_task, &log_header, &publish)
+                            }));
+                            if handled.is_err() {
+                                log::error!(
+                                    "{} [MQTT] status=publish_handler_panicked",
+                                    log_header
+                                );
                             }
                         }
                         Event::Incoming(Incoming::ConnAck(..)) => {
@@ -322,6 +266,7 @@ pub async fn app_connection() {
 
                     // One line per failed poll: kind + retry delay; full error
                     // details only for genuinely unexpected failures.
+                    let reconnect_delay_secs = backoff.failed();
                     crate::mqtt::log_connection_failure(
                         &log_header,
                         "CONN",
@@ -331,7 +276,6 @@ pub async fn app_connection() {
                     );
 
                     tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
-                    reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
                 }
             }
         }
@@ -360,5 +304,64 @@ pub async fn app_connection() {
             card.reader_name.as_deref().unwrap_or("unknown"),
             card.atr.as_deref().unwrap_or("unknown"),
         );
+    }
+}
+
+/// Routes one publish of the app connection: rack traffic, or a server command.
+fn handle_publish(mqtt_client: &AsyncClient, log_header: &str, publish: &Publish) {
+    let topic = match std::str::from_utf8(&publish.topic) {
+        Ok(topic) => topic,
+        Err(e) => {
+            log::error!("{} invalid UTF-8 in publish topic: {:?}", log_header, e);
+            return;
+        }
+    };
+
+    // Debug log: when the server sent it (its `timestamp` user property)
+    // against when it got here — the MQTT transit part of a slow exchange.
+    log::debug!(
+        "{} [MQTT] rx topic={} bytes={} pkid={} server_ts={}",
+        log_header,
+        topic,
+        publish.payload.len(),
+        publish.pkid,
+        crate::debug_log::server_timestamp(publish)
+    );
+
+    // Rack traffic rides this connection under the `rack/<id>/` prefix; its
+    // payloads are handled as raw bytes by the rack module.
+    if crate::com_port::handle_app_publish(mqtt_client, topic, &publish.payload) {
+        return;
+    }
+
+    // server command requests come as JSON publishes on request/<id>/0
+    match serde_json::from_slice::<Value>(&publish.payload) {
+        Ok(json_payload) => {
+            // Never the payload itself: set_credentials carries the password,
+            // and the log file is uploaded by fetch_logs.
+            log::debug!(
+                "{} server command name={}",
+                log_header,
+                json_payload.get("name").unwrap_or(&Value::Null)
+            );
+            let handled = crate::commands_settings::dispatch_request(
+                mqtt_client,
+                log_header,
+                topic,
+                &json_payload,
+            );
+            if !handled {
+                log::warn!(
+                    "{} unsupported publish topic={} name={} bytes={}",
+                    log_header,
+                    topic,
+                    json_payload.get("name").unwrap_or(&Value::Null),
+                    publish.payload.len()
+                );
+            }
+        }
+        Err(e) => {
+            log::error!("{} parsing JSON payload issue: {:?}", log_header, e);
+        }
     }
 }
