@@ -21,7 +21,7 @@ use tauri::async_runtime::{self, JoinHandle}; // Async runtime and task join han
 use serde_json::Value; // For working with JSON data structures.
 
 // ───── Local Modules ─────
-use crate::backoff::{next_reconnect_delay, RECONNECT_DELAY_INITIAL_SECS};
+use crate::backoff::Backoff;
 use crate::config::get_from_cache; // Function to get data from cache for syncing server data.
 use crate::config::split_host_to_parts; // Function to split the host into parts for MQTT connection.
 use crate::config::CacheSection; // Enum for cache sections for getting data from cache.
@@ -434,15 +434,31 @@ fn session_retired(session_id: u64) -> bool {
 /// switch) run from the card's poll loop. A reader or driver wedged inside
 /// PC/SC would otherwise stop the loop from polling: keep-alives lapse, the
 /// broker drops the session, and the card stays dead until it is pulled.
-const CARD_IO_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CARD_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runs a card operation under `CARD_IO_TIMEOUT`; `None` when it expired.
-async fn card_io<T>(
+pub(crate) async fn card_io<T>(
     op: impl std::future::Future<Output = T>,
     log_header: &str,
     what: &str,
 ) -> Option<T> {
-    match tokio::time::timeout(CARD_IO_TIMEOUT, op).await {
+    card_io_by(
+        tokio::time::Instant::now() + CARD_IO_TIMEOUT,
+        op,
+        log_header,
+        what,
+    )
+    .await
+}
+
+/// `card_io` against a deadline shared by several operations in a row.
+async fn card_io_by<T>(
+    deadline: tokio::time::Instant,
+    op: impl std::future::Future<Output = T>,
+    log_header: &str,
+    what: &str,
+) -> Option<T> {
+    match tokio::time::timeout_at(deadline, op).await {
         Ok(value) => Some(value),
         Err(_) => {
             log::error!(
@@ -494,8 +510,26 @@ pub async fn ensure_connection(
             "Reader: {:?}. ClientID is empty. Cannot ensure connection.",
             reader_name
         );
+        managed_card.release();
         return;
     }
+
+    // Resolved before an existing entry is touched: replacing it and then
+    // failing on the host would leave the card served by nothing.
+    let full_host = get_from_cache(CacheSection::Server, "host");
+    let (host, port) = match split_host_to_parts(&full_host) {
+        Ok(host_port) => host_port,
+        Err(e) => {
+            log::error!(
+                "[CONN] phase=ensure_connection status=failed reason=invalid_host reader={} client_id={} err={}",
+                reader_name.to_string_lossy(),
+                client_id,
+                e
+            );
+            managed_card.release();
+            return;
+        }
+    };
 
     // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
@@ -519,6 +553,8 @@ pub async fn ensure_connection(
                 reader_name.to_string_lossy(),
                 client_id
             );
+            // Only a probe: dropping it would reset the card under the live session.
+            managed_card.release();
             return;
         }
         // INVARIANT: no `.await` may sit between this removal and the push of
@@ -543,24 +579,6 @@ pub async fn ensure_connection(
         ));
     }
 
-    // Getting server data from the cache
-    let full_host = get_from_cache(CacheSection::Server, "host");
-    let (host, port) = match split_host_to_parts(&full_host) {
-        Ok((host, port)) => {
-            // log::debug!("Server data from cache: {:?}:{}", host, port);
-            (host, port)
-        }
-        Err(e) => {
-            log::error!(
-                "[CONN] phase=ensure_connection status=failed reason=invalid_host reader={} client_id={} err={}",
-                reader_name.to_string_lossy(),
-                client_id,
-                e
-            );
-            return;
-        }
-    };
-
     // A live rack-backed session for the same card number would collide with
     // the connection opened below: the flespi broker allows one session per
     // client_id and would drop the two connections in a loop. The card was
@@ -568,8 +586,8 @@ pub async fn ensure_connection(
     // rack slot — the rack session is stale (the server's card set dropping
     // it was lost or is still in flight). Abort it before opening ours.
     // Deliberately AFTER
-    // every early return above (empty client_id, existing session, invalid
-    // host): killing the rack session and then not opening the reader one
+    // every early return above (empty client_id, invalid host, existing
+    // session): killing the rack session and then not opening the reader one
     // would leave the card served by neither transport.
     crate::com_port::abort_rack_card_session(&client_id);
 
@@ -608,7 +626,7 @@ pub async fn ensure_connection(
                                 //    self-heal, which must NOT make the card look clean to the reset gate.
     let mut auth_process: bool = false;
     let mut busy_announced: bool = false;
-    let mut reconnect_delay_secs: u64 = RECONNECT_DELAY_INITIAL_SECS; // exponential backoff state
+    let mut backoff = Backoff::new();
 
     // Idempotency state for the current MQTT connection. The server re-sends a command with the
     // same request_id when it does not get a timely reply. We remember the last id we answered and
@@ -694,9 +712,8 @@ pub async fn ensure_connection(
                 Ok(notification) => {
                     if !is_online {
                         is_online = true;
-                        // Successful poll → reset the backoff so the next failure
-                        // starts from the initial delay again.
-                        reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
+                        // Successful poll: the backoff resets once the link holds.
+                        backoff.connected();
                         if !was_online {
                             was_online = true;
                             // Send the global-cards-sync event to the frontend that card is connected
@@ -866,14 +883,26 @@ pub async fn ensure_connection(
                                             // before this point may be replayed from cache.
                                             card_generation = card_generation.wrapping_add(1);
 
+                                            // The reset may have landed on a swapped card (see the
+                                            // session-start check): a mismatch ends the session.
+                                            let verified = reset.is_some()
+                                                && card_io(
+                                                    managed_card
+                                                        .ensure_same_card(&client_id_cloned),
+                                                    &log_header,
+                                                    "verify_card",
+                                                )
+                                                .await
+                                                    == Some(true);
+
                                             payload_ack = process_rapdu_mqtt_hex("".to_string());
 
                                             // Session closed cleanly and the card was just reset:
                                             // it holds no session state, and the UI indicator is
-                                            // cleared by the emit above. A reset that did not
-                                            // complete leaves it dirty: the next session start
-                                            // resets it again.
-                                            auth_process = reset.is_none();
+                                            // cleared by the emit above. A reset or check that did
+                                            // not complete leaves it dirty: the next session start
+                                            // resets and checks it again.
+                                            auth_process = !verified;
                                             busy_announced = false;
 
                                         // handle the case when finish == true
@@ -898,8 +927,16 @@ pub async fn ensure_connection(
                                                     crate::apdu_sniffer::forget(&client_id_cloned);
                                                 }
                                                 let rapdu_mqtt_hex = if is_session_start {
+                                                    // One budget for the whole start (reset,
+                                                    // protocol switch, card check): the loop does
+                                                    // not poll meanwhile, and several full
+                                                    // timeouts in a row outlast the keep-alive.
+                                                    let deadline = tokio::time::Instant::now()
+                                                        + CARD_IO_TIMEOUT;
+                                                    let mut card_reset = false;
                                                     // This case is needed to reset the card when authorization is not completed, otherwise the card will not respond to commands correctly.
                                                     if auth_process {
+                                                        card_reset = true;
                                                         log::warn!(
                                                             "{} Empty payload received while auth in progress. Reconnecting card.",
                                                             log_header
@@ -911,7 +948,8 @@ pub async fn ensure_connection(
                                                             false,
                                                         );
                                                         // Reset the card to its original state
-                                                        let reset = card_io(
+                                                        let reset = card_io_by(
+                                                            deadline,
                                                             managed_card.reconnect(),
                                                             &log_header,
                                                             "reconnect",
@@ -930,7 +968,12 @@ pub async fn ensure_connection(
                                                     // Session-scoped by design - not persisted to the config,
                                                     // the server owns the value per tracker.
                                                     if let Some(protocol) = requested_protocol {
-                                                        if card_io(
+                                                        card_reset |=
+                                                            crate::smart_card::protocol_to_str(
+                                                                protocol,
+                                                            ) != managed_card.protocol_str();
+                                                        if card_io_by(
+                                                            deadline,
                                                             managed_card.switch_protocol(protocol),
                                                             &log_header,
                                                             "switch_protocol",
@@ -946,22 +989,45 @@ pub async fn ensure_connection(
                                                             card_generation.wrapping_add(1);
                                                     }
 
-                                                    // If the input value is empty, then pass the ATR to the server.
-                                                    log::info!(
-                                                        "{} Authentication process started",
-                                                        log_header
-                                                    );
+                                                    // A reset lands on a swapped card without an
+                                                    // error: the card about to answer the VU must
+                                                    // still be this session's one. A mismatch ends
+                                                    // the session; a timed-out check leaves the
+                                                    // card dirty, so the next start retries it.
+                                                    let verified = !card_reset
+                                                        || card_io_by(
+                                                            deadline,
+                                                            managed_card.ensure_same_card(
+                                                                &client_id_cloned,
+                                                            ),
+                                                            &log_header,
+                                                            "verify_card",
+                                                        )
+                                                        .await
+                                                            == Some(true);
 
-                                                    // Send the global-cards-sync event to the frontend that card is connected
-                                                    emit_card_sync_event(
-                                                        &iccid,
-                                                        &reader_name,
-                                                        &client_id_cloned,
-                                                        Some(true),
-                                                        Some(false),
-                                                    );
+                                                    if verified {
+                                                        // If the input value is empty, then pass the ATR to the server.
+                                                        log::info!(
+                                                            "{} Authentication process started",
+                                                            log_header
+                                                        );
 
-                                                    atr_clone.clone()
+                                                        // Send the global-cards-sync event to the frontend that card is connected
+                                                        emit_card_sync_event(
+                                                            &iccid,
+                                                            &reader_name,
+                                                            &client_id_cloned,
+                                                            Some(true),
+                                                            Some(false),
+                                                        );
+
+                                                        atr_clone.clone()
+                                                    } else {
+                                                        auth_process = true;
+                                                        exchange_failed = true;
+                                                        SW_TECHNICAL_PROBLEM.to_string()
+                                                    }
                                                 } else {
                                                     // a differing T protocol mid-session is ignored: switching resets
                                                     // the card and would destroy the authentication state
@@ -1223,6 +1289,7 @@ pub async fn ensure_connection(
 
                     // One line per failed poll: kind + retry delay; full error
                     // details only for genuinely unexpected failures.
+                    let reconnect_delay_secs = backoff.failed();
                     log_connection_failure(
                         &log_header,
                         "CONN",
@@ -1232,7 +1299,6 @@ pub async fn ensure_connection(
                     );
 
                     tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
-                    reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
                 }
             }
         }

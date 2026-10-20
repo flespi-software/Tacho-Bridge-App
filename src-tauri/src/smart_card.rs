@@ -22,7 +22,7 @@ use pcsc::{
 // ───── Local Modules ─────
 use crate::config::{get_card_config_from_cache, mutate_card_config};
 use crate::global_app_handle::card_emit_event;
-use crate::mqtt::{ensure_connection, remove_connections_all};
+use crate::mqtt::{card_io, ensure_connection, remove_connections_all};
 
 // ───── Constants ─────
 const READERS_BUFFER_SIZE: usize = 2048;
@@ -62,6 +62,11 @@ pub enum ApduError {
     TaskDied(String),
     /// The PCSC handle could not be recreated after a retriable failure.
     RecreateFailed(String),
+    /// An earlier card operation is still running on the blocking pool: its
+    /// caller timed out, but a PC/SC call cannot be interrupted. The command
+    /// is not queued behind it — once the reader recovers it would run late,
+    /// after the server already re-sent it, and execute twice.
+    Busy,
 }
 
 impl std::fmt::Display for ApduError {
@@ -71,6 +76,7 @@ impl std::fmt::Display for ApduError {
             ApduError::Pcsc(e) => write!(f, "PCSC transmit error: {}", e),
             ApduError::TaskDied(e) => write!(f, "APDU transmit task died: {}", e),
             ApduError::RecreateFailed(e) => write!(f, "card handle recreate failed: {}", e),
+            ApduError::Busy => write!(f, "previous card operation still in progress"),
         }
     }
 }
@@ -109,6 +115,8 @@ impl ApduError {
             // before the transmit call — the command did not reach the card.
             ApduError::TaskDied(_) => true,
             ApduError::RecreateFailed(_) => false,
+            // Not sent, but a recreate would queue behind the stuck operation.
+            ApduError::Busy => false,
         }
     }
 }
@@ -347,12 +355,19 @@ async fn register_card(
             return None;
         }
     };
-    let iccid = match managed_card.get_iccid().await {
-        Ok(iccid) => iccid,
-        Err(e) => {
+    // Card I/O is bounded: this runs under READER_SWEEP, and one wedged
+    // reader would otherwise stop card detection on every reader.
+    let header = format!("Reader {:?} |", reader_name);
+    let iccid = match card_io(managed_card.get_iccid(), &header, "get_iccid").await {
+        Some(Ok(iccid)) => iccid,
+        Some(Err(e)) => {
             error!("Failed to get ICCID for reader {:?}: {}", reader_name, e);
+            // An unlinked or unreadable card: leave it as it is, it may be in
+            // use by another application.
+            managed_card.release();
             return None;
         }
+        None => return None,
     };
     info!("ICCID: {}", iccid);
     // The same deterministic lookup the rack path uses (duplicate ICCID
@@ -361,8 +376,22 @@ async fn register_card(
 
     // The config entry is known only after reading the ICCID, so open with
     // the ATR-derived protocol first and then apply the configured protocol.
-    let requested_protocol = resolve_t_protocol(&card_number, atr_protocol);
-    managed_card.switch_protocol(requested_protocol).await;
+    // Off the async worker: storing a first-seen protocol writes the config.
+    let requested_protocol = {
+        let (card_number, atr_protocol) = (card_number.clone(), atr_protocol.clone());
+        let fallback = atr_protocol.protocol();
+        tauri::async_runtime::spawn_blocking(move || {
+            resolve_t_protocol(&card_number, &atr_protocol)
+        })
+        .await
+        .unwrap_or(fallback)
+    };
+    card_io(
+        managed_card.switch_protocol(requested_protocol),
+        &header,
+        "switch_protocol",
+    )
+    .await?;
     // A failed switch keeps the old protocol; report the actual stored value.
     let protocol = managed_card.protocol;
     ensure_connection(
@@ -402,8 +431,13 @@ pub async fn reconcile_reader_event(reader_name: &str, atr: &str) -> CardProcess
 
     // Case 1: Both reader_name and atr are provided and not found in the pool → register new card
     if !reader_name.is_empty() && !atr.is_empty() {
+        // A finished task (returned early or panicked) serves nobody: treat its
+        // entry as absent, or the card stays unserved until a replug.
+        // `ensure_connection` replaces it.
         let exists = pool.iter().any(|c| {
-            c.reader_name.as_deref() == Some(reader_name) && c.atr.as_deref() == Some(atr)
+            c.reader_name.as_deref() == Some(reader_name)
+                && c.atr.as_deref() == Some(atr)
+                && !c.task_handle.inner().is_finished()
         });
 
         if !exists {
@@ -739,6 +773,13 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
         // on the async workers; this thread just waits for the result.
         block_on(process_reader_states(&mut reader_states));
 
+        // A rescan requested while this thread was busy above found no wait
+        // to cancel: honour it now, not after a whole quiet poll window.
+        if RESCAN_REQUESTED.swap(false, Ordering::SeqCst) {
+            info!("Rescan requested (picked up after a sweep). Re-establishing context...");
+            break;
+        }
+
         debug!("Waiting for the next status change...");
     }
 
@@ -847,7 +888,7 @@ fn resolve_t_protocol(card_number: &str, atr: &AtrProtocol) -> Protocols {
 /// could pin the wrong protocol into the config forever — only fixable by hand
 /// editing the YAML. Keeping "I could not tell" separate from "it is T0" lets
 /// the caller decline to store a guess.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AtrProtocol {
     /// The interface bytes were present and complete: this is the card's protocol.
     Resolved(Protocols),
@@ -1211,6 +1252,25 @@ impl ManagedCard {
         protocol_to_str(self.protocol)
     }
 
+    /// Closes the handle without resetting the card. pcsc's `Drop` resets it,
+    /// which wipes the state another handle to the same card relies on — a
+    /// live session's, when this one was only a probe, or another
+    /// application's. Only for a handle that has not been cloned.
+    pub fn release(self) {
+        let Ok(mut slot) = self.inner.try_lock() else {
+            return;
+        };
+        if let Some(card) = slot.take() {
+            if let Err((_, e)) = card.disconnect(Disposition::LeaveCard) {
+                debug!(
+                    "Releasing the card handle for reader {} failed: {}",
+                    self.reader_name.to_string_lossy(),
+                    e
+                );
+            }
+        }
+    }
+
     pub async fn reconnect(&self) {
         debug!(
             "Attempting to reconnect card for reader: {}",
@@ -1280,10 +1340,14 @@ impl ManagedCard {
         let response = tauri::async_runtime::spawn_blocking(move || {
             let mut rapdu_buf = vec![0u8; pcsc::MAX_BUFFER_SIZE_EXTENDED];
 
-            let locked = card.blocking_lock();
+            // The card's operations run one at a time from its session task,
+            // so a held lock means one of them outlived its caller's timeout.
+            let Ok(locked) = card.try_lock() else {
+                return Err(ApduError::Busy);
+            };
             let Some(locked) = locked.as_ref() else {
                 // a previous reset-recreate could not reconnect: retriable
-                return Err(pcsc::Error::InvalidHandle);
+                return Err(ApduError::Pcsc(pcsc::Error::InvalidHandle));
             };
 
             match locked.transmit(&apdu, &mut rapdu_buf) {
@@ -1292,15 +1356,14 @@ impl ManagedCard {
                     error!("APDU transmit failed: {}", err);
                     // Preserved as the typed pcsc error so send_apdu can tell a
                     // dead handle from an error of an already-delivered command.
-                    Err(err)
+                    Err(ApduError::Pcsc(err))
                 }
             }
         })
         .await;
 
         match response {
-            Ok(Ok(rapdu)) => Ok(rapdu),
-            Ok(Err(pcsc_err)) => Err(ApduError::Pcsc(pcsc_err)),
+            Ok(result) => result,
             // The blocking task itself died: keep this distinct from a pcsc
             // failure so the retry decision does not lump it into the
             // "may have reached the card" bucket (see ApduError::is_retriable).
@@ -1403,31 +1466,57 @@ impl ManagedCard {
                 None
             }
         };
-        let expected = self.iccid.get();
-        if current.is_some() && current.as_ref() == expected {
+        if self.continue_if_same(client_id, current) {
             info!(
                 "{} Card in reader {} was reinserted (same ICCID); the session continues after a reset",
                 client_id, reader
             );
-            return;
         }
+    }
+
+    /// Re-reads the ICCID after the card was reset or its handle replaced. A
+    /// reset of a swapped card succeeds silently — and a failed reconnect falls
+    /// back to a fresh handle to whatever card is inserted — so without this
+    /// check the session would carry on against the other card (see
+    /// `handle_removed_card`). Returns whether the session continues.
+    pub async fn ensure_same_card(&self, client_id: &str) -> bool {
+        let current = self.read_iccid().await.ok();
+        self.continue_if_same(client_id, current)
+    }
+
+    /// Ends the session and asks for a rescan unless `current` is this
+    /// session's card. Returns whether the session continues.
+    fn continue_if_same(&self, client_id: &str, current: Option<String>) -> bool {
+        let expected = self.iccid.get();
+        if current.is_some() && current.as_ref() == expected {
+            return true;
+        }
+        let reader = self.reader_name.to_string_lossy().into_owned();
         warn!(
             "{} Card in reader {} changed (ICCID {:?} → {:?}): ending the session and rescanning",
             client_id, reader, expected, current
         );
-        let stale: Vec<ProcessingCard> = {
-            let mut pool = TASK_POOL.lock().await;
-            let (stale, keep) = std::mem::take(&mut *pool).into_iter().partition(|c| {
-                c.client_id == client_id && c.reader_name.as_deref() == Some(reader.as_str())
-            });
-            *pool = keep;
-            stale
-        };
-        if !stale.is_empty() {
-            // Detached: this very task is one of those being shut down.
-            tauri::async_runtime::spawn(crate::mqtt::shutdown_connections(stale, "card_swapped"));
-        }
-        request_rescan();
+        // Detached: callers run under a timeout that would cancel a cleanup
+        // half-way and leave the stale entry behind, and this very task is
+        // among those being shut down.
+        let client_id = client_id.to_owned();
+        tauri::async_runtime::spawn(async move {
+            let stale: Vec<ProcessingCard> = {
+                let mut pool = TASK_POOL.lock().await;
+                let (stale, keep) = std::mem::take(&mut *pool).into_iter().partition(|c| {
+                    c.client_id == client_id && c.reader_name.as_deref() == Some(reader.as_str())
+                });
+                *pool = keep;
+                stale
+            };
+            // After the cleanup: an entry left in the pool would make the
+            // rescan ignore the inserted card.
+            request_rescan();
+            if !stale.is_empty() {
+                crate::mqtt::shutdown_connections(stale, "card_swapped").await;
+            }
+        });
+        false
     }
 
     /// Returns the card ICCID using lazy caching.
