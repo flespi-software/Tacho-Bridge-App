@@ -295,11 +295,13 @@ pub fn run() {
                     logger::replay_access_warning();
                     async_runtime::spawn(updater::replay_pending_update());
 
-                    // Reader state has no replay of its own: the PCSC monitor only
-                    // emits on card-state CHANGES, so a reloaded webview would show
-                    // "no readers" forever while a card sits inserted. A rescan from
-                    // UNAWARE makes PCSC re-report every present card through the
-                    // normal pipeline.
+                    // Last reported reader states first: the rescan below skips
+                    // cards whose session is already running.
+                    global_app_handle::emit_current_reader_states();
+
+                    // The PCSC monitor only emits on card-state CHANGES; a rescan
+                    // from UNAWARE re-reports every present card through the
+                    // normal pipeline, so the view converges on the real state.
                     smart_card::request_rescan();
                 });
 

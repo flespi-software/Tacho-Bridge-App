@@ -130,8 +130,7 @@
     <SmartCardList
       ref="cardlist"
       :cards="state.cards"
-      @add-card="saveCardNumber"
-      @update-card="saveCardNumber"
+      :save="saveCardNumber"
       @delete-card="removeCard"
     />
   </div>
@@ -147,10 +146,10 @@ import {
   formatAuthDate,
   cardStatusIcon,
 } from './cardFormatters'
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { emit } from '@tauri-apps/api/event'
-import { useTauriListeners } from 'src/composables/useTauriListeners'
+import { useTauriListeners, LAYOUT_LISTENERS_READY } from 'src/composables/useTauriListeners'
 import { notifyError, TOAST_LONG } from 'src/composables/notify'
 
 const cardlist = ref<null | {
@@ -171,6 +170,7 @@ const racks = ref<RackState[]>([])
 
 // Registered Tauri listeners. Kept in an array so we can detach them all
 const { on } = useTauriListeners()
+const layoutListenersReady = inject(LAYOUT_LISTENERS_READY, Promise.resolve())
 
 // Transient "authentication in progress" flag per card_number, derived from
 // the Reader.authentication field emitted by the backend via global-cards-sync.
@@ -245,13 +245,18 @@ function handleCardsSync(raw: unknown): void {
   const iccid = raw.iccid
   // Find the index of the reader with the same name
   const index = state.readers.findIndex((reader) => reader.name === name)
+  // The PC/SC monitor reports a card without the session flags (null), the
+  // card's MQTT session reports only them: an event that does not carry the
+  // flags keeps those of the same card.
+  const prev = index !== -1 ? state.readers[index] : undefined
+  const sameCard = iccid !== '' && prev?.iccid === iccid
   const next: Reader = {
     name,
     status,
     iccid,
     card_number,
-    online: raw.online,
-    authentication: raw.authentication,
+    online: raw.online ?? (sameCard ? prev?.online : undefined),
+    authentication: raw.authentication ?? (sameCard ? prev?.authentication : undefined),
   }
   if (index !== -1) {
     state.readers[index] = next
@@ -285,7 +290,7 @@ function handleRackState(raw: unknown): void {
 
 ///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
 
-const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
+const saveCardNumber = async (cardNumber: string, content: SmartCard): Promise<boolean> => {
   console.log(`Card Number: ${cardNumber}, Card iccid: ${content.iccid}`)
 
   // The backend reconnects the affected card itself after a successful save
@@ -301,9 +306,11 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard) => {
       content: content,
     })
     console.log('Card number updated successfully')
+    return true
   } catch (error) {
     console.error(`Failed to update card ${cardNumber}:`, error)
     notifyError(`Failed to save card ${cardNumber}`, error, TOAST_LONG)
+    return false
   }
 }
 
@@ -362,6 +369,9 @@ onMounted(async () => {
   await on('global-cards-sync', handleCardsSync)
   await on('global-card-config-updated', handleCardConfigUpdated)
   await on('rack-state', handleRackState)
+
+  // The layout's listeners too (notifications, server config).
+  await layoutListenersReady
 
   // Now that the listeners are wired, tell the backend it can start
   // emitting initial state. The replay bursts one event per EXISTING card and

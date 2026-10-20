@@ -198,7 +198,14 @@
 
         <q-card-actions align="right" class="q-px-md q-pb-md">
           <q-btn flat label="Cancel" color="grey-7" v-close-popup @click="closeCard" />
-          <q-btn unelevated label="Save" color="primary" rounded @click="saveCard" />
+          <q-btn
+            unelevated
+            label="Save"
+            color="primary"
+            rounded
+            :loading="saving"
+            @click="saveCard"
+          />
         </q-card-actions>
       </q-card>
     </q-dialog>
@@ -219,6 +226,9 @@ type SmartCardMap = Record<string, SmartCard>
 // Props
 const props = defineProps<{
   cards: SmartCardMap
+  // Persists a card; resolves to whether it was saved. Awaited so a rejected
+  // save keeps the dialog (and the typed values) open.
+  save: (number: string, data: SmartCard) => Promise<boolean>
 }>()
 
 // Filtered view of cards rendered in the list:
@@ -240,12 +250,11 @@ const cardsList = computed(() => {
 
 // Emits
 const emit = defineEmits<{
-  (e: 'add-card', number: string, data: SmartCard): void
-  (e: 'update-card', number: string, data: SmartCard): void
   (e: 'delete-card', number: string): void
 }>()
 
 const isDialogOpen = ref<boolean>(false)
+const saving = ref<boolean>(false)
 const isEditMode = ref<boolean>(false)
 
 const isExpanded = ref<boolean>(false)
@@ -280,15 +289,18 @@ function linkMode(iccid: string) {
   linkICCID.value = iccid || ''
 }
 
-function cardClick(number: string) {
+async function cardClick(number: string) {
   if (isLinkMode.value) {
+    if (saving.value) return
     // Send only the fields this action owns: echoing the whole card snapshot
     // back would overwrite backend-owned metadata (last_auth, company data)
     // written concurrently by the sniffer. Absent fields are preserved.
     const cardData: SmartCard = { name: props.cards[number]?.name ?? '', iccid: linkICCID.value }
-    emit('update-card', number, cardData)
-    isLinkMode.value = false
-    linkICCID.value = ''
+    saving.value = true
+    const saved = await props.save(number, cardData)
+    saving.value = false
+    // A rejected link stays pending, so the user can pick another card.
+    if (saved) cancelLink()
   } else {
     openEditDialog(number)
   }
@@ -304,6 +316,12 @@ function openEditDialog(number: string): void {
 }
 
 function validateCardNumber(): boolean {
+  // An existing card keeps its key verbatim, even one saved before the format
+  // was enforced: reformatting it would save a second entry.
+  if (isEditMode.value) {
+    cardNumberError.value = ''
+    return true
+  }
   const number = dialogCardNumber.value.trim().toUpperCase()
 
   if (!TACHO_COMPANY_CARD_REGEXP.test(number)) {
@@ -313,7 +331,7 @@ function validateCardNumber(): boolean {
 
   // Use hasOwnProperty instead of `in` so prototype-chain names like
   // "constructor" or "__proto__" can't falsely report "already exists".
-  if (!isEditMode.value && Object.prototype.hasOwnProperty.call(props.cards, number)) {
+  if (Object.prototype.hasOwnProperty.call(props.cards, number)) {
     cardNumberError.value = 'Card number already exists'
     return false
   }
@@ -323,8 +341,11 @@ function validateCardNumber(): boolean {
 }
 
 // Save logic
-function saveCard(): void {
-  const number = dialogCardNumber.value.trim().toUpperCase()
+async function saveCard(): Promise<void> {
+  if (saving.value) return
+  const number = isEditMode.value
+    ? dialogCardNumber.value
+    : dialogCardNumber.value.trim().toUpperCase()
   const name = dialogCardName.value.trim()
 
   if (!validateCardNumber()) return
@@ -334,11 +355,10 @@ function saveCard(): void {
   // dialog's stale snapshot.
   const cardData: SmartCard = { name, iccid: dialogCardICCID.value || '' }
 
-  if (isEditMode.value) {
-    emit('update-card', number, cardData)
-  } else {
-    emit('add-card', number, cardData)
-  }
+  saving.value = true
+  const saved = await props.save(number, cardData)
+  saving.value = false
+  if (!saved) return
   isDialogOpen.value = false
   cancelLink()
   isExpanded.value = true

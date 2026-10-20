@@ -40,8 +40,8 @@
 
 <script setup lang="ts">
 import { useQuasar, Notify } from 'quasar'
-import { ref, computed, onMounted } from 'vue'
-import { useTauriListeners } from 'src/composables/useTauriListeners'
+import { ref, computed, onMounted, provide } from 'vue'
+import { useTauriListeners, LAYOUT_LISTENERS_READY } from 'src/composables/useTauriListeners'
 import {
   TBA_IDENT_REGEXP,
   parseThemeMode,
@@ -84,6 +84,37 @@ const ACCESS_NOTIFICATION_TEXT =
 
 /// Notification kinds the backend can raise, and how each is surfaced.
 /// Keyed lookup rather than an if/else ladder so adding a kind is one entry.
+/// The update toast. Clicking an action dismisses it, so a failed install
+/// brings it back: the backend announces a version only once.
+function showUpdateNotification(message: string): void {
+  Notify.create({
+    message: message || 'Application update is available.',
+    color: 'primary',
+    position: 'bottom',
+    timeout: 999000,
+    actions: [
+      {
+        label: 'Install & restart',
+        color: 'white',
+        handler: () => {
+          void invoke('install_update').catch((e) => {
+            // On success the app restarts and this never runs.
+            console.error('install_update failed:', e)
+            Notify.create({
+              message: `Update installation failed: ${String(e)}`,
+              color: 'red',
+              position: 'bottom',
+              timeout: 8000,
+            })
+            showUpdateNotification(message)
+          })
+        },
+      },
+      { label: 'Later', color: 'white' },
+    ],
+  })
+}
+
 const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
   access: () =>
     Notify.create({
@@ -91,38 +122,12 @@ const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
       color: 'red',
       position: 'bottom',
       timeout: 999000,
+      actions: [{ label: 'Dismiss', color: 'white' }],
     }),
 
   // Backend message names the new version; install_update downloads,
   // verifies the signature, installs and restarts the app.
-  update: (message) =>
-    Notify.create({
-      message: message || 'Application update is available.',
-      color: 'primary',
-      position: 'bottom',
-      timeout: 999000,
-      actions: [
-        {
-          label: 'Install & restart',
-          color: 'white',
-          handler: () => {
-            void invoke('install_update').catch((e) => {
-              // On success the app restarts and this never runs; a silent
-              // catch here meant a failed download looked like nothing
-              // happened after the user clicked "Install & restart".
-              console.error('install_update failed:', e)
-              Notify.create({
-                message: `Update installation failed: ${String(e)}. You can retry from the update notification.`,
-                color: 'red',
-                position: 'bottom',
-                timeout: 8000,
-              })
-            })
-          },
-        },
-        { label: 'Later', color: 'white' },
-      ],
-    }),
+  update: showUpdateNotification,
 
   // Backend message names the COM port occupied by another application.
   port_busy: (message) =>
@@ -131,6 +136,7 @@ const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
       color: 'orange',
       position: 'bottom',
       timeout: 999000,
+      actions: [{ label: 'Dismiss', color: 'white' }],
     }),
 
   // The broker refused the credentials (or requires some): the message names
@@ -186,18 +192,26 @@ function handleGlobalNotification(raw: unknown): void {
   else console.log('global-notification: unknown type:', type)
 }
 
-onMounted(async () => {
-  await on('global-config-server', handleGlobalConfigServer)
+// Registered from setup, not onMounted: the page inside the layout mounts
+// first and emits `frontend-loaded` once these are in place (see
+// LAYOUT_LISTENERS_READY), so the replayed config and notifications land.
+let statusEventSeen = false
+const listenersReady = Promise.all([
+  on('global-config-server', handleGlobalConfigServer),
   // The backend connects before the webview loads, so the status event may
   // have fired with no listener: subscribe first, then pull the cached
   // snapshot. An event that arrives in between is fresher than the snapshot
   // and must not be overwritten by it.
-  let statusEventSeen = false
-  await on('app-connection-status', (raw) => {
+  on('app-connection-status', (raw) => {
     statusEventSeen = true
     appConnected.value = raw === true
-  })
-  await on('global-notification', handleGlobalNotification)
+  }),
+  on('global-notification', handleGlobalNotification),
+]).then(() => undefined)
+provide(LAYOUT_LISTENERS_READY, listenersReady)
+
+onMounted(async () => {
+  await listenersReady
   try {
     const online = await invoke<boolean>('get_app_connection_status')
     if (!statusEventSeen) appConnected.value = online === true

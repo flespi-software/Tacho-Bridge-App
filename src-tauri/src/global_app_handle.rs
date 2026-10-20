@@ -90,7 +90,40 @@ pub fn card_emit_event(
         authentication,
     };
 
+    {
+        let mut readers = READER_STATES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A reader that left the bus is dropped from the UI for good.
+        if payload.card_state.contains("UNKNOWN") || payload.card_state.contains("IGNORE") {
+            readers.remove(&payload.reader_name);
+        } else {
+            readers.insert(payload.reader_name.clone(), payload.clone());
+        }
+    }
     emit_to_frontend(event_name, payload);
+}
+
+// Last reported state of every reader, keyed by reader name. A rescan
+// re-reports only cards that are not served yet — a card with a live session
+// is left alone, so a reloaded webview would not see it until its next MQTT
+// event. Replayed on `frontend-loaded` instead.
+lazy_static! {
+    static ref READER_STATES: Mutex<std::collections::BTreeMap<String, TachoState>> =
+        Mutex::new(std::collections::BTreeMap::new());
+}
+
+/// Re-emits the last reported state of every reader (`global-cards-sync`).
+pub fn emit_current_reader_states() {
+    let states: Vec<TachoState> = READER_STATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect();
+    for state in states {
+        emit_to_frontend("global-cards-sync", state);
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

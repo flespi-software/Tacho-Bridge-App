@@ -38,6 +38,9 @@
           outlined
           dense
           v-model="hostValue"
+          :error="hostValue.trim() !== '' && !isHostValid"
+          error-message="Expected host:port, e.g. mqtt.flespi.io:8883"
+          hide-bottom-space
           @keyup.enter="saveServerConfig"
         >
           <template v-slot:prepend>
@@ -315,6 +318,13 @@ const identInput = computed({
 const isIdentValid = computed(() => TBA_IDENT_REGEXP.test(identInput.value))
 
 const hostValue = ref('')
+// Same rule as the backend's split_host_to_parts: host:port, an IPv6 literal
+// in brackets, port 1..65535.
+const isHostValid = computed(() => {
+  const match = /^(\[[^\]\s]+\]|[^:\s]+):(\d{1,5})$/.exec(hostValue.value.trim())
+  const port = Number(match?.[2])
+  return match !== null && port >= 1 && port <= 65535
+})
 
 // Server authentication. The fields show the pair in effect (the password
 // too, masked until the eye icon is clicked); the pair is sent to the
@@ -328,11 +338,9 @@ const authPasswordVisible = ref(false)
 // asked again at the next launch.
 const saveCredentials = ref(true)
 const credentialsDirty = ref(false)
-// A typed pair needs a username: the backend would save "" and every
-// connection would then be rejected.
-const isUsernameValid = computed(
-  () => !(authEnabled.value && credentialsDirty.value && authUsername.value.trim() === ''),
-)
+// Authentication needs a username: the field shows the one in effect, and the
+// backend rejects the switch without one.
+const isUsernameValid = computed(() => !(authEnabled.value && authUsername.value.trim() === ''))
 
 // Extended debug log — the same switch the server's `debug_log` command
 // drives, with the duration picked from a list (seconds). Applied on Save
@@ -476,9 +484,7 @@ const openChangelog = async () => {
 }
 
 const saving = ref(false)
-const canSave = computed(
-  () => isIdentValid.value && hostValue.value.trim() !== '' && isUsernameValid.value,
-)
+const canSave = computed(() => isIdentValid.value && isHostValid.value && isUsernameValid.value)
 const saveServerConfig = async () => {
   if (saving.value || !canSave.value) return
   const theme = themeMode.value
@@ -500,12 +506,10 @@ const saveServerConfig = async () => {
   // it drops every card session, so a save that only switched the theme or
   // the update channel must not abort an authentication in progress.
   const before = lastPayload
-  const connectionChanged =
-    !before ||
-    (before.host ?? '') !== hostValue.value ||
-    (before.ident ?? '') !== identInput.value ||
-    (before.auth_enabled === 'true') !== credentials.enabled ||
-    credentialsDirty.value
+  const serverChanged =
+    !before || (before.host ?? '') !== hostValue.value || (before.ident ?? '') !== identInput.value
+  const credentialsChanged =
+    !before || (before.auth_enabled === 'true') !== credentials.enabled || credentialsDirty.value
 
   saving.value = true
   try {
@@ -534,12 +538,14 @@ const saveServerConfig = async () => {
   // reported on its own and keeps the dialog open, but must not leave the app
   // on the old broker.
   let complete = true
+  let credentialsApplied = false
   try {
     // The switch is persisted on every save; the pair only when the user
     // typed into it (null = keep what is in effect). The reconnect below
     // picks the new state up, so the backend does not reconnect here.
     await invoke('apply_credentials', { ...credentials, reconnect: false })
     credentialsDirty.value = false
+    credentialsApplied = true
   } catch (error) {
     complete = false
     console.error('Applying credentials failed:', error)
@@ -561,7 +567,8 @@ const saveServerConfig = async () => {
     emit('update:modelValue', false)
   }
 
-  if (!connectionChanged) return
+  // Credentials that were not applied changed nothing to reconnect for.
+  if (!serverChanged && !(credentialsChanged && credentialsApplied)) return
 
   // Reconnect steps run after a confirmed save, each on its own: a PCSC sync
   // failure (e.g. the smart-card service is down) must not prevent the app
