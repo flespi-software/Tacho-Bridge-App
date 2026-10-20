@@ -64,7 +64,13 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
     let is_select = cmd.len() >= 2 && (cmd[0] == 0x00 || cmd[0] == 0x0C) && cmd[1] == 0xA4;
     if is_select {
         let sw_ok = resp.len() >= 2 && resp[resp.len() - 2] == 0x90 && resp[resp.len() - 1] == 0x00;
-        if !sw_ok {
+        // Under SM the outer 9000 only covers the wrapping: the command's own
+        // status is in DO'99.
+        let secure_messaging = cmd[0] & 0x0C == 0x0C;
+        let inner_ok = !sw_ok
+            || !secure_messaging
+            || sm_status(&resp[..resp.len() - 2]).is_none_or(|sw| sw == [0x90, 0x00]);
+        if !sw_ok || !inner_ok {
             return; // selection unchanged on the card: keep the tracked state
         }
         let fid = select_ef_fid(&cmd); // None for recognized-but-untracked selects
@@ -91,6 +97,13 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
     // it began at 0 shifts every field and silently persists garbage into
     // config.yaml.
     let Some(offset) = read_binary_offset(&cmd) else {
+        // The short-EF-identifier form selects another EF implicitly: the
+        // tracked FID no longer names the current file.
+        if let Ok(mut state) = STATE.lock() {
+            if let Some(entry) = state.get_mut(client_id) {
+                entry.last_selected_ef = None;
+            }
+        }
         return;
     };
     if offset != 0 {
@@ -134,6 +147,21 @@ fn select_ef_fid(cmd: &[u8]) -> Option<u16> {
     // SM: 0C A4 02 0C Lc 81 02 HI LO ...
     if cmd[0] == 0x0C && cmd.len() >= 9 && cmd[5] == 0x81 && cmd[6] == 0x02 {
         return Some(u16::from_be_bytes([cmd[7], cmd[8]]));
+    }
+    None
+}
+
+/// The processing status a SM response body reports in its DO'99, if any.
+fn sm_status(body: &[u8]) -> Option<[u8; 2]> {
+    let mut rest = body;
+    while let Some((&tag, after)) = rest.split_first() {
+        let (len, len_bytes) = ber_length(after)?;
+        let end = len_bytes.checked_add(len)?;
+        let value = after.get(len_bytes..end)?;
+        if tag == 0x99 {
+            return value.try_into().ok();
+        }
+        rest = &after[end..];
     }
     None
 }
@@ -293,7 +321,9 @@ const COMPANY_EF_IDENTIFICATION_LEN: usize = 65 + 36 + 36 + 2;
 /// Logs all fields and persists the subset we track (expire, company_name,
 /// company_address) into the card's config if values changed.
 fn parse_ef_identification(client_id: &str, data: &[u8]) {
-    log::debug!(
+    // Trace only: on a driver card the file holds the holder's names and
+    // birth date, and the debug level can be switched on remotely.
+    log::trace!(
         "EF_Identification (0520) plaintext ({} bytes): {}",
         data.len(),
         hex::encode(data)
@@ -388,7 +418,7 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
 /// Layout: typeOfTachographCardId (1) + cardStructureVersion (2) + noOfCompanyActivityRecords (2).
 /// Persists card_type and structure_version into the card's config if changed.
 fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
-    log::debug!(
+    log::trace!(
         "EF_Application_Identification (0501) plaintext ({} bytes): {}",
         data.len(),
         hex::encode(data)
@@ -474,8 +504,7 @@ fn name_str(b: &[u8]) -> String {
         return String::new();
     }
     let cp = b[0];
-    let payload = trim(&b[1..]);
-    format!("[cp={}] \"{}\"", cp, String::from_utf8_lossy(payload))
+    format!("[cp={}] \"{}\"", cp, decode_name(cp, trim(&b[1..])))
 }
 
 /// Extracts just the string value from a `Name` field (codePage byte + 35-byte string).
@@ -488,7 +517,34 @@ fn extract_name(b: &[u8]) -> Option<String> {
     if payload.is_empty() {
         return None;
     }
-    Some(String::from_utf8_lossy(payload).to_string())
+    Some(decode_name(b[0], payload))
+}
+
+/// Decodes the text of a `Name` field: its code page byte 1..16 is the part
+/// of ISO/IEC 8859 the bytes are in (Annex 1C, Chapter 4). Anything else is
+/// read as UTF-8, which covers plain ASCII. Where WHATWG has no exact ISO
+/// table (parts 1, 9, 11) its Windows superset decodes the same letters.
+fn decode_name(code_page: u8, text: &[u8]) -> String {
+    use encoding_rs::*;
+    let encoding = match code_page {
+        1 => WINDOWS_1252,
+        2 => ISO_8859_2,
+        3 => ISO_8859_3,
+        4 => ISO_8859_4,
+        5 => ISO_8859_5,
+        6 => ISO_8859_6,
+        7 => ISO_8859_7,
+        8 => ISO_8859_8,
+        9 => WINDOWS_1254,
+        10 => ISO_8859_10,
+        11 => WINDOWS_874,
+        13 => ISO_8859_13,
+        14 => ISO_8859_14,
+        15 => ISO_8859_15,
+        16 => ISO_8859_16,
+        _ => return String::from_utf8_lossy(text).into_owned(),
+    };
+    encoding.decode_without_bom_handling(text).0.into_owned()
 }
 
 /// IA5 fixed-length string, trims padding.
@@ -841,5 +897,34 @@ mod tests {
         let mut buf2 = vec![0x01];
         buf2.extend_from_slice(&[0xFF; 35]);
         assert_eq!(extract_name(&buf2), None);
+    }
+
+    #[test]
+    fn sm_status_reads_do99_among_the_data_objects() {
+        // DO'99 6A82 + DO'8E MAC: a SM SELECT that failed under an outer 9000
+        let body = hex::decode("99026A828E081122334455667788").unwrap();
+        assert_eq!(sm_status(&body), Some([0x6A, 0x82]));
+        // DO'81 data first, then DO'99 9000
+        let body = hex::decode("8102AABB990290008E081122334455667788").unwrap();
+        assert_eq!(sm_status(&body), Some([0x90, 0x00]));
+        assert_eq!(sm_status(&[]), None);
+        assert_eq!(sm_status(&[0x99, 0x05, 0x90]), None); // truncated
+    }
+
+    #[test]
+    fn extract_name_decodes_the_code_page() {
+        // "Müller" in ISO 8859-1, "Łódź" in ISO 8859-2, "Иван" in ISO 8859-5
+        assert_eq!(
+            extract_name(&[1, b'M', 0xFC, b'l', b'l', b'e', b'r']),
+            Some("Müller".to_string())
+        );
+        assert_eq!(
+            extract_name(&[2, 0xA3, 0xF3, b'd', 0xBC]),
+            Some("Łódź".to_string())
+        );
+        assert_eq!(
+            extract_name(&[5, 0xB8, 0xD2, 0xD0, 0xDD]),
+            Some("Иван".to_string())
+        );
     }
 }

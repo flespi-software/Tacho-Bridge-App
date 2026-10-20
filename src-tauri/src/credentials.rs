@@ -31,6 +31,13 @@ fn apply(
     password: Option<&str>,
     save: bool,
 ) -> Result<(), String> {
+    // One change at a time: the dialog and the server command can race on two
+    // blocking threads, and the session pair and the file are updated in
+    // separate steps — interleaved, one could delete the pair the other saved.
+    static APPLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _applying = APPLY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let username = username.filter(|u| !u.is_empty());
     if enabled && !save {
         // For this run only: resolve the pair now (a field left untouched in

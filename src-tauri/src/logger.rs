@@ -215,6 +215,13 @@ impl RotatingLogWriter {
     }
 
     fn rotate(&mut self) {
+        // odd while the generations are being moved (see `rotation_epoch`)
+        ROTATION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.rotate_files();
+        ROTATION_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn rotate_files(&mut self) {
         // close our handle first: Windows cannot rename a file that is open
         drop(self.file.take());
 
@@ -231,7 +238,14 @@ impl RotatingLogWriter {
                 Ok(()) => {
                     let dir = self.dir.clone();
                     let keep = self.keep;
-                    std::thread::spawn(move || archive_detached_generations(&dir, &[temp], keep));
+                    // `Builder::spawn` reports a failure instead of panicking:
+                    // this runs under the logger lock, and the panic hook logs.
+                    let spawned = std::thread::Builder::new()
+                        .spawn(move || archive_detached_generations(&dir, &[temp], keep));
+                    if let Err(e) = spawned {
+                        // the generation stays detached for the next start's sweep
+                        eprintln!("Failed to start log archiving: {}", e);
+                    }
                 }
                 Err(e) => {
                     // Keep the displaced generation. Deleting it here would destroy up
@@ -267,6 +281,15 @@ impl RotatingLogWriter {
             }
         }
     }
+}
+
+/// Bumped before and after every rotation: odd while one is moving the files.
+static ROTATION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lets a reader of both generations tell whether a rotation ran in between
+/// (the value changed) or is running now (it is odd).
+pub fn rotation_epoch() -> u64 {
+    ROTATION_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 impl Write for RotatingLogWriter {
@@ -419,6 +442,25 @@ fn archive_detached_generations(dir: &Path, detached: &[PathBuf], keep: usize) {
     }
 }
 
+/// Removes the `.part` files of archivings cut off by a previous exit. Runs at
+/// startup, before this process archives anything (one instance at a time).
+fn remove_partial_archives(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir.join("archive")) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        let partial = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("log_") && name.ends_with(".zip.part"));
+        if partial {
+            if let Err(e) = std::fs::remove_file(&path) {
+                eprintln!("Failed to remove partial log archive {:?}: {}", path, e);
+            }
+        }
+    }
+}
+
 /// Removes the oldest `log_*.zip` archives so at most `keep` remain. The
 /// timestamped names sort chronologically, so a name sort is enough.
 fn prune_archives(archive_dir: &Path, keep: usize) {
@@ -520,6 +562,7 @@ pub fn setup_logging() {
     // detached right away and zipped in the background: waiting for the next
     // rotation to displace it would keep hundreds of MB on disk for months and
     // then stall the logging mutex while such a generation is compressed.
+    remove_partial_archives(&dir);
     let detached = detach_oversized_generation(&dir, LOG_ROTATE_BYTES);
     if !detached.is_empty() {
         let sweep_dir = dir.clone();

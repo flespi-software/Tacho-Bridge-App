@@ -257,15 +257,27 @@ fn collect_zipped_logs(days: i64, period: &str) -> Result<(String, Vec<u8>), Str
     let cutoff = Local::now().naive_local() - Duration::days(days);
     let (current_path, archived_path) = log_file_paths();
 
-    // Snapshot both generations at one instant BEFORE any reading: the logger
-    // rotates concurrently (log.txt -> log.1.txt -> archive), and path-based
-    // opens spread over the collection would miss a whole generation when a
-    // rotation lands between them. An open handle keeps following its file
-    // across the rename, so the pair below stays a consistent chain.
-    let mut current_file =
-        open_optional(&current_path).map_err(|e| format!("cannot read log file: {}", e))?;
-    let archived_file = open_optional(&archived_path)
-        .map_err(|e| format!("cannot read archived log file: {}", e))?;
+    // Snapshot both generations BEFORE any reading: the logger rotates
+    // concurrently (log.txt -> log.1.txt -> archive). An open handle keeps
+    // following its file across the rename, but a rotation landing between
+    // the two opens would pair one generation with itself and drop the other:
+    // the opens are retried until no rotation ran in between.
+    let (mut current_file, archived_file) = {
+        let mut attempt = 0;
+        loop {
+            let epoch = crate::logger::rotation_epoch();
+            let current =
+                open_optional(&current_path).map_err(|e| format!("cannot read log file: {}", e))?;
+            let archived = open_optional(&archived_path)
+                .map_err(|e| format!("cannot read archived log file: {}", e))?;
+            attempt += 1;
+            let stable = epoch % 2 == 0 && crate::logger::rotation_epoch() == epoch;
+            if stable || attempt >= 10 {
+                break (current, archived);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
 
     // the current log covers the whole period when its first entry is older than the cutoff
     let first_ts = match current_file.as_mut() {

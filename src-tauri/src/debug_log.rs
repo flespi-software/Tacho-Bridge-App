@@ -279,21 +279,27 @@ fn persist() {
     }
 }
 
+/// Bound of one command reply publish.
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn reply(client: &AsyncClient, log_header: &str, topic: String, value: Value) {
     let client = client.clone();
     let log_header = log_header.to_string();
     async_runtime::spawn(async move {
-        if let Err(e) = client
-            .publish(&topic, QoS::AtLeastOnce, false, value.to_string())
-            .await
-        {
-            log::error!(
-                "{} [DEBUG] status=reply_failed topic={} err={:?}",
-                log_header,
-                topic,
-                e
-            );
-        }
+        // Bounded: a full request channel of a connection stuck offline would
+        // otherwise park this task for as long as the outage lasts.
+        let publish = client.publish(&topic, QoS::AtLeastOnce, false, value.to_string());
+        let err = match tokio::time::timeout(REPLY_TIMEOUT, publish).await {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => format!("{:?}", e),
+            Err(_) => "timeout".to_string(),
+        };
+        log::error!(
+            "{} [DEBUG] status=reply_failed topic={} err={}",
+            log_header,
+            topic,
+            err
+        );
     });
 }
 

@@ -30,7 +30,9 @@ pcsc = "2.9.0"
 hex = "0.4.3"
 sha2 = "0.10" # frame digests in the debug log (already a transitive dependency)
 rumqttc = "0.25.1"
-fern = "0.7.1"
+# Formats a record into one buffer before taking the logger lock: one write
+# per line, and a panicking argument cannot fire inside the lock.
+fern = { version = "0.7.1", features = ["meta-logging-in-format"] }
 chrono = "0.4.39"
 serde_yaml = "0.9.34"
 lazy_static = "1.5.0"
@@ -47,6 +49,8 @@ tauri-plugin-single-instance = "2"
 # Self-update from GitHub releases (latest.json + minisign-signed artifacts).
 tauri-plugin-updater = "2"
 tauri-plugin-autostart = "2.5.1"
+# Tachograph `Name` fields (company name/address) carry an ISO 8859 code page.
+encoding_rs = "0.8"
 
 # Windows only: the serial-port layer there reports the FTDI driver's strings,
 # not the device's own USB descriptors. nusb reads the real iProduct/serial

@@ -288,7 +288,7 @@ fn save_config(
     tmp_name.push(".tmp");
     tmp_path.push(tmp_name);
 
-    {
+    let written = (|| -> io::Result<()> {
         // The file may hold the broker credentials: owner-only on unix, from
         // creation on (`mode` covers a fresh file, `set_permissions` a
         // leftover one from a crash), so no window exposes a readable copy.
@@ -303,7 +303,12 @@ fn save_config(
             tmp_file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
         tmp_file.write_all(yaml.as_bytes())?;
-        tmp_file.sync_all()?;
+        tmp_file.sync_all()
+    })();
+    if let Err(e) = written {
+        // A partial temp copy (disk full) may still hold the credentials.
+        let _ = fs::remove_file(&tmp_path);
+        return Err(Box::new(e));
     }
 
     if let Err(e) = rename_with_retry(&tmp_path, config_path) {
@@ -359,6 +364,20 @@ fn update_card_config(
 
     let mut config = load_config(config_path)?;
     log::debug!("Loaded configuration: {:?}", config);
+
+    // The card number becomes the MQTT client id and part of its topics: a new
+    // entry must have the card number format (the dialog checks it too). An
+    // existing entry is updated as it is, whatever it was saved as.
+    if !config.cards.contains_key(card_number) && !is_valid_card_number(card_number) {
+        return Err(format!(
+            "invalid card number '{}': 16 characters A-Z, 0-9 expected",
+            card_number
+        )
+        .into());
+    }
+    if !content.iccid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid ICCID '{}': hex digits expected", content.iccid).into());
+    }
 
     // One physical card belongs to exactly one card number. Linking an ICCID
     // that another entry already holds would make `find_card_number_by_iccid`
@@ -1004,12 +1023,15 @@ pub fn find_card_number_by_iccid(iccid: &str) -> Option<String> {
 /// `success == true` → green "success" line in UI; `false` → red "fail".
 /// The processing state while auth is running is derived from Reader.authentication
 /// in the frontend and is NOT stored here (it's transient, lost on restart).
-fn record_auth_result(card_number: &str, success: bool) {
-    let ts = chrono::Utc::now().timestamp() as u64;
+fn record_auth_result(card_number: &str, success: bool, ts: u64) {
     // Mutate fresh file state under the config lock instead of writing a full
     // cache snapshot back — a stale snapshot would revert fields a concurrent
-    // writer (e.g. the sniffer) just persisted.
+    // writer (e.g. the sniffer) just persisted. Detached writes can run out of
+    // order: an older result never replaces a newer one.
     let outcome = mutate_card_config(card_number, |card| {
+        if card.last_auth.is_some_and(|(recorded, _)| recorded > ts) {
+            return false;
+        }
         card.last_auth = Some((ts, success));
         true
     });
@@ -1040,8 +1062,10 @@ fn record_auth_result(card_number: &str, success: bool) {
 /// have landed before the reply goes out.
 pub fn record_auth_result_detached(card_number: &str, success: bool) {
     let card_number = card_number.to_string();
+    // when the authentication ended, not when the blocking pool gets to it
+    let ts = chrono::Utc::now().timestamp() as u64;
     tauri::async_runtime::spawn_blocking(move || {
-        record_auth_result(&card_number, success);
+        record_auth_result(&card_number, success, ts);
     });
 }
 
@@ -1095,7 +1119,12 @@ pub fn get_from_cache(section: CacheSection, key: &str) -> String {
 /// unable to connect, with no remote way back.
 pub fn split_host_to_parts(host: &str) -> Result<(String, u16), String> {
     let format_err = || "Host doesn't correspond to the format 'host:port'".to_string();
-    let (name, port) = host.split_once(':').ok_or_else(format_err)?;
+    let host = host.trim();
+    // An IPv6 literal is bracketed: `[2001:db8::1]:8883`.
+    let (name, port) = match host.strip_prefix('[') {
+        Some(rest) => rest.split_once("]:").ok_or_else(format_err)?,
+        None => host.split_once(':').ok_or_else(format_err)?,
+    };
     let name = name.trim();
     if name.is_empty() || port.contains(':') {
         return Err(format_err());
@@ -1214,6 +1243,14 @@ pub fn saved_credentials() -> Option<(String, String)> {
     Some((username, server.password.clone().unwrap_or_default()))
 }
 
+/// The tachograph card number format (same rule as the frontend dialog).
+fn is_valid_card_number(number: &str) -> bool {
+    number.len() == 16
+        && number
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
 /// The app identity format the server registers devices under: "TBA" + 13
 /// digits (mirrors `TBA_IDENT_REGEXP` in the frontend).
 fn is_valid_ident(ident: &str) -> bool {
@@ -1266,14 +1303,31 @@ pub fn init_config() -> io::Result<()> {
     };
 
     if exists {
-        let mut contents = String::new();
-        File::open(&config_path)?.read_to_string(&mut contents)?;
+        // A file saved as another encoding by a hand edit goes down the corrupt
+        // path too: backed up, then salvaged from its lossy decoding.
+        let (contents, parsed) = match String::from_utf8(fs::read(&config_path)?) {
+            Ok(text) => {
+                let parsed =
+                    serde_yaml::from_str::<ConfigurationFile>(&text).map_err(|e| e.to_string());
+                (text, parsed)
+            }
+            Err(e) => (
+                String::from_utf8_lossy(e.as_bytes()).into_owned(),
+                Err(format!("not valid UTF-8: {e}")),
+            ),
+        };
 
-        match serde_yaml::from_str::<ConfigurationFile>(&contents) {
+        match parsed {
             Ok(mut loaded_config) => {
                 let version = env!("CARGO_PKG_VERSION");
                 needs_save = loaded_config.version != version;
                 loaded_config.version = version.to_string();
+                // A hand-prepared config may carry only `server` and `cards`;
+                // without an ident the app never connects.
+                if loaded_config.ident.as_deref().is_none_or(str::is_empty) {
+                    loaded_config.ident = Some(generate_ident());
+                    needs_save = true;
+                }
                 config = loaded_config;
             }
             Err(e) => {
@@ -1286,10 +1340,13 @@ pub fn init_config() -> io::Result<()> {
                     "yaml.corrupt.{}",
                     chrono::Local::now().format("%Y%m%d_%H%M%S")
                 ));
-                // A rename fails when another process holds the file (cloud
-                // sync, antivirus on Windows); a copy usually still works.
-                let backed_up = fs::rename(&config_path, &backup)
-                    .or_else(|_| fs::copy(&config_path, &backup).map(|_| ()));
+                // A copy keeps the original in place until the atomic save
+                // below replaces it: a crash or a full disk in between must
+                // not leave the app with no config (it would start over with
+                // a new ident). The rename is a fallback for a full disk.
+                let backed_up = fs::copy(&config_path, &backup)
+                    .map(|_| ())
+                    .or_else(|_| fs::rename(&config_path, &backup));
                 if let Err(backup_err) = backed_up {
                     // Never overwrite a file that has no copy: leave it for
                     // the user to repair and run without a config.
@@ -1641,6 +1698,24 @@ mod tests {
     fn split_host_to_parts_rejects_empty_host_and_extra_colons() {
         assert!(split_host_to_parts(":1883").is_err());
         assert!(split_host_to_parts("a:b:1883").is_err());
+    }
+
+    #[test]
+    fn card_number_format() {
+        assert!(is_valid_card_number("ABCDEF0123456789"));
+        assert!(!is_valid_card_number("abcdef0123456789"));
+        assert!(!is_valid_card_number("ABCDEF012345678"));
+        assert!(!is_valid_card_number("ABCDEF012345678/"));
+        assert!(!is_valid_card_number("ABCDEF012345678#"));
+    }
+
+    #[test]
+    fn split_host_to_parts_accepts_bracketed_ipv6() {
+        let (host, port) = split_host_to_parts("[2001:db8::1]:8883").expect("split");
+        assert_eq!(host, "2001:db8::1");
+        assert_eq!(port, 8883);
+        assert!(split_host_to_parts("[2001:db8::1]").is_err());
+        assert!(split_host_to_parts("[]:8883").is_err());
     }
 
     #[test]
