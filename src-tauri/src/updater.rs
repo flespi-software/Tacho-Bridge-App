@@ -30,12 +30,36 @@ struct PendingUpdate {
     /// Monotonic time of the last failed attempt; the next retry waits for the
     /// backoff derived from `failed_attempts`.
     last_failure: Option<std::time::Instant>,
+    /// Set when the unattended install gave up on this version: it stays
+    /// parked (the user can still install it from the notification), but the
+    /// loop leaves it alone for `GIVE_UP_PAUSE`.
+    gave_up_at: Option<std::time::Instant>,
+    /// Whether the "installing, the app will restart" banner was shown.
+    install_announced: bool,
 }
 
-/// After this many consecutive failures the parked update is dropped. A fresh
-/// network check can still find it again later (hourly at most), so a genuinely
-/// transient outage is not fatal — this only stops the tight retry loop.
+/// After this many consecutive failures the unattended install gives up on the
+/// version for `GIVE_UP_PAUSE` — a permanently broken artifact (bad signature,
+/// truncated asset) is then not re-downloaded around the clock.
 const MAX_INSTALL_ATTEMPTS: u32 = 5;
+
+/// How long a version the loop gave up on is left alone.
+const GIVE_UP_PAUSE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Why an install did not happen.
+enum InstallError {
+    /// A card authentication is in progress; nothing failed, try later.
+    Postponed(String),
+    Failed(String),
+}
+
+impl From<InstallError> for String {
+    fn from(e: InstallError) -> Self {
+        match e {
+            InstallError::Postponed(e) | InstallError::Failed(e) => e,
+        }
+    }
+}
 
 /// Backoff before retrying a failed install: 10 min, 20, 40, 80 …
 fn install_retry_backoff(failed_attempts: u32) -> std::time::Duration {
@@ -143,14 +167,29 @@ async fn perform_check(
             );
             let already_announced = {
                 let mut guard = PENDING_UPDATE.lock().await;
-                let already_announced = guard
+                // The same version found again keeps its install history: a
+                // re-check must not reset the backoff or the give-up.
+                let same = guard
                     .as_ref()
-                    .is_some_and(|pending| pending.update.version == version);
+                    .filter(|pending| pending.update.version == version && pending.beta == beta);
+                let already_announced = same.is_some();
+                let (failed_attempts, last_failure, gave_up_at, install_announced) = same
+                    .map(|p| {
+                        (
+                            p.failed_attempts,
+                            p.last_failure,
+                            p.gave_up_at,
+                            p.install_announced,
+                        )
+                    })
+                    .unwrap_or_default();
                 *guard = Some(PendingUpdate {
                     update,
                     beta,
-                    failed_attempts: 0,
-                    last_failure: None,
+                    failed_attempts,
+                    last_failure,
+                    gave_up_at,
+                    install_announced,
                 });
                 already_announced
             };
@@ -244,11 +283,14 @@ pub async fn auto_update_loop(app: AppHandle) {
             continue;
         }
 
-        // Look for a new version when the hourly budget allows and nothing is
-        // already waiting to be installed.
-        if PENDING_UPDATE.lock().await.is_none()
-            && last_network_check.elapsed() >= AUTO_CHECK_MIN_INTERVAL
-        {
+        // Look for a new version when the hourly budget allows and nothing
+        // installable is already waiting.
+        let nothing_installable = PENDING_UPDATE
+            .lock()
+            .await
+            .as_ref()
+            .is_none_or(|pending| pending.gave_up_at.is_some());
+        if nothing_installable && last_network_check.elapsed() >= AUTO_CHECK_MIN_INTERVAL {
             last_network_check = std::time::Instant::now();
             let _ = perform_check(&app, None).await;
         }
@@ -266,11 +308,19 @@ pub async fn auto_update_loop(app: AppHandle) {
         let beta_now =
             crate::config::get_from_cache(crate::config::CacheSection::Updates, "beta_updates")
                 == "true";
-        let (version, prior_attempts) = {
+        let (version, prior_attempts, announce) = {
             let mut guard = PENDING_UPDATE.lock().await;
-            let Some(pending) = guard.as_ref() else {
+            let Some(pending) = guard.as_mut() else {
                 continue;
             };
+            if let Some(gave_up_at) = pending.gave_up_at {
+                if gave_up_at.elapsed() < GIVE_UP_PAUSE {
+                    continue;
+                }
+                pending.gave_up_at = None;
+                pending.failed_attempts = 0;
+                pending.last_failure = None;
+            }
             if pending.beta != beta_now {
                 log::info!(
                     "{TAG} phase=auto_install status=dropped version={} reason=channel_changed parked_channel={} current_channel={}",
@@ -289,7 +339,11 @@ pub async fn auto_update_loop(app: AppHandle) {
                     continue;
                 }
             }
-            (pending.update.version.clone(), pending.failed_attempts)
+            (
+                pending.update.version.clone(),
+                pending.failed_attempts,
+                !pending.install_announced,
+            )
         };
         let quiet_for = crate::mqtt::seconds_since_card_activity();
         if quiet_for < AUTO_INSTALL_QUIET_SECS {
@@ -316,10 +370,12 @@ pub async fn auto_update_loop(app: AppHandle) {
             "{TAG} phase=auto_install status=starting version={version} attempt={}",
             prior_attempts + 1
         );
-        // Announce the install once. A retry after a failed attempt must not
-        // re-promise a restart that never came — repeating the banner every
-        // retry was pure noise to the user.
-        if prior_attempts == 0 {
+        // Announce the install once. A retry after a failed or postponed
+        // attempt must not re-promise a restart that never came.
+        if announce {
+            if let Some(pending) = PENDING_UPDATE.lock().await.as_mut() {
+                pending.install_announced = true;
+            }
             emit_notification_event(
                 "global-notification",
                 NotificationPayload {
@@ -333,25 +389,37 @@ pub async fn auto_update_loop(app: AppHandle) {
         // On success the app is restarting (the restart is only requested, so
         // this returns Ok); on failure the update stays parked and the next
         // tick retries after a backoff.
-        if let Err(e) = install_update(app.clone()).await {
-            log::error!("{TAG} phase=auto_install status=failed version={version} err={e}");
-            let mut guard = PENDING_UPDATE.lock().await;
-            if let Some(pending) = guard.as_mut() {
-                // Only count the failure against the update we actually tried:
-                // a concurrent check may have replaced the slot meanwhile.
-                if pending.update.version == version {
-                    pending.failed_attempts += 1;
-                    pending.last_failure = Some(std::time::Instant::now());
-                    if pending.failed_attempts >= MAX_INSTALL_ATTEMPTS {
-                        log::error!(
-                            "{TAG} phase=auto_install status=gave_up version={version} attempts={} — a later check may find it again",
-                            pending.failed_attempts
-                        );
-                        *guard = None;
-                    }
-                }
+        match install_parked(&app).await {
+            Ok(()) => {}
+            // Cards got busy meanwhile: not the artifact's fault.
+            Err(InstallError::Postponed(e)) => {
+                log::info!("{TAG} phase=auto_install status=postponed version={version} err={e}");
+            }
+            Err(InstallError::Failed(e)) => {
+                log::error!("{TAG} phase=auto_install status=failed version={version} err={e}");
+                record_install_failure(&version).await;
             }
         }
+    }
+}
+
+/// Counts a failed unattended install against the update that was tried.
+async fn record_install_failure(version: &str) {
+    let mut guard = PENDING_UPDATE.lock().await;
+    // Only count the failure against the update we actually tried: a
+    // concurrent check may have replaced the slot meanwhile.
+    let Some(pending) = guard.as_mut().filter(|p| p.update.version == version) else {
+        return;
+    };
+    pending.failed_attempts += 1;
+    pending.last_failure = Some(std::time::Instant::now());
+    if pending.failed_attempts >= MAX_INSTALL_ATTEMPTS {
+        log::error!(
+            "{TAG} phase=auto_install status=gave_up version={version} attempts={} retry_in_hours={}",
+            pending.failed_attempts,
+            GIVE_UP_PAUSE.as_secs() / 3600
+        );
+        pending.gave_up_at = Some(std::time::Instant::now());
     }
 }
 
@@ -377,12 +445,19 @@ pub fn get_changelog() -> &'static str {
 /// Invoked from the frontend when the user accepts the update notification.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
+    install_parked(&app).await.map_err(String::from)
+}
+
+/// The install itself, with a postponement told apart from a failure.
+async fn install_parked(app: &AppHandle) -> Result<(), InstallError> {
     // Claim the install slot before touching PENDING_UPDATE, so a concurrent
     // caller (auto-loop vs. the user's "Install" click) backs off instead of
     // racing us for the taken update.
     if INSTALL_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::SeqCst) {
         log::info!("{TAG} phase=install status=skipped reason=already_in_progress");
-        return Err("an update install is already in progress".to_string());
+        return Err(InstallError::Postponed(
+            "an update install is already in progress".to_string(),
+        ));
     }
     let _install_guard = InstallGuard;
 
@@ -399,7 +474,7 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
         guard
             .as_ref()
             .map(|pending| pending.update.clone())
-            .ok_or_else(|| "no pending update".to_string())?
+            .ok_or_else(|| InstallError::Failed("no pending update".to_string()))?
     };
 
     log::info!(
@@ -432,18 +507,20 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(e)) => {
             log::error!("{TAG} phase=install status=failed err={e}");
-            return Err(e.to_string());
+            return Err(InstallError::Failed(e.to_string()));
         }
         Err(_) => {
             log::error!("{TAG} phase=install status=failed err=download_timeout");
-            return Err("the update download timed out".to_string());
+            return Err(InstallError::Failed(
+                "the update download timed out".to_string(),
+            ));
         }
     };
 
     // The download can take minutes on a slow link: an authentication that
-    // started meanwhile must not be cut by the restart. The next tick (or the
-    // user's retry) downloads again once the link is quiet.
-    refuse_while_card_active()?;
+    // started meanwhile must not be cut by the restart. Wait for it to end
+    // with the bytes in hand rather than throw them away.
+    wait_for_card_quiet().await?;
 
     // Release the rack's serial port and close the broker sessions before
     // installing: on Windows the NSIS install exits the process from inside
@@ -451,12 +528,17 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
     crate::com_port::shutdown();
     crate::mqtt::remove_connections_all().await;
 
-    if let Err(e) = update.install(bytes) {
+    // Unpacking and replacing the bundle takes seconds of blocking file I/O.
+    let installed = tauri::async_runtime::spawn_blocking(move || update.install(bytes))
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|result| result.map_err(|e| e.to_string()));
+    if let Err(e) = installed {
         log::error!("{TAG} phase=install status=failed step=install err={e}");
         // Bring back what was torn down for the install.
         crate::com_port::resume();
         crate::app_connect::reconnect_everything("update_install_failed").await;
-        return Err(e.to_string());
+        return Err(InstallError::Failed(e));
     }
 
     // Installed successfully — drop it so the restarted app does not find a
@@ -499,18 +581,33 @@ pub async fn replay_pending_update() {
 
 /// An install restarts the app; a card authentication in flight would be cut
 /// mid-way and fail on the VU side.
-fn refuse_while_card_active() -> Result<(), String> {
+fn refuse_while_card_active() -> Result<(), InstallError> {
     let quiet_for = crate::mqtt::seconds_since_card_activity();
     if quiet_for < AUTO_INSTALL_QUIET_SECS {
         log::info!(
             "{TAG} phase=install status=postponed reason=card_activity quiet_secs={quiet_for}"
         );
-        return Err(format!(
+        return Err(InstallError::Postponed(format!(
             "a card authentication is in progress; retry in {} seconds",
             AUTO_INSTALL_QUIET_SECS - quiet_for
-        ));
+        )));
     }
     Ok(())
+}
+
+/// How long a downloaded update waits for the card link to go quiet.
+const QUIET_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// `refuse_while_card_active`, waiting up to `QUIET_WAIT_MAX` for the link to
+/// go quiet first.
+async fn wait_for_card_quiet() -> Result<(), InstallError> {
+    let started = std::time::Instant::now();
+    while crate::mqtt::seconds_since_card_activity() < AUTO_INSTALL_QUIET_SECS
+        && started.elapsed() < QUIET_WAIT_MAX
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+    refuse_while_card_active()
 }
 
 #[cfg(test)]
