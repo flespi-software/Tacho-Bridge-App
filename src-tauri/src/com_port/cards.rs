@@ -10,6 +10,7 @@
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, Event, Incoming};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tauri::async_runtime::{self, JoinHandle};
@@ -26,9 +27,7 @@ use super::transport::{
     execute_envelope, normalize_hex, SerialEnvelope, SharedPort, SERIAL_MS_MAX, SERIAL_MS_MIN,
     SERIAL_READ_DEADLINE, SERIAL_REPLY_TIMEOUT,
 };
-use super::{
-    linked_rack_ports, lock, next_reconnect_delay, rack_port_is_live, RECONNECT_DELAY_INITIAL_SECS,
-};
+use super::{linked_rack_ports, lock, rack_port_is_live, Backoff, RECONNECT_DELAY_INITIAL_SECS};
 
 /// One rack-backed card session: the running task plus the identity it was
 /// spawned with. `rack_id` is the id of the rack whose serial port the session
@@ -225,7 +224,9 @@ pub async fn connect_pending_rack_cards() {
             iccid,
             card_number
         );
-        update_rack_card_ui(&rack_id, slot, &iccid, Some(card_number.clone()));
+        update_rack_card_ui(&rack_id, slot, &iccid, Some(card_number.clone()), || {
+            card_epoch(&rack_id) == epoch
+        });
         spawn_rack_card_checked(
             card_number,
             iccid,
@@ -446,11 +447,100 @@ fn link_report(iccid: &str, slot: u16, rack_id: &str) -> String {
 }
 
 /// Task aborts (card removed/moved or a rack restart) release local ownership.
-struct AuthCleanup(SharedPort, u16);
+/// Only this session's own lease: the abort can land after a successor in the
+/// same slot took its lease, which must survive.
+struct AuthCleanup(SharedPort, u16, u64);
 impl Drop for AuthCleanup {
     fn drop(&mut self) {
-        super::access::release(&self.0, self.1, false, None);
+        super::access::release(&self.0, self.1, false, Some(self.2));
     }
+}
+
+/// Owner tokens of the card sessions' authentication leases.
+static NEXT_AUTH_SESSION: AtomicU64 = AtomicU64::new(1);
+
+/// Work of a card session's serial worker, in MQTT arrival order.
+enum CardJob {
+    /// The MQTT session was (re)established or lost: the server's request ids
+    /// restart and its authentication is gone.
+    Reset,
+    /// A serial envelope, tagged with the MQTT session it arrived on.
+    Request {
+        topic: String,
+        payload: Vec<u8>,
+        connection: u64,
+    },
+}
+
+/// Aborts the task when dropped: the worker must not outlive its session.
+struct AbortOnDrop(JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Runs a card session's serial requests one at a time, off its MQTT poll
+/// loop. One exchange can wait far longer than the keep-alive (slot lease,
+/// port queue, read deadline); a loop parked on it sends no PINGREQ, and the
+/// broker drops the session together with the reply.
+///
+/// `in_flight` is set while a request runs.
+fn spawn_serial_worker(
+    card: (String, String, u16, u64),
+    serial_port: SharedPort,
+    mqtt_client: AsyncClient,
+    connection: Arc<AtomicU64>,
+    in_flight: Arc<AtomicBool>,
+    log_header: String,
+) -> (tokio::sync::mpsc::UnboundedSender<CardJob>, AbortOnDrop) {
+    let (jobs, mut queue) = tokio::sync::mpsc::unbounded_channel::<CardJob>();
+    let (iccid, card_number, slot, session) = card;
+    let worker = async_runtime::spawn(async move {
+        let mut idempotency = IdempotencySlot::default();
+        while let Some(job) = queue.recv().await {
+            let (topic, payload, arrived_on) = match job {
+                CardJob::Reset => {
+                    idempotency.reset();
+                    super::access::release(&serial_port, slot, false, Some(session));
+                    continue;
+                }
+                CardJob::Request {
+                    topic,
+                    payload,
+                    connection,
+                } => (topic, payload, connection),
+            };
+            // Activity marking happens inside, driven by the envelope's
+            // `finish` flag rather than by the mere arrival of a command.
+            in_flight.store(true, Ordering::SeqCst);
+            let reply = run_serial_request(
+                &topic,
+                &payload,
+                &serial_port,
+                &log_header,
+                &mut idempotency,
+                Some((&iccid, &card_number, slot, session)),
+            )
+            .await;
+            in_flight.store(false, Ordering::SeqCst);
+            let Some((resp_topic, resp_payload)) = reply else {
+                continue;
+            };
+            // A reply of a lost MQTT session would go out on the next one,
+            // whose request ids restart at 1, and answer the wrong request.
+            if connection.load(Ordering::SeqCst) != arrived_on {
+                log::warn!(
+                    "{} [MQTT] status=reply_dropped reason=connection_replaced topic={}",
+                    log_header,
+                    resp_topic
+                );
+                continue;
+            }
+            publish_reply(&mqtt_client, resp_topic, resp_payload, &log_header).await;
+        }
+    });
+    (jobs, AbortOnDrop(worker))
 }
 
 /// MQTT loop of one rack-backed card connection: the opaque envelope handling funneled into
@@ -467,7 +557,8 @@ async fn rack_card_mqtt_loop(
     // see RackCardTask.client
     client_slot: Arc<OnceLock<AsyncClient>>,
 ) {
-    let _ownership = AuthCleanup(serial_port.clone(), slot);
+    let session = NEXT_AUTH_SESSION.fetch_add(1, Ordering::Relaxed);
+    let _ownership = AuthCleanup(serial_port.clone(), slot, session);
     let log_header = format!("RACKCARD {} |", card_number);
 
     // same waiting policy as the rack loop: the server may not be configured yet
@@ -497,16 +588,37 @@ async fn rack_card_mqtt_loop(
     let (mqtt_client, mut eventloop) = crate::mqtt::build_mqtt_client(&card_number, &host, port);
     let _ = client_slot.set(mqtt_client.clone());
 
+    // Bumped on every CONNACK and connection loss: tags requests with the MQTT
+    // session they arrived on.
+    let connection = Arc::new(AtomicU64::new(0));
+    let in_flight = Arc::new(AtomicBool::new(false));
+    let (jobs, _worker) = spawn_serial_worker(
+        (iccid.clone(), card_number.clone(), slot, session),
+        serial_port.clone(),
+        mqtt_client.clone(),
+        connection.clone(),
+        in_flight.clone(),
+        log_header.clone(),
+    );
+    // Queues a job; the worker only stops if it panicked, which ends the
+    // session as a panic inline would have.
+    let enqueue = |job: CardJob| {
+        let sent = jobs.send(job).is_ok();
+        if !sent {
+            log::error!("{} [MQTT] status=serial_worker_died", log_header);
+        }
+        sent
+    };
+
     let mut is_online = false;
-    let mut reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
-    let mut idempotency = IdempotencySlot::default();
+    let mut backoff = Backoff::new();
 
     loop {
         match eventloop.poll().await {
             Ok(notification) => {
                 if !is_online {
                     is_online = true;
-                    reconnect_delay_secs = RECONNECT_DELAY_INITIAL_SECS;
+                    backoff.connected();
                     log::info!(
                         "{} [MQTT] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
                         log_header
@@ -516,8 +628,10 @@ async fn rack_card_mqtt_loop(
                 match notification {
                     Event::Incoming(Incoming::ConnAck(..)) => {
                         // new MQTT session: the server-side request_id counter restarts at 1
-                        idempotency.reset();
-                        super::access::release(&serial_port, slot, false, None);
+                        connection.fetch_add(1, Ordering::SeqCst);
+                        if !enqueue(CardJob::Reset) {
+                            return;
+                        }
                         // Session is up: show the card as served and idle.
                         set_rack_card_state(&iccid, true, false);
                         // rack link report: must be the first publish of the session
@@ -579,35 +693,29 @@ async fn rack_card_mqtt_loop(
                             );
                             continue;
                         }
-                        // Activity marking happens inside, driven by the
-                        // envelope's `finish` flag rather than by the mere
-                        // arrival of a command.
-                        if let Some((resp_topic, resp_payload)) = run_serial_request(
-                            &topic,
-                            &publish.payload,
-                            &serial_port,
-                            &log_header,
-                            &mut idempotency,
-                            Some((&iccid, &card_number, slot)),
-                        )
-                        .await
-                        {
-                            publish_reply(&mqtt_client, resp_topic, resp_payload, &log_header)
-                                .await;
+                        if !enqueue(CardJob::Request {
+                            topic,
+                            payload: publish.payload.to_vec(),
+                            connection: connection.load(Ordering::SeqCst),
+                        }) {
+                            return;
                         }
                     }
                     Event::Incoming(Incoming::PingResp(..)) => {
                         // A keep-alive ping means this connection sent nothing
-                        // for the whole keep-alive window: no serial exchange
-                        // is in flight. Clear the busy indicator — same
-                        // self-heal the reader path performs in mqtt.rs. This
-                        // is the only recovery when the closing `finish:true`
-                        // envelope never arrives (tracker aborted the session,
-                        // message lost, or an older server that does not send
-                        // the flag at all); without it the activity animation
-                        // blinks forever on an idle card.
-                        set_rack_card_state(&iccid, true, false);
-                        log::debug!("{} [MQTT] event=ping_resp status=idle", log_header);
+                        // for the whole keep-alive window. Unless a serial
+                        // exchange is still running in the worker, the card is
+                        // idle: clear the busy indicator — same self-heal the
+                        // reader path performs in mqtt.rs. This is the only
+                        // recovery when the closing `finish:true` envelope
+                        // never arrives (tracker aborted the session, message
+                        // lost, or an older server that does not send the flag
+                        // at all); without it the activity animation blinks
+                        // forever on an idle card.
+                        if !in_flight.load(Ordering::SeqCst) {
+                            set_rack_card_state(&iccid, true, false);
+                            log::debug!("{} [MQTT] event=ping_resp status=idle", log_header);
+                        }
                     }
                     other => {
                         log::debug!("{} [MQTT] event=other detail={:?}", log_header, other);
@@ -621,11 +729,14 @@ async fn rack_card_mqtt_loop(
                     "OFFLINE"
                 };
                 is_online = false;
-                idempotency.reset();
-                super::access::release(&serial_port, slot, false, None);
+                connection.fetch_add(1, Ordering::SeqCst);
+                if !enqueue(CardJob::Reset) {
+                    return;
+                }
                 // Connection lost: the card is present in its slot but no
                 // longer served, so it must stop looking active.
                 set_rack_card_state(&iccid, false, false);
+                let reconnect_delay_secs = backoff.failed();
                 crate::mqtt::log_connection_failure(
                     &log_header,
                     "MQTT",
@@ -634,7 +745,6 @@ async fn rack_card_mqtt_loop(
                     reconnect_delay_secs,
                 );
                 tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
-                reconnect_delay_secs = next_reconnect_delay(reconnect_delay_secs);
             }
         }
     }
@@ -956,6 +1066,9 @@ pub fn disconnect_rack_card(card_number: &str) {
             if card.card_number.as_deref() == Some(card_number) {
                 card.card_number = None;
                 card.name = None;
+                // its session is gone: not served, not busy
+                card.online = None;
+                card.authentication = None;
                 touched = true;
             }
         }
@@ -1061,6 +1174,12 @@ pub(super) async fn handle_cards_set(
             return;
         }
     };
+    // A set dispatched before an unlink/relink belongs to the previous life of
+    // the rack: taking an epoch would let it write that life's rows.
+    if !rack_port_is_live(&rack_id, &serial_port) {
+        log::info!("{} [CARDS] status=ignored reason=port_replaced", log_header);
+        return;
+    }
     let epoch = bump_card_epoch(&rack_id);
     // a set that follows a `link up` closes a full re-discovery: the sessions it
     // lists re-publish their link reports, every other set leaves them alone
@@ -1152,7 +1271,9 @@ pub(super) async fn handle_cards_set(
                 iccid
             ),
         }
-        update_rack_card_ui(&rack_id, *slot, iccid, card_number.clone());
+        update_rack_card_ui(&rack_id, *slot, iccid, card_number.clone(), || {
+            card_epoch(&rack_id) == epoch
+        });
         let Some(card_number) = card_number else {
             continue;
         };

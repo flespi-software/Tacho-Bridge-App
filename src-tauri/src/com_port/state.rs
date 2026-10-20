@@ -40,17 +40,24 @@ pub(super) fn mutate_rack_rows(mut mutate: impl FnMut(&str, &mut Vec<RackCard>) 
 /// the application connection was down). Without the purge the card would be
 /// displayed in two rack blocks, and the stale row would feed
 /// `connect_pending_rack_cards` a wrong location.
+///
+/// `still_current` is checked under the UI lock: a newer card set prunes rows
+/// under that lock too, so a superseded caller can never write after it.
 pub(super) fn update_rack_card_ui(
     rack_id: &str,
     slot: u16,
     iccid: &str,
     card_number: Option<String>,
+    still_current: impl FnOnce() -> bool,
 ) {
     let name = card_number
         .as_deref()
         .and_then(|number| crate::config::get_card_config_from_cache(number).and_then(|c| c.name));
     let updates: Vec<(String, Vec<RackCard>)> = {
         let mut ui = lock(&RACK_CARDS_UI);
+        if !still_current() {
+            return;
+        }
         let mut updates = Vec::new();
         for (other_id, list) in ui.iter_mut() {
             if other_id == rack_id {

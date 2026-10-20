@@ -19,6 +19,7 @@
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::AsyncClient;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use tauri::async_runtime;
 
 use crate::mqtt::{request_id_from_topic, request_to_response_topic};
@@ -65,10 +66,13 @@ pub(super) fn request_queue() -> tokio::sync::mpsc::UnboundedSender<RackRequest>
 /// gone.
 static APP_CLIENT: std::sync::Mutex<Option<AsyncClient>> = std::sync::Mutex::new(None);
 
-/// Registers the MQTT client of the application connection as the carrier of
-/// the rack traffic. Called when the app connection is (re)created.
+/// Registers the MQTT client of a new application connection as the carrier
+/// of the rack traffic. The new connection has no server instance until its
+/// CONNACK: rack publishes are held until then (the CONNACK announces every
+/// rack), or a `link up` queued now would reach the server twice.
 pub fn register_app_client(client: &AsyncClient) {
     *lock(&APP_CLIENT) = Some(client.clone());
+    on_app_offline();
 }
 
 fn app_client() -> Option<AsyncClient> {
@@ -159,13 +163,20 @@ pub(super) fn parse_rack_topic(topic: &str) -> Option<(&str, &str)> {
     Some((rack_id, tail))
 }
 
-/// Publishes the link state of the given racks to the server, in order, from
-/// one task: a `down` followed by an `up` of the same rack (a port reopened)
-/// must reach the server in that order, and separately spawned publishes give
-/// no such guarantee. Nothing is published while the application connection
-/// is offline (or does not exist yet): the CONNACK that brings it online
-/// announces every linked rack anyway, and a report queued before it would
-/// make the server hear the same `up` twice, running its discovery twice.
+/// A batch of link reports and the connection it goes out on.
+type LinkBatch = (AsyncClient, Vec<(String, bool)>);
+
+/// The single publisher of link reports (see `announce_links`).
+static LINK_PUBLISHER: OnceLock<tokio::sync::mpsc::UnboundedSender<LinkBatch>> = OnceLock::new();
+
+/// Publishes the link state of the given racks to the server, in order: a
+/// `down` followed by an `up` of the same rack (a port reopened) must reach
+/// the server in that order, also when the two are announced by separate
+/// calls — so every batch goes through one long-lived publisher task.
+/// Nothing is published while the application connection is offline (or does
+/// not exist yet): the CONNACK that brings it online announces every linked
+/// rack anyway, and a report queued before it would make the server hear the
+/// same `up` twice, running its discovery twice.
 pub(super) fn announce_links(links: Vec<(String, bool)>) {
     if links.is_empty() {
         return;
@@ -180,41 +191,55 @@ pub(super) fn announce_links(links: Vec<(String, bool)>) {
             return;
         }
     };
-    async_runtime::spawn(async move {
-        for (rack_id, up) in links {
-            let state = if up { "up" } else { "down" };
-            let payload = if up {
+    let publisher = LINK_PUBLISHER.get_or_init(|| {
+        let (sender, mut batches) = tokio::sync::mpsc::unbounded_channel::<LinkBatch>();
+        async_runtime::spawn(async move {
+            while let Some((client, links)) = batches.recv().await {
+                publish_links(&client, links).await;
+            }
+        });
+        sender
+    });
+    if publisher.send((client, links)).is_err() {
+        log::error!("RACK | [LINK] status=publisher_gone");
+    }
+}
+
+/// Publishes one batch of link reports, in order.
+async fn publish_links(client: &AsyncClient, links: Vec<(String, bool)>) {
+    for (rack_id, up) in links {
+        let state = if up { "up" } else { "down" };
+        let payload = if up {
                 serde_json::json!({"state": state, "guarded_discovery": true, "serial_transactions": true,
                     "cards": super::cards::inventory(&rack_id)})
             } else {
                 serde_json::json!({"state": state})
             }
             .to_string();
-            match client
-                .publish(
-                    rack_topic(&rack_id, "link"),
-                    QoS::AtLeastOnce,
-                    false,
-                    payload,
-                )
-                .await
-            {
-                Ok(()) => {
-                    // the server rebuilds its card map from the discovery this starts
-                    if up {
-                        mark_rebind(&rack_id);
-                    }
-                    log::info!("RACK {} | [LINK] status=published state={}", rack_id, state)
+        match client
+            .publish(
+                rack_topic(&rack_id, "link"),
+                QoS::AtLeastOnce,
+                false,
+                payload,
+            )
+            .await
+        {
+            Ok(()) => {
+                // the server rebuilds its card map from the discovery this starts
+                if up {
+                    mark_rebind(&rack_id);
                 }
-                Err(e) => log::warn!(
-                    "RACK {} | [LINK] status=publish_failed state={} err={:?}",
-                    rack_id,
-                    state,
-                    e
-                ),
+                log::info!("RACK {} | [LINK] status=published state={}", rack_id, state)
             }
+            Err(e) => log::warn!(
+                "RACK {} | [LINK] status=publish_failed state={} err={:?}",
+                rack_id,
+                state,
+                e
+            ),
         }
-    });
+    }
 }
 
 /// CONNACK of the application connection: the server runs a fresh instance
@@ -226,7 +251,7 @@ pub(super) fn announce_links(links: Vec<(String, bool)>) {
 /// report of the old baseline would only be noise), and the reply cache is
 /// dropped (the server's request id counters restart at 1).
 pub fn on_app_connack(client: &AsyncClient) {
-    register_app_client(client);
+    *lock(&APP_CLIENT) = Some(client.clone());
     APP_GENERATION.fetch_add(1, Ordering::SeqCst);
     APP_ONLINE.store(true, Ordering::SeqCst);
     stop_all_rack_watches();
@@ -599,17 +624,21 @@ fn parse_serial_control(json: &serde_json::Value) -> Result<SerialControl, &'sta
     })
 }
 
+/// `(iccid, card_number, slot, session)` of the card a card session serves;
+/// `session` is the owner token of the session's authentication lease.
+pub(super) type RackCardRef<'a> = (&'a str, &'a str, u16, u64);
+
 /// Which slot ownership an envelope needs, as `(slot, discovery)`: a discovery step of the rack
 /// reserves its slot against authentications, an in-session command of a card holds the card's
 /// slot against discovery. Other envelopes (indicator repaints, the closing message) need none.
 fn slot_ownership(
-    card: Option<(&str, &str, u16)>,
+    card: Option<RackCardRef>,
     discovery_slot: Option<u16>,
     finish: Option<bool>,
 ) -> Option<(u16, bool)> {
     match card {
         None => discovery_slot.map(|slot| (slot, true)),
-        Some((_, _, slot)) if finish == Some(false) => Some((slot, false)),
+        Some((_, _, slot, _)) if finish == Some(false) => Some((slot, false)),
         Some(_) => None,
     }
 }
@@ -658,10 +687,10 @@ pub(super) async fn run_serial_request(
     serial_port: &SharedPort,
     log_header: &str,
     idempotency: &mut IdempotencySlot,
-    // `(iccid, card_number, slot)` of the card this connection serves, when the
-    // caller is a card session. `None` for a rack's own exchange, which has
-    // no single card and therefore no authentication state to track.
-    card: Option<(&str, &str, u16)>,
+    // The card this connection serves, when the caller is a card session.
+    // `None` for a rack's own exchange, which has no single card and
+    // therefore no authentication state to track.
+    card: Option<RackCardRef<'_>>,
 ) -> Option<(String, String)> {
     // A server-driven rack exchange counts as card activity: the auto-updater
     // must not restart the app in the middle of a rack card operation. The
@@ -720,13 +749,18 @@ pub(super) async fn run_serial_request(
                 .unwrap_or_else(|| "-".to_string());
             let finish = envelope.finish;
             let slot = card
-                .map(|(_, _, slot)| slot)
+                .map(|(_, _, slot, _)| slot)
                 .or(discovery_slot)
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "-".to_string());
             if let Some((slot, discovery)) = slot_ownership(card, discovery_slot, envelope.finish) {
-                if !super::access::acquire(serial_port, slot, discovery, req_id.unwrap_or(0)).await
-                {
+                // An authentication lease belongs to the card session, a
+                // discovery lease to its request.
+                let token = match card {
+                    Some((_, _, _, session)) if !discovery => session,
+                    _ => req_id.unwrap_or(0),
+                };
+                if !super::access::acquire(serial_port, slot, discovery, token).await {
                     log::debug!(
                         "{} [XCHG] req={} slot={} status=refused reason=card_busy discovery={}",
                         log_header,
@@ -737,7 +771,7 @@ pub(super) async fn run_serial_request(
                     return failure(&resp_topic, SERIAL_ERR_CARD_BUSY);
                 }
             }
-            if let Some((iccid, card_number, _)) = card {
+            if let Some((iccid, card_number, _, _)) = card {
                 record_card_activity(iccid, card_number, envelope.finish, log_header);
             }
             let finished = envelope.finish == Some(true);
@@ -757,8 +791,8 @@ pub(super) async fn run_serial_request(
                     .await
             };
             if finished {
-                if let Some((_, _, slot)) = card {
-                    super::access::release(serial_port, slot, false, None);
+                if let Some((_, _, slot, session)) = card {
+                    super::access::release(serial_port, slot, false, Some(session));
                 }
             }
             // One line per exchange with everything the server's own log
@@ -857,7 +891,7 @@ mod tests {
     fn slot_ownership_depends_on_the_caller_and_the_session_phase() {
         assert_eq!(slot_ownership(None, Some(5), None), Some((5, true)));
         assert_eq!(slot_ownership(None, None, Some(false)), None);
-        let card = Some(("iccid", "card", 9));
+        let card = Some(("iccid", "card", 9, 1));
         assert_eq!(slot_ownership(card, Some(5), Some(false)), Some((9, false)));
         assert_eq!(slot_ownership(card, Some(5), Some(true)), None);
         assert_eq!(slot_ownership(card, None, None), None);

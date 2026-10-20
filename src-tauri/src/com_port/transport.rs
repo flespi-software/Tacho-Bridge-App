@@ -18,6 +18,7 @@ use crate::debug_log::frame_digest;
 use super::SHUTTING_DOWN;
 
 pub(super) type SharedPort = Arc<AsyncMutex<Box<dyn SerialPort>>>;
+type WeakPort = std::sync::Weak<AsyncMutex<Box<dyn SerialPort>>>;
 
 /// Transport health of one open port, keyed by `port_key`.
 #[derive(Default)]
@@ -37,6 +38,12 @@ lazy_static::lazy_static! {
     /// faults — a silent device is a protocol matter, not a dead handle.
     static ref PORT_HEALTH: std::sync::Mutex<std::collections::HashMap<usize, PortHealth>> =
         std::sync::Mutex::new(std::collections::HashMap::new());
+
+    /// Ports whose rack was unlinked (`release_port`), held weakly: an entry
+    /// lives exactly as long as an operation still holds the port, so its
+    /// `port_key` cannot be confused with a later port at the same address.
+    static ref RELEASED_PORTS: std::sync::Mutex<Vec<(usize, WeakPort)>> =
+        std::sync::Mutex::new(Vec::new());
 }
 
 /// Identity of an open port for `PORT_HEALTH`: the address of the boxed port
@@ -55,6 +62,27 @@ pub(super) fn track_port(key: usize) {
 
 pub(super) fn untrack_port(key: usize) {
     super::lock(&PORT_HEALTH).remove(&key);
+}
+
+/// Marks the port of an unlinked rack: an operation still running on it stops
+/// at its next check (see `must_stop`).
+pub(super) fn release_port(key: usize, port: &SharedPort) {
+    let mut released = super::lock(&RELEASED_PORTS);
+    released.retain(|(_, port)| port.strong_count() > 0);
+    released.push((key, Arc::downgrade(port)));
+}
+
+/// The app is closing, or the port's rack was unlinked: an operation still
+/// running on the port stops waiting, so its blocking closure drops the
+/// handle — `spawn_blocking` cannot be aborted from outside, and until the
+/// handle closes the device cannot be reopened (on Windows: "Access is
+/// denied").
+fn must_stop(port: &dyn SerialPort) -> bool {
+    let key = port_key(port);
+    SHUTTING_DOWN.load(Ordering::SeqCst)
+        || super::lock(&RELEASED_PORTS)
+            .iter()
+            .any(|(released, port)| *released == key && port.strong_count() > 0)
 }
 
 /// Consecutive operations on this port that failed with an I/O error.
@@ -162,9 +190,14 @@ impl SerialLease {
                 started.elapsed().as_millis(),
                 until.saturating_duration_since(Instant::now()).as_millis()
             );
-            // the port stays retained only after a successful exchange inside the lifetime
-            if outcome.exchange.is_ok() && Instant::now() < until {
-                *held(&cell) = Some(port);
+            // the port stays retained only after a successful exchange inside the lifetime;
+            // checked under the cell lock: `expire_lease` takes the cell once, after `until`,
+            // and a guard put back behind it would stay locked with nothing to free it
+            if outcome.exchange.is_ok() {
+                let mut slot = held(&cell);
+                if Instant::now() < until {
+                    *slot = Some(port);
+                }
             }
             outcome.exchange
         })
@@ -321,6 +354,9 @@ pub(super) const SERIAL_MS_MIN: u64 = 20;
 /// thread) for up to `SERIAL_MS_MAX` after the app started closing.
 const SERIAL_READ_SLICE: Duration = Duration::from_millis(500);
 
+/// Bound of one command write: frames are small, a healthy port drains them at once.
+const SERIAL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Server-scripted poll loop of one envelope: after the command is accepted, keep sending
 /// `cmd` every `interval` while the device answers exactly `while_hex`; the first differing
 /// reply is the operation result. Pure byte comparison - no protocol knowledge on this side.
@@ -393,11 +429,13 @@ fn parse_envelope_fields(
     Ok(SerialEnvelope {
         cmd_hex: normalize_hex(cmd)?,
         expect_hex,
+        // Floored: a zero silence bound ends the read on the first chunk, and
+        // a zero deadline writes a command whose reply is never read.
         idle: ms_field(json, "idle_ms")
-            .map(Duration::from_millis)
+            .map(|ms| Duration::from_millis(ms.max(SERIAL_MS_MIN)))
             .unwrap_or(SERIAL_REPLY_TIMEOUT),
         deadline: ms_field(json, "deadline_ms")
-            .map(Duration::from_millis)
+            .map(|ms| Duration::from_millis(ms.max(SERIAL_MS_MIN)))
             .unwrap_or(SERIAL_READ_DEADLINE),
         poll,
         finish: json.get("finish").and_then(|v| v.as_bool()),
@@ -560,11 +598,10 @@ fn read_reply(
             reply.end = READ_END_DEADLINE;
             break;
         }
-        // App is closing: stop waiting so the blocking closure releases the
-        // port lock promptly — `spawn_blocking` cannot be aborted from outside.
-        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        // App closing or rack unlinked: stop waiting (see `must_stop`).
+        if must_stop(&**port) {
             log::info!(
-                "{} [SERIAL] read stopped reason=app_shutdown bytes={}",
+                "{} [SERIAL] read stopped reason=port_released bytes={}",
                 log_header,
                 reply.bytes.len()
             );
@@ -590,6 +627,9 @@ fn read_reply(
         }
         match port.read(&mut buf) {
             Ok(0) => {
+                // A hung-up handle reads EOF instead of failing: count it, or
+                // the dead-handle reopen never triggers.
+                note_io_fault(&**port);
                 reply.end = READ_END_EOF;
                 break;
             }
@@ -640,7 +680,7 @@ fn resync_line(port: &mut Box<dyn SerialPort>, log_header: &str) -> bool {
     let mut dropped = 0usize;
     let mut quiet = false;
     loop {
-        if started.elapsed() >= SERIAL_RESYNC_BUDGET || SHUTTING_DOWN.load(Ordering::SeqCst) {
+        if started.elapsed() >= SERIAL_RESYNC_BUDGET || must_stop(&**port) {
             break;
         }
         // A port that fails outright will not go quiet by waiting: give up
@@ -784,6 +824,14 @@ fn exchange_once(
     purge_stale: bool,
     log_header: &str,
 ) -> (SerialExchange, &'static str) {
+    // A spent lease budget leaves no time to read the reply: the device would
+    // act on a command whose answer is thrown away.
+    if deadline < Duration::from_millis(SERIAL_MS_MIN) {
+        return (
+            SerialExchange::error(SERIAL_ERR_TRANSACTION_EXPIRED),
+            READ_END_DEADLINE,
+        );
+    }
     // envelope hex is pre-normalized; this guard covers direct callers only
     let bytes = match hex::decode(cmd_hex) {
         Ok(b) => b,
@@ -805,9 +853,15 @@ fn exchange_once(
     );
     log::trace!("{} [SERIAL] tx hex={}", log_header, cmd_hex);
     let write_started = Instant::now();
+    // The port keeps the timeout of the last read slice, possibly a fraction
+    // of a millisecond: a momentarily full TX buffer would fail the write.
+    let _ = port.set_timeout(SERIAL_WRITE_TIMEOUT);
     if let Err(e) = port.write_all(&bytes) {
         log::error!("{} [SERIAL] write failed: {}", log_header, e);
-        note_io_fault(&**port);
+        // A slow drain is not a dead handle.
+        if e.kind() != std::io::ErrorKind::TimedOut {
+            note_io_fault(&**port);
+        }
         return (
             SerialExchange::error(SERIAL_ERR_WRITE_FAILED),
             READ_END_ERROR,
@@ -942,8 +996,8 @@ fn poll_for_outcome(
             outcome.exchange = SerialExchange::error(SERIAL_ERR_TRANSACTION_EXPIRED);
             return;
         }
-        // App is closing: abandon the operation so the port lock is released.
-        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        // App closing or rack unlinked: abandon the operation (see `must_stop`).
+        if must_stop(&**port) {
             outcome.end = READ_END_SHUTDOWN;
             outcome.exchange = SerialExchange::error(SERIAL_ERR_NO_REPLY);
             return;

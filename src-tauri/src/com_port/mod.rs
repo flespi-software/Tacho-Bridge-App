@@ -51,7 +51,7 @@ pub use cards::connect_pending_rack_cards;
 pub use cards::disconnect_rack_card;
 pub use rack::{handle_app_publish, on_app_connack, on_app_offline, register_app_client};
 
-use crate::backoff::{next_reconnect_delay, RECONNECT_DELAY_INITIAL_SECS};
+use crate::backoff::{Backoff, RECONNECT_DELAY_INITIAL_SECS};
 
 /// Guards against starting more than one rack monitor. `initialize_backend` in
 /// `lib.rs` runs once, so this is a backstop rather than the load-bearing guard
@@ -256,8 +256,9 @@ pub fn shutdown() {
 
 /// Undoes `shutdown()` when the exit it prepared for did not happen (a failed
 /// update install): clears the flag and starts the monitor again, which
-/// rediscovers and relinks the racks on its first tick. Harmless while the
-/// old monitor is still winding down — it then simply keeps running.
+/// rediscovers and relinks the racks on its first tick. When the old monitor
+/// is still alive (it was asleep through the whole shutdown), the new one
+/// exits and the old one relinks: it treats racks missing from RACKS as new.
 pub fn resume() {
     if !SHUTTING_DOWN.swap(false, Ordering::SeqCst) {
         return;
@@ -284,6 +285,7 @@ fn unlink_rack(rack_id: &str, links: &mut Vec<(String, bool)>) -> Option<SharedP
     let port = lock(&RACKS).remove(rack_id).map(|rack| {
         log::info!("RACK {} | [LINK] phase=stop", rack_id);
         transport::untrack_port(rack.io_key);
+        transport::release_port(rack.io_key, &rack.port);
         rack.port
     });
     stop_rack_watch(rack_id);
@@ -411,15 +413,17 @@ fn on_rack_connected(rack: &RackInfo, port: Box<dyn SerialPort>) {
     let mut links = Vec::with_capacity(2);
     let _ = unlink_rack(&rack_id, &mut links);
 
-    // Remember which device node backs this rack, so a later alias for the same
-    // device cannot displace it during discovery.
-    lock(&RACK_ACTIVE_PORTS).insert(rack_id.clone(), rack.port_name.clone());
-
     // Link the rack to the server: from now on its `rack/<id>/request/...`
     // envelopes are written straight to this port.
     let io_key = transport::port_key(&*port);
     let shared_port: SharedPort = Arc::new(AsyncMutex::new(port));
-    links.extend(link_rack(rack_id, shared_port, io_key));
+    let linked = link_rack(rack_id.clone(), shared_port, io_key);
+    if !linked.is_empty() {
+        // Remember which device node backs this rack, so a later alias for the
+        // same device cannot displace it during discovery.
+        lock(&RACK_ACTIVE_PORTS).insert(rack_id, rack.port_name.clone());
+    }
+    links.extend(linked);
     announce_links(links);
 }
 
@@ -514,7 +518,13 @@ pub async fn rack_connection() {
         }
 
         for (id, rack) in &found {
-            let prev = current.get(id).cloned();
+            // A rack we hold as connected but that is not linked any more (a
+            // `shutdown` + `resume` emptied RACKS under this loop, or linking
+            // was skipped) is handled as newly appeared.
+            let prev = current
+                .get(id)
+                .filter(|_| lock(&RACKS).contains_key(id))
+                .cloned();
             // Same device node, but our handle to it went dead (the device
             // dropped off the bus and came back between two polls): reopen
             // it exactly like a renamed port.
