@@ -226,3 +226,17 @@ All notable changes to this project will be documented in this file.
 
 - Improved update and logging reliability: update checks time out, installs wait for card activity to end, crashed background tasks restart, and log upload tolerates damaged lines.
 - Improved the main window: the smart card readers block collapses to a single line while no reader is connected.
+
+### [0.8.0-rc.18] - 2026-10-20
+
+🛠 Fixes
+
+- Fixed smart card reader sessions: a swapped card is detected after each reset, a stuck reader no longer blocks the others, and timed-out commands are never run twice.
+- Fixed the main window losing readers after a reload, and the card dialog now closes only after the card is saved.
+
+🆕 Features / Improvements
+
+- Improved server reconnection: the retry delay resets only after a stable connection, and a malformed message no longer drops the connection.
+- Improved card rack reliability: rack exchanges no longer interrupt the server connection, racks relink after a failed update, and a stale session can no longer release another card's slot.
+- Improved updates: installation waits up to 10 minutes for card activity to end, and a repeatedly failing version pauses for 24 hours.
+- Improved config and log safety: a corrupt config is kept as a backup copy, company names decode non-Latin characters, and driver names no longer appear in debug logs.
