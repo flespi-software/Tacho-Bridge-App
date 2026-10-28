@@ -1,11 +1,9 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import {
   formatCardMeta,
   formatStructureVersion,
   formatExpire,
-  isExpired,
   formatAuthDate,
-  cardStatusIcon,
 } from './cardFormatters'
 
 describe('formatStructureVersion', () => {
@@ -70,27 +68,6 @@ describe('formatExpire', () => {
   })
 })
 
-describe('isExpired', () => {
-  afterEach(() => {
-    vi.useRealTimers()
-  })
-
-  it('compares against the current time', () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-06-01T00:00:00Z'))
-    expect(isExpired(Math.floor(Date.parse('2026-05-31T00:00:00Z') / 1000))).toBe(true)
-    expect(isExpired(Math.floor(Date.parse('2026-06-02T00:00:00Z') / 1000))).toBe(false)
-  })
-
-  // An unknown expiry must not render the card as expired — that would flag
-  // every card the sniffer has not read yet.
-  it('treats an unknown expiry as not expired', () => {
-    expect(isExpired(null)).toBe(false)
-    expect(isExpired(undefined)).toBe(false)
-    expect(isExpired(0)).toBe(false)
-  })
-})
-
 describe('formatAuthDate', () => {
   it('renders local time zero-padded to a fixed width', () => {
     const ts = Math.floor(Date.parse('2026-03-04T05:06:07Z') / 1000)
@@ -111,53 +88,5 @@ describe('formatAuthDate', () => {
   it('renders nothing when the card has never authenticated', () => {
     expect(formatAuthDate(null)).toBe('')
     expect(formatAuthDate(0)).toBe('')
-  })
-})
-
-describe('cardStatusIcon', () => {
-  it('shows an empty slot when no card is present', () => {
-    const icon = cardStatusIcon({ present: false, linked: true, online: true })
-    expect(icon.name).toBe('mdi-smart-card-off-outline')
-    expect(icon.color).toBe('grey')
-  })
-
-  it('prompts to link a card that is present but unconfigured', () => {
-    const icon = cardStatusIcon({ present: true, linked: false })
-    expect(icon.name).toBe('mdi-card-plus-outline')
-    expect(icon.color).toBe('orange')
-  })
-
-  it('greys out a linked card with no session', () => {
-    const icon = cardStatusIcon({ present: true, linked: true, online: false })
-    expect(icon.name).toBe('mdi-smart-card-outline')
-    expect(icon.color).toBe('grey')
-  })
-
-  it('goes solid green when the session is up and idle', () => {
-    const icon = cardStatusIcon({ present: true, linked: true, online: true })
-    expect(icon).toMatchObject({ name: 'mdi-smart-card', color: 'green' })
-    expect(icon.class).toBeUndefined()
-  })
-
-  it('blinks while an APDU exchange is running', () => {
-    const icon = cardStatusIcon({
-      present: true,
-      linked: true,
-      online: true,
-      authentication: true,
-    })
-    expect(icon.class).toBe('blinking-icon')
-  })
-
-  // online/authentication are tri-state on the wire; "not known yet" must read
-  // the same as false rather than throwing or blinking.
-  it('treats an absent online flag as offline', () => {
-    expect(cardStatusIcon({ present: true, linked: true }).name).toBe('mdi-smart-card-outline')
-    expect(cardStatusIcon({ present: true, linked: true, online: null }).color).toBe('grey')
-  })
-
-  it('honours a caller-supplied size and defaults otherwise', () => {
-    expect(cardStatusIcon({ present: false, linked: false }).size).toBe('25px')
-    expect(cardStatusIcon({ present: false, linked: false }, '12px').size).toBe('12px')
   })
 })

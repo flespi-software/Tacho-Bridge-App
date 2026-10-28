@@ -1,161 +1,20 @@
 <template>
-  <div style="width: 600px; max-width: 100%">
-    <div class="readers-container">
-      <!-- Collapsed to a single row while no reader is connected; the block
-           grows with the reader rows once one is plugged in. -->
-      <q-item v-if="state.readers.length === 0" class="empty-readers" dense>
-        <q-item-section avatar>
-          <q-icon name="mdi-card-search-outline" />
-        </q-item-section>
-        <q-item-section>
-          <q-item-label>No connected smart card readers</q-item-label>
-        </q-item-section>
-      </q-item>
-      <div v-for="reader in state.readers" :key="reader.name" class="row reader-row">
-        <q-item class="col-6" style="min-height: 50px" dense>
-          <q-item-section avatar>
-            <q-icon name="mdi-usb-port" :color="reader.status !== 'UNKNOWN' ? 'green' : 'red'" />
-          </q-item-section>
-          <q-item-section>
-            <q-item-label caption lines="3" class="text-grey text-bold">
-              <small>{{ reader.name }}</small>
-            </q-item-label>
-            <!--
-              Last authentication state. Three modes:
-                - processing (yellow) — active APDU exchange with the VU
-                - success (green)    — last completed auth ended with finish:true
-                - fail (red)         — last completed auth was aborted
-              Only the status word itself is coloured; the prefix stays neutral.
-            -->
-            <q-item-label
-              v-if="
-                reader.card_number &&
-                (authInProgress[reader.card_number] || state.cards[reader.card_number]?.last_auth)
-              "
-              caption
-            >
-              <template v-if="authInProgress[reader.card_number]">
-                Last auth:
-                <span class="text-amber-8 text-weight-medium">processing...</span>
-              </template>
-              <template v-else-if="state.cards[reader.card_number]?.last_auth">
-                Last auth:
-                {{ formatAuthDate(state.cards[reader.card_number]?.last_auth?.[0]) }}
-                (<span
-                  :class="
-                    state.cards[reader.card_number]?.last_auth?.[1]
-                      ? 'text-green-8'
-                      : 'text-red text-weight-medium'
-                  "
-                  >{{ state.cards[reader.card_number]?.last_auth?.[1] ? 'success' : 'fail' }}</span
-                >)
-              </template>
-            </q-item-label>
-          </q-item-section>
-        </q-item>
-        <q-item class="col-6" style="min-height: 50px" dense v-if="reader.status !== 'UNKNOWN'">
-          <q-item-section avatar>
-            <q-icon v-bind="cardConnectedStatus(reader)" />
-          </q-item-section>
-
-          <q-item-section>
-            <template v-if="!reader.card_number && reader.iccid">
-              <q-item-label lines="1">UNKNOWN CARD</q-item-label>
-              <q-item-label lines="1" caption>
-                <q-chip
-                  dense
-                  size="sm"
-                  color="blue-grey-2"
-                  text-color="blue-grey-9"
-                  class="text-bold"
-                >
-                  ICCID: {{ reader.iccid }}
-                </q-chip>
-              </q-item-label>
-            </template>
-            <template v-if="reader.card_number">
-              <q-item-label
-                v-if="state.cards && reader.card_number && state.cards[reader.card_number]"
-                style="word-break: break-word; white-space: normal"
-              >
-                {{ state.cards[reader.card_number]?.name }}
-              </q-item-label>
-              <q-item-label>
-                <span class="text-weight-medium">{{ reader.card_number }}</span>
-                <span
-                  v-if="state.cards[reader.card_number]?.structure_version"
-                  class="text-grey-7 q-ml-xs"
-                >
-                  ({{ formatStructureVersion(state.cards[reader.card_number]?.structure_version) }})
-                </span>
-              </q-item-label>
-              <q-item-label
-                v-if="state.cards[reader.card_number]?.company_name"
-                caption
-                class="overflow-hidden ellipsis"
-              >
-                <q-icon name="mdi-domain" size="xs" class="q-mr-xs" />
-                {{ state.cards[reader.card_number]?.company_name }}
-              </q-item-label>
-              <q-item-label v-if="state.cards[reader.card_number]?.expire" caption>
-                <q-icon name="mdi-calendar" size="xs" class="q-mr-xs" />
-                <span
-                  :class="
-                    isExpired(state.cards[reader.card_number]?.expire)
-                      ? 'text-red text-weight-medium'
-                      : ''
-                  "
-                >
-                  {{ formatExpire(state.cards[reader.card_number]?.expire) }}
-                </span>
-              </q-item-label>
-            </template>
-
-            <q-item-label lines="1" v-if="!reader.iccid && !reader.card_number">
-              <span class="text-weight-medium text-grey-6">EMPTY SLOT</span>
-            </q-item-label>
-          </q-item-section>
-          <q-item-section side v-if="reader.iccid && !reader.card_number">
-            <div class="text-grey-8 q-gutter-xs">
-              <q-btn size="12px" flat dense round icon="mdi-link" @click="linkMode(reader.iccid)" />
-            </div>
-          </q-item-section>
-        </q-item>
-      </div>
-    </div>
-    <!-- Card rack blocks, below the plain readers. One block per connected
-         rack (several racks on separate USB ports are all served), each rack
-         holding many cards. -->
-    <RackList v-for="r in racks" :key="r.id" :rack="r" @link="linkMode" />
-    <SmartCardList
-      ref="cardlist"
-      :cards="state.cards"
-      :save="saveCardNumber"
-      @delete-card="removeCard"
-    />
-  </div>
+  <CardBoard
+    :readers="state.readers"
+    :racks="racks"
+    :cards="state.cards"
+    :save="saveCardNumber"
+    :remove="removeCard"
+  />
 </template>
 <script setup lang="ts">
-import SmartCardList from './SmartCardList.vue'
-import RackList from './RackList.vue'
+import CardBoard from './CardBoard.vue'
 import type { SmartCard, Reader, RackState } from './models'
-import {
-  formatStructureVersion,
-  formatExpire,
-  isExpired,
-  formatAuthDate,
-  cardStatusIcon,
-} from './cardFormatters'
-import { ref, reactive, computed, onMounted, inject } from 'vue'
+import { ref, reactive, onMounted, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { emit } from '@tauri-apps/api/event'
 import { useTauriListeners, LAYOUT_LISTENERS_READY } from 'src/composables/useTauriListeners'
 import { notifyError, TOAST_LONG } from 'src/composables/notify'
-
-const cardlist = ref<null | {
-  linkMode: (iccid: string) => void
-  openAddDialog: () => void
-}>(null)
 
 // reactive state for the readers and cards
 const state = reactive<{ readers: Reader[]; cards: Record<string, SmartCard> }>({
@@ -171,20 +30,6 @@ const racks = ref<RackState[]>([])
 // Registered Tauri listeners. Kept in an array so we can detach them all
 const { on } = useTauriListeners()
 const layoutListenersReady = inject(LAYOUT_LISTENERS_READY, Promise.resolve())
-
-// Transient "authentication in progress" flag per card_number, derived from
-// the Reader.authentication field emitted by the backend via global-cards-sync.
-// Persists only for the duration of an active APDU exchange; SmartCardList
-// uses it to render the yellow "Last auth: processing..." line.
-const authInProgress = computed<Record<string, boolean>>(() => {
-  const map: Record<string, boolean> = {}
-  for (const r of state.readers) {
-    if (r.card_number && r.authentication) {
-      map[r.card_number] = true
-    }
-  }
-  return map
-})
 
 ////////////////////////// Listening for the event from the backend //////////////////////////
 // Narrow runtime guard for the global-cards-sync payload. We do not trust the
@@ -314,32 +159,17 @@ const saveCardNumber = async (cardNumber: string, content: SmartCard): Promise<b
   }
 }
 
-// Status icon for a card in a reader, from the shared vocabulary the rack list
-// uses too. `iccid` present means a card is physically in the reader.
-const cardConnectedStatus = (reader: Reader) =>
-  cardStatusIcon({
-    present: !!reader.iccid,
-    linked: !!reader.card_number,
-    online: reader.online,
-    authentication: reader.authentication,
-  })
-
-// SmartCardList handlers
-function linkMode(iccid: string) {
-  cardlist.value?.linkMode(iccid)
-  if (Object.values(state.cards)?.filter((card) => !card.iccid).length === 0) {
-    cardlist.value?.openAddDialog()
-  }
-}
-
-// remove card func from the config
-const removeCard = async (cardNumber: string) => {
+// Removes a card from the config; resolves to whether it was removed. As with
+// a save, the local list is updated by the backend's config event only.
+const removeCard = async (cardNumber: string): Promise<boolean> => {
   try {
     await invoke('remove_card', { cardnumber: cardNumber })
     console.log('Card removed:', cardNumber)
+    return true
   } catch (error) {
     console.error('Failed to remove card:', error)
     notifyError(`Failed to remove card ${cardNumber}`, error, TOAST_LONG)
+    return false
   }
 }
 
