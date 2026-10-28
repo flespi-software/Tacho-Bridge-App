@@ -1,11 +1,25 @@
 <template>
   <!-- Unified card list: every reader, rack slot and configured card in one
        place, grouped by location, with search and status filters on top. -->
-  <div class="card-board">
+  <div class="card-board" :class="{ 'card-board--tiles': cardView !== 'list' }">
     <div class="cb-toolbar">
       <div class="cb-toolbar__inner">
         <div class="row no-wrap items-center q-gutter-x-sm">
           <div class="col cb-toolbar__total">{{ totalLine }}</div>
+          <div class="cb-viewswitch" role="group" aria-label="View">
+            <button
+              v-for="v in VIEW_BUTTONS"
+              :key="v.id"
+              type="button"
+              :class="{ 'cb-viewswitch__on': cardView === v.id }"
+              :aria-pressed="cardView === v.id"
+              :aria-label="v.label"
+              :title="v.label"
+              @click="pickView(v.id)"
+            >
+              <q-icon :name="v.icon" size="18px" />
+            </button>
+          </div>
           <q-btn
             unelevated
             rounded
@@ -25,7 +39,7 @@
             outlined
             dense
             clearable
-            placeholder="Name, card number, ICCID, company, slot"
+            placeholder="Name, number, slot, company"
             aria-label="Search cards"
           >
             <template #prepend><q-icon name="mdi-magnify" size="xs" /></template>
@@ -38,9 +52,18 @@
             outlined
             dense
             options-dense
-            aria-label="Location"
+            aria-label="Filter by location"
             class="cb-toolbar__loc"
-          />
+          >
+            <!-- The field names itself, so the location filter and the sort
+                 order cannot be mistaken for each other. -->
+            <template #selected>
+              <span class="cb-field-value">
+                <span class="cb-field-value__prefix">Filter:</span>
+                {{ locationShort }}
+              </span>
+            </template>
+          </q-select>
           <q-select
             v-model="sort"
             :options="SORT_OPTIONS"
@@ -51,7 +74,14 @@
             options-dense
             aria-label="Sort by"
             class="cb-toolbar__sort"
-          />
+          >
+            <template #selected>
+              <span class="cb-field-value">
+                <span class="cb-field-value__prefix">Sort:</span>
+                {{ sortLabel }}
+              </span>
+            </template>
+          </q-select>
         </div>
         <div class="cb-chips">
           <button
@@ -85,6 +115,7 @@
           :group="v.group"
           :rows="v.rows"
           :limit="v.limit"
+          :view="cardView"
           :open="v.open"
           :open-row="openRow"
           :now="now"
@@ -176,8 +207,12 @@ import {
   matchesSearch,
   matchesStatus,
   newCardNumberError,
+  parseViewPrefs,
+  nextViewSlot,
+  viewSlot,
   NOT_INSERTED_GROUP,
   SORTERS,
+  type CardView,
   type SortKey,
   type StatusFilter,
 } from './cardBoard'
@@ -192,16 +227,26 @@ const props = defineProps<{
 }>()
 
 const SORT_OPTIONS: { value: SortKey; label: string }[] = [
-  { value: 'slot', label: 'By slot' },
-  { value: 'name', label: 'By name' },
-  { value: 'exp', label: 'By expiry' },
-  { value: 'auth', label: 'By last auth' },
+  { value: 'slot', label: 'Slot' },
+  { value: 'name', label: 'Name' },
+  { value: 'exp', label: 'Expiry' },
+  { value: 'auth', label: 'Last auth' },
 ]
 
-// Rows rendered per group before "Show all": a rack can hold 180+ cards, and
-// a filtered view is short enough to show more at once.
-const ROW_LIMIT = 10
-const ROW_LIMIT_FILTERED = 40
+// Cards rendered per group before "Show all", as [unfiltered, filtered]: a
+// rack can hold 180+ cards, a filtered view is short enough to show more, and
+// tiles fit several cards in the height of one list row.
+const ROW_LIMITS: Record<CardView, [number, number]> = {
+  list: [10, 40],
+  tiles: [36, 120],
+  mini: [64, 160],
+}
+
+const VIEW_BUTTONS: { id: CardView; label: string; icon: string }[] = [
+  { id: 'list', label: 'List', icon: 'mdi-format-list-bulleted' },
+  { id: 'tiles', label: 'Tiles', icon: 'mdi-view-grid-outline' },
+  { id: 'mini', label: 'Mini tiles', icon: 'mdi-view-comfy' },
+]
 
 const search = ref<string | null>('')
 const location = ref<string>('all')
@@ -251,6 +296,41 @@ function isGroupOpen(id: string): boolean {
   return openGroups[id] ?? id !== NOT_INSERTED_GROUP
 }
 
+// The view is remembered separately for a normal and a stretched window, so
+// stretching the window switches to tiles and narrowing it brings the list
+// back; a view picked by hand is kept for that window width.
+const VIEW_PREFS_KEY = 'tba.cardBoard.view'
+const viewPrefs = reactive(loadViewPrefs())
+// The window width is read straight from resize events rather than through
+// $q.screen, whose debounce switched the view late, after the drag had already
+// moved on. No requestAnimationFrame either: WebKit pauses it for a window that
+// is not on screen while still delivering resize events.
+const viewSlotNow = ref(viewSlot(window.innerWidth))
+function onWindowResize(): void {
+  viewSlotNow.value = nextViewSlot(viewSlotNow.value, window.innerWidth)
+}
+window.addEventListener('resize', onWindowResize, { passive: true })
+onUnmounted(() => window.removeEventListener('resize', onWindowResize))
+
+const cardView = computed(() => viewPrefs[viewSlotNow.value])
+
+function loadViewPrefs() {
+  try {
+    return parseViewPrefs(localStorage.getItem(VIEW_PREFS_KEY))
+  } catch {
+    return parseViewPrefs(null)
+  }
+}
+
+function pickView(view: CardView): void {
+  viewPrefs[viewSlotNow.value] = view
+  try {
+    localStorage.setItem(VIEW_PREFS_KEY, JSON.stringify(viewPrefs))
+  } catch {
+    // not persisted; the choice still applies for this session
+  }
+}
+
 const groups = computed(() => buildGroups(props.readers, props.racks, props.cards))
 
 // A rack that disappears must not leave the selector pointing at nothing.
@@ -261,6 +341,14 @@ watch(groups, (gs) => {
 const query = computed(() => (search.value ?? '').trim().toLowerCase())
 const narrowing = computed(() => !!query.value || status.value !== 'all')
 const filtering = computed(() => narrowing.value || location.value !== 'all')
+
+// The field shows "Filter: All"; the menu keeps the fuller "All locations".
+const locationShort = computed(() =>
+  location.value === 'all'
+    ? 'All'
+    : (groups.value.find((g) => g.id === location.value)?.label ?? 'All'),
+)
+const sortLabel = computed(() => SORT_OPTIONS.find((o) => o.value === sort.value)?.label ?? '')
 
 const locationOptions = computed(() => [
   { value: 'all', label: 'All locations' },
@@ -302,7 +390,7 @@ const views = computed(() => {
       // A filtered view opens every matching group, or the matches would be
       // hidden behind a fold the user never opened.
       open: narrowing.value || isGroupOpen(group.id),
-      limit: showAll[group.id] ? rows.length : narrowing.value ? ROW_LIMIT_FILTERED : ROW_LIMIT,
+      limit: showAll[group.id] ? rows.length : ROW_LIMITS[cardView.value][narrowing.value ? 1 : 0],
     }
   })
 })

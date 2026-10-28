@@ -14,6 +14,15 @@
   background: rgba(255, 255, 255, 0.04);
 }
 
+// The layout is exactly the window height (the card list scrolls inside the
+// page). Quasar sets its min-height from $q.screen.height, which trails a
+// shrinking window by a resize event: for that frame the document overflowed
+// and, with classic (always shown) scrollbars, a page scrollbar flickered in
+// and out, shaking the whole window content sideways during a resize.
+.q-layout--standard {
+  min-height: 100vh !important;
+}
+
 // Smooth page transitions
 .q-page {
   animation: fadeIn 0.25s ease-out;

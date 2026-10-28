@@ -149,11 +149,26 @@ body.body--dark {
 }
 
 .cb-toolbar__loc {
-  width: 140px;
+  width: 172px;
 }
 
 .cb-toolbar__sort {
-  width: 124px;
+  width: 148px;
+}
+
+// "Filter: Rack A" / "Sort: Slot": a muted prefix that names the field and
+// the value in medium weight.
+.cb-field-value {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+
+.cb-field-value__prefix {
+  color: var(--cb-text2);
+  font-weight: 400;
 }
 
 .cb-chips {
@@ -291,6 +306,10 @@ body.body--dark {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  // Classic scrollbars take width: keep their room reserved, so the list does
+  // not shift sideways (and tiles do not reflow) when the scrollbar comes and
+  // goes as filters change or the window is resized.
+  scrollbar-gutter: stable;
   padding: 10px 12px 16px;
 }
 
@@ -740,4 +759,248 @@ body.body--dark {
 .card-board button:focus-visible {
   outline: 2px solid var(--cb-active);
   outline-offset: 2px;
+}
+
+// Segmented controls clip their overflow (for the rounded border), which
+// would cut an outer ring off entirely: draw it inside the button instead.
+.card-board .cb-tabs button:focus-visible,
+.card-board .cb-viewswitch button:focus-visible {
+  outline-offset: -2px;
+}
+
+// View switch (list / tiles / mini tiles)
+
+.cb-viewswitch {
+  display: flex;
+  height: 32px;
+  flex-shrink: 0;
+  border: 1px solid var(--cb-input-bd);
+  border-radius: 16px;
+  overflow: hidden;
+
+  button {
+    width: 38px;
+    border: 0;
+    background: var(--cb-surface);
+    color: var(--cb-icon) !important;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+
+    + button {
+      border-left: 1px solid var(--cb-input-bd);
+    }
+  }
+
+  .cb-viewswitch__on {
+    background: var(--cb-chip-on-bg);
+    color: var(--cb-chip-on-fg) !important;
+  }
+}
+
+// Tile views: a stretched window uses its full width.
+.card-board--tiles {
+  .cb-toolbar__inner,
+  .cb-scroll__inner {
+    max-width: none;
+  }
+}
+
+// Tiles flow in a grid. `dense` lets the tiles after an opened card backfill
+// its row, so the full-width details panel lands right under that row.
+.cb-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(178px, 1fr));
+  grid-auto-flow: row dense;
+  gap: 6px;
+  padding: 8px;
+
+  &--mini {
+    grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
+  }
+}
+
+// The row wrapper steps out of the layout, so its tile and its panel are
+// separate grid items.
+.cb-row--tile {
+  display: contents;
+}
+
+.cb-tile {
+  position: relative;
+  min-width: 0;
+  height: 66px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  padding: 4px 8px 4px 12px;
+  border: 1px solid var(--cb-border);
+  border-radius: 8px;
+  background: var(--cb-surface);
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+
+  .cb-tiles--mini & {
+    height: 46px;
+  }
+
+  // Status stripe on the left edge.
+  &::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 4px;
+    background: transparent;
+  }
+
+  &--active::before {
+    background: var(--cb-active);
+  }
+  &--online::before {
+    background: var(--cb-online);
+  }
+  &--offline::before {
+    background: var(--cb-offline-dot);
+  }
+  &--unlinked::before {
+    background: var(--cb-unlinked);
+  }
+  &--absent::before {
+    background: var(--cb-absent);
+  }
+
+  &--unlinked {
+    background: var(--cb-warn-surface);
+    border-color: var(--cb-unlinked);
+  }
+
+  &--empty {
+    border-style: dashed;
+    border-color: var(--cb-input-bd);
+    cursor: default;
+  }
+
+  &:hover:not(:disabled) {
+    background: var(--cb-surface2);
+  }
+
+  &--open,
+  &--open:hover:not(:disabled) {
+    background: var(--cb-radio-on);
+    border-color: var(--cb-primary);
+    box-shadow: 0 0 0 1px var(--cb-primary);
+  }
+}
+
+.cb-tile__top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.cb-tile__slot {
+  flex-shrink: 0;
+  font-family: 'Roboto Mono', ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--cb-text2);
+}
+
+.cb-dot--small {
+  width: 8px;
+  height: 8px;
+}
+
+.cb-tile__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.cb-tile__att {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--cb-danger);
+  color: var(--cb-surface);
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cb-tile__sub {
+  font-family: 'Roboto Mono', ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--cb-text2);
+}
+
+.cb-tile__sub,
+.cb-tile__note {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cb-tile__note {
+  font-size: 11px;
+}
+
+// Details of a tile: a full-width box under the tile's row.
+.cb-panel--tile {
+  grid-column: 1 / -1;
+  padding: 10px 12px 12px;
+  border: 1px solid var(--cb-border);
+  border-radius: 8px;
+
+  &.cb-panel--warn {
+    border-color: var(--cb-unlinked);
+  }
+
+  .cb-facts {
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  }
+
+  // Forms stay readable instead of stretching across a wide window.
+  > :not(.cb-facts):not(.cb-panel__head) {
+    max-width: 560px;
+  }
+}
+
+.cb-panel__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--cb-text);
+}
+
+.cb-panel__headmain {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.cb-panel__title {
+  font-size: 15px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cb-panel__where {
+  font-size: 12px;
+  color: var(--cb-text2);
 }

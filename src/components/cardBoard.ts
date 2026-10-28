@@ -327,6 +327,86 @@ export function expiryLine(entry: CardEntry, now: number): ToneText {
   return { text: `exp ${date}`, tone: 'muted' }
 }
 
+/**
+ * The single status line of a tile: an urgent expiry wins over the session
+ * line, since a tile has no room for both, unless the session line reports
+ * something worse than an upcoming expiry (a failed auth, a disconnected rack).
+ */
+export function tileLine(entry: CardEntry, now: number): ToneText {
+  if (entry.status === 'empty') return { text: 'empty reader', tone: 'muted' }
+  if (entry.status === 'unlinked') {
+    return { text: entry.iccid ? 'not configured · click to link' : 'ICCID not read', tone: 'warn' }
+  }
+  const session = authLine(entry, now)
+  const days = daysToExpiry(entry, now)
+  if (days !== null && days <= EXPIRY_WARN_DAYS) {
+    const expiry = expiryLine(entry, now)
+    if (expiry.tone === 'danger' || session.tone !== 'danger') return expiry
+  }
+  return session
+}
+
+/** How cards are drawn inside a group. */
+export type CardView = 'list' | 'tiles' | 'mini'
+
+export const CARD_VIEWS: readonly CardView[] = ['list', 'tiles', 'mini']
+
+/** Default window width, as set in tauri.conf.json. */
+export const BASE_WINDOW_WIDTH = 620
+
+/**
+ * Window width (px) above which the window counts as stretched: more than 15%
+ * wider than the default.
+ */
+export const WIDE_WINDOW_AT = Math.round(BASE_WINDOW_WIDTH * 1.15)
+
+/**
+ * The view chosen for a normal and for a stretched window, remembered
+ * separately: stretching the window switches to medium tiles until the user
+ * picks another view there, narrowing it brings the list back.
+ */
+export interface ViewPrefs {
+  narrow: CardView
+  wide: CardView
+}
+
+export const DEFAULT_VIEW_PREFS: ViewPrefs = { narrow: 'list', wide: 'tiles' }
+
+export function viewSlot(windowWidth: number): keyof ViewPrefs {
+  return windowWidth > WIDE_WINDOW_AT ? 'wide' : 'narrow'
+}
+
+/**
+ * How far below WIDE_WINDOW_AT a stretched window must shrink before the
+ * normal view comes back. Without this band a window edge resting on the
+ * threshold flips between tiles and list on every pixel of hand jitter, and
+ * the two layouts differ enough that the content visibly jumps each time.
+ */
+export const VIEW_SWITCH_BAND = 24
+
+/** The next view slot for `windowWidth`, with hysteresis around the threshold. */
+export function nextViewSlot(current: keyof ViewPrefs, windowWidth: number): keyof ViewPrefs {
+  if (current === 'wide') return windowWidth < WIDE_WINDOW_AT - VIEW_SWITCH_BAND ? 'narrow' : 'wide'
+  return viewSlot(windowWidth)
+}
+
+/** Reads stored prefs, falling back per field on anything unexpected. */
+export function parseViewPrefs(raw: string | null): ViewPrefs {
+  let parsed: unknown = null
+  try {
+    parsed = raw ? JSON.parse(raw) : null
+  } catch {
+    parsed = null
+  }
+  const p = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {}
+  const pick = (v: unknown, fallback: CardView): CardView =>
+    CARD_VIEWS.includes(v as CardView) ? (v as CardView) : fallback
+  return {
+    narrow: pick(p.narrow, DEFAULT_VIEW_PREFS.narrow),
+    wide: pick(p.wide, DEFAULT_VIEW_PREFS.wide),
+  }
+}
+
 export interface GroupSummary {
   counts: Record<Exclude<CardStatus, 'empty'>, number>
   /** Cards in the group, not counting empty readers. */

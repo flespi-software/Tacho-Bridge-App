@@ -1,7 +1,11 @@
 <template>
-  <div class="cb-row" :class="{ 'cb-row--open': open, 'cb-row--warn': open && unlinked }">
+  <div
+    class="cb-row"
+    :class="{ 'cb-row--open': open, 'cb-row--warn': open && unlinked, 'cb-row--tile': tiled }"
+  >
     <!-- Collapsed line: slot, status dot, name + number, auth + expiry -->
     <button
+      v-if="!tiled"
       type="button"
       class="cb-row__line"
       :aria-expanded="isEmpty ? undefined : open"
@@ -32,194 +36,257 @@
       </span>
     </button>
 
-    <!-- Configured card: details, rename, remove -->
-    <div v-if="open && !unlinked && !isEmpty" class="cb-panel">
-      <div class="cb-facts">
-        <div v-for="f in facts" :key="f.k" class="cb-fact">
-          <span class="cb-fact__k">{{ f.k }}</span>
-          <span class="cb-fact__v" :class="f.tone ? `cb-tone--${f.tone}` : ''" :title="f.v">{{
-            f.v
-          }}</span>
-        </div>
+    <!-- Tile: the same card in a grid cell. Mini tiles drop the status line;
+         the full summary is in the tooltip and the opened panel. -->
+    <button
+      v-else
+      type="button"
+      class="cb-tile"
+      :class="[`cb-tile--${entry.status}`, { 'cb-tile--open': open }]"
+      :aria-expanded="isEmpty ? undefined : open"
+      :disabled="isEmpty"
+      :title="tileTip"
+      @click="emit('toggle')"
+    >
+      <span class="cb-tile__top">
+        <span class="cb-tile__slot">{{ entry.slotLabel }}</span>
+        <span
+          class="cb-dot cb-dot--small"
+          :class="[`cb-dot--${entry.status}`, { 'cb-dot--pulse': entry.status === 'active' }]"
+        />
+        <span
+          class="cb-tile__title"
+          :class="{ 'cb-row__title--warn': unlinked, 'cb-row__title--muted': isEmpty }"
+        >
+          {{ rowTitle }}
+        </span>
+        <span v-if="attention" class="cb-tile__att" role="img" aria-label="Needs attention">!</span>
+      </span>
+      <span v-if="rowSub" class="cb-tile__sub">{{ rowSub }}</span>
+      <span v-if="view === 'tiles'" class="cb-tile__note" :class="`cb-tone--${note.tone}`">
+        {{ note.text }}
+      </span>
+    </button>
+
+    <!-- Opened card. A tile's panel sits apart from its tile, so it repeats
+         the card's title and place in a head with a close button. -->
+    <div
+      v-if="open && !isEmpty"
+      class="cb-panel"
+      :class="{ 'cb-panel--warn': unlinked, 'cb-panel--tile': tiled }"
+    >
+      <div v-if="tiled" class="cb-panel__head">
+        <span class="cb-panel__headmain">
+          <span class="cb-panel__title" :class="{ 'cb-row__title--warn': unlinked }">
+            {{ rowTitle }}
+          </span>
+          <span class="cb-panel__where">
+            <span v-if="rowSub" class="cb-mono">{{ rowSub }} · </span>{{ entry.place }}
+          </span>
+        </span>
+        <span v-if="!unlinked" class="cb-row__meta">
+          <span :class="`cb-tone--${auth.tone}`">{{ auth.text }}</span>
+          <span :class="`cb-tone--${expiry.tone}`">{{ expiry.text }}</span>
+        </span>
+        <q-btn
+          flat
+          round
+          dense
+          icon="mdi-close"
+          aria-label="Close details"
+          @click="emit('toggle')"
+        />
       </div>
 
-      <template v-if="entry.card">
-        <div class="row no-wrap items-end q-gutter-x-sm">
-          <q-input
-            v-model="draft"
-            class="col"
-            label="Card name"
-            outlined
-            dense
-            :disable="busy"
-            @keyup.enter="saveName"
-          />
-          <q-btn
-            unelevated
-            rounded
-            no-caps
-            class="cb-btn-primary"
-            label="Save"
-            :disable="draft.trim() === entry.name || busy"
-            :loading="busy && action === 'rename'"
-            @click="saveName"
-          />
-        </div>
-
-        <div v-if="!confirming">
-          <q-btn
-            outline
-            rounded
-            no-caps
-            dense
-            class="cb-btn-danger q-px-md"
-            label="Remove"
-            :disable="busy"
-            @click="confirming = true"
-          />
-        </div>
-        <div v-else class="cb-confirm row no-wrap items-center">
-          <span class="col">{{ removeText }}</span>
-          <q-btn
-            flat
-            rounded
-            no-caps
-            dense
-            class="q-px-sm"
-            label="Cancel"
-            @click="confirming = false"
-          />
-          <q-btn
-            unelevated
-            rounded
-            no-caps
-            dense
-            color="negative"
-            class="q-px-md"
-            label="Remove"
-            :loading="busy && action === 'remove'"
-            @click="doRemove"
-          />
-        </div>
-      </template>
-    </div>
-
-    <!-- Unknown card: link to a configured card or add a new one -->
-    <div v-if="open && unlinked" class="cb-panel cb-panel--warn">
-      <template v-if="entry.iccid">
-        <div class="cb-panel__text">
-          This card is in {{ entry.place }} but is not in the configuration. Link it to a configured
-          card or add it as a new one.
-        </div>
-        <div class="cb-tabs" role="tablist">
-          <button
-            type="button"
-            role="tab"
-            :aria-selected="tab === 'existing'"
-            :class="{ 'cb-tabs__on': tab === 'existing' }"
-            @click="tab = 'existing'"
-          >
-            Configured card · {{ linkable.length }}
-          </button>
-          <button
-            type="button"
-            role="tab"
-            :aria-selected="tab === 'new'"
-            :class="{ 'cb-tabs__on': tab === 'new' }"
-            @click="tab = 'new'"
-          >
-            New card
-          </button>
-        </div>
-
-        <template v-if="tab === 'existing'">
-          <q-input
-            v-model="linkQuery"
-            outlined
-            dense
-            clearable
-            placeholder="Cards in the configuration without ICCID"
-          >
-            <template #prepend><q-icon name="mdi-magnify" size="xs" /></template>
-          </q-input>
-          <div class="cb-picklist">
-            <button
-              v-for="c in linkShown"
-              :key="c.number"
-              type="button"
-              class="cb-pick"
-              :class="{ 'cb-pick--on': linkPick === c.number }"
-              :aria-pressed="linkPick === c.number"
-              @click="linkPick = c.number"
-            >
-              <span class="cb-radio"><span /></span>
-              <span class="cb-pick__main">
-                <span class="cb-pick__name">{{ c.card.name || c.number }}</span>
-                <span class="cb-pick__sub">
-                  <span class="cb-mono">{{ c.number }}</span>
-                  · {{ c.card.company_name || 'company not read yet' }}
-                </span>
-              </span>
-            </button>
-            <div v-if="linkShown.length === 0" class="cb-picklist__empty">
-              {{
-                linkable.length
-                  ? 'No configured card matches the search.'
-                  : 'No configured cards without ICCID. Use “New card”.'
-              }}
-            </div>
+      <!-- Configured card: details, rename, remove -->
+      <template v-if="!unlinked">
+        <div class="cb-facts">
+          <div v-for="f in facts" :key="f.k" class="cb-fact">
+            <span class="cb-fact__k">{{ f.k }}</span>
+            <span class="cb-fact__v" :class="f.tone ? `cb-tone--${f.tone}` : ''" :title="f.v">{{
+              f.v
+            }}</span>
           </div>
-          <div class="row justify-end">
-            <q-btn
-              unelevated
-              rounded
-              no-caps
-              class="cb-btn-primary"
-              label="Link to selected card"
-              :disable="!canLink || busy"
-              :loading="busy && action === 'link'"
-              @click="doLink"
-            />
-          </div>
-        </template>
+        </div>
 
-        <template v-else>
-          <div class="row no-wrap q-gutter-x-sm">
+        <template v-if="entry.card">
+          <div class="row no-wrap items-end q-gutter-x-sm">
             <q-input
-              :model-value="newNumber"
+              v-model="draft"
               class="col"
-              input-class="cb-mono"
-              label="Card number"
+              label="Card name"
               outlined
               dense
-              maxlength="16"
-              :error="!!newNumber && !!newNumberError"
-              :error-message="newNumberError"
-              hide-bottom-space
-              @update:model-value="(v) => (newNumber = String(v ?? '').toUpperCase())"
+              :disable="busy"
+              @keyup.enter="saveName"
             />
-            <q-input v-model="newName" class="col" label="Card name" outlined dense />
-          </div>
-          <div class="row no-wrap items-center">
-            <span class="col cb-hint">{{
-              newNumber ? (newNumberError ? '' : 'Looks good') : 'The number printed on the card'
-            }}</span>
             <q-btn
               unelevated
               rounded
               no-caps
               class="cb-btn-primary"
-              label="Add and link"
-              :disable="!!newNumberError || busy"
-              :loading="busy && action === 'add'"
-              @click="doAdd"
+              label="Save"
+              :disable="draft.trim() === entry.name || busy"
+              :loading="busy && action === 'rename'"
+              @click="saveName"
+            />
+          </div>
+
+          <div v-if="!confirming">
+            <q-btn
+              outline
+              rounded
+              no-caps
+              dense
+              class="cb-btn-danger q-px-md"
+              label="Remove"
+              :disable="busy"
+              @click="confirming = true"
+            />
+          </div>
+          <div v-else class="cb-confirm row no-wrap items-center">
+            <span class="col">{{ removeText }}</span>
+            <q-btn
+              flat
+              rounded
+              no-caps
+              dense
+              class="q-px-sm"
+              label="Cancel"
+              @click="confirming = false"
+            />
+            <q-btn
+              unelevated
+              rounded
+              no-caps
+              dense
+              color="negative"
+              class="q-px-md"
+              label="Remove"
+              :loading="busy && action === 'remove'"
+              @click="doRemove"
             />
           </div>
         </template>
       </template>
-      <div v-else class="cb-panel__text">
-        The card's ICCID could not be read, so it cannot be linked. Reinsert the card.
-      </div>
+
+      <!-- Unknown card: link to a configured card or add a new one -->
+      <template v-else>
+        <template v-if="entry.iccid">
+          <div class="cb-panel__text">
+            This card is in {{ entry.place }} but is not in the configuration. Link it to a
+            configured card or add it as a new one.
+          </div>
+          <div class="cb-tabs" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              :aria-selected="tab === 'existing'"
+              :class="{ 'cb-tabs__on': tab === 'existing' }"
+              @click="tab = 'existing'"
+            >
+              Configured card · {{ linkable.length }}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              :aria-selected="tab === 'new'"
+              :class="{ 'cb-tabs__on': tab === 'new' }"
+              @click="tab = 'new'"
+            >
+              New card
+            </button>
+          </div>
+
+          <template v-if="tab === 'existing'">
+            <q-input
+              v-model="linkQuery"
+              outlined
+              dense
+              clearable
+              placeholder="Cards in the configuration without ICCID"
+            >
+              <template #prepend><q-icon name="mdi-magnify" size="xs" /></template>
+            </q-input>
+            <div class="cb-picklist">
+              <button
+                v-for="c in linkShown"
+                :key="c.number"
+                type="button"
+                class="cb-pick"
+                :class="{ 'cb-pick--on': linkPick === c.number }"
+                :aria-pressed="linkPick === c.number"
+                @click="linkPick = c.number"
+              >
+                <span class="cb-radio"><span /></span>
+                <span class="cb-pick__main">
+                  <span class="cb-pick__name">{{ c.card.name || c.number }}</span>
+                  <span class="cb-pick__sub">
+                    <span class="cb-mono">{{ c.number }}</span>
+                    · {{ c.card.company_name || 'company not read yet' }}
+                  </span>
+                </span>
+              </button>
+              <div v-if="linkShown.length === 0" class="cb-picklist__empty">
+                {{
+                  linkable.length
+                    ? 'No configured card matches the search.'
+                    : 'No configured cards without ICCID. Use “New card”.'
+                }}
+              </div>
+            </div>
+            <div class="row justify-end">
+              <q-btn
+                unelevated
+                rounded
+                no-caps
+                class="cb-btn-primary"
+                label="Link to selected card"
+                :disable="!canLink || busy"
+                :loading="busy && action === 'link'"
+                @click="doLink"
+              />
+            </div>
+          </template>
+
+          <template v-else>
+            <div class="row no-wrap q-gutter-x-sm">
+              <q-input
+                :model-value="newNumber"
+                class="col"
+                input-class="cb-mono"
+                label="Card number"
+                outlined
+                dense
+                maxlength="16"
+                :error="!!newNumber && !!newNumberError"
+                :error-message="newNumberError"
+                hide-bottom-space
+                @update:model-value="(v) => (newNumber = String(v ?? '').toUpperCase())"
+              />
+              <q-input v-model="newName" class="col" label="Card name" outlined dense />
+            </div>
+            <div class="row no-wrap items-center">
+              <span class="col cb-hint">{{
+                newNumber ? (newNumberError ? '' : 'Looks good') : 'The number printed on the card'
+              }}</span>
+              <q-btn
+                unelevated
+                rounded
+                no-caps
+                class="cb-btn-primary"
+                label="Add and link"
+                :disable="!!newNumberError || busy"
+                :loading="busy && action === 'add'"
+                @click="doAdd"
+              />
+            </div>
+          </template>
+        </template>
+        <div v-else class="cb-panel__text">
+          The card's ICCID could not be read, so it cannot be linked. Reinsert the card.
+        </div>
+      </template>
     </div>
   </div>
 </template>
@@ -233,9 +300,12 @@ import {
   daysToExpiry,
   expiryLine,
   linkableCards,
+  needsAttention,
+  tileLine,
   newCardNumberError,
   EXPIRY_WARN_DAYS,
   type CardEntry,
+  type CardView,
   type Tone,
 } from './cardBoard'
 import { notifySuccess, TOAST_SHORT } from 'src/composables/notify'
@@ -243,6 +313,7 @@ import { notifySuccess, TOAST_SHORT } from 'src/composables/notify'
 const props = defineProps<{
   entry: CardEntry
   open: boolean
+  view: CardView
   now: number
   cards: Record<string, SmartCard>
   // Both resolve to whether the change was persisted; failures are reported
@@ -269,8 +340,17 @@ const rowSub = computed(() => {
   return props.entry.name ? props.entry.number : ''
 })
 
+const tiled = computed(() => props.view !== 'list')
+
 const auth = computed(() => authLine(props.entry, props.now))
 const expiry = computed(() => expiryLine(props.entry, props.now))
+const note = computed(() => tileLine(props.entry, props.now))
+const attention = computed(() => needsAttention(props.entry, props.now))
+const tileTip = computed(() =>
+  [rowTitle.value, rowSub.value, props.entry.place, auth.value.text, expiry.value.text]
+    .filter(Boolean)
+    .join(' · '),
+)
 
 const facts = computed(() => {
   const card = props.entry.card

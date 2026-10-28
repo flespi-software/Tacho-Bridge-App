@@ -13,7 +13,10 @@ defineOptions({
   name: 'IndexPage',
 })
 
-function fillViewport(offset: number, height: number) {
-  return { height: `${height - offset}px` }
+// Sized in CSS rather than from the height Quasar passes in: that value trails
+// a shrinking window by a resize event, so the page overflowed for a frame and
+// a page scrollbar flickered in and out while the window was being resized.
+function fillViewport(offset: number) {
+  return { height: `calc(100vh - ${offset}px)` }
 }
 </script>

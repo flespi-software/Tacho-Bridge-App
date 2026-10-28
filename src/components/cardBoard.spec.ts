@@ -10,6 +10,12 @@ import {
   summarize,
   linkableCards,
   newCardNumberError,
+  tileLine,
+  viewSlot,
+  nextViewSlot,
+  VIEW_SWITCH_BAND,
+  parseViewPrefs,
+  WIDE_WINDOW_AT,
   SORTERS,
   type CardEntry,
 } from './cardBoard'
@@ -311,5 +317,92 @@ describe('card config helpers', () => {
     expect(newCardNumberError('a000000000000002', cards)).not.toBe('')
     expect(newCardNumberError('A00000000000000', cards)).not.toBe('')
     expect(newCardNumberError('CONSTRUCTOR00000', cards)).toBe('')
+  })
+})
+
+describe('tileLine', () => {
+  it('shows an urgent expiry instead of the session line', () => {
+    const e = entry({ card: { expire: nowS + 5 * DAY_S, last_auth: [nowS - 300, true] } })
+    expect(tileLine(e, NOW)).toEqual({ text: 'expires in 5 d', tone: 'warn' })
+  })
+
+  it('does not hide a failed auth or a disconnected rack behind an upcoming expiry', () => {
+    const soon = nowS + 5 * DAY_S
+    expect(
+      tileLine(entry({ card: { expire: soon, last_auth: [nowS - 300, false] } }), NOW),
+    ).toEqual({ text: 'auth failed · 5 min ago', tone: 'danger' })
+    expect(
+      tileLine(entry({ status: 'offline', rackDown: true, card: { expire: soon } }), NOW).text,
+    ).toBe('rack disconnected')
+    // An expired card explains the failed auth, so the expiry is shown.
+    expect(
+      tileLine(entry({ card: { expire: nowS - DAY_S, last_auth: [nowS - 300, false] } }), NOW).tone,
+    ).toBe('danger')
+    expect(
+      tileLine(entry({ card: { expire: nowS - DAY_S, last_auth: [nowS - 300, false] } }), NOW).text,
+    ).toMatch(/^expired /)
+  })
+
+  it('falls back to the session line', () => {
+    expect(tileLine(entry({ card: { last_auth: [nowS - 300, true] } }), NOW).text).toBe(
+      'auth 5 min ago',
+    )
+    expect(tileLine(entry({ status: 'active' }), NOW).text).toBe('authenticating…')
+  })
+
+  it('invites linking an unknown card', () => {
+    expect(tileLine(entry({ status: 'unlinked' }), NOW)).toEqual({
+      text: 'not configured · click to link',
+      tone: 'warn',
+    })
+    expect(tileLine(entry({ status: 'unlinked', iccid: '' }), NOW).text).toBe('ICCID not read')
+    expect(tileLine(entry({ status: 'empty' }), NOW).text).toBe('empty reader')
+  })
+})
+
+describe('view prefs', () => {
+  it('switches to the stretched-window slot above 15% over the default width', () => {
+    expect(WIDE_WINDOW_AT).toBe(713)
+    expect(viewSlot(620)).toBe('narrow')
+    expect(viewSlot(713)).toBe('narrow')
+    expect(viewSlot(714)).toBe('wide')
+  })
+
+  it('defaults to the list normally and medium tiles when stretched', () => {
+    expect(parseViewPrefs(null)).toEqual({ narrow: 'list', wide: 'tiles' })
+  })
+
+  it('keeps stored choices and repairs broken ones field by field', () => {
+    expect(parseViewPrefs('{"narrow":"mini","wide":"list"}')).toEqual({
+      narrow: 'mini',
+      wide: 'list',
+    })
+    expect(parseViewPrefs('{"narrow":"grid","wide":"mini"}')).toEqual({
+      narrow: 'list',
+      wide: 'mini',
+    })
+    expect(parseViewPrefs('not json')).toEqual({ narrow: 'list', wide: 'tiles' })
+    expect(parseViewPrefs('[1]')).toEqual({ narrow: 'list', wide: 'tiles' })
+  })
+
+  it('keeps the stretched view until the window is clearly narrower again', () => {
+    // Up: switches once above the threshold.
+    expect(nextViewSlot('narrow', 713)).toBe('narrow')
+    expect(nextViewSlot('narrow', 714)).toBe('wide')
+    // Down: a window resting on the threshold does not flip back...
+    expect(nextViewSlot('wide', 713)).toBe('wide')
+    expect(nextViewSlot('wide', 713 - VIEW_SWITCH_BAND)).toBe('wide')
+    // ...only one clearly below it does.
+    expect(nextViewSlot('wide', 713 - VIEW_SWITCH_BAND - 1)).toBe('narrow')
+  })
+
+  it('does not flap when the width jitters around the threshold', () => {
+    let slot: 'narrow' | 'wide' = 'narrow'
+    const seen: string[] = []
+    for (const w of [700, 714, 712, 715, 711, 713, 710, 716]) {
+      slot = nextViewSlot(slot, w)
+      seen.push(slot)
+    }
+    expect(seen).toEqual(['narrow', 'wide', 'wide', 'wide', 'wide', 'wide', 'wide', 'wide'])
   })
 })

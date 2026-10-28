@@ -56,18 +56,26 @@
     />
 
     <div v-if="open">
-      <CardRow
-        v-for="e in shownRows"
-        :key="e.key"
-        :entry="e"
-        :open="openRow === e.key"
-        :now="now"
-        :cards="cards"
-        :save="save"
-        :remove="remove"
-        @toggle="emit('row-toggle', e.key)"
-        @close="emit('row-close')"
-      />
+      <!-- In the tile views the rows flow in a grid, and an opened card's
+           panel spans the full grid width under its tile (see .cb-tiles). -->
+      <div
+        v-if="shownRows.length"
+        :class="view === 'list' ? undefined : ['cb-tiles', `cb-tiles--${view}`]"
+      >
+        <CardRow
+          v-for="e in shownRows"
+          :key="e.key"
+          :entry="e"
+          :open="openRow === e.key"
+          :view="view"
+          :now="now"
+          :cards="cards"
+          :save="save"
+          :remove="remove"
+          @toggle="emit('row-toggle', e.key)"
+          @close="emit('row-close')"
+        />
+      </div>
       <div v-if="rows.length === 0" class="cb-group__empty">{{ emptyText }}</div>
       <button
         v-if="rows.length > shownRows.length"
@@ -85,7 +93,13 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import CardRow from './CardRow.vue'
 import type { SmartCard } from './models'
-import { summarize, type CardEntry, type CardGroup, type StatusFilter } from './cardBoard'
+import {
+  summarize,
+  type CardEntry,
+  type CardGroup,
+  type CardView,
+  type StatusFilter,
+} from './cardBoard'
 
 const props = defineProps<{
   group: CardGroup
@@ -93,6 +107,7 @@ const props = defineProps<{
   rows: CardEntry[]
   /** How many rows to render before the "Show all" button. */
   limit: number
+  view: CardView
   open: boolean
   openRow: string | null
   now: number
@@ -109,7 +124,13 @@ const emit = defineEmits<{
   (e: 'row-close'): void
 }>()
 
-const shownRows = computed(() => props.rows.slice(0, props.limit))
+// An opened card stays rendered even past the limit: the limit shrinks when
+// the window narrows into the list view, and cutting the card off there would
+// silently drop its half-typed name or pending remove confirmation.
+const shownRows = computed(() => {
+  const openAt = props.openRow ? props.rows.findIndex((e) => e.key === props.openRow) : -1
+  return props.rows.slice(0, Math.max(props.limit, openAt + 1))
+})
 const summary = computed(() => summarize(props.group, props.now))
 
 const icon = computed(() =>
