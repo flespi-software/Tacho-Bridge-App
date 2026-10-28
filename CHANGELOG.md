@@ -240,3 +240,10 @@ All notable changes to this project will be documented in this file.
 - Improved card rack reliability: rack exchanges no longer interrupt the server connection, racks relink after a failed update, and a stale session can no longer release another card's slot.
 - Improved updates: installation waits up to 10 minutes for card activity to end, and a repeatedly failing version pauses for 24 hours.
 - Improved config and log safety: a corrupt config is kept as a backup copy, company names decode non-Latin characters, and driver names no longer appear in debug logs.
+
+### [0.8.0-rc.19] - 2026-10-28
+
+🆕 Features / Improvements
+
+- Redesigned the card list: one list grouped by reader and rack, with search, status filters and inline card linking.
+- redesign UI/UX.
