@@ -1,6 +1,7 @@
 // ───── Std Lib ─────
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +26,6 @@ use crate::global_app_handle::card_emit_event;
 use crate::mqtt::{card_io, ensure_connection, remove_connections_all};
 
 // ───── Constants ─────
-const READERS_BUFFER_SIZE: usize = 2048;
 const MANUAL_SYNC_TIMEOUT_SECS: u64 = 1;
 /// Status word `mqtt.rs` substitutes on the wire when `send_apdu` returns a
 /// transport error (the APDU could not be run against the card at all). Never
@@ -197,11 +197,19 @@ pub fn request_rescan() {
     }
 }
 
-fn setup_reader_states(
-    ctx: &Context,
-    readers_buf: &mut [u8],
-    reader_states: &mut Vec<ReaderState>,
-) -> DynResult<()> {
+/// Lists the reader names with a buffer sized by PC/SC itself. A fixed buffer
+/// failed the enumeration with `InsufficientBuffer` for good once enough
+/// readers (or long enough names) were attached — and with it every monitor
+/// pass. A reader plugged in between the length query and the listing makes
+/// the queried size stale: one retry with a fresh length covers that race.
+fn list_reader_names(ctx: &Context) -> Result<Vec<CString>, pcsc::Error> {
+    match ctx.list_readers_owned() {
+        Err(pcsc::Error::InsufficientBuffer) => ctx.list_readers_owned(),
+        other => other,
+    }
+}
+
+fn setup_reader_states(ctx: &Context, reader_states: &mut Vec<ReaderState>) -> DynResult<()> {
     // Remove dead readers.
     fn is_dead(rs: &ReaderState) -> bool {
         rs.event_state()
@@ -217,10 +225,10 @@ fn setup_reader_states(
     reader_states.retain(|rs| !is_dead(rs));
     // Add new readers.
 
-    let names = ctx.list_readers(readers_buf)?;
+    let names = list_reader_names(ctx)?;
 
     for name in names {
-        if !reader_states.iter().any(|rs| rs.name() == name) {
+        if !reader_states.iter().any(|rs| rs.name() == name.as_c_str()) {
             debug!("Reader {:?} has been connected to the computer", name);
             reader_states.push(ReaderState::new(name, PcscState::UNAWARE));
         }
@@ -247,6 +255,151 @@ lazy_static::lazy_static! {
     /// right after the winner registered its session, wiping the card's security
     /// state in the middle of a live VU authentication.
     static ref READER_SWEEP: tokio::sync::Mutex<()> = tokio::sync::Mutex::new(());
+}
+
+/// Poison-tolerant lock for the plain bookkeeping maps below: a panic in one
+/// sweep must not turn every later sweep into a panic too.
+fn lock_map<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Number of PC/SC calls per reader currently running (or queued) on the
+/// blocking pool. A PC/SC call cannot be interrupted: when its caller gives up
+/// after `CARD_IO_TIMEOUT`, the call keeps its blocking-pool thread until the
+/// reader lets go — possibly never. The count is taken before the closure is
+/// spawned and released when the closure itself ends (not when its caller
+/// stops waiting), so it tells whether the reader is still wedged.
+static READER_IO_IN_FLIGHT: std::sync::Mutex<BTreeMap<CString, usize>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Marks one blocking PC/SC call on a reader for as long as it lives; moved
+/// into the `spawn_blocking` closure that makes the call.
+struct ReaderIoGuard(Arc<CStr>);
+
+impl ReaderIoGuard {
+    fn new(reader_name: &Arc<CStr>) -> Self {
+        *lock_map(&READER_IO_IN_FLIGHT)
+            .entry(reader_name.as_ref().to_owned())
+            .or_insert(0) += 1;
+        Self(Arc::clone(reader_name))
+    }
+}
+
+impl Drop for ReaderIoGuard {
+    fn drop(&mut self) {
+        let mut in_flight = lock_map(&READER_IO_IN_FLIGHT);
+        if let Some(count) = in_flight.get_mut(self.0.as_ref()) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                in_flight.remove(self.0.as_ref());
+            }
+        }
+    }
+}
+
+/// True while a blocking PC/SC call on this reader has not returned yet.
+fn reader_io_in_flight(reader_name: &CStr) -> bool {
+    lock_map(&READER_IO_IN_FLIGHT).contains_key(reader_name)
+}
+
+/// `reader_io_in_flight` by the reader name as `ProcessingCard` stores it.
+/// Covers the close of a dropped card handle too (see `CardCell`), which is
+/// what `mqtt::shutdown_connections` waits for.
+pub(crate) fn reader_io_pending(reader_name: &str) -> bool {
+    CString::new(reader_name).is_ok_and(|name| reader_io_in_flight(&name))
+}
+
+/// Readers whose card the last probe left unserved (not linked in the config,
+/// unreadable ICCID, no usable server host), with the ATR and PC/SC event
+/// count it was probed at. Every sweep walks ALL readers, and a sweep runs on
+/// an event from ANY reader — including the INUSE flips the probe's own
+/// connect/disconnect causes — so without this an unserved card was reopened
+/// and re-read on every event of every reader. The entry is dropped (and the
+/// card probed again) when the reader reports another ATR or event count
+/// (re-insertion), the card is removed, or a new pass / manual sync starts:
+/// linking a card in the UI saves the config and calls `request_rescan`.
+static UNSERVED_PROBES: std::sync::Mutex<BTreeMap<String, (String, u32)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// True when the card in the reader is the one a previous probe already found
+/// unserved, unchanged since (same ATR, no insertion/removal in between).
+fn probed_unserved(memo: Option<&(String, u32)>, atr: &str, event_count: u32) -> bool {
+    memo.is_some_and(|(probed_atr, probed_count)| probed_atr == atr && *probed_count == event_count)
+}
+
+fn forget_unserved_probes() {
+    lock_map(&UNSERVED_PROBES).clear();
+}
+
+/// Records the outcome of a probe: a card left without a live session is not
+/// probed again until its reader changes (see `UNSERVED_PROBES`). A probe that
+/// ran out of time is not recorded — its reader is retried once it recovers.
+async fn note_probe_outcome(reader_name: &CStr, reader: &str, atr: &str, event_count: u32) {
+    let served = TASK_POOL.lock().await.iter().any(|c| {
+        c.reader_name.as_deref() == Some(reader)
+            && c.atr.as_deref() == Some(atr)
+            && !c.task_handle.inner().is_finished()
+    });
+    let stuck = !served && reader_io_in_flight(reader_name);
+    {
+        let mut memo = lock_map(&UNSERVED_PROBES);
+        if served || stuck {
+            memo.remove(reader);
+        } else {
+            memo.insert(reader.to_owned(), (atr.to_owned(), event_count));
+        }
+    }
+    if stuck {
+        rescan_when_reader_idle(reader_name);
+    }
+}
+
+/// Readers with a `rescan_when_reader_idle` watcher already running.
+static IDLE_RESCAN_PENDING: std::sync::Mutex<BTreeSet<CString>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+/// Poll step of the `rescan_when_reader_idle` watcher.
+const IDLE_RESCAN_POLL: Duration = Duration::from_secs(1);
+
+/// Requests a rescan once the reader's stuck PC/SC call returns. A probe
+/// skipped (or timed out) because of that call is otherwise retried only on
+/// the reader's next PC/SC event, which may never come: the card sits there
+/// unserved although the reader recovered. One watcher per reader.
+fn rescan_when_reader_idle(reader_name: &CStr) {
+    let reader = reader_name.to_owned();
+    if !lock_map(&IDLE_RESCAN_PENDING).insert(reader.clone()) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        while reader_io_in_flight(&reader) {
+            tokio::time::sleep(IDLE_RESCAN_POLL).await;
+        }
+        lock_map(&IDLE_RESCAN_PENDING).remove(&reader);
+        info!(
+            "Reader {:?}: the stuck card operation returned, rescanning",
+            reader
+        );
+        request_rescan();
+    });
+}
+
+/// PC/SC readers that currently have a row in the UI (the last state the
+/// sweep emitted for them was not a removal). Mirrors the rule
+/// `card_emit_event` applies to its replay map, so `evict_vanished_readers`
+/// can retire the rows of readers that disappeared while no context watched
+/// them — not only the ones that had a card session.
+static REPORTED_READERS: std::sync::Mutex<BTreeSet<String>> =
+    std::sync::Mutex::new(BTreeSet::new());
+
+fn note_reported_reader(reader: &str, card_state: &str) {
+    let mut reported = lock_map(&REPORTED_READERS);
+    if card_state.contains("UNKNOWN") || card_state.contains("IGNORE") {
+        reported.remove(reader);
+    } else {
+        reported.insert(reader.to_owned());
+    }
 }
 
 // Every failure here is per-card and non-fatal: it is logged and the loop
@@ -290,9 +443,43 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) {
 
         let action = reconcile_reader_event(reader_name_string, &atr).await;
         let registered = match action {
-            CardProcessingResult::Create => register_card(reader_name, &atr, &atr_protocol).await,
+            CardProcessingResult::Create => {
+                let event_count = rs.event_count();
+                let unchanged = probed_unserved(
+                    lock_map(&UNSERVED_PROBES).get(reader_name_string),
+                    &atr,
+                    event_count,
+                );
+                if unchanged {
+                    // Already probed and reported; nothing changed in this
+                    // reader since, so there is nothing new to emit either.
+                    trace!(
+                        "Reader {:?}: card already probed and unserved, skipping",
+                        reader_name
+                    );
+                    continue;
+                }
+                if reader_io_in_flight(reader_name) {
+                    // A probe would queue behind (and park another thread
+                    // next to) a PC/SC call that already outlived its caller,
+                    // holding READER_SWEEP for up to two card_io timeouts.
+                    // Not recorded as unserved: retried by the next sweep,
+                    // or by a rescan once the call returns.
+                    warn!(
+                        "Reader {:?}: an earlier card operation is still stuck in PC/SC, not probing the card",
+                        reader_name
+                    );
+                    rescan_when_reader_idle(reader_name);
+                    None
+                } else {
+                    let registered = register_card(reader_name, &atr, &atr_protocol).await;
+                    note_probe_outcome(reader_name, reader_name_string, &atr, event_count).await;
+                    registered
+                }
+            }
             CardProcessingResult::Delete => {
                 debug!("CARD DELETED {}", card_state_string);
+                lock_map(&UNSERVED_PROBES).remove(reader_name_string);
                 None
             }
             CardProcessingResult::Ignore => None,
@@ -310,6 +497,7 @@ async fn process_reader_states(reader_states: &mut [ReaderState]) {
         });
 
         if action != CardProcessingResult::Ignore {
+            note_reported_reader(reader_name_string, &card_state_string);
             card_emit_event(
                 "global-cards-sync",
                 iccid,
@@ -367,7 +555,14 @@ async fn register_card(
             managed_card.release();
             return None;
         }
-        None => return None,
+        None => {
+            // The read is still stuck in PC/SC holding the handle: `release`
+            // cannot close it now, but marks it to be closed with LeaveCard
+            // on the blocking pool once the read returns. A plain drop would
+            // reset the card — possibly another application's.
+            managed_card.release();
+            return None;
+        }
     };
     info!("ICCID: {}", iccid);
     // The same deterministic lookup the rack path uses (duplicate ICCID
@@ -513,6 +708,9 @@ pub async fn reconcile_reader_event(reader_name: &str, atr: &str) -> CardProcess
 /// — a failed pass's backoff, a pcscd restart — never reports a removal: its
 /// card would stay "online" with a dead handle for good, and keep the rack
 /// from serving the same card number.
+///
+/// The same applies to readers without a session (empty, or holding an
+/// unlinked card): their UI row is retired too, or it stays for good.
 async fn evict_vanished_readers(present: &[String]) {
     let _sweep = READER_SWEEP.lock().await;
     let stale: Vec<ProcessingCard> = {
@@ -525,26 +723,45 @@ async fn evict_vanished_readers(present: &[String]) {
         *pool = keep;
         stale
     };
-    if stale.is_empty() {
-        return;
-    }
+    // Every vanished reader gets exactly one UNKNOWN row update: the ones
+    // with a session, and the ones the UI merely shows.
+    let mut vanished: BTreeSet<String> = {
+        let mut reported = lock_map(&REPORTED_READERS);
+        let gone: BTreeSet<String> = reported
+            .iter()
+            .filter(|name| !present.contains(name))
+            .cloned()
+            .collect();
+        reported.retain(|name| !gone.contains(name));
+        gone
+    };
     for card in &stale {
+        let reader = card.reader_name.clone().unwrap_or_default();
         warn!(
             "Reader {} is gone: ending the session of card {}",
-            card.reader_name.as_deref().unwrap_or("unknown"),
-            card.client_id
+            reader, card.client_id
         );
+        vanished.insert(reader);
+    }
+    for reader in vanished {
+        info!(
+            "Reader {} is gone: removing it from the reader list",
+            reader
+        );
+        lock_map(&UNSERVED_PROBES).remove(&reader);
         card_emit_event(
             "global-cards-sync",
             String::new(),
-            card.reader_name.clone().unwrap_or_default(),
+            reader,
             format!("{:?}", PcscState::UNKNOWN),
             String::new(),
             None,
             None,
         );
     }
-    tauri::async_runtime::spawn(crate::mqtt::shutdown_connections(stale, "reader_gone"));
+    if !stale.is_empty() {
+        tauri::async_runtime::spawn(crate::mqtt::shutdown_connections(stale, "reader_gone"));
+    }
 }
 
 /// Check if the reader is a virtual reader. This usually only applies to Windows.
@@ -685,13 +902,17 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
     // get_status_change from another thread.
     set_monitor_ctx(Some(ctx.clone()));
 
-    let mut readers_buf = [0; READERS_BUFFER_SIZE];
+    // Probes skipped as "unchanged since found unserved" are keyed by event
+    // counters of the previous context's view; a fresh pass (rescan, a config
+    // change linking a card, a reloaded webview) probes every card again.
+    forget_unserved_probes();
+
     let mut reader_states: Vec<ReaderState> = vec![
         // Listen for reader insertions/removals, if supported.
         ReaderState::new(PNP_NOTIFICATION(), PcscState::UNAWARE),
     ];
 
-    debug!("Initialized readers buffer and reader states.");
+    debug!("Initialized reader states.");
 
     // How this pass ended; only an explicit failure downgrades it.
     let mut outcome = PassEnd::Rescan;
@@ -705,7 +926,7 @@ fn monitor_pass() -> Result<PassEnd, pcsc::Error> {
         // These repeat every poll timeout (30s), so they live at trace to
         // keep debug output focused on actual card events.
         trace!("Starting the inner loop to monitor reader states...");
-        if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
+        if let Err(e) = setup_reader_states(&ctx, &mut reader_states) {
             error!(
                 "Failed to list readers while updating monitor states: {:?}",
                 e
@@ -1040,14 +1261,12 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
             .map_err(|e| format!("failed to establish context: {e}"))?;
         debug!("Context established successfully.");
 
-        let mut readers_buf = [0; READERS_BUFFER_SIZE];
         // A failed enumeration is reported to the caller: returning Ok here
         // told the frontend the sync succeeded while nothing had been swept,
         // so a broken PCSC stack looked like an empty reader list.
-        let reader_count = ctx
-            .list_readers(&mut readers_buf)
+        let reader_count = list_reader_names(&ctx)
             .map_err(|e| format!("failed to list readers: {e}"))?
-            .count();
+            .len();
         if reader_count == 0 {
             warn!("No readers found. Nothing to sync.");
             return Ok(());
@@ -1060,7 +1279,7 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
         ];
 
         // setup readers states. Getting changes and other inits
-        if let Err(e) = setup_reader_states(&ctx, &mut readers_buf, &mut reader_states) {
+        if let Err(e) = setup_reader_states(&ctx, &mut reader_states) {
             error!(
                 "Failed to list readers while updating manual sync states: {:?}",
                 e
@@ -1079,6 +1298,8 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
             Err(e) => return Err(format!("failed to get status change: {e}")),
         }
 
+        // An explicit sync request re-probes cards found unserved before.
+        forget_unserved_probes();
         block_on(process_reader_states(&mut reader_states));
         Ok(())
     })
@@ -1086,15 +1307,62 @@ pub async fn manual_sync_cards(_readername: String, restart: bool) -> Result<(),
     .map_err(|e| format!("manual_sync_cards: blocking task failed: {e}"))?
 }
 
-/// Owns a shared PCSC card handle, caches its ICCID, and manages APDU
-/// exchanges and reconnection using the selected protocol.
-#[derive(Clone)]
-pub struct ManagedCard {
+/// The PCSC handle shared by a `ManagedCard`, its clones, and the blocking
+/// closures running PC/SC calls on it.
+struct CardCell {
     /// `None` only between disconnecting a handle and connecting its
     /// replacement (see `replace_handle`), or when that reconnect failed: a
     /// transmit then fails with `InvalidHandle`, which is retriable and
     /// recreates the handle.
-    inner: Arc<Mutex<Option<Card>>>,
+    slot: Mutex<Option<Card>>,
+    reader_name: Arc<CStr>,
+    /// Set by `release`: the handle is closed with LeaveCard instead of the
+    /// ResetCard a dropped handle has always meant.
+    leave_on_drop: AtomicBool,
+}
+
+impl Drop for CardCell {
+    /// The last owner may be a card task ending (or aborted) on an async
+    /// worker, and `SCardDisconnect` — pcsc's own `Drop` included — is a
+    /// synchronous call that can block on a wedged reader. The handle is
+    /// therefore closed on the blocking pool, with the disposition a plain
+    /// drop had: ResetCard, unless the handle was released.
+    fn drop(&mut self) {
+        let Some(card) = self.slot.get_mut().take() else {
+            return;
+        };
+        let disposition = if self.leave_on_drop.load(Ordering::SeqCst) {
+            Disposition::LeaveCard
+        } else {
+            Disposition::ResetCard
+        };
+        let io = ReaderIoGuard::new(&self.reader_name);
+        let reader_name = Arc::clone(&self.reader_name);
+        tauri::async_runtime::spawn_blocking(move || {
+            let _io = io;
+            if let Err((_, e)) = card.disconnect(disposition) {
+                // the returned handle is dropped (and the card reset) here anyway
+                debug!(
+                    "Closing the card handle for reader {} failed: {}",
+                    reader_name.to_string_lossy(),
+                    e
+                );
+            }
+        });
+    }
+}
+
+/// True when a card operation failed because an earlier one still holds the
+/// handle (see `ApduError::Busy`).
+fn is_busy(e: &DynError) -> bool {
+    matches!(e.downcast_ref::<ApduError>(), Some(ApduError::Busy))
+}
+
+/// Owns a shared PCSC card handle, caches its ICCID, and manages APDU
+/// exchanges and reconnection using the selected protocol.
+#[derive(Clone)]
+pub struct ManagedCard {
+    inner: Arc<CardCell>,
     reader_name: Arc<CStr>,
     protocol: Protocols,
     pub iccid: OnceCell<String>,
@@ -1114,9 +1382,14 @@ impl ManagedCard {
             reader_name.to_string_lossy()
         );
 
+        let reader_name: Arc<CStr> = Arc::from(reader_name.to_owned());
         Ok(Self {
-            inner: Arc::new(Mutex::new(Some(card))),
-            reader_name: Arc::from(reader_name.to_owned()),
+            inner: Arc::new(CardCell {
+                slot: Mutex::new(Some(card)),
+                reader_name: Arc::clone(&reader_name),
+                leave_on_drop: AtomicBool::new(false),
+            }),
+            reader_name,
             protocol,
             iccid: OnceCell::new(),
         })
@@ -1133,14 +1406,24 @@ impl ManagedCard {
     /// cold reset takes hundreds of ms and can block for much longer on a
     /// wedged reader, which must not stall an async worker (and with it the
     /// MQTT event loops of every other card).
+    ///
+    /// Fails fast with `ApduError::Busy` while an earlier operation still
+    /// holds the handle, like `apdu_transmit`: waiting for the lock would park
+    /// one more blocking-pool thread per attempt behind a call that may never
+    /// return, and a reset queued that way runs late, in the middle of
+    /// whatever session the card serves by then.
     async fn reconnect_handle(
         &self,
         protocol: Protocols,
         disposition: Disposition,
     ) -> DynResult<()> {
         let inner = Arc::clone(&self.inner);
+        let io = ReaderIoGuard::new(&self.reader_name);
         tauri::async_runtime::spawn_blocking(move || -> DynResult<()> {
-            let mut slot = inner.blocking_lock();
+            let _io = io;
+            let Ok(mut slot) = inner.slot.try_lock() else {
+                return Err(Box::new(ApduError::Busy));
+            };
             let card = slot.as_mut().ok_or("no card handle")?;
             card.reconnect(ShareMode::Shared, protocol, disposition)?;
             Ok(())
@@ -1158,6 +1441,9 @@ impl ManagedCard {
     /// connected afterwards: in the other order the fresh handle's first
     /// transmit would fail with `ResetCard`. Any other disposition connects
     /// first and keeps the old handle if that fails.
+    ///
+    /// Fails fast with `ApduError::Busy` while the handle is held (see
+    /// `reconnect_handle`).
     async fn replace_handle(
         &self,
         protocol: Protocols,
@@ -1165,7 +1451,9 @@ impl ManagedCard {
     ) -> DynResult<()> {
         let inner = Arc::clone(&self.inner);
         let reader_name = Arc::clone(&self.reader_name);
+        let io = ReaderIoGuard::new(&self.reader_name);
         tauri::async_runtime::spawn_blocking(move || -> DynResult<()> {
+            let _io = io;
             let disconnect = |old: Card| {
                 if let Err((_, e)) = old.disconnect(old_disposition) {
                     // the handle is dropped (and the card reset) on the way out anyway
@@ -1176,7 +1464,9 @@ impl ManagedCard {
                     );
                 }
             };
-            let mut slot = inner.blocking_lock();
+            let Ok(mut slot) = inner.slot.try_lock() else {
+                return Err(Box::new(ApduError::Busy));
+            };
             if old_disposition == Disposition::ResetCard {
                 if let Some(old) = slot.take() {
                     disconnect(old);
@@ -1215,6 +1505,15 @@ impl ManagedCard {
             .await
         {
             Ok(()) => self.protocol = protocol,
+            // The handle is untouched and still held by a stuck operation: a
+            // recreate would only fail the same way.
+            Err(e) if is_busy(&e) => warn!(
+                "Failed to switch card protocol to {} for reader {}: {}. Keeping {}.",
+                protocol_to_str(protocol),
+                self.reader_name.to_string_lossy(),
+                e,
+                protocol_to_str(self.protocol)
+            ),
             Err(e) => {
                 warn!(
                     "Failed to switch card protocol to {} for reader {}: {}. Will try to recreate.",
@@ -1256,8 +1555,13 @@ impl ManagedCard {
     /// which wipes the state another handle to the same card relies on — a
     /// live session's, when this one was only a probe, or another
     /// application's. Only for a handle that has not been cloned.
+    ///
+    /// When an operation that outlived its timeout still holds the handle, it
+    /// cannot be closed now: it is marked instead, and closed with LeaveCard
+    /// on the blocking pool once that operation lets go (see `CardCell`).
     pub fn release(self) {
-        let Ok(mut slot) = self.inner.try_lock() else {
+        self.inner.leave_on_drop.store(true, Ordering::SeqCst);
+        let Ok(mut slot) = self.inner.slot.try_lock() else {
             return;
         };
         if let Some(card) = slot.take() {
@@ -1289,6 +1593,15 @@ impl ManagedCard {
                     self.reader_name.to_string_lossy()
                 );
             }
+            // A stuck operation holds the handle: a recreate would fail the
+            // same way. The card check that follows every reset hits the
+            // same Busy, which leaves the card marked dirty (see
+            // `ensure_same_card`).
+            Err(e) if is_busy(&e) => warn!(
+                "Failed to reconnect card: {} for reader: {}",
+                e,
+                self.reader_name.to_string_lossy()
+            ),
             Err(e) => {
                 warn!(
                     "Failed to reconnect card: {} for reader: {}. Will try to recreate.",
@@ -1332,17 +1645,22 @@ impl ManagedCard {
         };
 
         let card = Arc::clone(&self.inner);
+        let io = ReaderIoGuard::new(&self.reader_name);
 
         // The send/response pair is logged by send_apdu() with the client_id
         // header; this layer only logs failures. The buffer is sized for
         // extended-length responses: a RAPDU past 258 bytes is legitimate
-        // (chained/extended reads) and must not fail the exchange.
+        // (chained/extended reads) and must not fail the exchange. It is not
+        // tried small first: PC/SC reports a too-small buffer only after the
+        // card executed the command, and re-sending it would run a stateful
+        // APDU twice.
         let response = tauri::async_runtime::spawn_blocking(move || {
+            let _io = io;
             let mut rapdu_buf = vec![0u8; pcsc::MAX_BUFFER_SIZE_EXTENDED];
 
             // The card's operations run one at a time from its session task,
             // so a held lock means one of them outlived its caller's timeout.
-            let Ok(locked) = card.try_lock() else {
+            let Ok(locked) = card.slot.try_lock() else {
                 return Err(ApduError::Busy);
             };
             let Some(locked) = locked.as_ref() else {
@@ -1478,10 +1796,25 @@ impl ManagedCard {
     /// reset of a swapped card succeeds silently — and a failed reconnect falls
     /// back to a fresh handle to whatever card is inserted — so without this
     /// check the session would carry on against the other card (see
-    /// `handle_removed_card`). Returns whether the session continues.
+    /// `handle_removed_card`). Returns whether the card was verified.
+    ///
+    /// A check that could not run because an earlier operation still holds
+    /// the handle proves nothing about the card: it returns `false` without
+    /// ending the session — the same outcome as a check that timed out, which
+    /// leaves the card dirty so the next session start resets and checks it.
     pub async fn ensure_same_card(&self, client_id: &str) -> bool {
-        let current = self.read_iccid().await.ok();
-        self.continue_if_same(client_id, current)
+        match self.read_iccid().await {
+            Err(e) if is_busy(&e) => {
+                warn!(
+                    "{} Card in reader {} not verified: {}",
+                    client_id,
+                    self.reader_name.to_string_lossy(),
+                    e
+                );
+                false
+            }
+            current => self.continue_if_same(client_id, current.ok()),
+        }
     }
 
     /// Ends the session and asks for a rescan unless `current` is this
@@ -1619,6 +1952,48 @@ mod tests {
         assert!(!ApduError::BadRequest(String::new()).is_retriable());
         assert!(!ApduError::RecreateFailed(String::new()).is_retriable());
         assert!(ApduError::TaskDied(String::new()).is_retriable());
+    }
+
+    #[test]
+    fn unserved_probe_is_skipped_only_while_the_reader_is_unchanged() {
+        let memo = ("3B8131AABB".to_string(), 4);
+        assert!(probed_unserved(Some(&memo), "3B8131AABB", 4));
+        // Re-inserted (event count moved) or another card (ATR differs).
+        assert!(!probed_unserved(Some(&memo), "3B8131AABB", 5));
+        assert!(!probed_unserved(Some(&memo), "3B6000FF", 4));
+        // Never probed.
+        assert!(!probed_unserved(None, "3B8131AABB", 4));
+    }
+
+    #[test]
+    fn reader_io_marker_lives_until_the_last_guard_drops() {
+        let reader: Arc<CStr> = Arc::from(c"Test Reader io-marker 00".to_owned());
+        assert!(!reader_io_in_flight(&reader));
+        let first = ReaderIoGuard::new(&reader);
+        let second = ReaderIoGuard::new(&reader);
+        drop(first);
+        assert!(reader_io_in_flight(&reader), "one call is still running");
+        drop(second);
+        assert!(!reader_io_in_flight(&reader));
+    }
+
+    #[test]
+    fn reported_readers_follow_the_ui_row_rule() {
+        let reader = "Test Reader reported 00";
+        note_reported_reader(reader, "State(EMPTY | CHANGED)");
+        assert!(lock_map(&REPORTED_READERS).contains(reader));
+        note_reported_reader(reader, &format!("{:?}", PcscState::UNKNOWN));
+        assert!(!lock_map(&REPORTED_READERS).contains(reader));
+    }
+
+    #[test]
+    fn busy_is_recognised_through_the_boxed_error() {
+        let busy: DynError = Box::new(ApduError::Busy);
+        assert!(is_busy(&busy));
+        let other: DynError = Box::new(ApduError::Pcsc(pcsc::Error::Timeout));
+        assert!(!is_busy(&other));
+        let plain: DynError = "no card handle".into();
+        assert!(!is_busy(&plain));
     }
 
     #[test]

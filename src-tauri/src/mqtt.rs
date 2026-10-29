@@ -47,6 +47,10 @@ pub(crate) const SHUTDOWN_REASON_APP_CONNECTION_REPLACED: &str = "app_connection
 /// How long a closing MQTT task gets to flush its DISCONNECT packet and exit
 /// before being force-aborted.
 const SHUTDOWN_FLUSH_TIMEOUT_MS: u64 = 2000;
+/// How long the shutdown waits for the card handles of ended tasks to be
+/// closed on the blocking pool (a ResetCard close is a cold reset: hundreds of
+/// milliseconds on a healthy reader).
+const HANDLE_CLOSE_TIMEOUT_MS: u64 = 2000;
 /// Poll step while waiting for closing MQTT tasks to finish.
 const SHUTDOWN_POLL_INTERVAL_MS: u64 = 50;
 
@@ -716,14 +720,19 @@ pub async fn ensure_connection(
                         backoff.connected();
                         if !was_online {
                             was_online = true;
-                            // Send the global-cards-sync event to the frontend that card is connected
-                            emit_card_sync_event(
-                                &iccid,
-                                &reader_name,
-                                &client_id_cloned,
-                                Some(true),
-                                None,
-                            );
+                            // Send the global-cards-sync event to the frontend that card is connected.
+                            // Not for a retired session: one retired during the
+                            // reconnect backoff reconnects once more to flush its
+                            // DISCONNECT, and must not resurrect its removed row.
+                            if !session_retired(session_id) {
+                                emit_card_sync_event(
+                                    &iccid,
+                                    &reader_name,
+                                    &client_id_cloned,
+                                    Some(true),
+                                    None,
+                                );
+                            }
 
                             log::info!(
                                 "{} [CONN] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
@@ -872,8 +881,15 @@ pub async fn ensure_connection(
                                                 true,
                                             );
 
+                                            // One budget for the reset and the card check,
+                                            // as at session start: the loop does not poll
+                                            // meanwhile, and two full timeouts in a row
+                                            // outlast the keep-alive.
+                                            let deadline =
+                                                tokio::time::Instant::now() + CARD_IO_TIMEOUT;
                                             // Reset the card to its original state
-                                            let reset = card_io(
+                                            let reset = card_io_by(
+                                                deadline,
                                                 managed_card.reconnect(),
                                                 &log_header,
                                                 "reconnect",
@@ -886,7 +902,8 @@ pub async fn ensure_connection(
                                             // The reset may have landed on a swapped card (see the
                                             // session-start check): a mismatch ends the session.
                                             let verified = reset.is_some()
-                                                && card_io(
+                                                && card_io_by(
+                                                    deadline,
                                                     managed_card
                                                         .ensure_same_card(&client_id_cloned),
                                                     &log_header,
@@ -1235,13 +1252,18 @@ pub async fn ensure_connection(
                                 );
                             }
                             busy_announced = false;
-                            emit_card_sync_event(
-                                &iccid,
-                                &reader_name,
-                                &client_id_cloned,
-                                Some(true),
-                                Some(false),
-                            );
+                            // A ping still in flight when the session was taken
+                            // out of the pool must not resurrect the row the
+                            // monitor just removed (same gate as the error path).
+                            if !session_retired(session_id) {
+                                emit_card_sync_event(
+                                    &iccid,
+                                    &reader_name,
+                                    &client_id_cloned,
+                                    Some(true),
+                                    Some(false),
+                                );
+                            }
                         }
                         Event::Outgoing(Outgoing::Disconnect) => {
                             // graceful teardown: the DISCONNECT packet is already flushed to the
@@ -1347,6 +1369,8 @@ pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
     // Phase 1: queue DISCONNECTs; a task whose request queue is unreachable
     // (already dead or clogged) has nothing to flush and is aborted right away.
     let mut waiting: Vec<ProcessingCard> = Vec::with_capacity(cards.len());
+    // Tasks that ended or were aborted, kept for the handle-close wait below.
+    let mut ended: Vec<ProcessingCard> = Vec::with_capacity(cards.len());
     for card in cards {
         // Single choke point every removal path goes through: drop the card's
         // sniffer state here so no path (e.g. physical card extraction) leaks
@@ -1377,6 +1401,7 @@ pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
                     e
                 );
                 card.task_handle.abort();
+                ended.push(card);
             }
         }
     }
@@ -1386,18 +1411,18 @@ pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
     let deadline = Instant::now() + Duration::from_millis(SHUTDOWN_FLUSH_TIMEOUT_MS);
     while !waiting.is_empty() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(SHUTDOWN_POLL_INTERVAL_MS)).await;
-        waiting.retain(|card| {
-            if card.task_handle.inner().is_finished() {
-                log::info!(
-                    "{} | [CONN] phase=shutdown status=closed_cleanly reason={}",
-                    card.client_id,
-                    reason
-                );
-                false
-            } else {
-                true
-            }
-        });
+        let (closed, still_running): (Vec<_>, Vec<_>) = std::mem::take(&mut waiting)
+            .into_iter()
+            .partition(|card| card.task_handle.inner().is_finished());
+        for card in closed {
+            log::info!(
+                "{} | [CONN] phase=shutdown status=closed_cleanly reason={}",
+                card.client_id,
+                reason
+            );
+            ended.push(card);
+        }
+        waiting = still_running;
     }
 
     // A task still alive here is offline or wedged (e.g. sitting in reconnect
@@ -1409,6 +1434,39 @@ pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
             SHUTDOWN_FLUSH_TIMEOUT_MS
         );
         card.task_handle.abort();
+        ended.push(card);
+    }
+
+    // Phase 3: an ended reader-backed task dropped its card handle, which is
+    // closed — resetting the card, as a dropped handle always did — on the
+    // blocking pool rather than inline (see smart_card::CardCell). Wait for
+    // those closes: callers rescan right after this returns (a probe racing
+    // the reset fails its ICCID read and leaves the card unserved), or exit
+    // the process, which would skip the reset. Bounded: a reader wedged in
+    // PC/SC may never let go of its handle.
+    let readers: Vec<String> = ended
+        .iter()
+        .filter_map(|card| card.reader_name.clone())
+        .collect();
+    if !readers.is_empty() {
+        let deadline = Instant::now() + Duration::from_millis(HANDLE_CLOSE_TIMEOUT_MS);
+        while ended
+            .iter()
+            .any(|card| card.reader_name.is_some() && !card.task_handle.inner().is_finished())
+            || readers
+                .iter()
+                .any(|reader| crate::smart_card::reader_io_pending(reader))
+        {
+            if Instant::now() >= deadline {
+                log::warn!(
+                    "[CONN] phase=shutdown status=handle_close_timeout reason={} readers={:?}",
+                    reason,
+                    readers
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(SHUTDOWN_POLL_INTERVAL_MS)).await;
+        }
     }
 
     // The card numbers just released may belong to cards physically sitting in
