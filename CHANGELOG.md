@@ -247,3 +247,12 @@ All notable changes to this project will be documented in this file.
 
 - Redesigned the card list: one list grouped by reader and rack, with search, status filters and inline card linking.
 - redesign UI/UX.
+
+### [0.8.0-rc.20] - 2026-10-29
+
+🛠 Fixes
+
+- Fixed reader stalls: a hung card reader no longer piles up blocked threads, card resets run off the main workers, and vanished readers disappear from the list.
+- Fixed the app going idle until restart: the configuration is retried when Documents is unavailable at startup, and the server connection recovers after an internal error.
+- Fixed card rack sessions getting stuck and the COM port staying locked after a reconnect or a hung USB driver.
+- Fixed renaming or removing the wrong card when a card is swapped while its panel is open, and important notifications no longer disappear on their own.
