@@ -214,8 +214,30 @@ impl Drop for SerialLease {
 
 /// Frees a retained port whose lifetime ended without a release from the server, draining
 /// whatever the device still sends so the next operation starts on a quiet line.
+///
+/// Also frees it early once the port's rack is unlinked (`release_port`): the parked guard
+/// holds the port lock and a strong reference to the port, and the lease's owner (a rack's
+/// idempotency slot) can outlive the unlink while a request still holds it. Waiting out the
+/// lifetime would keep the COM handle open for up to 10 s, past the wait for its release
+/// before a reopen of the same device (`stop_rack_and_await_port_release`). The resync below
+/// then returns at once (`must_stop`), so nothing more is read from a released port.
 async fn expire_lease(cell: std::sync::Weak<std::sync::Mutex<Option<PortGuard>>>, until: Instant) {
     while Instant::now() < until && !SHUTTING_DOWN.load(Ordering::SeqCst) {
+        // the lease is gone (released or dropped): nothing left to free
+        let Some(strong) = cell.upgrade() else {
+            return;
+        };
+        // `None` while an exchange runs under the lease: that exchange checks `must_stop`
+        // itself and puts the guard back only on success, so a later tick sees it.
+        let released = held(&strong)
+            .as_ref()
+            .is_some_and(|guard| must_stop(&***guard));
+        // not held across the sleep: the cell must die with its lease
+        drop(strong);
+        if released {
+            log::debug!("SERIAL lease status=freed reason=port_released");
+            break;
+        }
         let left = until.saturating_duration_since(Instant::now());
         tokio::time::sleep(Duration::from_millis(20).min(left)).await;
     }
@@ -1939,6 +1961,21 @@ mod tests {
             *writes.lock().unwrap(),
             vec![CMD.to_string(), POLL_CMD.to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn retained_port_is_freed_once_its_rack_is_unlinked() {
+        let port: SharedPort = Arc::new(AsyncMutex::new(Box::new(ScriptedPort::new(&[]))));
+        let key = port_key(&**port.lock().await);
+        let lease = SerialLease::acquire(&port, 7, 10_000).await.unwrap();
+        assert!(port.try_lock().is_err());
+        // the rack is unlinked while its lease is still parked (its owner alive)
+        release_port(key, &port);
+        let guard = tokio::time::timeout(Duration::from_secs(2), port.lock())
+            .await
+            .expect("the port must be freed long before the 10 s lifetime ends");
+        drop(guard);
+        assert!(!lease.is_live());
     }
 
     #[tokio::test]

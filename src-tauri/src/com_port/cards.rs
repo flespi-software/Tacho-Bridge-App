@@ -45,6 +45,14 @@ struct RackCardTask {
     /// slot indicator from it) after the application connection re-established and
     /// its discovery re-ran.
     client: Arc<OnceLock<AsyncClient>>,
+    /// True while the session's MQTT connection is up (set on its CONNACK,
+    /// cleared on a connection error). A re-bind report is only worth sending
+    /// over a live connection: one queued while offline sits in the client's
+    /// bounded request channel, and enough of them fill it — after which the
+    /// session's own CONNACK link report can no longer be enqueued. An
+    /// offline session needs no re-bind anyway: its next CONNACK sends the
+    /// link report by itself.
+    online: Arc<AtomicBool>,
 }
 
 lazy_static::lazy_static! {
@@ -341,28 +349,35 @@ fn spawn_rack_card(
                 // exchange, and a routine card set (one per discovery chain, and
                 // a chain runs on every card insertion or removal) would then
                 // put one frame per card of the rack on the wire, ahead of the
-                // tracker exchanges. Detached: publish() can park on a full
-                // request channel, and this path holds the task-map lock.
-                if let Some(client) = existing.client.get().cloned().filter(|_| rebind) {
-                    let card = existing.card_number.clone();
+                // tracker exchanges. Only over a live connection (see
+                // `RackCardTask::online`), and with `try_publish`: this path
+                // holds the task-map lock, and `publish().await` parks on a
+                // full request channel.
+                if let Some(client) = existing
+                    .client
+                    .get()
+                    .filter(|_| rebind && existing.online.load(Ordering::SeqCst))
+                {
+                    let card = &existing.card_number;
                     let report = link_report(&iccid, slot, &rack_id);
-                    async_runtime::spawn(async move {
-                        match client
-                            .publish("rack", QoS::AtLeastOnce, false, report)
-                            .await
-                        {
-                            Ok(()) => log::info!(
-                                "RACKCARD {} | [MQTT] status=link_report_republished slot={}",
-                                card,
-                                slot
-                            ),
-                            Err(e) => log::warn!(
-                                "RACKCARD {} | [MQTT] status=link_report_republish_failed err={:?}",
-                                card,
-                                e
-                            ),
-                        }
-                    });
+                    match client.try_publish("rack", QoS::AtLeastOnce, false, report) {
+                        Ok(()) => log::info!(
+                            "RACKCARD {} | [MQTT] status=link_report_republished slot={}",
+                            card,
+                            slot
+                        ),
+                        Err(e) => log::warn!(
+                            "RACKCARD {} | [MQTT] status=link_report_republish_failed err={:?}",
+                            card,
+                            e
+                        ),
+                    }
+                } else if rebind {
+                    log::debug!(
+                        "RACKCARD {} | [MQTT] status=link_report_republish_skipped reason=session_offline slot={}",
+                        existing.card_number,
+                        slot
+                    );
                 }
                 log::debug!(
                     "RACK | [SPAWN] card={} status=skipped reason=already_running",
@@ -419,6 +434,7 @@ fn spawn_rack_card(
         slot
     );
     let client_slot = Arc::new(OnceLock::new());
+    let online = Arc::new(AtomicBool::new(false));
     let handle = async_runtime::spawn(rack_card_mqtt_loop(
         card_number.clone(),
         iccid.clone(),
@@ -426,6 +442,7 @@ fn spawn_rack_card(
         rack_id.clone(),
         serial_port,
         client_slot.clone(),
+        online.clone(),
     ));
     tasks.insert(
         iccid,
@@ -435,6 +452,7 @@ fn spawn_rack_card(
             rack_id,
             handle,
             client: client_slot,
+            online,
         },
     );
 }
@@ -556,6 +574,8 @@ async fn rack_card_mqtt_loop(
     // shared back-reference to this session's MQTT client, filled once built —
     // see RackCardTask.client
     client_slot: Arc<OnceLock<AsyncClient>>,
+    // see RackCardTask.online
+    session_online: Arc<AtomicBool>,
 ) {
     let session = NEXT_AUTH_SESSION.fetch_add(1, Ordering::Relaxed);
     let _ownership = AuthCleanup(serial_port.clone(), slot, session);
@@ -634,25 +654,58 @@ async fn rack_card_mqtt_loop(
                         }
                         // Session is up: show the card as served and idle.
                         set_rack_card_state(&iccid, true, false);
-                        // rack link report: must be the first publish of the session
+                        // Rack link report: must be the first publish of the
+                        // session. `try_publish`, never `publish().await`: this
+                        // task is the only one polling the session's event
+                        // loop, so awaiting room in a full request channel
+                        // (bounded, see `mqtt::build_mqtt_client`) would park
+                        // the very loop that drains it — forever, with the
+                        // session still counted as running but unserved.
+                        // `try_publish` enqueues in call order, so the report
+                        // still precedes every reply of this session (requests
+                        // reach the worker only through this loop, after this).
                         let report = link_report(&iccid, slot, &rack_id);
-                        if let Err(e) = mqtt_client
-                            .publish("rack", QoS::AtLeastOnce, false, report)
-                            .await
-                        {
-                            log::error!(
-                                "{} [MQTT] status=link_report_failed err={:?}",
-                                log_header,
-                                e
-                            );
-                        } else {
-                            log::info!(
+                        match mqtt_client.try_publish("rack", QoS::AtLeastOnce, false, report) {
+                            Ok(()) => log::info!(
                                 "{} [MQTT] status=link_report_sent slot={} iccid={}",
                                 log_header,
                                 slot,
                                 iccid
-                            );
+                            ),
+                            Err(e) => {
+                                // The channel is full (or closed): hand the
+                                // report to a detached task that waits for room
+                                // while this loop keeps polling and drains it.
+                                // Queued behind whatever filled the channel, so
+                                // not strictly first — but delivered, which the
+                                // server needs to bind the card to its slot.
+                                log::warn!(
+                                    "{} [MQTT] status=link_report_deferred reason=request_channel_full err={:?}",
+                                    log_header,
+                                    e
+                                );
+                                let client = mqtt_client.clone();
+                                let report = link_report(&iccid, slot, &rack_id);
+                                let log_header = log_header.clone();
+                                async_runtime::spawn(async move {
+                                    match client
+                                        .publish("rack", QoS::AtLeastOnce, false, report)
+                                        .await
+                                    {
+                                        Ok(()) => log::info!(
+                                            "{} [MQTT] status=link_report_sent deferred=true",
+                                            log_header
+                                        ),
+                                        Err(e) => log::error!(
+                                            "{} [MQTT] status=link_report_failed err={:?}",
+                                            log_header,
+                                            e
+                                        ),
+                                    }
+                                });
+                            }
                         }
+                        session_online.store(true, Ordering::SeqCst);
                     }
                     Event::Incoming(Incoming::Publish(publish)) => {
                         let topic = String::from_utf8_lossy(&publish.topic).into_owned();
@@ -729,6 +782,7 @@ async fn rack_card_mqtt_loop(
                     "OFFLINE"
                 };
                 is_online = false;
+                session_online.store(false, Ordering::SeqCst);
                 connection.fetch_add(1, Ordering::SeqCst);
                 if !enqueue(CardJob::Reset) {
                     return;
@@ -750,10 +804,34 @@ async fn rack_card_mqtt_loop(
     }
 }
 
+/// One armed presence watch: its task plus the arming it came from. A watch
+/// that ends by itself (its rack's link went down) removes its own entry, and
+/// `arming` is what keeps it from removing the entry of a newer watch that
+/// re-armed the same rack in between.
+struct RackWatch {
+    arming: u64,
+    handle: JoinHandle<()>,
+}
+
+/// Arming tokens of the presence watches (see `RackWatch::arming`).
+static NEXT_WATCH_ARMING: AtomicU64 = AtomicU64::new(1);
+
 lazy_static::lazy_static! {
     /// Card presence watch tasks, one per connected rack, keyed by rack id.
-    static ref RACK_WATCH_TASKS: std::sync::Mutex<HashMap<String, JoinHandle<()>>> =
+    static ref RACK_WATCH_TASKS: std::sync::Mutex<HashMap<String, RackWatch>> =
         std::sync::Mutex::new(HashMap::new());
+}
+
+/// Removes the map entry of a watch that ended by itself, but only if the
+/// entry is still that watch's own.
+fn forget_rack_watch(rack_id: &str, arming: u64) {
+    let mut watches = lock(&RACK_WATCH_TASKS);
+    if watches
+        .get(rack_id)
+        .is_some_and(|watch| watch.arming == arming)
+    {
+        watches.remove(rack_id);
+    }
 }
 
 /// Arms (or re-arms) one rack's card presence watch from a server `rack/<id>/watch` instruction:
@@ -809,6 +887,7 @@ pub(super) fn start_rack_watch(
         .map(Duration::from_millis)
         .unwrap_or(SERIAL_READ_DEADLINE);
 
+    let armed_port = serial_port.clone();
     let serial_port = serial_port.clone();
     let mqtt_client = mqtt_client.clone();
     let log_header = log_header.to_string();
@@ -823,6 +902,7 @@ pub(super) fn start_rack_watch(
         deadline.as_millis()
     );
 
+    let arming = NEXT_WATCH_ARMING.fetch_add(1, Ordering::Relaxed);
     let handle = async_runtime::spawn(async move {
         let mut last: Option<String> = None;
         let mut last_report = std::time::Instant::now();
@@ -832,6 +912,14 @@ pub(super) fn start_rack_watch(
         let mut failures: u32 = 0;
         loop {
             tokio::time::sleep(watch_delay(interval, failures)).await;
+            // The rack's link went down (or the rack relinked on a new port):
+            // this watch's port life is over, and nothing would ever stop it
+            // otherwise — every branch below only `continue`s. The relinked
+            // rack gets a watch of its own from the server's next `watch`.
+            if !rack_port_is_live(&watched_rack, &serial_port) {
+                log::info!("{} [WATCH] status=ended reason=link_down", log_header);
+                break;
+            }
             let envelope = SerialEnvelope {
                 cmd_hex: cmd_hex.clone(),
                 expect_hex: None,
@@ -904,10 +992,26 @@ pub(super) fn start_rack_watch(
                 }
             }
         }
+        forget_rack_watch(&watched_rack, arming);
     });
 
-    if let Some(old) = lock(&RACK_WATCH_TASKS).insert(rack_id.to_string(), handle) {
-        old.abort();
+    let mut watches = lock(&RACK_WATCH_TASKS);
+    // Re-checked under the watch-map lock: the rack may have been unlinked
+    // between the caller's `linked_rack()` and here, and `unlink_rack` takes
+    // this lock (in `stop_rack_watch`) only after removing the rack from
+    // RACKS — so either its stop sees this entry, or this sees the rack gone.
+    // A watch inserted after that stop would poll a dead port forever.
+    if !rack_port_is_live(rack_id, &armed_port) {
+        drop(watches);
+        handle.abort();
+        log::info!(
+            "RACK {} | [WATCH] status=skipped reason=rack_not_linked",
+            rack_id
+        );
+        return;
+    }
+    if let Some(old) = watches.insert(rack_id.to_string(), RackWatch { arming, handle }) {
+        old.handle.abort();
     }
 }
 
@@ -923,8 +1027,8 @@ fn watch_delay(interval: Duration, failures: u32) -> Duration {
 
 /// Stops one rack's card presence watch task, if armed.
 pub(super) fn stop_rack_watch(rack_id: &str) {
-    if let Some(handle) = lock(&RACK_WATCH_TASKS).remove(rack_id) {
-        handle.abort();
+    if let Some(watch) = lock(&RACK_WATCH_TASKS).remove(rack_id) {
+        watch.handle.abort();
         log::info!("RACK {} | [WATCH] status=stopped", rack_id);
     }
 }
@@ -933,8 +1037,8 @@ pub(super) fn stop_rack_watch(rack_id: &str) {
 /// entry was already removed elsewhere.
 pub(super) fn stop_all_rack_watches() {
     let mut guard = lock(&RACK_WATCH_TASKS);
-    for (rack_id, handle) in guard.drain() {
-        handle.abort();
+    for (rack_id, watch) in guard.drain() {
+        watch.handle.abort();
         log::info!("RACK {} | [WATCH] status=stopped", rack_id);
     }
 }

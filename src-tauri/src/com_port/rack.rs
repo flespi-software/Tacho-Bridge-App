@@ -523,6 +523,12 @@ impl IdempotencySlot {
         self.last_response_payload = Some(reply.to_string());
     }
 
+    /// Ends whatever retained operation is parked here, freeing the port it
+    /// holds — the rack is being unlinked (see `unlink_rack`).
+    pub(super) fn drop_lease(&mut self) {
+        self.lease = None;
+    }
+
     /// Ends the retained operation `id`; a repeated or outdated release changes nothing.
     fn release_lease(&mut self, id: u64) {
         if self.lease.as_ref().is_some_and(|lease| lease.id == id) {

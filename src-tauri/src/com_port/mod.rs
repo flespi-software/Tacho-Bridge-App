@@ -259,12 +259,19 @@ pub fn shutdown() {
 /// rediscovers and relinks the racks on its first tick. When the old monitor
 /// is still alive (it was asleep through the whole shutdown), the new one
 /// exits and the old one relinks: it treats racks missing from RACKS as new.
+/// When the old monitor is just on its way out (it saw the flag, but has not
+/// cleared `MONITOR_RUNNING` yet), the new one still exits — and the old one,
+/// re-checking the flag after clearing its own, starts over instead (see
+/// `rack_connection`), so there is always exactly one monitor.
+///
+/// Started under the same supervisor as the monitor `lib.rs` starts: a panic
+/// in this one must not leave the app without rack presence detection.
 pub fn resume() {
     if !SHUTTING_DOWN.swap(false, Ordering::SeqCst) {
         return;
     }
     log::info!("RACK | phase=resume");
-    tauri::async_runtime::spawn(rack_connection());
+    crate::supervise("rack_connection", rack_connection);
 }
 
 /// Unlinks one rack: its presence watch and card sessions go with it (without
@@ -286,6 +293,17 @@ fn unlink_rack(rack_id: &str, links: &mut Vec<(String, bool)>) -> Option<SharedP
         log::info!("RACK {} | [LINK] phase=stop", rack_id);
         transport::untrack_port(rack.io_key);
         transport::release_port(rack.io_key, &rack.port);
+        // A retained serial operation (`serial_hold_ms`) parked in the rack's
+        // slot holds the port lock — and a strong reference to the port — for
+        // up to 10 s, and the slot outlives this entry while a queued request
+        // still holds a clone of it. Drop the lease now, or a reopen of the
+        // same device waits out `PORT_RELEASE_TIMEOUT` and then fails busy.
+        // A slot locked by a request in flight is skipped: that request stops
+        // at its next `must_stop` check, and the lease it parks is freed by
+        // `transport::expire_lease` as soon as it sees the port released.
+        if let Ok(mut slot) = rack.idempotency.try_lock() {
+            slot.drop_lease();
+        }
         rack.port
     });
     stop_rack_watch(rack_id);
@@ -458,28 +476,111 @@ fn announce_rack_disconnected(rack: &RackInfo) {
 /// started it loops forever; a second concurrent call returns immediately (see
 /// `MONITOR_RUNNING`).
 pub async fn rack_connection() {
-    // Ignore duplicate spawns from repeated `frontend-loaded` events.
-    if MONITOR_RUNNING.swap(true, Ordering::SeqCst) {
-        log::debug!("RACK | phase=rack_connection status=already_running");
-        return;
-    }
-    // Clears the flag however the loop ends — a shutdown return or a panic —
-    // so a supervisor or `resume()` can start the monitor again.
-    struct RunningGuard;
-    impl Drop for RunningGuard {
-        fn drop(&mut self) {
-            MONITOR_RUNNING.store(false, Ordering::SeqCst);
+    loop {
+        // Ignore duplicate spawns from repeated `frontend-loaded` events.
+        if MONITOR_RUNNING.swap(true, Ordering::SeqCst) {
+            log::debug!("RACK | phase=rack_connection status=already_running");
+            return;
         }
+        // Clears the flag however the loop ends — a shutdown return or a panic —
+        // so a supervisor or `resume()` can start the monitor again.
+        struct RunningGuard;
+        impl Drop for RunningGuard {
+            fn drop(&mut self) {
+                MONITOR_RUNNING.store(false, Ordering::SeqCst);
+            }
+        }
+        let running = RunningGuard;
+        monitor_loop().await;
+        drop(running);
+        // `monitor_loop` returns only on shutdown. A `resume()` that ran
+        // between its flag check and the `drop` above found this monitor
+        // still running, so the monitor it started exited at once: with the
+        // flag clear again, carry on as that monitor. When it did start (the
+        // `drop` came first), the swap above sees it and this one returns.
+        if SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return;
+        }
+        log::info!("RACK | phase=rack_connection status=restart reason=resumed_during_exit");
     }
-    let _running = RunningGuard;
+}
 
+/// Consecutive scans a rack must be missing from before it is declared gone.
+/// One scan that misses a rack still on the bus (an enumeration racing a USB
+/// hub re-enumeration, a transient SetupAPI/IOKit glitch) would otherwise abort
+/// every card session of the rack — authentications in progress included —
+/// only to rebuild them on the next tick.
+const MISSING_SCANS_BEFORE_GONE: u32 = 2;
+
+/// First pause before reopening a rack whose handle went dead again, doubled
+/// per repeat up to `DEAD_REOPEN_BACKOFF_MAX`. Every reopen tears down all
+/// card sessions of the rack; a device whose handle keeps dying right after a
+/// reopen would otherwise do that every few seconds.
+const DEAD_REOPEN_BACKOFF_INITIAL: std::time::Duration = POLL_INTERVAL;
+const DEAD_REOPEN_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+/// A dead handle this long after the previous reopen starts the backoff over:
+/// the device was healthy in between.
+const DEAD_REOPEN_BACKOFF_RESET: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Dead-handle reopens of one rack, for their backoff.
+struct DeadReopens {
+    count: u32,
+    last: std::time::Instant,
+}
+
+impl DeadReopens {
+    /// The pause that must pass after the last reopen before the next one.
+    fn pause(&self) -> std::time::Duration {
+        dead_reopen_pause(self.count)
+    }
+}
+
+/// The pause after the `reopens`-th recent reopen: `DEAD_REOPEN_BACKOFF_INITIAL`
+/// doubled per reopen (4 s after the first, 8 s after the second, …), capped
+/// at `DEAD_REOPEN_BACKOFF_MAX`.
+fn dead_reopen_pause(reopens: u32) -> std::time::Duration {
+    DEAD_REOPEN_BACKOFF_INITIAL
+        .saturating_mul(1u32 << reopens.min(16))
+        .min(DEAD_REOPEN_BACKOFF_MAX)
+}
+
+/// The monitor itself; returns only when the app is shutting down.
+async fn monitor_loop() {
     log::info!(
         "RACK | phase=rack_connection status=start poll_secs={}",
         POLL_INTERVAL.as_secs()
     );
 
+    // A monitor restarted by its supervisor after a panic starts with an empty
+    // `current`, while RACKS may still hold the ports the previous one opened.
+    // Every scan would then report those racks as newly appeared and try to
+    // open ports this app itself holds exclusively — failing busy every tick,
+    // forever. Start from a clean slate instead: unlink them (the server
+    // hears `link down`, then `link up` on the first scan) and wait for the
+    // ports to close. Preferred over seeding `current` from RACKS: the panic
+    // may have hit in the middle of a transition (a reopen half done, a rack
+    // linked on an alias node), and RACKS does not carry the device attributes
+    // the scan compares against; a relink costs one discovery and is rare.
+    // On a normal start and after `resume()` RACKS is empty and this is a no-op.
+    let stale = linked_rack_ids();
+    if !stale.is_empty() {
+        log::warn!(
+            "RACK | phase=rack_connection status=relinking reason=monitor_restarted racks={}",
+            stale.len()
+        );
+        for id in &stale {
+            stop_rack_and_await_port_release(id).await;
+        }
+        stop_all_rack_watches();
+        stop_all_rack_cards();
+    }
+
     // The racks we currently consider connected, keyed by rack id.
     let mut current: HashMap<String, RackInfo> = HashMap::new();
+    // Consecutive scans each connected rack was missing from.
+    let mut missing: HashMap<String, u32> = HashMap::new();
+    // Dead-handle reopens of each rack, for their backoff.
+    let mut dead_reopens: HashMap<String, DeadReopens> = HashMap::new();
 
     loop {
         if SHUTTING_DOWN.load(Ordering::SeqCst) {
@@ -490,11 +591,12 @@ pub async fn rack_connection() {
         // blocking USB scan on Windows) that can take hundreds of ms — run it
         // on the blocking pool so this 2s tick never stalls the async workers
         // driving the MQTT event loops.
-        // A failed scan (enumeration error, or a panic in the USB scan) says
-        // nothing about the racks: skip the tick instead of reading it as
-        // "every rack unplugged", which would abort every card session —
-        // authentications in progress included — only to rebuild them 2 s later.
-        let Ok(Some(scanned)) = tokio::task::spawn_blocking(find_racks).await else {
+        // A failed scan (enumeration error, a panic in the USB scan, a wedged
+        // call that timed out) says nothing about the racks: skip the tick
+        // instead of reading it as "every rack unplugged", which would abort
+        // every card session — authentications in progress included — only to
+        // rebuild them 2 s later.
+        let Some(Some(scanned)) = bounded_blocking("scan".to_string(), find_racks).await else {
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
         };
@@ -505,13 +607,28 @@ pub async fn rack_connection() {
 
         // Disappeared racks. A device swapped under the same rack id cannot
         // happen (the id derives from the serial); a port rename keeps the id
-        // and lands in the "changed" branch below.
+        // and lands in the "changed" branch below. Declared gone only after
+        // `MISSING_SCANS_BEFORE_GONE` scans in a row missed it.
+        missing.retain(|id, _| current.contains_key(id) && !found.contains_key(id));
         let gone: Vec<String> = current
             .keys()
             .filter(|id| !found.contains_key(*id))
             .cloned()
             .collect();
         for id in gone {
+            let misses = missing.entry(id.clone()).or_insert(0);
+            *misses += 1;
+            if *misses < MISSING_SCANS_BEFORE_GONE {
+                log::info!(
+                    "RACK {} | phase=presence status=missing scans={} need={}",
+                    id,
+                    misses,
+                    MISSING_SCANS_BEFORE_GONE
+                );
+                continue;
+            }
+            missing.remove(&id);
+            dead_reopens.remove(&id);
             if let Some(prev) = current.remove(&id) {
                 on_rack_disconnected(&prev);
             }
@@ -527,19 +644,40 @@ pub async fn rack_connection() {
                 .cloned();
             // Same device node, but our handle to it went dead (the device
             // dropped off the bus and came back between two polls): reopen
-            // it exactly like a renamed port.
+            // it exactly like a renamed port — unless it was reopened for the
+            // same reason only a moment ago (see `DEAD_REOPEN_BACKOFF_*`).
             let prev = prev.map(|prev| {
-                if port_handle_is_dead(id) {
-                    log::warn!(
-                        "RACK {} | phase=presence status=port_dead failed_ops={} action=reopen port={}",
-                        id,
-                        PORT_DEAD_AFTER_FAILED_OPS,
-                        prev.port_name
-                    );
-                    (prev, true)
-                } else {
-                    (prev, false)
+                if !port_handle_is_dead(id) {
+                    return (prev, false);
                 }
+                let now = std::time::Instant::now();
+                let reopens = dead_reopens.entry(id.clone()).or_insert(DeadReopens {
+                    count: 0,
+                    last: now,
+                });
+                let since = now.saturating_duration_since(reopens.last);
+                if reopens.count > 0 && since >= DEAD_REOPEN_BACKOFF_RESET {
+                    reopens.count = 0;
+                }
+                if reopens.count > 0 && since < reopens.pause() {
+                    log::debug!(
+                        "RACK {} | phase=presence status=port_dead action=reopen_deferred reopens={} wait_ms={}",
+                        id,
+                        reopens.count,
+                        (reopens.pause() - since).as_millis()
+                    );
+                    return (prev, false);
+                }
+                reopens.count = reopens.count.saturating_add(1);
+                reopens.last = now;
+                log::warn!(
+                    "RACK {} | phase=presence status=port_dead failed_ops={} action=reopen reopens={} port={}",
+                    id,
+                    PORT_DEAD_AFTER_FAILED_OPS,
+                    reopens.count,
+                    prev.port_name
+                );
+                (prev, true)
             });
             match prev {
                 // Newly appeared.
@@ -590,10 +728,134 @@ fn port_handle_is_dead(rack_id: &str) -> bool {
 }
 
 /// `open_rack` moved to the blocking pool: opening a busy COM port can block,
-/// and the monitor runs on an async worker.
+/// and the monitor runs on an async worker. Bounded and deduplicated per
+/// device node by `bounded_blocking`.
 async fn open_rack_blocking(rack: &RackInfo) -> Option<Box<dyn SerialPort>> {
+    let key = format!("open:{}", rack.port_name);
     let rack = rack.clone();
-    tokio::task::spawn_blocking(move || open_rack(&rack))
+    bounded_blocking(key, move || open_rack(&rack))
         .await
-        .unwrap_or_default()
+        .flatten()
+}
+
+/// Upper bound on one blocking OS call of the monitor (a bus scan, a port
+/// open). They normally take milliseconds to hundreds of ms; past this the
+/// call is wedged in the OS (a SetupAPI query or CreateFile stuck on a
+/// misbehaving driver, a USB scan stuck on a hung device).
+const BLOCKING_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+lazy_static::lazy_static! {
+    /// Blocking monitor calls still running, by key (`scan`, `open:<node>`).
+    /// A call that timed out keeps its blocking-pool thread until the OS lets
+    /// it go — it cannot be cancelled — so a retry of the same call is not
+    /// started while it runs: a wedged driver would otherwise collect one
+    /// stuck thread per tick.
+    static ref BLOCKING_IN_FLIGHT: std::sync::Mutex<std::collections::HashSet<String>> =
+        std::sync::Mutex::new(std::collections::HashSet::new());
+}
+
+/// Runs `call` on the blocking pool and waits for it at most
+/// `BLOCKING_CALL_TIMEOUT`. `None` when the call timed out, panicked, or the
+/// previous call under the same `key` is still running — the monitor skips
+/// the tick (or this rack) and tries again on the next one.
+///
+/// A result that arrives after the timeout is dropped by the blocking thread
+/// itself, before it clears the in-flight mark: a port opened late is closed
+/// before a retry may open the same device again.
+async fn bounded_blocking<T, F>(key: String, call: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    if !lock(&BLOCKING_IN_FLIGHT).insert(key.clone()) {
+        log::debug!(
+            "RACK | phase=presence status=skipped reason=previous_call_in_flight op={}",
+            key
+        );
+        return None;
+    }
+    // Clears the mark when the blocking closure ends — returned, panicked, or
+    // dropped unrun by a runtime shutting down.
+    struct InFlight(String);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            lock(&BLOCKING_IN_FLIGHT).remove(&self.0);
+        }
+    }
+    let in_flight = InFlight(key.clone());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // Detached: a timed-out call cannot be cancelled, only abandoned.
+    drop(tokio::task::spawn_blocking(move || {
+        let _in_flight = in_flight;
+        // Declared after `_in_flight`, so dropped before it: when nobody
+        // waits any more, the late result (an open port) is released here.
+        let _ = tx.send(call());
+    }));
+    match tokio::time::timeout(BLOCKING_CALL_TIMEOUT, rx).await {
+        Ok(Ok(value)) => Some(value),
+        // The closure panicked (the sender went away unsent).
+        Ok(Err(_)) => {
+            log::warn!(
+                "RACK | phase=presence status=call_failed reason=panic op={}",
+                key
+            );
+            None
+        }
+        Err(_) => {
+            log::warn!(
+                "RACK | phase=presence status=call_timeout op={} timeout_ms={}",
+                key,
+                BLOCKING_CALL_TIMEOUT.as_millis()
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dead_reopen_pause_doubles_up_to_the_cap() {
+        assert_eq!(dead_reopen_pause(1), POLL_INTERVAL * 2);
+        assert_eq!(dead_reopen_pause(2), POLL_INTERVAL * 4);
+        assert_eq!(dead_reopen_pause(3), POLL_INTERVAL * 8);
+        assert_eq!(dead_reopen_pause(10), DEAD_REOPEN_BACKOFF_MAX);
+        assert_eq!(dead_reopen_pause(u32::MAX), DEAD_REOPEN_BACKOFF_MAX);
+    }
+
+    #[tokio::test]
+    async fn a_blocking_call_still_running_is_not_started_again() {
+        const KEY: &str = "test:in_flight";
+        let in_flight = || lock(&BLOCKING_IN_FLIGHT).contains(KEY);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let first = tokio::spawn(bounded_blocking(KEY.to_string(), move || {
+            let _ = wait.recv();
+            1
+        }));
+        while !in_flight() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // the first call is still blocked: a retry is not started at all
+        assert_eq!(bounded_blocking(KEY.to_string(), || 2).await, None);
+        release.send(()).unwrap();
+        assert_eq!(first.await.unwrap(), Some(1));
+        // the mark goes once the blocking closure has ended
+        while in_flight() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(bounded_blocking(KEY.to_string(), || 3).await, Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_blocking_call_clears_its_mark() {
+        const KEY: &str = "test:panic";
+        let result: Option<u32> = bounded_blocking(KEY.to_string(), || panic!("boom")).await;
+        assert_eq!(result, None);
+        while lock(&BLOCKING_IN_FLIGHT).contains(KEY) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(bounded_blocking(KEY.to_string(), || 4).await, Some(4));
+    }
 }

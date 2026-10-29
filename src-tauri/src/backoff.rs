@@ -48,6 +48,9 @@ impl Backoff {
     }
 
     /// The connection failed: returns the delay to wait before the next attempt.
+    ///
+    /// The delay is the schedule's value spread by up to `JITTER_PERCENT`
+    /// either way (see `jittered`); the schedule itself stays exact.
     pub fn failed(&mut self) -> u64 {
         if self
             .online_since
@@ -58,8 +61,35 @@ impl Backoff {
         }
         let delay = self.delay_secs;
         self.delay_secs = next_reconnect_delay(delay);
-        delay
+        jittered(delay)
     }
+}
+
+/// Spread of a reconnect delay, in percent of it, either way.
+const JITTER_PERCENT: u64 = 20;
+
+/// `delay` moved by a random amount of up to `JITTER_PERCENT` either way, and
+/// never past `RECONNECT_DELAY_MAX_SECS`. Every card session of a rack, every
+/// reader bridge and the application connection lose the broker together when
+/// the network drops; with the exact schedule they would all reconnect in the
+/// same second, every time, and hit the broker as one burst. The randomness
+/// only has to differ between calls, not be unpredictable: `RandomState` keys
+/// are random per process and change with every instance, which is enough, and
+/// avoids a dependency for it.
+fn jittered(delay: u64) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let spread = delay.saturating_mul(JITTER_PERCENT) / 100;
+    if spread == 0 {
+        return delay;
+    }
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos()),
+    );
+    let offset = hasher.finish() % (2 * spread + 1);
+    (delay - spread + offset).min(RECONNECT_DELAY_MAX_SECS)
 }
 
 #[cfg(test)]
@@ -79,17 +109,61 @@ mod tests {
         );
     }
 
+    /// `delay` is `base` give or take the jitter, and within the cap.
+    fn assert_jittered(delay: u64, base: u64) {
+        let spread = base * JITTER_PERCENT / 100;
+        assert!(
+            delay >= base - spread && delay <= (base + spread).min(RECONNECT_DELAY_MAX_SECS),
+            "delay {delay} outside {base} ± {spread}"
+        );
+    }
+
     #[test]
     fn a_connection_dropped_right_away_keeps_backing_off() {
         let mut backoff = Backoff::new();
-        assert_eq!(backoff.failed(), RECONNECT_DELAY_INITIAL_SECS);
+        assert_jittered(backoff.failed(), RECONNECT_DELAY_INITIAL_SECS);
         backoff.connected();
         // dropped at once: the schedule goes on growing
-        assert_eq!(backoff.failed(), RECONNECT_DELAY_INITIAL_SECS * 2);
+        assert_jittered(backoff.failed(), RECONNECT_DELAY_INITIAL_SECS * 2);
         // held long enough: back to the initial delay
         backoff.connected();
         backoff.online_since = Some(std::time::Instant::now() - STABLE_AFTER);
-        assert_eq!(backoff.failed(), RECONNECT_DELAY_INITIAL_SECS);
+        assert_jittered(backoff.failed(), RECONNECT_DELAY_INITIAL_SECS);
+    }
+
+    #[test]
+    fn jitter_stays_within_bounds_and_varies() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let delay = jittered(RECONNECT_DELAY_INITIAL_SECS);
+            assert_jittered(delay, RECONNECT_DELAY_INITIAL_SECS);
+            seen.insert(delay);
+        }
+        // 10 s ± 20 % has five possible values; 500 draws hit more than one
+        assert!(seen.len() > 1, "jitter never varied: {seen:?}");
+    }
+
+    #[test]
+    fn jitter_never_exceeds_the_cap() {
+        for _ in 0..500 {
+            assert!(jittered(RECONNECT_DELAY_MAX_SECS) <= RECONNECT_DELAY_MAX_SECS);
+        }
+        // too small to spread: returned as is
+        assert_eq!(jittered(0), 0);
+        assert_eq!(jittered(4), 4);
+    }
+
+    #[test]
+    fn schedule_climbs_to_the_cap_under_jitter() {
+        // the jitter is applied to each returned delay, never fed back into
+        // the schedule: it still doubles from the initial delay to the cap
+        let mut backoff = Backoff::new();
+        let mut base = RECONNECT_DELAY_INITIAL_SECS;
+        for _ in 0..12 {
+            assert_jittered(backoff.failed(), base);
+            base = next_reconnect_delay(base);
+        }
+        assert_eq!(backoff.delay_secs, RECONNECT_DELAY_MAX_SECS);
     }
 
     #[test]
