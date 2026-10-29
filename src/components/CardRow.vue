@@ -387,7 +387,7 @@ function expirySuffix(days: number | null): string {
   return days <= EXPIRY_WARN_DAYS ? ` · in ${days} d` : ''
 }
 
-// Panel state, reset every time the row opens.
+// Panel state, reset every time the row opens (see the watch below).
 const draft = ref('')
 const confirming = ref(false)
 const tab = ref<'existing' | 'new'>('existing')
@@ -409,9 +409,19 @@ const linkShown = computed(() => {
 const canLink = computed(() => linkable.value.some((c) => c.number === linkPick.value))
 const newNumberError = computed(() => newCardNumberError(newNumber.value.trim(), props.cards))
 
+// Which card the row shows. Row keys are locations, so the same row can carry
+// another card after a swap in its reader or slot: a configured card is known
+// by its number, an unknown one by its ICCID (an empty slot yields 'i:').
+const identity = computed(() =>
+  props.entry.number ? `n:${props.entry.number}` : `i:${props.entry.iccid}`,
+)
+
+// Seeded on open and again when the card under an open panel changes, so a
+// draft name, a pending remove confirmation or a link pick made for the old
+// card can never be applied to the new one.
 watch(
-  () => props.open,
-  (open) => {
+  [() => props.open, identity],
+  ([open]) => {
     if (!open) return
     draft.value = props.entry.name
     confirming.value = false
@@ -439,15 +449,19 @@ async function run(
   }
 }
 
+// Every action reads its arguments from the card shown at the click, before
+// the first await: the row may carry another card by the time the backend
+// answers, and what runs after the await only closes the panel and reports
+// the action that was sent.
 async function saveName(): Promise<void> {
   const name = draft.value.trim()
-  if (!props.entry.card || name === props.entry.name) return
+  const card = props.entry.card
+  if (!card || name === props.entry.name) return
+  const number = props.entry.number
   // Only the form-owned fields: the backend keeps every absent field, so a
   // rename cannot clobber metadata the sniffer wrote meanwhile. The ICCID is
   // echoed unchanged — the backend never rewrites an ICCID that is already set.
-  const ok = await run('rename', () =>
-    props.save(props.entry.number, { name, iccid: props.entry.card?.iccid ?? '' }),
-  )
+  const ok = await run('rename', () => props.save(number, { name, iccid: card.iccid ?? '' }))
   if (ok) notifySuccess('Name saved', TOAST_SHORT)
 }
 

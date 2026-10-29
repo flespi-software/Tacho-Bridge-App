@@ -333,9 +333,16 @@ function pickView(view: CardView): void {
 
 const groups = computed(() => buildGroups(props.readers, props.racks, props.cards))
 
-// A rack that disappears must not leave the selector pointing at nothing.
+// A rack that disappears must not leave the selector pointing at nothing, nor
+// a row that is gone (a removed card, an unplugged reader) stay the open one:
+// a row unmounted by the config event before its own action resumes cannot
+// emit `close` any more, and the key would reopen a later row under it.
 watch(groups, (gs) => {
   if (location.value !== 'all' && !gs.some((g) => g.id === location.value)) location.value = 'all'
+  const open = openRow.value
+  if (open !== null && !gs.some((g) => g.entries.some((e) => e.key === open))) {
+    openRow.value = null
+  }
 })
 
 const query = computed(() => (search.value ?? '').trim().toLowerCase())

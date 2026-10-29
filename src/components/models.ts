@@ -80,6 +80,30 @@ export interface GlobalConfigServerPayload {
   debug_log_until?: string
 }
 
+const GLOBAL_CONFIG_SERVER_KEYS: readonly (keyof GlobalConfigServerPayload)[] = [
+  'host',
+  'ident',
+  'dark_theme',
+  'beta_updates',
+  'auto_install_updates',
+  'auth_enabled',
+  'auth_username',
+  'auth_password',
+  'auth_saved',
+  'auth_active',
+  'debug_log_enabled',
+  'debug_log_until',
+]
+
+/// Runtime guard for the `global-config-server` payload: a plain object whose
+/// known fields, when present, are strings (the backend sends every value as
+/// a string). Fails closed so a changed contract is ignored, not half-applied.
+export function isGlobalConfigServerPayload(raw: unknown): raw is GlobalConfigServerPayload {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  const p = raw as Record<string, unknown>
+  return GLOBAL_CONFIG_SERVER_KEYS.every((k) => p[k] === undefined || typeof p[k] === 'string')
+}
+
 export type ThemeMode = 'Auto' | 'Light' | 'Dark'
 
 /// Narrows the persisted `dark_theme` value; empty/unknown (an old config

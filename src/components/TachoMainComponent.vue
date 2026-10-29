@@ -10,7 +10,7 @@
 <script setup lang="ts">
 import CardBoard from './CardBoard.vue'
 import type { SmartCard, Reader, RackState } from './models'
-import { ref, reactive, onMounted, inject } from 'vue'
+import { shallowRef, reactive, onMounted, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { emit } from '@tauri-apps/api/event'
 import { useTauriListeners, LAYOUT_LISTENERS_READY } from 'src/composables/useTauriListeners'
@@ -24,8 +24,10 @@ const state = reactive<{ readers: Reader[]; cards: Record<string, SmartCard> }>(
 
 // Card rack states, pushed from the backend via `rack-state` as the full list
 // keyed by rack id. Empty until the backend reports a rack at least once;
-// racks that disconnect stay listed with connected=false.
-const racks = ref<RackState[]>([])
+// racks that disconnect stay listed with connected=false. Always replaced
+// wholesale, never mutated, so a shallow ref is enough and the payload is not
+// deep-proxied on every push.
+const racks = shallowRef<RackState[]>([])
 
 // Registered Tauri listeners. Kept in an array so we can detach them all
 const { on } = useTauriListeners()
@@ -104,10 +106,23 @@ function handleCardsSync(raw: unknown): void {
     authentication: raw.authentication ?? (sameCard ? prev?.authentication : undefined),
   }
   if (index !== -1) {
+    // The card's MQTT session repeats its state on every keep-alive: an
+    // unchanged reader is not replaced, or the whole board would rebuild.
+    if (prev && sameReader(prev, next)) return
     state.readers[index] = next
   } else {
     state.readers.push(next)
   }
+}
+
+function sameReader(a: Reader, b: Reader): boolean {
+  return (
+    a.status === b.status &&
+    a.iccid === b.iccid &&
+    a.card_number === b.card_number &&
+    a.online === b.online &&
+    a.authentication === b.authentication
+  )
 }
 
 // Runtime guard for one rack in the rack-state payload — fail closed on a

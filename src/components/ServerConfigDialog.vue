@@ -140,6 +140,7 @@
           label="Launch at system startup"
           dense
           class="q-mb-sm"
+          :disable="autostartBusy"
           @update:model-value="onAutostartToggled"
         >
           <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
@@ -284,9 +285,8 @@
 
 <script setup lang="ts">
 import { useQuasar } from 'quasar'
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { useTauriListeners } from 'src/composables/useTauriListeners'
 import { notifyError, notifyWarn, notifySuccess, TOAST_SHORT } from 'src/composables/notify'
 import {
   TBA_IDENT_REGEXP,
@@ -297,6 +297,11 @@ import {
 
 const props = defineProps<{
   modelValue: boolean
+  // The last `global-config-server` payload, owned by the layout (its
+  // listener is in place before `frontend-loaded`). The form is (re)seeded
+  // from it on every open, so edits abandoned by Cancel never resurface on
+  // the next open and never ride along with a later, unrelated Save.
+  config: GlobalConfigServerPayload | null
 }>()
 
 const emit = defineEmits<{
@@ -365,8 +370,10 @@ const autoInstallUpdates = ref(false)
 
 // Launch at login. The OS registration is the source of truth (no config
 // field): the state is read on every dialog open and the toggle applies
-// immediately, reverting itself when the OS call fails.
+// immediately. One OS call at a time — the toggle is disabled while one is in
+// flight — and a failure re-reads the registration instead of guessing it.
 const autostartEnabled = ref(false)
+const autostartBusy = ref(false)
 async function refreshAutostartState() {
   try {
     autostartEnabled.value = await invoke<boolean>('autostart_get')
@@ -375,20 +382,21 @@ async function refreshAutostartState() {
   }
 }
 async function onAutostartToggled(value: boolean) {
+  if (autostartBusy.value) return
+  autostartBusy.value = true
   autostartEnabled.value = value
   try {
     await invoke('autostart_set', { enabled: value })
   } catch (error) {
-    autostartEnabled.value = !value
     console.error('Failed to change autostart:', error)
     notifyError(`Failed to ${value ? 'enable' : 'disable'} launch at startup`, error)
+    // A failed call may still have changed the registration partway.
+    autostartEnabled.value = !value
+    await refreshAutostartState()
+  } finally {
+    autostartBusy.value = false
   }
 }
-
-// The last `global-config-server` payload. The form is (re)seeded from it on
-// every open, so edits abandoned by Cancel never resurface on the next open
-// and never ride along with a later, unrelated Save.
-let lastPayload: GlobalConfigServerPayload | null = null
 
 watch(
   () => props.modelValue,
@@ -397,7 +405,7 @@ watch(
     credentialsDirty.value = false
     debugLogDirty.value = false
     authPasswordVisible.value = false
-    if (lastPayload) seedFromPayload(lastPayload, true)
+    if (props.config) seedFromPayload(props.config, true)
     void refreshAutostartState()
   },
 )
@@ -505,7 +513,7 @@ const saveServerConfig = async () => {
   // Only a change of what the connections are built from earns a reconnect:
   // it drops every card session, so a save that only switched the theme or
   // the update channel must not abort an authentication in progress.
-  const before = lastPayload
+  const before = props.config
   const serverChanged =
     !before || (before.host ?? '') !== hostValue.value || (before.ident ?? '') !== identInput.value
   const credentialsChanged =
@@ -587,8 +595,6 @@ const saveServerConfig = async () => {
   }
 }
 
-const { on } = useTauriListeners()
-
 // Copies the backend state into the form. `force` (dialog opening) seeds
 // everything; otherwise the dialog is open and only what the user is not
 // editing follows the backend, so a server command or reconnect arriving
@@ -633,10 +639,13 @@ function seedFromPayload(payload: GlobalConfigServerPayload, force: boolean) {
   if (theme) themeMode.value = theme
 }
 
-onMounted(async () => {
-  await on('global-config-server', (raw) => {
-    lastPayload = raw as GlobalConfigServerPayload
-    seedFromPayload(lastPayload, !props.modelValue)
-  })
-})
+// Every backend push: a closed dialog takes it whole, an open one only where
+// the user is not editing.
+watch(
+  () => props.config,
+  (payload) => {
+    if (payload) seedFromPayload(payload, !props.modelValue)
+  },
+  { immediate: true },
+)
 </script>

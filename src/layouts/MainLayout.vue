@@ -27,7 +27,7 @@
         <q-btn flat round icon="mdi-cog" color="grey-4" size="sm" @click="configOpen = true">
           <q-tooltip>Settings</q-tooltip>
         </q-btn>
-        <ServerConfigDialog v-model="configOpen" />
+        <ServerConfigDialog v-model="configOpen" :config="serverConfig" />
         <CredentialsPromptDialog v-model="credentialsPromptOpen" />
       </q-toolbar>
     </q-header>
@@ -40,10 +40,11 @@
 
 <script setup lang="ts">
 import { useQuasar, Notify } from 'quasar'
-import { ref, computed, onMounted, provide } from 'vue'
+import { ref, shallowRef, computed, onMounted, provide } from 'vue'
 import { useTauriListeners, LAYOUT_LISTENERS_READY } from 'src/composables/useTauriListeners'
 import {
   TBA_IDENT_REGEXP,
+  isGlobalConfigServerPayload,
   parseThemeMode,
   type GlobalConfigServerPayload,
 } from 'src/components/models'
@@ -65,6 +66,10 @@ let credentialsPromptShown = false
 const appConnected = ref(false)
 const serverHost = ref('')
 const serverIdent = ref('')
+// The last `global-config-server` payload, handed to the settings dialog. The
+// dialog does not listen on its own: this listener is part of the ready
+// promise below, so the payload replayed on `frontend-loaded` always lands.
+const serverConfig = shallowRef<GlobalConfigServerPayload | null>(null)
 const serverConfigured = computed(
   () => serverHost.value.length > 0 && TBA_IDENT_REGEXP.test(serverIdent.value),
 )
@@ -91,7 +96,11 @@ function showUpdateNotification(message: string): void {
     message: message || 'Application update is available.',
     color: 'primary',
     position: 'bottom',
-    timeout: 999000,
+    // Stays until an action is clicked: the backend announces a version once,
+    // and an unattended machine must still show it when someone gets back.
+    // One group, so a newer announcement replaces the old prompt in place.
+    timeout: 0,
+    group: 'tba-update',
     actions: [
       {
         label: 'Install & restart',
@@ -115,15 +124,30 @@ function showUpdateNotification(message: string): void {
   })
 }
 
+// Closes the shown access toast. A grouped repeat replaces the toast in place,
+// so the latest create() result always closes the one on screen.
+let dismissAccess: (() => void) | null = null
+
 const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
-  access: () =>
-    Notify.create({
+  access: () => {
+    dismissAccess = Notify.create({
       message: ACCESS_NOTIFICATION_TEXT,
       color: 'red',
       position: 'bottom',
-      timeout: 999000,
+      // Raised once at startup and fatal, so it stays until dismissed; a
+      // repeat joins the shown toast instead of stacking a second one.
+      timeout: 0,
+      group: 'tba-access',
       actions: [{ label: 'Dismiss', color: 'white' }],
-    }),
+    })
+  },
+
+  // The backend loaded the config after a failed startup: the access problem
+  // is gone, so its toast is too.
+  access_restored: () => {
+    dismissAccess?.()
+    dismissAccess = null
+  },
 
   // Backend message names the new version; install_update downloads,
   // verifies the signature, installs and restarts the app.
@@ -163,7 +187,12 @@ const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
 }
 
 function handleGlobalConfigServer(raw: unknown): void {
-  const payload = raw as GlobalConfigServerPayload
+  if (!isGlobalConfigServerPayload(raw)) {
+    console.warn('global-config-server: ignoring malformed payload', raw)
+    return
+  }
+  const payload = raw
+  serverConfig.value = payload
   const theme = parseThemeMode(payload.dark_theme)
   if (theme) $q.dark.set(theme === 'Auto' ? 'auto' : theme === 'Dark')
   serverHost.value = payload.host ?? ''
