@@ -54,6 +54,16 @@ pub async fn reconnect_everything(reason: &str) {
     crate::com_port::restart_rack_links(reason);
 }
 
+/// Whether an app-level connection is registered in the task pool (the one
+/// entry without a reader) — running, or in its reconnect backoff.
+pub async fn is_app_connection_registered() -> bool {
+    TASK_POOL
+        .lock()
+        .await
+        .iter()
+        .any(|card| card.reader_name.is_none())
+}
+
 /// (Re)establishes the application-level MQTT connection with the current
 /// settings, replacing the running one.
 #[tauri::command]
@@ -135,7 +145,8 @@ pub async fn app_connection() {
     let client_id_for_task = client_id.clone();
 
     // create async task for the mqtt client
-    let handle: JoinHandle<()> = async_runtime::spawn(async move {
+    let panic_header = log_header.clone();
+    let event_loop = async move {
         let mut is_online = false;
         let mut backoff = Backoff::new();
 
@@ -279,6 +290,17 @@ pub async fn app_connection() {
                 }
             }
         }
+    };
+    // Nothing else restarts this loop (it is not under `supervise`: a reconnect
+    // replaces it through this very function), and only the publish handler
+    // above has its own catch_unwind — a panic in the CONNACK/offline rack
+    // hooks, the status emit, the failure logging or rumqttc's poll() would
+    // end the task for good with the UI still showing "online". Caught here,
+    // the panic marks the connection offline and schedules a fresh one.
+    let handle: JoinHandle<()> = async_runtime::spawn(async move {
+        if CatchUnwind::new(event_loop).await.is_err() {
+            on_event_loop_panic(&panic_header, session_id);
+        }
     });
 
     task_pool.push(ProcessingCard {
@@ -304,6 +326,82 @@ pub async fn app_connection() {
             card.reader_name.as_deref().unwrap_or("unknown"),
             card.atr.as_deref().unwrap_or("unknown"),
         );
+    }
+}
+
+/// Delay before a panicked app connection is rebuilt: long enough that a
+/// panic repeating on every connect cannot spin, short enough that the server
+/// commands and the rack traffic come back without user action.
+const PANIC_RESTART_DELAY: Duration = Duration::from_secs(5);
+
+/// Cleanup after the app event loop panicked (see the spawn in
+/// `app_connection`): report the connection offline, hold the racks' reports,
+/// and rebuild the connection after `PANIC_RESTART_DELAY` — unless it has been
+/// replaced meanwhile, in which case the successor owns all of that.
+fn on_event_loop_panic(log_header: &str, session_id: u64) {
+    if !is_current_app_session(session_id) {
+        log::error!(
+            "{} [CONN] status=eventloop_panicked superseded=true action=none",
+            log_header
+        );
+        return;
+    }
+    log::error!(
+        "{} [CONN] status=eventloop_panicked action=restart delay_secs={}",
+        log_header,
+        PANIC_RESTART_DELAY.as_secs()
+    );
+    // Each step on its own guard: one of them may be what just panicked, and
+    // the restart below must be scheduled regardless.
+    let _ = std::panic::catch_unwind(|| app_emit_event(false));
+    let _ = std::panic::catch_unwind(crate::com_port::on_app_offline);
+    schedule_app_restart(session_id);
+}
+
+/// Rebuilds the app connection after `PANIC_RESTART_DELAY` if `session_id` is
+/// still the one in charge. A plain fn (not part of `app_connection`'s body):
+/// the restart future embeds `app_connection()`'s own future, which inside
+/// that body would make its type recursive.
+fn schedule_app_restart(session_id: u64) {
+    async_runtime::spawn(async move {
+        tokio::time::sleep(PANIC_RESTART_DELAY).await;
+        if is_current_app_session(session_id) {
+            // Replaces the dead pool entry like any reconnect does.
+            let restart: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                Box::pin(app_connection());
+            restart.await;
+        }
+    });
+}
+
+/// Future adapter that turns a panic while polling the inner future into an
+/// `Err` (the `catch_unwind` of `futures::FutureExt`, which is not a direct
+/// dependency). After a panic the inner future is never polled again.
+struct CatchUnwind<F> {
+    inner: std::pin::Pin<Box<F>>,
+}
+
+impl<F: std::future::Future> CatchUnwind<F> {
+    fn new(inner: F) -> Self {
+        Self {
+            inner: Box::pin(inner),
+        }
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let inner = self.inner.as_mut();
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(output)) => std::task::Poll::Ready(Ok(output)),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
     }
 }
 
@@ -363,5 +461,23 @@ fn handle_publish(mqtt_client: &AsyncClient, log_header: &str, publish: &Publish
         Err(e) => {
             log::error!("{} parsing JSON payload issue: {:?}", log_header, e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn catch_unwind_passes_output_and_catches_panics() {
+        assert_eq!(CatchUnwind::new(async { 7 }).await.ok(), Some(7));
+
+        // A panic after an await point (a later poll, like the event loop's)
+        // is caught too.
+        let panicking = CatchUnwind::new(async {
+            tokio::task::yield_now().await;
+            panic!("event loop panic");
+        });
+        assert!(panicking.await.is_err());
     }
 }

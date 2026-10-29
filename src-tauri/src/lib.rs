@@ -103,7 +103,19 @@ fn initialize_backend(app_handle: tauri::AppHandle) {
     // Read config.yaml (or create the default) and fill the runtime cache.
     match config::init_config() {
         Ok(_) => log::info!("Config initialized successfully."),
-        Err(e) => log::error!("Failed to initialize config: {}", e),
+        Err(e) => {
+            // Typical at login: ~/Documents not reachable yet (cloud-sync
+            // placeholder, network home, a pending macOS permission prompt,
+            // Windows Controlled Folder Access). Without a retry the cache
+            // stays empty for the whole uptime: no MQTT, no cards, and the
+            // config writers (they start from the file) cannot repair it.
+            log::error!(
+                "Failed to initialize config: {} (retrying in the background)",
+                e
+            );
+            config::emit_access_warning();
+            spawn_config_init_retry();
+        }
     }
 
     // Resume an extended debug window a previous run was inside of (the
@@ -141,11 +153,107 @@ fn initialize_backend(app_handle: tauri::AppHandle) {
     });
 }
 
+/// First delay of the startup config retry; doubles up to the max.
+const CONFIG_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Cap of the startup config retry delay.
+const CONFIG_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Wakes the startup config retry ahead of its schedule (a permit is kept
+/// when it is mid-attempt, so the kick is never lost).
+static CONFIG_RETRY_KICK: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Next delay of the startup config retry: doubled, capped.
+fn next_config_retry_delay(delay: std::time::Duration) -> std::time::Duration {
+    (delay * 2).min(CONFIG_RETRY_MAX)
+}
+
+/// Keeps retrying `config::init_config` after it failed at startup (5 s
+/// doubling to 5 min, or right away when kicked by a webview load) until it
+/// succeeds, then brings up what the empty config held back.
+fn spawn_config_init_retry() {
+    async_runtime::spawn(async {
+        let mut delay = CONFIG_RETRY_INITIAL;
+        let mut attempt: u32 = 0;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = CONFIG_RETRY_KICK.notified() => {}
+            }
+            attempt += 1;
+            // File I/O: off the async workers. A panic inside is a failed
+            // attempt like any other.
+            match async_runtime::spawn_blocking(config::init_config).await {
+                Ok(Ok(())) => {
+                    log::info!("[CONFIG] status=recovered attempt={}", attempt);
+                    on_config_recovered().await;
+                    return;
+                }
+                Ok(Err(e)) => log::warn!(
+                    "[CONFIG] status=still_unavailable attempt={} err={} retry_secs={}",
+                    attempt,
+                    e,
+                    next_config_retry_delay(delay).as_secs()
+                ),
+                Err(e) => log::error!(
+                    "[CONFIG] status=retry_task_failed attempt={} err={:?} retry_secs={}",
+                    attempt,
+                    e,
+                    next_config_retry_delay(delay).as_secs()
+                ),
+            }
+            delay = next_config_retry_delay(delay);
+        }
+    });
+}
+
+/// Brings the backend up to the config that has just become readable: the
+/// steps startup ran against an empty cache, plus a refresh of the webview.
+/// Each one is idempotent — a settings save may have loaded the config and
+/// reconnected in the meantime (`config::update_server`).
+async fn on_config_recovered() {
+    // The persisted extended-debug window was invisible at startup.
+    debug_log::restore_from_config();
+
+    // The startup connection attempt returned at once (no host / ident) and
+    // left nothing in the pool; a connection the settings dialog has started
+    // since is left alone.
+    if !app_connect::is_app_connection_registered().await {
+        app_connect::app_connection().await;
+    }
+
+    // Inserted cards were seen with an empty card list: re-report them so the
+    // known ones get their sessions. Running sessions are skipped.
+    smart_card::request_rescan();
+
+    // Close the access warning raised at startup — unless the logger still
+    // writes to its fallback dir, which shows the same toast.
+    if !logger::access_warning_active() {
+        global_app_handle::emit_notification_event(
+            "global-notification",
+            global_app_handle::NotificationPayload {
+                notification_type: "access_restored".to_string(),
+                message: String::new(),
+            },
+        );
+    }
+
+    // The webview (if loaded) still shows the empty config.
+    if let Some(app) = global_app_handle::get_app_handle() {
+        if let Err(e) = config::emit_global_config_server(&app) {
+            log::error!(
+                "Failed to emit global config server after recovery: {:?}",
+                e
+            );
+        }
+        config::emit_all_card_configs();
+    }
+}
+
 /// Runs a long-lived background loop and restarts it after a panic, so one
 /// unexpected panic cannot silently switch a subsystem off until the next app
 /// launch. A normal return ends the supervision (e.g. the app is shutting
 /// down).
-fn supervise<F, Fut>(name: &'static str, make: F)
+pub(crate) fn supervise<F, Fut>(name: &'static str, make: F)
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -293,6 +401,15 @@ pub fn run() {
 
                     // Notifications raised before the webview listened.
                     logger::replay_access_warning();
+
+                    // Still running on an empty config (the startup load
+                    // failed): say so again, and retry the load right away —
+                    // the user is at the window now, possibly having just
+                    // granted the access the startup lacked.
+                    config::replay_access_warning();
+                    if !config::is_initialized() {
+                        CONFIG_RETRY_KICK.notify_one();
+                    }
                     async_runtime::spawn(updater::replay_pending_update());
 
                     // Last reported reader states first: the rescan below skips
@@ -350,4 +467,20 @@ pub fn run() {
             RunEvent::Reopen { .. } => show_main_window(_app_handle),
             _ => {}
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_retry_delay_doubles_then_caps() {
+        let mut delay = CONFIG_RETRY_INITIAL;
+        let mut seen = vec![delay.as_secs()];
+        for _ in 0..8 {
+            delay = next_config_retry_delay(delay);
+            seen.push(delay.as_secs());
+        }
+        assert_eq!(seen, vec![5, 10, 20, 40, 80, 160, 300, 300, 300]);
+    }
 }

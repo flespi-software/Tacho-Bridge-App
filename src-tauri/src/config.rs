@@ -810,6 +810,23 @@ pub async fn update_server(
 
     let host_for_task = host.clone();
     let updated = tauri::async_runtime::spawn_blocking(move || {
+        // The startup load failed and its background retry has not caught up
+        // yet: the user saving the settings is the moment to try right away.
+        // Without it a first run whose Documents was unavailable at launch has
+        // no file for the read-modify-write below, and the save could never
+        // succeed until the retry happened to run. The background retry still
+        // runs its own recovery (debug window, card rescan) when it next ticks;
+        // the dialog reconnects by itself after a successful save.
+        if !is_initialized() {
+            match init_config() {
+                Ok(()) => log::info!("[CONFIG] status=recovered by=settings_save"),
+                Err(e) => {
+                    log::error!("Config is still not accessible: {}", e);
+                    return false;
+                }
+            }
+        }
+
         let config_path = match get_config_path() {
             Ok(path) => path,
             Err(e) => {
@@ -1273,11 +1290,53 @@ fn generate_ident() -> String {
     format!("TBA{:013}", micros % 1_000_000_000_000u128)
 }
 
+/// Set once `init_config` has succeeded. Until then the cache is empty (no
+/// host, no ident, no cards): nothing connects, and the startup retry in
+/// lib.rs (`spawn_config_init_retry`) keeps trying to load the file.
+static CONFIG_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the config file has been loaded into the cache (see
+/// `CONFIG_INITIALIZED`).
+pub fn is_initialized() -> bool {
+    CONFIG_INITIALIZED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Tells the user the config directory is not accessible. Reuses the
+/// frontend's `access` notification (the one the logger raises for an
+/// unwritable `~/Documents/tba`), which shows its own fixed text.
+pub fn emit_access_warning() {
+    let path = get_config_path()
+        .map(|p| format!("{:?}", p))
+        .unwrap_or_else(|_| "~/Documents/tba/config.yaml".to_string());
+    crate::global_app_handle::emit_notification_event(
+        "global-notification",
+        crate::global_app_handle::NotificationPayload {
+            notification_type: "access".to_string(),
+            message: format!("The configuration {} is not accessible yet; retrying", path),
+        },
+    );
+}
+
+/// Re-emits the config access warning to a freshly loaded webview while the
+/// config is still not loaded. Skipped when the logger's own `access` warning
+/// is being replayed already: the frontend shows the same text for both, and
+/// two identical persistent toasts would only be noise.
+pub fn replay_access_warning() {
+    if !is_initialized() && !crate::logger::access_warning_active() {
+        emit_access_warning();
+    }
+}
+
 /// Initializes the configuration file.
 /// This function creates a default configuration file if it does not exist, and loads it into the cache.
+///
+/// Safe to call repeatedly: besides startup it is retried in the background
+/// after a failed startup (lib.rs `spawn_config_init_retry`) and by a settings
+/// save while the config is still missing (`update_server`).
 pub fn init_config() -> io::Result<()> {
-    // Startup also participates in the write serialization: a card task could
-    // already be persisting by the time a repeated `frontend-loaded` re-inits.
+    // Startup also participates in the write serialization: a card task or a
+    // settings save may be persisting while the startup retry re-inits.
     let _guard = config_write_guard();
 
     let config_path = get_config_path()?;
@@ -1379,6 +1438,7 @@ pub fn init_config() -> io::Result<()> {
     }
 
     load_config_to_cache(&config).map_err(io::Error::other)?;
+    CONFIG_INITIALIZED.store(true, std::sync::atomic::Ordering::SeqCst);
 
     Ok(())
 }

@@ -112,6 +112,13 @@ pub fn replay_access_warning() {
     }
 }
 
+/// Whether the "cannot write the log" warning is in effect (and replayed on
+/// `frontend-loaded`) — config.rs skips its own, identical-looking `access`
+/// warning then.
+pub fn access_warning_active() -> bool {
+    LOG_ACCESS_FAILED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 fn emit_access_warning() {
     emit_notification_event(
         "global-notification",
@@ -487,10 +494,67 @@ fn prune_archives(archive_dir: &Path, keep: usize) {
     }
 }
 
+/// How many panics get a full backtrace unconditionally: the first ones of a
+/// run are the most telling (the original fault, not its repeats).
+const PANIC_BACKTRACE_FIRST: u64 = 5;
+
+/// After the first `PANIC_BACKTRACE_FIRST` panics, at most one full backtrace
+/// per this interval. Deliberately caught panics (a supervised loop restarted
+/// every 5 s, a per-message `catch_unwind`) can repeat for hours: a forced
+/// capture walks and symbolizes the whole stack each time — a CPU spike and
+/// tens of lines of identical text in the log for every repeat.
+const PANIC_BACKTRACE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Panics seen so far in this run (the hook's sequence number).
+static PANIC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// When the last full backtrace was written, as milliseconds
+/// since `panic_clock_base()` plus one (0 = never).
+static LAST_PANIC_BACKTRACE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Monotonic origin for `LAST_PANIC_BACKTRACE_MS` (wall-clock jumps must not
+/// unlock or block the backtraces).
+fn panic_clock_base() -> Instant {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+/// Pure decision of the panic backtrace rate limit: `seq` is the 0-based panic
+/// number, `now_ms` the current time and `last_ms` the time of the last full
+/// backtrace (both as stored in `LAST_PANIC_BACKTRACE_MS`, 0 =
+/// never).
+fn panic_backtrace_due(seq: u64, now_ms: u64, last_ms: u64) -> bool {
+    seq < PANIC_BACKTRACE_FIRST
+        || last_ms == 0
+        || now_ms.saturating_sub(last_ms) >= PANIC_BACKTRACE_INTERVAL.as_millis() as u64
+}
+
+/// Whether this panic gets a full backtrace; claims the rate-limit slot when it
+/// does, so two threads panicking at once cannot both take it.
+fn claim_panic_backtrace(seq: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    let now_ms = (panic_clock_base().elapsed().as_millis() as u64).saturating_add(1);
+    if seq < PANIC_BACKTRACE_FIRST {
+        // Counts as the last one: the interval starts after the first burst.
+        LAST_PANIC_BACKTRACE_MS.store(now_ms, Ordering::SeqCst);
+        return true;
+    }
+    let last_ms = LAST_PANIC_BACKTRACE_MS.load(Ordering::SeqCst);
+    panic_backtrace_due(seq, now_ms, last_ms)
+        && LAST_PANIC_BACKTRACE_MS
+            .compare_exchange(last_ms, now_ms, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+}
+
 /// Routes panics into the log file as well. The default hook prints to
 /// stderr only, which a GUI build has nowhere to show: a panicking background
 /// task would otherwise vanish without a trace. The previous hook still runs.
+///
+/// The message and location are logged for every panic; the full backtrace
+/// is rate-limited (see `PANIC_BACKTRACE_FIRST` / `PANIC_BACKTRACE_INTERVAL`).
 fn install_panic_hook() {
+    // Pin the clock origin now, not inside the first panic.
+    panic_clock_base();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let message = info
@@ -504,13 +568,27 @@ fn install_panic_hook() {
             .map(|l| format!("{}:{}", l.file(), l.line()))
             .unwrap_or_else(|| "<unknown>".to_string());
         let thread = std::thread::current();
-        log::error!(
-            "PANIC in thread '{}' at {}: {}\n{}",
-            thread.name().unwrap_or("<unnamed>"),
-            location,
-            message,
-            std::backtrace::Backtrace::force_capture()
-        );
+        let seq = PANIC_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if claim_panic_backtrace(seq) {
+            log::error!(
+                "PANIC #{} in thread '{}' at {}: {}\n{}",
+                seq + 1,
+                thread.name().unwrap_or("<unnamed>"),
+                location,
+                message,
+                std::backtrace::Backtrace::force_capture()
+            );
+        } else {
+            log::error!(
+                "PANIC #{} in thread '{}' at {}: {} (backtrace suppressed: at most one per {} min after the first {})",
+                seq + 1,
+                thread.name().unwrap_or("<unnamed>"),
+                location,
+                message,
+                PANIC_BACKTRACE_INTERVAL.as_secs() / 60,
+                PANIC_BACKTRACE_FIRST
+            );
+        }
         previous(info);
     }));
 }
@@ -680,6 +758,27 @@ fn log_system_info() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_backtrace_rate_limit() {
+        let interval = PANIC_BACKTRACE_INTERVAL.as_millis() as u64;
+        // the first panics always get one, whatever the clock says
+        for seq in 0..PANIC_BACKTRACE_FIRST {
+            assert!(panic_backtrace_due(seq, 10, 9));
+        }
+        // past them: the first rate-limited one is due, then one per interval
+        assert!(panic_backtrace_due(PANIC_BACKTRACE_FIRST, 1_000, 0));
+        assert!(!panic_backtrace_due(
+            PANIC_BACKTRACE_FIRST + 1,
+            1_000 + interval - 1,
+            1_000
+        ));
+        assert!(panic_backtrace_due(
+            PANIC_BACKTRACE_FIRST + 1,
+            1_000 + interval,
+            1_000
+        ));
+    }
 
     /// Creates a unique empty scratch directory for a rotation test.
     fn scratch_dir(tag: &str) -> PathBuf {
