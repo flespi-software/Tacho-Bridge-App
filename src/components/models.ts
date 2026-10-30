@@ -3,6 +3,7 @@ export interface SmartCard {
   name?: string
   iccid?: string
   expire?: number | null
+  t_protocol?: string | null
   card_type?: number | null
   structure_version?: [number, number] | null
   company_name?: string | null
@@ -17,4 +18,96 @@ export interface Reader {
   card_number: string
   online?: boolean | undefined
   authentication?: boolean | undefined
+}
+
+// One card held in a rack slot, as reported by the server's rack discovery.
+// card_number/name are null when the card's ICCID is not in the local config —
+// the card is visible in the rack section but not served yet.
+export interface RackCard {
+  slot: number
+  iccid?: string | null
+  card_number?: string | null
+  name?: string | null
+  // Session state of this rack-backed card, mirroring Reader.online /
+  // Reader.authentication: `online` is true once its MQTT session is up,
+  // `authentication` is true while an APDU exchange is actually running.
+  // Both absent for a card the rack reports but TBA does not serve.
+  online?: boolean | null
+  authentication?: boolean | null
+}
+
+// State of one connected card rack. The backend pushes the full rack list as
+// an array via `rack-state` — several racks can be connected at once, each on
+// its own USB port. Unlike a plain reader, one rack holds many cards.
+export interface RackState {
+  // Stable identity of the rack (its rack id, derived from the device
+  // serial); keys the rack rows in the UI.
+  id: string
+  connected: boolean
+  name: string
+  serial?: string | null
+  manufacturer?: string | null
+  product?: string | null
+  vid?: number | null
+  pid?: number | null
+  cards: RackCard[]
+  // True once the server has finished enumerating the rack. Absent on older
+  // backends, where the UI falls back to its silence timeout.
+  scan_complete?: boolean
+}
+
+/// The app identifier the backend generates and the server registers a device
+/// under: literal "TBA" followed by exactly 13 digits. Shared so the header's
+/// reconnect gate and the settings dialog's validation cannot drift apart on
+/// what counts as a valid identity.
+export const TBA_IDENT_REGEXP = /^TBA\d{13}$/
+
+// Payload of the `global-config-server` event (config.rs
+// `emit_global_config_server`): every value is a string, booleans as
+// "true"/"false", timestamps as decimal unix seconds.
+export interface GlobalConfigServerPayload {
+  host?: string
+  ident?: string
+  dark_theme?: string
+  beta_updates?: string
+  auto_install_updates?: string
+  auth_enabled?: string
+  auth_username?: string
+  auth_password?: string
+  auth_saved?: string
+  auth_active?: string
+  debug_log_enabled?: string
+  debug_log_until?: string
+}
+
+const GLOBAL_CONFIG_SERVER_KEYS: readonly (keyof GlobalConfigServerPayload)[] = [
+  'host',
+  'ident',
+  'dark_theme',
+  'beta_updates',
+  'auto_install_updates',
+  'auth_enabled',
+  'auth_username',
+  'auth_password',
+  'auth_saved',
+  'auth_active',
+  'debug_log_enabled',
+  'debug_log_until',
+]
+
+/// Runtime guard for the `global-config-server` payload: a plain object whose
+/// known fields, when present, are strings (the backend sends every value as
+/// a string). Fails closed so a changed contract is ignored, not half-applied.
+export function isGlobalConfigServerPayload(raw: unknown): raw is GlobalConfigServerPayload {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  const p = raw as Record<string, unknown>
+  return GLOBAL_CONFIG_SERVER_KEYS.every((k) => p[k] === undefined || typeof p[k] === 'string')
+}
+
+export type ThemeMode = 'Auto' | 'Light' | 'Dark'
+
+/// Narrows the persisted `dark_theme` value; empty/unknown (an old config
+/// without an appearance section) yields null so callers keep the current mode.
+export function parseThemeMode(value: string | undefined): ThemeMode | null {
+  return value === 'Auto' || value === 'Light' || value === 'Dark' ? value : null
 }

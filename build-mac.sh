@@ -113,6 +113,22 @@ else
     export TAURI_SIGNING_SKIP=true
 fi
 
+# Updater signing key: with bundle.createUpdaterArtifacts enabled the bundler
+# must sign the .app.tar.gz updater artifact, otherwise the build fails.
+# The key is generated once via `npx tauri signer generate` (same key that CI
+# holds in the TAURI_SIGNING_PRIVATE_KEY secret).
+if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+    UPDATER_KEY_FILE="$HOME/.tauri/tba-updater.key"
+    if [ -f "$UPDATER_KEY_FILE" ]; then
+        export TAURI_SIGNING_PRIVATE_KEY="$UPDATER_KEY_FILE"
+        export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}"
+        echo "   • TAURI_SIGNING_PRIVATE_KEY: $UPDATER_KEY_FILE"
+    else
+        echo "❌ Updater signing key not found ($UPDATER_KEY_FILE) — the build will fail."
+        echo "   Generate it with: npx tauri signer generate -w ~/.tauri/tba-updater.key"
+    fi
+fi
+
 # Run the build with universal architecture
 echo "🚀 Starting universal Tauri build (Intel + Apple Silicon)..."
 npm run tauri build -- --target universal-apple-darwin

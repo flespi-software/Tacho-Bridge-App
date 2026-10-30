@@ -1,20 +1,18 @@
 // Display formatters for CardConfig fields populated by the APDU sniffer.
-// Used by SmartCardList.vue and TachoMainComponent.vue.
+// Used by the unified card list (CardRow.vue, cardBoard.ts).
 
 import type { SmartCard } from './models'
 
 /// Builds the meta string shown in parentheses after the card number,
 /// e.g. "Gen1 | Company Card". Omits missing parts.
-export function formatCardMeta(
-  card: Pick<SmartCard, 'structure_version' | 'card_type'>,
-): string {
+export function formatCardMeta(card: Pick<SmartCard, 'structure_version' | 'card_type'>): string {
   const parts: string[] = []
   if (card.structure_version) parts.push(formatStructureVersion(card.structure_version))
   if (card.card_type != null) parts.push(formatCardType(card.card_type))
   return parts.join(' | ')
 }
 
-export function formatCardType(type: number | null | undefined): string {
+function formatCardType(type: number | null | undefined): string {
   switch (type) {
     case 1:
       return 'Driver Card'
@@ -41,11 +39,6 @@ export function formatStructureVersion(v: [number, number] | null | undefined): 
 export function formatExpire(unixTs: number | null | undefined): string {
   if (!unixTs) return ''
   return new Date(unixTs * 1000).toISOString().slice(0, 10)
-}
-
-export function isExpired(unixTs: number | null | undefined): boolean {
-  if (!unixTs) return false
-  return unixTs * 1000 < Date.now()
 }
 
 /// Formats last_auth timestamp (stored as UTC unix seconds) in the user's local

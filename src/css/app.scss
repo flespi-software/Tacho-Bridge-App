@@ -1,1 +1,128 @@
-// app global css in SCSS form
+// Global transitions
+.q-card,
+.q-item {
+  transition:
+    box-shadow 0.2s ease,
+    transform 0.2s ease;
+}
+
+.q-item:hover {
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.body--dark .q-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+// The layout is exactly the window height (the card list scrolls inside the
+// page). Quasar sets its min-height from $q.screen.height, which trails a
+// shrinking window by a resize event: for that frame the document overflowed
+// and, with classic (always shown) scrollbars, a page scrollbar flickered in
+// and out, shaking the whole window content sideways during a resize.
+.q-layout--standard {
+  min-height: 100vh !important;
+}
+
+// Smooth page transitions
+.q-page {
+  animation: fadeIn 0.25s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+// Better chip styling
+.q-chip {
+  font-size: 11px;
+  border-radius: 4px;
+}
+
+// Rack scan bar: a calmer take on Quasar's indeterminate animation.
+// The default runs two overlapping dashes on a 2.1s cycle with a sharp
+// cubic-bezier — reads as urgent foreground work and is tiring to sit next to.
+// This is a passive background status, so we slow the sweep down, ease it
+// symmetrically, and drop the second dash entirely (`:after`).
+// The animation lives on the inner `__model` element, not on the root the
+// class is applied to — the root only ever carries `q-linear-progress`.
+.rack-scan-bar {
+  opacity: 0.75;
+
+  .q-linear-progress__model--indeterminate {
+    &:before {
+      animation-duration: 3.6s;
+      animation-timing-function: ease-in-out;
+    }
+
+    // The trailing dash is what makes the default feel busy — one travelling
+    // bar is enough to say "working".
+    &:after {
+      animation: none;
+      opacity: 0;
+    }
+  }
+}
+
+// Respect a user's reduced-motion preference: no sweep at all, just a static
+// muted track so the state is still visible without movement.
+@media (prefers-reduced-motion: reduce) {
+  .rack-scan-bar .q-linear-progress__model--indeterminate {
+    &:before {
+      animation: none;
+      transform: none;
+      opacity: 0.5;
+    }
+
+    &:after {
+      animation: none;
+      opacity: 0;
+    }
+  }
+}
+
+// Header improvements
+.q-header .q-toolbar {
+  min-height: 48px;
+}
+
+.q-toolbar__title {
+  font-size: 16px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+}
+
+// Dialog improvements
+.q-dialog .q-card {
+  border-radius: 12px;
+}
+
+// $primary (#37474f) is the same hex as $dark, so primary-colored elements
+// (dialog icons, unelevated buttons) vanish on dark surfaces — remap the
+// primary brand color to a readable blue-grey for the whole dark mode.
+.body--dark {
+  --q-primary: #90a4ae;
+}
+
+// The header is primary-coloured, so the remap above would turn it light
+// blue-grey; keep it dark in dark mode, as it is in the light theme.
+.body--dark .q-header {
+  background-color: #263238;
+}
+
+// Fix primary color contrast in dark mode for focused input labels and borders
+.body--dark {
+  .q-field--focused .q-field__label,
+  .q-field--focused .q-field__control::before {
+    color: #90a4ae !important;
+  }
+  .q-field--focused.q-field--outlined .q-field__control::before {
+    border-color: #90a4ae !important;
+  }
+}

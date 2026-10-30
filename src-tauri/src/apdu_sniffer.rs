@@ -15,6 +15,8 @@ use std::sync::Mutex;
 
 use lazy_static::lazy_static;
 
+use crate::config::CardConfig;
+
 struct SniffState {
     /// FID of the most recently SELECTed EF (plain or SM-wrapped).
     last_selected_ef: Option<u16>,
@@ -51,13 +53,34 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
         Err(_) => return,
     };
 
-    // Track SELECTed EF (ignore SELECT AID / SELECT MF)
-    if let Some(fid) = select_ef_fid(&cmd) {
+    // Track the card's currently selected file. Two guards keep a later
+    // READ BINARY from being parsed against the wrong EF (which would persist
+    // garbage identification data into the card's config):
+    //  * a FAILED SELECT (SW != 9000) leaves the card's selection unchanged
+    //    per ISO 7816 — the attempted FID must NOT be recorded;
+    //  * a successful SELECT the sniffer does not recognize (by AID, by path,
+    //    MF) DID change the selection to something unknown — the tracked FID
+    //    must be cleared, not left stale.
+    let is_select = cmd.len() >= 2 && (cmd[0] == 0x00 || cmd[0] == 0x0C) && cmd[1] == 0xA4;
+    if is_select {
+        let sw_ok = resp.len() >= 2 && resp[resp.len() - 2] == 0x90 && resp[resp.len() - 1] == 0x00;
+        // Under SM the outer 9000 only covers the wrapping: the command's own
+        // status is in DO'99.
+        let secure_messaging = cmd[0] & 0x0C == 0x0C;
+        let inner_ok = !sw_ok
+            || !secure_messaging
+            || sm_status(&resp[..resp.len() - 2]).is_none_or(|sw| sw == [0x90, 0x00]);
+        if !sw_ok || !inner_ok {
+            return; // selection unchanged on the card: keep the tracked state
+        }
+        let fid = select_ef_fid(&cmd); // None for recognized-but-untracked selects
         if let Ok(mut state) = STATE.lock() {
             state
                 .entry(client_id.to_string())
-                .or_insert(SniffState { last_selected_ef: None })
-                .last_selected_ef = Some(fid);
+                .or_insert(SniffState {
+                    last_selected_ef: None,
+                })
+                .last_selected_ef = fid;
         }
         return;
     }
@@ -67,15 +90,41 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
         return;
     }
 
-    let fid = {
-        let Ok(state) = STATE.lock() else { return; };
-        state
-            .get(client_id)
-            .and_then(|s| s.last_selected_ef)
+    // The field parsers below slice the EF at fixed offsets counted from the
+    // start of the file, so they are only valid for a read that actually starts
+    // at offset 0. A VU is free to read an EF in several chunks (and does for
+    // the 143-byte EF_Identification); parsing a chunk read from offset N as if
+    // it began at 0 shifts every field and silently persists garbage into
+    // config.yaml.
+    let Some(offset) = read_binary_offset(&cmd) else {
+        // The short-EF-identifier form selects another EF implicitly: the
+        // tracked FID no longer names the current file.
+        if let Ok(mut state) = STATE.lock() {
+            if let Some(entry) = state.get_mut(client_id) {
+                entry.last_selected_ef = None;
+            }
+        }
+        return;
     };
-    let Some(fid) = fid else { return; };
+    if offset != 0 {
+        return;
+    }
 
-    let Some(data) = extract_plain_body(&resp) else { return; };
+    let fid = {
+        let Ok(state) = STATE.lock() else {
+            return;
+        };
+        state.get(client_id).and_then(|s| s.last_selected_ef)
+    };
+    let Some(fid) = fid else {
+        return;
+    };
+
+    // CLA bits b4-b3 = 11: the command (and so its response) is SM-wrapped.
+    let secure_messaging = cmd.first().is_some_and(|cla| cla & 0x0C == 0x0C);
+    let Some(data) = extract_plain_body(&resp, secure_messaging) else {
+        return;
+    };
 
     match fid {
         0x0520 => parse_ef_identification(client_id, &data),
@@ -102,17 +151,54 @@ fn select_ef_fid(cmd: &[u8]) -> Option<u16> {
     None
 }
 
+/// The processing status a SM response body reports in its DO'99, if any.
+fn sm_status(body: &[u8]) -> Option<[u8; 2]> {
+    let mut rest = body;
+    while let Some((&tag, after)) = rest.split_first() {
+        let (len, len_bytes) = ber_length(after)?;
+        let end = len_bytes.checked_add(len)?;
+        let value = after.get(len_bytes..end)?;
+        if tag == 0x99 {
+            return value.try_into().ok();
+        }
+        rest = &after[end..];
+    }
+    None
+}
+
 fn is_read_binary(cmd: &[u8]) -> bool {
     cmd.len() >= 2 && (cmd[0] == 0x00 || cmd[0] == 0x0C) && cmd[1] == 0xB0
+}
+
+/// Offset a READ BINARY reads from, per ISO 7816-4: P1|P2 is a 15-bit offset
+/// when bit 8 of P1 is clear. With bit 8 set, P1 carries a short EF identifier
+/// instead and P2 alone is the offset — that form re-selects a different EF, so
+/// the tracked-FID context no longer applies and we report no usable offset.
+fn read_binary_offset(cmd: &[u8]) -> Option<u16> {
+    if cmd.len() < 4 {
+        return None;
+    }
+    let (p1, p2) = (cmd[2], cmd[3]);
+    if p1 & 0x80 != 0 {
+        return None;
+    }
+    Some(u16::from_be_bytes([p1, p2]))
 }
 
 /// Extracts plaintext body from a RAPDU.
 /// - SM response: body is the value of DO'81 (plain value), expected as the
 ///   first data object before DO'99/DO'8E and the trailing SW.
 /// - Plain response: body is everything except the trailing 2-byte SW.
-/// Returns None if the response has no payload (e.g. only SW).
-fn extract_plain_body(resp: &[u8]) -> Option<Vec<u8>> {
+///
+/// Returns None if the response has no payload (e.g. only SW) or if the card
+/// did not report full success: a warning status such as 6282 ("end of file
+/// reached before reading Le bytes") returns FEWER bytes than asked for, and
+/// the fixed-offset parsers would read past the data into whatever follows.
+fn extract_plain_body(resp: &[u8], secure_messaging: bool) -> Option<Vec<u8>> {
     if resp.len() < 2 {
+        return None;
+    }
+    if resp[resp.len() - 2] != 0x90 || resp[resp.len() - 1] != 0x00 {
         return None;
     }
     let body = &resp[..resp.len() - 2];
@@ -124,14 +210,19 @@ fn extract_plain_body(resp: &[u8]) -> Option<Vec<u8>> {
     if body[0] == 0x81 {
         let (len, len_bytes) = ber_length(&body[1..])?;
         let start = 1 + len_bytes;
-        if start + len <= body.len() {
-            return Some(body[start..start + len].to_vec());
-        }
-        return None;
+        // Checked: a BER long-form length is up to 4 bytes, so `len` can reach
+        // 0xFFFFFFFF. On a 32-bit target `start + len` would wrap and pass a
+        // plain `<= body.len()` test, and the slice below would then panic on
+        // a malformed (or hostile) response instead of being rejected here.
+        let end = start.checked_add(len)?;
+        return body.get(start..end).map(<[u8]>::to_vec);
     }
 
-    // SM with encrypted body (DO'87) — cannot decode without session keys
-    if body[0] == 0x87 {
+    // An SM response carries its data in DO'81 only. Anything else is
+    // DO'87 (encrypted, cannot be decoded without session keys) or a
+    // status-only body (DO'99 + DO'8E) — read as plain data, its first bytes
+    // would be persisted as file fields.
+    if secure_messaging || body[0] == 0x87 {
         return None;
     }
 
@@ -161,11 +252,78 @@ fn ber_length(data: &[u8]) -> Option<(usize, usize)> {
 
 // ─────────── Field parsers ───────────
 
+/// Applies a sniffed field update to the card's stored config, off the async
+/// task that produced it.
+///
+/// `sniff()` runs on the card's MQTT task, so the write (file I/O with fsync)
+/// is offloaded to the blocking pool. `mutate_card_config` re-applies `apply`
+/// against fresh file state under the global config lock, so a concurrent
+/// writer cannot be reverted by a stale snapshot. `apply` returns whether it
+/// actually changed anything.
+fn persist_sniffed(
+    client_id: &str,
+    what: &'static str,
+    apply: impl FnOnce(&mut CardConfig) -> bool + Send + 'static,
+) {
+    log::debug!("{} → config update for {}", what, client_id);
+    let client_id = client_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        match crate::config::mutate_card_config(&client_id, apply) {
+            // The sniffer runs for every proxied card, including ones with no
+            // config entry yet — nothing to persist there, and it is not an error.
+            crate::config::CardMutation::UnknownCard => log::debug!(
+                "sniffer: no config entry for {}, skipping {} fields",
+                client_id,
+                what
+            ),
+            crate::config::CardMutation::Failed => {
+                log::error!(
+                    "sniffer: failed to persist {} fields for {}",
+                    what,
+                    client_id
+                )
+            }
+            crate::config::CardMutation::Saved | crate::config::CardMutation::Unchanged => {}
+        }
+    });
+}
+
+/// Assigns `new` over `field` when it differs, reporting whether it changed.
+/// The building block of every sniffed-field update: a field absent from this
+/// response (`None`) is left untouched rather than cleared.
+fn set_if_changed<T: PartialEq>(field: &mut T, new: Option<T>, changed: &mut bool) {
+    if let Some(new) = new {
+        if *field != new {
+            *field = new;
+            *changed = true;
+        }
+    }
+}
+
+/// Gen2 cards expose EF_Application_Identification under BOTH DF_Tachograph
+/// (Gen1, ver 00.00) and DF_Tachograph_G2 (Gen2, ver 01.xx). Keep only the
+/// highest version seen — tuple comparison is lexicographic:
+/// (0,0) < (1,0) < (1,1) < (1,2) ...
+fn version_is_higher(current: Option<(u8, u8)>, candidate: (u8, u8)) -> bool {
+    match current {
+        Some(current) => candidate > current,
+        None => true,
+    }
+}
+
+/// Size of EF_Identification on a company card: CardIdentification (65) +
+/// companyName (36) + companyAddress (36) + preferred language (2). Driver,
+/// workshop and control cards carry a different holder block at offset 65
+/// (on a driver card: the holder's surname and first names).
+const COMPANY_EF_IDENTIFICATION_LEN: usize = 65 + 36 + 36 + 2;
+
 /// Parses EF_Identification (Annex 1C §2.24 CardIdentification + holder block).
 /// Logs all fields and persists the subset we track (expire, company_name,
 /// company_address) into the card's config if values changed.
 fn parse_ef_identification(client_id: &str, data: &[u8]) {
-    log::debug!(
+    // Trace only: on a driver card the file holds the holder's names and
+    // birth date, and the debug level can be switched on remotely.
+    log::trace!(
         "EF_Identification (0520) plaintext ({} bytes): {}",
         data.len(),
         hex::encode(data)
@@ -175,11 +333,7 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
         log::info!("  cardIssuingMemberState: 0x{:02X} ({})", b[0], b[0]);
     }
     if let Some(b) = slice(data, 1, 16) {
-        log::info!(
-            "  cardNumber: \"{}\" (raw={})",
-            ia5(b),
-            hex::encode(b)
-        );
+        log::info!("  cardNumber: \"{}\" (raw={})", ia5(b), hex::encode(b));
     }
     if let Some(b) = slice(data, 17, 36) {
         log::info!("  cardIssuingAuthorityName: {}", name_str(b));
@@ -195,7 +349,8 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
     }
 
     // Company Card holder block
-    if data.len() >= 65 + 74 {
+    let company_layout = data.len() == COMPANY_EF_IDENTIFICATION_LEN;
+    if company_layout {
         if let Some(b) = slice(data, 65, 36) {
             log::info!("  companyName: {}", name_str(b));
         }
@@ -210,46 +365,60 @@ fn parse_ef_identification(client_id: &str, data: &[u8]) {
         }
     }
 
-    // Persist changes to card config
-    let Some(mut cfg) = crate::config::get_card_config_from_cache(client_id) else {
+    // Persist changes to card config.
+    // Cheap pre-check against the runtime cache first: the VU re-reads these
+    // EFs on every authentication, and in the common no-change case we must
+    // not touch the disk at all.
+    let Some(cfg) = crate::config::get_card_config_from_cache(client_id) else {
         return;
     };
-    let mut changed = false;
 
-    if let Some(b) = slice(data, 61, 4) {
+    // Outer Option = field present in this response; inner value = new content.
+    let new_expire = slice(data, 61, 4).map(|b| {
         let ts = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-        let new_value = if ts == 0 { None } else { Some(ts as u64) };
-        if cfg.expire != new_value {
-            cfg.expire = new_value;
-            changed = true;
+        if ts == 0 {
+            None
+        } else {
+            Some(ts as u64)
         }
-    }
-    if let Some(b) = slice(data, 65, 36) {
-        let new_value = extract_name(b);
-        if cfg.company_name != new_value {
-            cfg.company_name = new_value;
-            changed = true;
-        }
-    }
-    if let Some(b) = slice(data, 101, 36) {
-        let new_value = extract_name(b);
-        if cfg.company_address != new_value {
-            cfg.company_address = new_value;
-            changed = true;
-        }
+    });
+    // The holder block is the company's only on a company card: the card type
+    // sniffed from EF_Application_Identification decides, the file size when
+    // that has not been seen yet. Anything else would store a driver's name.
+    let is_company = match cfg.card_type {
+        Some(card_type) => card_type == 4,
+        None => company_layout,
+    };
+    let new_company_name = slice(data, 65, 36).filter(|_| is_company).map(extract_name);
+    let new_company_address = slice(data, 101, 36)
+        .filter(|_| is_company)
+        .map(extract_name);
+
+    let would_change = new_expire.as_ref().is_some_and(|v| &cfg.expire != v)
+        || new_company_name
+            .as_ref()
+            .is_some_and(|v| &cfg.company_name != v)
+        || new_company_address
+            .as_ref()
+            .is_some_and(|v| &cfg.company_address != v);
+    if !would_change {
+        return;
     }
 
-    if changed {
-        log::debug!("EF_Identification → config update for {}", client_id);
-        crate::config::update_card(client_id, cfg);
-    }
+    persist_sniffed(client_id, "EF_Identification", move |card| {
+        let mut changed = false;
+        set_if_changed(&mut card.expire, new_expire, &mut changed);
+        set_if_changed(&mut card.company_name, new_company_name, &mut changed);
+        set_if_changed(&mut card.company_address, new_company_address, &mut changed);
+        changed
+    });
 }
 
 /// Parses EF_Application_Identification for Company Card.
 /// Layout: typeOfTachographCardId (1) + cardStructureVersion (2) + noOfCompanyActivityRecords (2).
 /// Persists card_type and structure_version into the card's config if changed.
 fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
-    log::debug!(
+    log::trace!(
         "EF_Application_Identification (0501) plaintext ({} bytes): {}",
         data.len(),
         hex::encode(data)
@@ -267,65 +436,56 @@ fn parse_ef_application_identification(client_id: &str, data: &[u8]) {
         log::info!("  typeOfTachographCardId: 0x{:02X} ({})", t, ts);
     }
     if data.len() >= 3 {
-        log::info!(
-            "  cardStructureVersion: {:02X}.{:02X}",
-            data[1],
-            data[2]
-        );
+        log::info!("  cardStructureVersion: {:02X}.{:02X}", data[1], data[2]);
     }
     if data.len() >= 5 {
         let n = u16::from_be_bytes([data[3], data[4]]);
         log::info!("  noOfCompanyActivityRecords: {}", n);
     }
 
-    // Persist changes to card config
-    let Some(mut cfg) = crate::config::get_card_config_from_cache(client_id) else {
+    // Persist changes to card config.
+    // Cheap pre-check against the runtime cache first — no disk I/O in the
+    // common no-change case (the VU reads this EF on every authentication).
+    let Some(cfg) = crate::config::get_card_config_from_cache(client_id) else {
         return;
     };
-    let mut changed = false;
 
-    if !data.is_empty() {
-        let new_value = Some(data[0]);
-        if cfg.card_type != new_value {
-            cfg.card_type = new_value;
-            changed = true;
-        }
-    }
-    if data.len() >= 3 {
-        // Gen2 cards expose EF_Application_Identification under BOTH DF_Tachograph (Gen1, ver 00.00)
-        // and DF_Tachograph_G2 (Gen2, ver 01.xx). Keep only the highest version seen —
-        // tuple comparison is lexicographic: (0,0) < (1,0) < (1,1) < (1,2) ...
-        let new_value = (data[1], data[2]);
-        let should_update = match cfg.structure_version {
-            Some(current) => new_value > current,
-            None => true,
-        };
-        if should_update {
-            cfg.structure_version = Some(new_value);
-            changed = true;
-        } else {
-            log::debug!(
-                "EF_AI structure_version {:?} not higher than stored {:?} — skipped",
-                new_value,
-                cfg.structure_version
-            );
-        }
+    // typeOfTachographCardId is 1..=4 (driver, workshop, control, company);
+    // any other value means the bytes are not this file's.
+    let new_card_type = data.first().copied().filter(|t| (1..=4).contains(t));
+    let new_structure_version = if data.len() >= 3 {
+        Some((data[1], data[2]))
+    } else {
+        None
+    };
+
+    let would_change = new_card_type.is_some_and(|t| cfg.card_type != Some(t))
+        || new_structure_version.is_some_and(|v| version_is_higher(cfg.structure_version, v));
+    if !would_change {
+        return;
     }
 
-    if changed {
-        log::debug!("EF_Application_Identification → config update for {}", client_id);
-        crate::config::update_card(client_id, cfg);
-    }
+    persist_sniffed(client_id, "EF_Application_Identification", move |card| {
+        let mut changed = false;
+        set_if_changed(&mut card.card_type, new_card_type.map(Some), &mut changed);
+        // Not set_if_changed: a lower version must never overwrite a higher one.
+        if let Some(v) = new_structure_version {
+            if version_is_higher(card.structure_version, v) {
+                card.structure_version = Some(v);
+                changed = true;
+            }
+        }
+        changed
+    });
 }
 
 // ─────────── Helpers ───────────
 
+/// Fixed-offset field read, bounds-checked. `get` handles the overflow of
+/// `start + len` for free, so a short or malformed EF body yields None instead
+/// of panicking.
 fn slice(d: &[u8], start: usize, len: usize) -> Option<&[u8]> {
-    if start + len <= d.len() {
-        Some(&d[start..start + len])
-    } else {
-        None
-    }
+    d.get(start..start.checked_add(len)?)
 }
 
 /// Trims trailing padding (0x00 / 0xFF) from tachograph fixed-length strings.
@@ -344,8 +504,7 @@ fn name_str(b: &[u8]) -> String {
         return String::new();
     }
     let cp = b[0];
-    let payload = trim(&b[1..]);
-    format!("[cp={}] \"{}\"", cp, String::from_utf8_lossy(payload))
+    format!("[cp={}] \"{}\"", cp, decode_name(cp, trim(&b[1..])))
 }
 
 /// Extracts just the string value from a `Name` field (codePage byte + 35-byte string).
@@ -358,7 +517,34 @@ fn extract_name(b: &[u8]) -> Option<String> {
     if payload.is_empty() {
         return None;
     }
-    Some(String::from_utf8_lossy(payload).to_string())
+    Some(decode_name(b[0], payload))
+}
+
+/// Decodes the text of a `Name` field: its code page byte 1..16 is the part
+/// of ISO/IEC 8859 the bytes are in (Annex 1C, Chapter 4). Anything else is
+/// read as UTF-8, which covers plain ASCII. Where WHATWG has no exact ISO
+/// table (parts 1, 9, 11) its Windows superset decodes the same letters.
+fn decode_name(code_page: u8, text: &[u8]) -> String {
+    use encoding_rs::*;
+    let encoding = match code_page {
+        1 => WINDOWS_1252,
+        2 => ISO_8859_2,
+        3 => ISO_8859_3,
+        4 => ISO_8859_4,
+        5 => ISO_8859_5,
+        6 => ISO_8859_6,
+        7 => ISO_8859_7,
+        8 => ISO_8859_8,
+        9 => WINDOWS_1254,
+        10 => ISO_8859_10,
+        11 => WINDOWS_874,
+        13 => ISO_8859_13,
+        14 => ISO_8859_14,
+        15 => ISO_8859_15,
+        16 => ISO_8859_16,
+        _ => return String::from_utf8_lossy(text).into_owned(),
+    };
+    encoding.decode_without_bom_handling(text).0.into_owned()
 }
 
 /// IA5 fixed-length string, trims padding.
@@ -385,6 +571,96 @@ fn time_real(b: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// A CardConfig with every sniffed field empty — the starting point for the
+    /// `set_if_changed` / `version_is_higher` cases below.
+    fn blank_card() -> CardConfig {
+        CardConfig {
+            iccid: "0123456789ABCDEF".to_string(),
+            expire: None,
+            name: None,
+            t_protocol: None,
+            card_type: None,
+            structure_version: None,
+            company_name: None,
+            company_address: None,
+            last_auth: None,
+        }
+    }
+
+    #[test]
+    fn set_if_changed_ignores_a_field_absent_from_the_response() {
+        // A short response must leave a stored value alone, never clear it.
+        let mut card = blank_card();
+        card.company_name = Some("ACME".to_string());
+        let mut changed = false;
+        set_if_changed(&mut card.company_name, None, &mut changed);
+        assert!(!changed);
+        assert_eq!(card.company_name.as_deref(), Some("ACME"));
+    }
+
+    #[test]
+    fn set_if_changed_reports_only_a_real_change() {
+        let mut card = blank_card();
+        card.expire = Some(42);
+        let mut changed = false;
+
+        // Same value: no write, no change reported.
+        set_if_changed(&mut card.expire, Some(Some(42)), &mut changed);
+        assert!(
+            !changed,
+            "re-reading an unchanged EF must not dirty the config"
+        );
+
+        // Different value: written and reported.
+        set_if_changed(&mut card.expire, Some(Some(99)), &mut changed);
+        assert!(changed);
+        assert_eq!(card.expire, Some(99));
+    }
+
+    #[test]
+    fn set_if_changed_can_clear_a_field_the_card_reports_as_empty() {
+        // Outer Some = the EF carried the field; inner None = it is empty.
+        let mut card = blank_card();
+        card.expire = Some(7);
+        let mut changed = false;
+        set_if_changed(&mut card.expire, Some(None), &mut changed);
+        assert!(changed);
+        assert_eq!(card.expire, None);
+    }
+
+    #[test]
+    fn set_if_changed_accumulates_across_fields() {
+        // `changed` is threaded through several fields; one real change must
+        // survive later no-op assignments.
+        let mut card = blank_card();
+        let mut changed = false;
+        set_if_changed(&mut card.company_name, Some(Some("A".into())), &mut changed);
+        assert!(changed);
+        set_if_changed(&mut card.company_address, None, &mut changed);
+        assert!(
+            changed,
+            "an earlier change must not be reset by a later no-op"
+        );
+    }
+
+    #[test]
+    fn version_is_higher_keeps_the_highest_generation_seen() {
+        // Gen2 cards expose the EF under both DF_Tachograph (00.00) and
+        // DF_Tachograph_G2 (01.xx); the Gen1 read must not clobber the Gen2 one.
+        assert!(version_is_higher(None, (0, 0)), "first read always stores");
+        assert!(version_is_higher(Some((0, 0)), (1, 0)));
+        assert!(version_is_higher(Some((1, 0)), (1, 1)));
+        assert!(
+            !version_is_higher(Some((1, 0)), (0, 0)),
+            "Gen1 must not overwrite Gen2"
+        );
+        assert!(
+            !version_is_higher(Some((1, 1)), (1, 1)),
+            "same version is not higher"
+        );
+        assert!(!version_is_higher(Some((1, 2)), (1, 1)));
+    }
+
     #[test]
     fn select_ef_fid_plain_form() {
         // Plain SELECT EF for FID 0x0520: 00 A4 02 0C 02 05 20
@@ -396,7 +672,10 @@ mod tests {
     fn select_ef_fid_sm_form() {
         // SM-wrapped SELECT EF for FID 0x0501:
         // 0C A4 02 0C Lc 81 02 05 01 ... MAC ... 00
-        let cmd = [0x0C, 0xA4, 0x02, 0x0C, 0x09, 0x81, 0x02, 0x05, 0x01, 0x8E, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0x00];
+        let cmd = [
+            0x0C, 0xA4, 0x02, 0x0C, 0x09, 0x81, 0x02, 0x05, 0x01, 0x8E, 0x04, 0xAA, 0xBB, 0xCC,
+            0xDD, 0x00,
+        ];
         assert_eq!(select_ef_fid(&cmd), Some(0x0501));
     }
 
@@ -417,28 +696,133 @@ mod tests {
     fn extract_plain_body_strips_sw() {
         // Plain response: 12 34 56  + SW 90 00
         let resp = [0x12, 0x34, 0x56, 0x90, 0x00];
-        assert_eq!(extract_plain_body(&resp), Some(vec![0x12, 0x34, 0x56]));
+        assert_eq!(
+            extract_plain_body(&resp, false),
+            Some(vec![0x12, 0x34, 0x56])
+        );
     }
 
     #[test]
     fn extract_plain_body_handles_do81() {
         // DO'81 body of length 3, then DO'8E and SW.
-        let resp = [0x81, 0x03, 0xAA, 0xBB, 0xCC, 0x8E, 0x02, 0xFF, 0xFF, 0x90, 0x00];
-        assert_eq!(extract_plain_body(&resp), Some(vec![0xAA, 0xBB, 0xCC]));
+        let resp = [
+            0x81, 0x03, 0xAA, 0xBB, 0xCC, 0x8E, 0x02, 0xFF, 0xFF, 0x90, 0x00,
+        ];
+        assert_eq!(
+            extract_plain_body(&resp, false),
+            Some(vec![0xAA, 0xBB, 0xCC])
+        );
     }
 
     #[test]
     fn extract_plain_body_refuses_encrypted_do87() {
         let resp = [0x87, 0x02, 0xAA, 0xBB, 0x90, 0x00];
-        assert_eq!(extract_plain_body(&resp), None);
+        assert_eq!(extract_plain_body(&resp, false), None);
+    }
+
+    #[test]
+    fn extract_plain_body_rejects_oversized_do81_length_without_panicking() {
+        // A DO'81 whose long-form length (4 bytes, 0xFFFFFFFF) far exceeds the
+        // body. On a 32-bit target `start + len` wraps and used to slip past a
+        // plain `<= body.len()` bound check, panicking on the slice; the
+        // checked add must reject it on every target instead.
+        let resp = [0x81, 0x84, 0xFF, 0xFF, 0xFF, 0xFF, 0xAA, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp, false), None);
+    }
+
+    #[test]
+    fn extract_plain_body_rejects_do81_length_past_the_body() {
+        // Ordinary truncation: the declared length is larger than what is
+        // actually present.
+        let resp = [0x81, 0x08, 0xAA, 0xBB, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp, false), None);
+    }
+
+    #[test]
+    fn slice_rejects_out_of_range_and_overflowing_reads() {
+        let data = [1u8, 2, 3, 4];
+        assert_eq!(slice(&data, 0, 4), Some(&data[..]));
+        assert_eq!(slice(&data, 2, 2), Some(&data[2..]));
+        // past the end
+        assert_eq!(slice(&data, 2, 3), None);
+        // start + len overflows usize
+        assert_eq!(slice(&data, 1, usize::MAX), None);
+    }
+
+    #[test]
+    fn extract_plain_body_refuses_sm_response_without_do81() {
+        // Status-only SM body: DO'99 (SW) + DO'8E (MAC), outer 90 00.
+        let resp = [0x99, 0x02, 0x6A, 0x82, 0x8E, 0x02, 0xFF, 0xFF, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp, true), None);
+        // The same DO'81 body is still extracted from an SM response.
+        let resp = [0x81, 0x01, 0x04, 0x8E, 0x02, 0xFF, 0xFF, 0x90, 0x00];
+        assert_eq!(extract_plain_body(&resp, true), Some(vec![0x04]));
     }
 
     #[test]
     fn extract_plain_body_handles_too_short() {
-        assert_eq!(extract_plain_body(&[]), None);
-        assert_eq!(extract_plain_body(&[0x90]), None);
+        assert_eq!(extract_plain_body(&[], false), None);
+        assert_eq!(extract_plain_body(&[0x90], false), None);
         // Only SW, no payload
-        assert_eq!(extract_plain_body(&[0x90, 0x00]), None);
+        assert_eq!(extract_plain_body(&[0x90, 0x00], false), None);
+    }
+
+    #[test]
+    fn extract_plain_body_refuses_partial_read_status() {
+        // 6282: end of file reached before Le bytes were read. The data is
+        // short, so parsing it at fixed offsets would read past the real
+        // content — the whole response must be rejected.
+        let resp = [0x12, 0x34, 0x56, 0x62, 0x82];
+        assert_eq!(extract_plain_body(&resp, false), None);
+        // A DO'81-wrapped body under a non-9000 status is rejected too.
+        let sm = [0x81, 0x03, 0xAA, 0xBB, 0xCC, 0x62, 0x82];
+        assert_eq!(extract_plain_body(&sm, true), None);
+    }
+
+    #[test]
+    fn read_binary_offset_reads_p1p2() {
+        // Offset 0 — the only form the fixed-offset parsers are valid for.
+        assert_eq!(read_binary_offset(&[0x00, 0xB0, 0x00, 0x00, 0x40]), Some(0));
+        // A second chunk of a split read starts at a non-zero offset.
+        assert_eq!(
+            read_binary_offset(&[0x00, 0xB0, 0x00, 0x46, 0x49]),
+            Some(0x46)
+        );
+        // High byte participates in the 15-bit offset.
+        assert_eq!(
+            read_binary_offset(&[0x00, 0xB0, 0x01, 0x00, 0x10]),
+            Some(0x0100)
+        );
+    }
+
+    #[test]
+    fn read_binary_offset_rejects_short_ef_identifier_form() {
+        // Bit 8 of P1 set: P1 carries a short EF id, not an offset, and the
+        // command re-selects a different EF — the tracked FID no longer applies.
+        assert_eq!(read_binary_offset(&[0x00, 0xB0, 0x82, 0x00, 0x10]), None);
+        // Too short to carry P1/P2 at all.
+        assert_eq!(read_binary_offset(&[0x00, 0xB0]), None);
+    }
+
+    #[test]
+    fn chunked_read_is_rejected_before_the_parsers() {
+        // Regression: a VU reading EF_Identification in two chunks used to have
+        // the second chunk parsed as if it started at file offset 0, shifting
+        // every field (company address read as the expiry date) and persisting
+        // the garbage into config.yaml.
+        //
+        // Asserted on the offset gate itself rather than on the global sniffer
+        // map: `forget_all` in a sibling test races this one under the parallel
+        // test runner.
+        let first_chunk = hex::decode("00B0000046").expect("hex");
+        assert_eq!(read_binary_offset(&first_chunk), Some(0));
+
+        let second_chunk = hex::decode("00B0004649").expect("hex");
+        assert_eq!(read_binary_offset(&second_chunk), Some(0x46));
+
+        // Only the offset-0 chunk is allowed through to the fixed-offset parsers.
+        assert!(read_binary_offset(&first_chunk) == Some(0));
+        assert!(read_binary_offset(&second_chunk) != Some(0));
     }
 
     #[test]
@@ -463,8 +847,16 @@ mod tests {
     fn forget_removes_only_target_client() {
         forget_all();
         // Push state for two clients via SELECT
-        sniff("clientA", "00A4020C02 0520".replace(' ', "").as_str(), "9000");
-        sniff("clientB", "00A4020C02 0501".replace(' ', "").as_str(), "9000");
+        sniff(
+            "clientA",
+            "00A4020C02 0520".replace(' ', "").as_str(),
+            "9000",
+        );
+        sniff(
+            "clientB",
+            "00A4020C02 0501".replace(' ', "").as_str(),
+            "9000",
+        );
         {
             let state = STATE.lock().unwrap();
             assert!(state.contains_key("clientA"));
@@ -505,5 +897,34 @@ mod tests {
         let mut buf2 = vec![0x01];
         buf2.extend_from_slice(&[0xFF; 35]);
         assert_eq!(extract_name(&buf2), None);
+    }
+
+    #[test]
+    fn sm_status_reads_do99_among_the_data_objects() {
+        // DO'99 6A82 + DO'8E MAC: a SM SELECT that failed under an outer 9000
+        let body = hex::decode("99026A828E081122334455667788").unwrap();
+        assert_eq!(sm_status(&body), Some([0x6A, 0x82]));
+        // DO'81 data first, then DO'99 9000
+        let body = hex::decode("8102AABB990290008E081122334455667788").unwrap();
+        assert_eq!(sm_status(&body), Some([0x90, 0x00]));
+        assert_eq!(sm_status(&[]), None);
+        assert_eq!(sm_status(&[0x99, 0x05, 0x90]), None); // truncated
+    }
+
+    #[test]
+    fn extract_name_decodes_the_code_page() {
+        // "Müller" in ISO 8859-1, "Łódź" in ISO 8859-2, "Иван" in ISO 8859-5
+        assert_eq!(
+            extract_name(&[1, b'M', 0xFC, b'l', b'l', b'e', b'r']),
+            Some("Müller".to_string())
+        );
+        assert_eq!(
+            extract_name(&[2, 0xA3, 0xF3, b'd', 0xBC]),
+            Some("Łódź".to_string())
+        );
+        assert_eq!(
+            extract_name(&[5, 0xB8, 0xD2, 0xD0, 0xDD]),
+            Some("Иван".to_string())
+        );
     }
 }
