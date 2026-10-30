@@ -113,6 +113,16 @@ lazy_static! {
         Mutex::new(std::collections::BTreeMap::new());
 }
 
+/// Whether any reader currently shows an authentication in progress (the
+/// state its card session last reported).
+pub fn any_reader_authenticating() -> bool {
+    READER_STATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .any(|state| state.authentication == Some(true))
+}
+
 /// Re-emits the last reported state of every reader (`global-cards-sync`).
 pub fn emit_current_reader_states() {
     let states: Vec<TachoState> = READER_STATES

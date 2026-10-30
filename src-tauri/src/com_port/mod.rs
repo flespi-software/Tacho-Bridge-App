@@ -50,6 +50,7 @@ pub use cards::abort_rack_card_session;
 pub use cards::connect_pending_rack_cards;
 pub use cards::disconnect_rack_card;
 pub use rack::{handle_app_publish, on_app_connack, on_app_offline, register_app_client};
+pub(crate) use state::any_card_authenticating;
 
 use crate::backoff::{Backoff, RECONNECT_DELAY_INITIAL_SECS};
 

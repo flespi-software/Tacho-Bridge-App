@@ -389,7 +389,7 @@ pub async fn auto_update_loop(app: AppHandle) {
         // On success the app is restarting (the restart is only requested, so
         // this returns Ok); on failure the update stays parked and the next
         // tick retries after a backoff.
-        match install_parked(&app).await {
+        match install_parked(&app, true).await {
             Ok(()) => {}
             // Cards got busy meanwhile: not the artifact's fault.
             Err(InstallError::Postponed(e)) => {
@@ -445,11 +445,13 @@ pub fn get_changelog() -> &'static str {
 /// Invoked from the frontend when the user accepts the update notification.
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> Result<(), String> {
-    install_parked(&app).await.map_err(String::from)
+    install_parked(&app, false).await.map_err(String::from)
 }
 
 /// The install itself, with a postponement told apart from a failure.
-async fn install_parked(app: &AppHandle) -> Result<(), InstallError> {
+/// `unattended` (the auto-update loop) picks the stricter card-activity rule,
+/// see `card_link_busy`.
+async fn install_parked(app: &AppHandle, unattended: bool) -> Result<(), InstallError> {
     // Claim the install slot before touching PENDING_UPDATE, so a concurrent
     // caller (auto-loop vs. the user's "Install" click) backs off instead of
     // racing us for the taken update.
@@ -482,7 +484,7 @@ async fn install_parked(app: &AppHandle) -> Result<(), InstallError> {
         update.version
     );
 
-    refuse_while_card_active()?;
+    refuse_while_card_active(unattended)?;
 
     let mut downloaded: usize = 0;
     let mut last_logged_pct: u64 = 0;
@@ -520,7 +522,7 @@ async fn install_parked(app: &AppHandle) -> Result<(), InstallError> {
     // The download can take minutes on a slow link: an authentication that
     // started meanwhile must not be cut by the restart. Wait for it to end
     // with the bytes in hand rather than throw them away.
-    wait_for_card_quiet().await?;
+    wait_for_card_quiet(unattended).await?;
 
     // Release the rack's serial port and close the broker sessions before
     // installing: on Windows the NSIS install exits the process from inside
@@ -579,17 +581,35 @@ pub async fn replay_pending_update() {
     }
 }
 
+/// Whether the card link is too busy for a restart.
+///
+/// Unattended, any card traffic within `AUTO_INSTALL_QUIET_SECS` counts:
+/// nobody is watching, so the cautious rule. On the user's click only an
+/// authentication actually in progress blocks — a reader or rack card shown
+/// as authenticating, with traffic in that same window (a flag left behind by
+/// a session that died silently must not block for good). The server's rack
+/// discovery right after startup is card traffic but no authentication, and
+/// used to refuse the click for a full minute after every launch.
+fn card_link_busy(unattended: bool) -> bool {
+    if crate::mqtt::seconds_since_card_activity() >= AUTO_INSTALL_QUIET_SECS {
+        return false;
+    }
+    unattended
+        || crate::global_app_handle::any_reader_authenticating()
+        || crate::com_port::any_card_authenticating()
+}
+
 /// An install restarts the app; a card authentication in flight would be cut
 /// mid-way and fail on the VU side.
-fn refuse_while_card_active() -> Result<(), InstallError> {
-    let quiet_for = crate::mqtt::seconds_since_card_activity();
-    if quiet_for < AUTO_INSTALL_QUIET_SECS {
+fn refuse_while_card_active(unattended: bool) -> Result<(), InstallError> {
+    if card_link_busy(unattended) {
+        let quiet_for = crate::mqtt::seconds_since_card_activity();
         log::info!(
-            "{TAG} phase=install status=postponed reason=card_activity quiet_secs={quiet_for}"
+            "{TAG} phase=install status=postponed reason=card_activity unattended={unattended} quiet_secs={quiet_for}"
         );
         return Err(InstallError::Postponed(format!(
             "a card authentication is in progress; retry in {} seconds",
-            AUTO_INSTALL_QUIET_SECS - quiet_for
+            AUTO_INSTALL_QUIET_SECS.saturating_sub(quiet_for)
         )));
     }
     Ok(())
@@ -600,14 +620,12 @@ const QUIET_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(10 * 
 
 /// `refuse_while_card_active`, waiting up to `QUIET_WAIT_MAX` for the link to
 /// go quiet first.
-async fn wait_for_card_quiet() -> Result<(), InstallError> {
+async fn wait_for_card_quiet(unattended: bool) -> Result<(), InstallError> {
     let started = std::time::Instant::now();
-    while crate::mqtt::seconds_since_card_activity() < AUTO_INSTALL_QUIET_SECS
-        && started.elapsed() < QUIET_WAIT_MAX
-    {
+    while card_link_busy(unattended) && started.elapsed() < QUIET_WAIT_MAX {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
-    refuse_while_card_active()
+    refuse_while_card_active(unattended)
 }
 
 #[cfg(test)]
