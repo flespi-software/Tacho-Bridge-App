@@ -649,26 +649,31 @@ fn slot_ownership(
     }
 }
 
-/// Shows and records the authentication activity the `finish` flag of a card envelope tells.
+/// Shows the authentication activity the `finish` flag of a card envelope tells.
 /// Authentication boundaries come from the server's flag alone — the same contract the PC/SC
 /// path uses (see `auth_process` in mqtt.rs); nothing is inferred from the traffic itself. An
 /// envelope without the flag is plain signalling on the same serial path (e.g. a slot
 /// indicator repaint), never shown or recorded as authentication activity. The one gap — a closing
 /// `finish:true` that never arrives — is covered by the keep-alive PingResp reset in cards.rs.
-fn record_card_activity(iccid: &str, card_number: &str, finish: Option<bool>, log_header: &str) {
+/// The outcome of a finished session is recorded separately, once its closing exchange has run.
+fn show_card_activity(iccid: &str, finish: Option<bool>) {
     match finish {
-        Some(true) => {
-            set_rack_card_state(iccid, true, false);
-            // Same bookkeeping as the reader path (mqtt.rs): persist the auth timestamp so a
-            // card that only ever authenticates through a rack still shows "Last auth" in the
-            // UI. Detached — the config write must not park the serial bridge before the reply.
-            crate::config::record_auth_result_detached(card_number, true);
-            log::info!("{} [MQTT] status=auth_finished", log_header);
-        }
+        Some(true) => set_rack_card_state(iccid, true, false),
         // a command of the session is in flight, so the card is busy
         Some(false) => set_rack_card_state(iccid, true, true),
         None => {}
     }
+}
+
+/// Records the outcome of a finished session in the card config — the "Last auth" line of the
+/// UI, the same bookkeeping as the reader path (mqtt.rs) — once the closing exchange has run.
+/// The closing exchange is the last word of the session: a reset the rack never answered is a
+/// failed session, not an authenticated card. Detached — the config write must not park the
+/// serial bridge before the reply.
+fn record_card_auth(card_number: &str, exchange: &SerialExchange, log_header: &str) {
+    let success = exchange.err.is_empty();
+    crate::config::record_auth_result_detached(card_number, success);
+    log::info!("{} [MQTT] status=auth_finished success={}", log_header, success);
 }
 
 /// A reply with an error code and no data, ready to publish on `resp_topic`.
@@ -777,8 +782,8 @@ pub(super) async fn run_serial_request(
                     return failure(&resp_topic, SERIAL_ERR_CARD_BUSY);
                 }
             }
-            if let Some((iccid, card_number, _, _)) = card {
-                record_card_activity(iccid, card_number, envelope.finish, log_header);
+            if let Some((iccid, _, _, _)) = card {
+                show_card_activity(iccid, envelope.finish);
             }
             let finished = envelope.finish == Some(true);
             let exchange = if envelope.cmd_hex.is_empty() {
@@ -797,8 +802,9 @@ pub(super) async fn run_serial_request(
                     .await
             };
             if finished {
-                if let Some((_, _, slot, session)) = card {
+                if let Some((_, card_number, slot, session)) = card {
                     super::access::release(serial_port, slot, false, Some(session));
+                    record_card_auth(card_number, &exchange, log_header);
                 }
             }
             // One line per exchange with everything the server's own log

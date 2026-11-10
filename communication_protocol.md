@@ -123,11 +123,15 @@ segment: the server is the only sender on this path.
 | TBA → server | `rack/<serial>/link`             | link snapshot (below)                 | the rack's port is open; repeated for every open rack after each CONNACK of the app connection |
 | TBA → server | `rack/<serial>/link`             | `{"state":"down"}`                     | the rack's port was closed or lost                                                |
 | TBA → server | `rack/<serial>/response/<id>`    | response envelope (below)              | reply to `request/<id>` of this rack                                              |
-| TBA → server | `rack/<serial>/watch`            | response envelope (below)              | the presence watch saw a change (below)                                           |
+| TBA → server | `rack/<serial>/watch`            | response envelope (below)              | the presence watch baseline; byte changes too for a watch armed without classes (below) |
+| TBA → server | `rack/<serial>/slot`             | slot transition (below)                | a slot changed its class and held it (planned)                                    |
 | server → TBA | `rack/<serial>/request/<id>`     | command envelope (below)               | one serial exchange with the rack                                                 |
-| server → TBA | `rack/<serial>/watch`            | watch envelope (below)                 | arm or re-arm the presence watch                                                  |
+| server → TBA | `rack/<serial>/watch`            | watch envelope (below)                 | arm the presence watch, once per link                                             |
 | server → TBA | `rack/<serial>/release`          | `{"slot":N,"request_id":N}`             | release the matching discovery reservation                                      |
-| server → TBA | `rack/<serial>/cards`            | `[{"slot":N,"iccid":"<16 hex>"},...]` | the complete set of cards of this rack to serve                                   |
+| server → TBA | `rack/<serial>/cards`            | `[{"slot":N,"iccid":"<16 hex>"},...]` | the complete set of cards of this rack to serve, once per link as the baseline    |
+| server → TBA | `rack/<serial>/card`             | `{"slot":N,"iccid":"<16 hex>"}`         | one identified card to serve (planned)                                            |
+| server → TBA | `rack/<serial>/card/gone`        | `{"slot":N,"iccid":"<16 hex>"}`         | one confirmed removal (planned)                                                   |
+| server → TBA | `rack/<serial>/slot/defer`       | `{"slot":N,"seconds":N}`                | keep quiet about the slot for that long (planned)                                 |
 
 `<id>` is counted by the server per rack. The request idempotency of section
 4 applies per rack too, and its cache is reset on every CONNACK. A reply or a
@@ -150,7 +154,8 @@ sessions, including sessions that survived the app connection:
 
 The server restores this inventory before checking the rack. A global status
 omission must be confirmed by a per-slot status request before removing a
-known card. Failed identity reads remain pending and retry on watch refresh.
+known card. Failed identity reads remain pending and retry on watch refresh
+(older server) or after the `slot/defer` period (slot contract).
 The physical port disappearing closes its card sessions on TBA; `link down`
 parks server state and preserves request numbering. A new app connection
 starts new server state and therefore needs the inventory again.
@@ -267,8 +272,12 @@ and checksum for every received buffer.
 
 ### Card set (`cards`) and the rack link report
 
-At the end of every discovery pass over a rack the server publishes the
-complete set of cards it wants served — topic `rack/<serial>/cards`:
+After the inventory that follows a `link up` the server publishes the
+complete set of cards it wants served — topic `rack/<serial>/cards`. With the
+slot contract below in place this is the only full set of a link life: later
+changes arrive one card at a time as `card` and `card/gone`. A server without
+the slot contract publishes the set at the end of every discovery pass, as
+before:
 
 ```json
 [{ "slot": 1, "iccid": "<16 hex>" }, { "slot": 3, "iccid": "<16 hex>" }]
@@ -308,24 +317,54 @@ only. All rack-backed card connections are closed when the rack disconnects.
 
 ### Card presence watch (`watch`)
 
-After discovery the server arms a client-side presence watch — topic
-`rack/<serial>/watch`:
+After the inventory the server arms a client-side presence watch — topic
+`rack/<serial>/watch`, once per link life:
 
 ```json
-{ "cmd": "<hex>", "interval_ms": 2000, "idle_ms": 300, "deadline_ms": 3000, "refresh_ms": 30000 }
+{
+  "cmd": "<hex>", "interval_ms": 5000, "idle_ms": 300, "deadline_ms": 3000, "refresh_ms": 30000,
+  "region": { "offset": 4, "length": 240 },
+  "classes": { "absent": [0, 1], "engaged": [4, 5, 6] },
+  "stable": 2,
+  "backoff": { "first_s": 60, "max_s": 1800 }
+}
 ```
 
 TBA re-executes the opaque `cmd` every `interval_ms` through the same FIFO
-port queue and publishes the reply back (topic `rack/<serial>/watch`, the
-standard `serial_resp`/`serial_err` envelope) **when its bytes change or the refresh interval has elapsed** (`refresh_ms`,
-default 30 seconds). The periodic snapshot retries failed discovery and
-unconfirmed removals without a baseline re-arm loop.
-Arming again replaces the loop and resets the change baseline, so the first
-reply after (re)arming is always published — this is how the server catches
-states that changed while it was busy. TBA compares bytes blindly; what the
-command means and what changed is decided entirely by the server. Inserted
-and removed cards need no special message: the server learns of them from a
-watch report and publishes the updated card set.
+port queue. The first reply after arming is always published back on
+`rack/<serial>/watch` (the standard `serial_resp`/`serial_err` envelope): it
+is the baseline the server checks its card set against. What happens next
+depends on the fields the server sent.
+
+**With `region` and `classes` (slot contract, planned).** TBA keeps one class
+per slot. Each reply is cut to `region`: one byte per slot, slot 1 first. A
+byte listed under `absent` or `engaged` gets that class, any other value is
+`present`. The class of a slot becomes its new state only after it was read
+the same `stable` polls in a row; a reply whose length does not cover
+`region` counts as a missed poll, not as a change. A confirmed change is
+reported once as a **slot transition** — topic `rack/<serial>/slot`:
+
+```json
+{ "slot": 83, "from": "present", "to": "absent", "frame": "<hex>" }
+```
+
+`frame` is the raw reply the transition was confirmed on; the server verifies
+it before acting. Nothing else is published: a byte flicker inside one class
+is not an event, and an unchanged rack is silent. `refresh_ms` only paces a
+heartbeat republish of the baseline on `watch` so the server can tell a living
+watch from a dead one.
+
+The watch is armed once and never re-armed after slot events; it ends with
+the rack link or the app connection, and a new app connection arms its own.
+
+**Without `region` (older server).** TBA compares the reply bytes blindly and
+publishes the whole reply on `rack/<serial>/watch` when its bytes change or
+`refresh_ms` elapsed; the server re-arms the watch after every discovery pass
+to reset the baseline. This is the behaviour of TBA 0.8.0.
+
+The class names are those of a generic slot bank; which byte values fall into
+which class, what the command means and what a transition implies are decided
+entirely by the server. TBA never learns the wire protocol of the rack.
 
 The timings are the server's to choose and are not the same for every command.
 A rack built of several blocks answers a whole-rack query (the watch command is
@@ -334,6 +373,38 @@ frame but not one burst, so the server sends a wider `idle_ms` for it than for
 a single-reader exchange. TBA logs why each read ended (`end=silence` — the
 device finished, `end=deadline` — a bound cut the reply), which is what makes a
 too-narrow bound visible on the client side.
+
+### Slot events (`slot`, `card`, `card/gone`, `slot/defer`) — planned
+
+The server answers a slot transition with its own serial exchanges of this
+section (`request/<id>`: a per-slot status check, card identification, LED)
+and then tells TBA the outcome with one of three messages:
+
+- `rack/<serial>/card` `{"slot":N,"iccid":"<16 hex>"}`: the slot holds an
+  identified card. TBA opens its session exactly as for a card listed in
+  `cards` (section 5 contract, rack link report included). A card already
+  served with the same `(slot, iccid)` pair is left alone, without a spawn
+  attempt or a UI event.
+- `rack/<serial>/card/gone` `{"slot":N,"iccid":"<16 hex>"}`: the removal was
+  confirmed. TBA closes the card session (its MQTT connection drops, so the
+  card device goes offline on the platform) and drops the slot from its UI.
+- `rack/<serial>/slot/defer` `{"slot":N,"seconds":N}`: the server could not
+  make anything of the slot (identification failed, or the reader itself does
+  not answer). TBA suppresses transitions of that slot for `seconds`, then
+  polls it as any other slot; the next stable `present` reading is reported
+  again. The server chooses the duration from the `backoff` range it armed
+  the watch with and lengthens it on every further refusal.
+
+A transition the server does not answer (a transition into or out of
+`engaged`, a frame it rejected) needs nothing from TBA: the slot simply keeps
+its new class and the next change is reported as usual. Transitions of a slot
+that arrive while the server is busy with another slot are handled by the
+server in order; TBA does not repeat them.
+
+Compatibility: a server that arms the watch without `region` never receives
+`slot` reports and keeps the `cards`-per-pass behaviour; a TBA without the
+slot contract ignores the extra watch fields and reports byte changes as
+before. Deploy the server first.
 
 ## 7. App connection
 
