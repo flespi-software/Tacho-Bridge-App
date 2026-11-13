@@ -140,6 +140,149 @@ function rackEntries(rack: RackState, cards: Record<string, SmartCard>): CardEnt
     })
 }
 
+/** Class of one slot of the rack's slot table, as the backend sent it. */
+export type SlotClass = 'free' | 'faulty' | 'card' | 'discovered' | 'error'
+
+export interface SlotCell {
+  slot: number
+  cls: SlotClass
+  /** Session state of a discovered card, from the card rows of the group. */
+  status?: CardStatus | undefined
+  /** Tooltip: slot, state, card. */
+  title: string
+}
+
+/** One contiguous run of readers of the rack: a block, drawn as rows of ten. */
+export interface SlotBlock {
+  from: number
+  to: number
+  /** The addressing gap right before this block, when there is one. */
+  gapBefore?: [number, number] | undefined
+  rows: SlotCell[][]
+  counts: SlotCounts
+  /** "20 slots · 3 used · 16 free · 1 faulty" for the frame of the block. */
+  summary: string
+}
+
+/** Slots of a block or of a whole rack per what the operator can do with them. */
+export interface SlotCounts {
+  total: number
+  /** Slots holding a card, in any state (cards in error included). */
+  used: number
+  /** Working readers without a card: a card can go here. */
+  free: number
+  /** Empty readers that do not answer the rack. */
+  faulty: number
+  /** Cards in error, a part of `used`. */
+  error: number
+}
+
+/** "20 slots · 3 used · 16 free", plus the faulty readers and cards in error when there are any. */
+function countsLine(c: SlotCounts): string {
+  const parts = [plural(c.total, 'slot'), `${c.used} used`, `${c.free} free`]
+  if (c.faulty) parts.push(`${c.faulty} faulty`)
+  if (c.error) parts.push(plural(c.error, 'error'))
+  return parts.join(' · ')
+}
+
+const SLOT_CLASS_TEXT: Record<SlotClass, string> = {
+  free: 'free',
+  faulty: 'empty reader, not answering',
+  card: 'card, not identified yet',
+  discovered: 'card',
+  error: 'card in error',
+}
+
+const SESSION_TEXT: Partial<Record<CardStatus, string>> = {
+  active: 'authenticating',
+  online: 'online',
+  offline: 'offline',
+  unlinked: 'unknown card',
+}
+
+/**
+ * Lays the slot table of a rack out as blocks of rows of ten slots, in
+ * address order. A block is a contiguous run of readers; the addressing gaps
+ * the backend marks `absent` separate the blocks (a DIP-set block sits at
+ * 211..240 on its own, for instance) and are shown as a caption, not as
+ * cells. Rows break on the address decade, so slot 31 always starts a row.
+ * Discovered cards carry the session state of their card row, so the grid
+ * and the list never disagree.
+ */
+export function slotBlocks(rack: RackState, entries: CardEntry[]): SlotBlock[] {
+  const table = rack.slots
+  if (!table) return []
+  const cls = new Map<number, SlotClass>()
+  for (const c of ['free', 'faulty', 'card', 'discovered', 'error'] as const)
+    for (const slot of table.states[c]) cls.set(slot, c)
+  const absent = new Set(table.states.absent)
+  const bySlot = new Map(entries.map((e) => [e.slot, e]))
+
+  const blocks: SlotBlock[] = []
+  let block: SlotBlock | undefined
+  let gap: [number, number] | undefined
+  for (let slot = 1; slot <= table.hi; slot++) {
+    if (absent.has(slot) || !cls.has(slot)) {
+      // an address the table does not classify is a gap too: a class this
+      // code does not know must not shift the grid
+      gap = gap ? [gap[0], slot] : [slot, slot]
+      block = undefined
+      continue
+    }
+    const c = cls.get(slot) as SlotClass
+    const entry = c === 'discovered' ? bySlot.get(slot) : undefined
+    const status = entry?.status
+    const parts = [`Slot ${slot}`, SLOT_CLASS_TEXT[c]]
+    if (entry) {
+      if (entry.number) parts.push(entry.name ? `${entry.number} (${entry.name})` : entry.number)
+      const text = status ? SESSION_TEXT[status] : undefined
+      if (text) parts.push(text)
+    }
+    const cell: SlotCell = { slot, cls: c, status, title: parts.join(' · ') }
+    if (!block) {
+      block = {
+        from: slot,
+        to: slot,
+        gapBefore: gap,
+        rows: [],
+        counts: { total: 0, used: 0, free: 0, faulty: 0, error: 0 },
+        summary: '',
+      }
+      blocks.push(block)
+      gap = undefined
+    }
+    block.to = slot
+    block.counts.total++
+    if (c === 'free') block.counts.free++
+    else if (c === 'faulty') block.counts.faulty++
+    else block.counts.used++
+    if (c === 'error') block.counts.error++
+    const row = block.rows[block.rows.length - 1]
+    if (!row || (slot - 1) % 10 === 0) block.rows.push([cell])
+    else row.push(cell)
+  }
+  for (const b of blocks) b.summary = countsLine(b.counts)
+  return blocks
+}
+
+/**
+ * "26 slots · 3 used · 20 free · 3 faulty · 1 error" for the rack header; ''
+ * without a table. The table counts every empty reader as free; here the
+ * faulty ones are told apart, since a card cannot be put to work there.
+ */
+export function slotsLine(rack: RackState): string {
+  const t = rack.slots
+  if (!t) return ''
+  const faulty = t.states.faulty.length
+  return countsLine({
+    total: t.total,
+    used: t.occupied,
+    free: Math.max(0, t.free - faulty),
+    faulty,
+    error: t.states.error.length,
+  })
+}
+
 export function rackGroupId(rack: RackState): string {
   // Prefixed so a rack id can never collide with the fixed group ids.
   return `rack:${rack.id}`

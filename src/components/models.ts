@@ -36,6 +36,25 @@ export interface RackCard {
   authentication?: boolean | null
 }
 
+// Slot table of a rack, as the backend classes the rack's status polls:
+// every address of the reader chain is in exactly one list. Slot numbers.
+export interface RackSlotStates {
+  free: number[] // working empty reader: a card can go here
+  faulty: number[] // empty reader that does not answer the rack
+  card: number[] // a card the server has not identified (yet), or a busy one
+  discovered: number[] // identified card, handed over in the card set
+  error: number[] // card in error: the rack reports it failed, or its discovery did
+  absent: number[] // addressing gap between DIP-set blocks, not a slot
+}
+
+export interface RackSlots {
+  hi: number // highest address that answered: the end of the reader chain
+  total: number // readers in the chain, gaps excluded
+  occupied: number // readers holding a card, in any state
+  free: number // total - occupied: working and faulty empty readers alike
+  states: RackSlotStates
+}
+
 // State of one connected card rack. The backend pushes the full rack list as
 // an array via `rack-state` — several racks can be connected at once, each on
 // its own USB port. Unlike a plain reader, one rack holds many cards.
@@ -54,6 +73,9 @@ export interface RackState {
   // True once the server has finished enumerating the rack. Absent on older
   // backends, where the UI falls back to its silence timeout.
   scan_complete?: boolean
+  // The slot table of the rack; absent or null until its first status poll
+  // (or for a rack the server drives itself), then no slot view.
+  slots?: RackSlots | null
 }
 
 /// The app identifier the backend generates and the server registers a device

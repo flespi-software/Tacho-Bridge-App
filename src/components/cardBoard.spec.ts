@@ -17,6 +17,8 @@ import {
   parseViewPrefs,
   WIDE_WINDOW_AT,
   SORTERS,
+  slotBlocks,
+  slotsLine,
   type CardEntry,
 } from './cardBoard'
 import type { RackState, Reader, SmartCard } from './models'
@@ -404,5 +406,98 @@ describe('view prefs', () => {
       seen.push(slot)
     }
     expect(seen).toEqual(['narrow', 'wide', 'wide', 'wide', 'wide', 'wide', 'wide', 'wide'])
+  })
+})
+
+describe('slotBlocks', () => {
+  const table = {
+    hi: 36,
+    total: 26,
+    occupied: 3,
+    free: 23,
+    states: {
+      free: [1, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 34, 36],
+      faulty: [3, 7, 35],
+      card: [31, 33],
+      discovered: [],
+      error: [32],
+      absent: [21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+    },
+  }
+
+  it('is empty without a table', () => {
+    expect(slotBlocks(rack(), [])).toEqual([])
+    expect(slotsLine(rack())).toBe('')
+  })
+
+  it('splits the chain into blocks at the addressing gaps, rows of ten', () => {
+    const blocks = slotBlocks(rack({ slots: table }), [])
+    expect(blocks.map((b) => [b.from, b.to, b.gapBefore])).toEqual([
+      [1, 20, undefined],
+      [31, 36, [21, 30]],
+    ])
+    expect(blocks[0]!.rows.map((r) => r.length)).toEqual([10, 10])
+    expect(blocks[0]!.counts).toEqual({ total: 20, used: 0, free: 18, faulty: 2, error: 0 })
+    expect(blocks[0]!.summary).toBe('20 slots · 0 used · 18 free · 2 faulty')
+    expect(blocks[1]!.counts).toEqual({ total: 6, used: 3, free: 2, faulty: 1, error: 1 })
+    expect(blocks[1]!.summary).toBe('6 slots · 3 used · 2 free · 1 faulty · 1 error')
+    expect(slotsLine(rack({ slots: table }))).toBe(
+      '26 slots · 3 used · 20 free · 3 faulty · 1 error',
+    )
+    expect(blocks[1]!.rows.map((r) => r.map((c) => c.slot))).toEqual([[31, 32, 33, 34, 35, 36]])
+    expect(blocks[1]!.rows[0]!.map((c) => c.cls)).toEqual([
+      'card',
+      'error',
+      'card',
+      'free',
+      'faulty',
+      'free',
+    ])
+    expect(blocks[0]!.rows[0]![2]!.title).toBe('Slot 3 · empty reader, not answering')
+  })
+
+  it('carries the session state of a discovered card from its row', () => {
+    const r = rack({
+      cards: [{ slot: 5, iccid: 'I5', card_number: 'AAAA000000000005', online: true }],
+      slots: {
+        hi: 5,
+        total: 5,
+        occupied: 1,
+        free: 4,
+        states: {
+          free: [1, 2, 3, 4],
+          faulty: [],
+          card: [],
+          discovered: [5],
+          error: [],
+          absent: [],
+        },
+      },
+    })
+    const cards: Record<string, SmartCard> = { AAAA000000000005: { name: 'Fleet 5', iccid: 'I5' } }
+    const entries = buildGroups([], [r], cards).find((g) => g.id === 'rack:r1')!.entries
+    const [block] = slotBlocks(r, entries)
+    const cell = block!.rows[0]![4]!
+    expect(cell.cls).toBe('discovered')
+    expect(cell.status).toBe('online')
+    expect(cell.title).toBe('Slot 5 · card · AAAA000000000005 (Fleet 5) · online')
+    expect(slotsLine(r)).toBe('5 slots · 1 used · 4 free')
+  })
+
+  it('treats an address of an unknown class as a gap, not a shifted cell', () => {
+    const r = rack({
+      slots: {
+        hi: 3,
+        total: 3,
+        occupied: 0,
+        free: 3,
+        states: { free: [1, 3], faulty: [], card: [], discovered: [], error: [], absent: [] },
+      },
+    })
+    const blocks = slotBlocks(r, [])
+    expect(blocks.map((b) => [b.from, b.to, b.gapBefore])).toEqual([
+      [1, 1, undefined],
+      [3, 3, [2, 2]],
+    ])
   })
 })

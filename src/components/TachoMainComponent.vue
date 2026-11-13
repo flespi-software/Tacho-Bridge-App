@@ -134,7 +134,27 @@ function isRackStatePayload(raw: unknown): raw is RackState {
     typeof p.id === 'string' &&
     typeof p.connected === 'boolean' &&
     typeof p.name === 'string' &&
-    Array.isArray(p.cards)
+    Array.isArray(p.cards) &&
+    (p.slots === undefined || p.slots === null || isRackSlotsPayload(p.slots))
+  )
+}
+
+const SLOT_CLASSES = ['free', 'faulty', 'card', 'discovered', 'error', 'absent'] as const
+
+// Runtime guard for the slot table of a rack: counters are numbers, every
+// class list is a list of numbers. A malformed table fails the whole rack
+// payload closed, like any other shape mismatch.
+function isRackSlotsPayload(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false
+  const p = raw as Record<string, unknown>
+  const states = p.states as Record<string, unknown> | undefined
+  return (
+    ['hi', 'total', 'occupied', 'free'].every((k) => typeof p[k] === 'number') &&
+    !!states &&
+    typeof states === 'object' &&
+    SLOT_CLASSES.every(
+      (k) => Array.isArray(states[k]) && states[k].every((n) => typeof n === 'number'),
+    )
   )
 }
 

@@ -30,6 +30,18 @@
       </button>
       <div class="cb-group__stats">
         <span class="cb-group__count">{{ countLine }}</span>
+        <!-- The slot table of a rack: counters here, the slot grid on click.
+             Nothing to show until the server has sent a table. -->
+        <button
+          v-if="slotsLineText"
+          type="button"
+          class="cb-slots-toggle"
+          :class="{ 'cb-slots-toggle--open': slotsOpen }"
+          :aria-expanded="slotsOpen"
+          @click="slotsOpen = !slotsOpen"
+        >
+          {{ slotsLineText }}
+        </button>
         <span class="cb-group__issues">
           <button
             v-for="i in issues"
@@ -54,6 +66,43 @@
       color="primary"
       class="rack-scan-bar"
     />
+
+    <!-- Slot grid: one framed block per contiguous run of readers, its slot
+         range cut into the top line of the frame; rows of ten in address
+         order, every cell numbered. The gaps between DIP-set blocks are
+         captions between the frames, not cells, so the rows never shift. -->
+    <div v-if="slotsOpen && blocks.length" class="cb-slots">
+      <template v-for="b in blocks" :key="b.from">
+        <div v-if="b.gapBefore" class="cb-slots__gap">
+          no readers at {{ b.gapBefore[0] }}–{{ b.gapBefore[1] }}
+        </div>
+        <fieldset class="cb-slots__block">
+          <legend class="cb-slots__caption">{{ b.from }} – {{ b.to }}</legend>
+          <div v-for="row in b.rows" :key="row[0]!.slot" class="cb-slots__row">
+            <span
+              v-for="c in row"
+              :key="c.slot"
+              class="cb-slot"
+              :class="[`cb-slot--${c.cls}`, c.status ? `cb-slot--${c.status}` : '']"
+              :title="c.title"
+            >
+              {{ c.slot }}
+            </span>
+          </div>
+          <div class="cb-slots__summary">{{ b.summary }}</div>
+        </fieldset>
+      </template>
+      <div class="cb-slots__legend">
+        <span><i class="cb-slot cb-slot--free" /> free</span>
+        <span><i class="cb-slot cb-slot--faulty" /> reader not answering</span>
+        <span><i class="cb-slot cb-slot--card" /> card, not identified</span>
+        <span><i class="cb-slot cb-slot--discovered cb-slot--online" /> card online</span>
+        <span><i class="cb-slot cb-slot--discovered cb-slot--active" /> authenticating</span>
+        <span><i class="cb-slot cb-slot--discovered cb-slot--offline" /> card offline</span>
+        <span><i class="cb-slot cb-slot--discovered cb-slot--unlinked" /> unknown card</span>
+        <span><i class="cb-slot cb-slot--error" /> error</span>
+      </div>
+    </div>
 
     <div v-if="open">
       <!-- In the tile views the rows flow in a grid, and an opened card's
@@ -94,6 +143,8 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import CardRow from './CardRow.vue'
 import type { SmartCard } from './models'
 import {
+  slotBlocks,
+  slotsLine,
   summarize,
   type CardEntry,
   type CardGroup,
@@ -132,6 +183,15 @@ const shownRows = computed(() => {
   return props.rows.slice(0, Math.max(props.limit, openAt + 1))
 })
 const summary = computed(() => summarize(props.group, props.now))
+
+// The slot grid of a rack is opened per group and survives the parent
+// replacing the rack list on every `rack-state` event: the toggle lives here,
+// the blocks are recomputed from the fresh table.
+const slotsOpen = ref(false)
+const slotsLineText = computed(() => (props.group.rack ? slotsLine(props.group.rack) : ''))
+const blocks = computed(() =>
+  props.group.rack ? slotBlocks(props.group.rack, props.group.entries) : [],
+)
 
 const icon = computed(() =>
   props.group.kind === 'rack'
