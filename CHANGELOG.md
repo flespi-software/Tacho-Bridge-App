@@ -197,3 +197,9 @@ All notable changes to this project will be documented in this file.
 
 - Rack slots in error are listed with the reason the card could not be identified, any slot can be blinked from the rack grid to find it, and the status badges left the group headers.
 - The main window opens taller to show more cards at once.
+
+### [0.8.1-beta.3] - 2026-11-13
+
+🛠 Fixes
+
+- Fixed rack cards not being identified in local mode when the rack answers a command with two frames in one read.
