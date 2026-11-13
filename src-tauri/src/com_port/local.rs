@@ -413,6 +413,27 @@ impl Profile {
     }
 
     /// A one-shot exchange with one slot.
+    /// The part of a step reply its rule judges. The device may deliver the
+    /// frames of one operation in a single read: the "accepted" frame of the
+    /// step, or a "still working" frame of its poll, ahead of the outcome.
+    /// Those are known byte for byte from the profile and are skipped here.
+    fn outcome_part<'a>(&self, step: &Step, slot: u16, reply: &'a [u8]) -> &'a [u8] {
+        let known: Vec<Vec<u8>> = [
+            step.expect.as_deref(),
+            self.poll.as_ref().map(|poll| poll.while_reply.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|template| fill(template, slot, self.check))
+        .filter(|frame| !frame.is_empty())
+        .collect();
+        let mut rest = reply;
+        while let Some(frame) = known.iter().find(|frame| rest.len() > frame.len() && rest.starts_with(frame)) {
+            rest = &rest[frame.len()..];
+        }
+        rest
+    }
+
     fn slot_envelope(&self, template: &str, slot: u16) -> Option<SerialEnvelope> {
         Some(SerialEnvelope {
             cmd_hex: hex::encode_upper(fill(template, slot, self.check)?),
@@ -592,7 +613,7 @@ async fn identify(
             return Err(exchange.err);
         }
         let reply = hex::decode(&exchange.resp_hex).map_err(|_| "bad_reply")?;
-        match profile.apply(&step.ok, slot, &reply) {
+        match profile.apply(&step.ok, slot, profile.outcome_part(step, slot, &reply)) {
             Some(Some(bytes)) => id = Some(hex::encode_upper(bytes)),
             Some(None) => {}
             None => {
@@ -1194,6 +1215,25 @@ mod tests {
         // a rule without a length judges the whole reply and yields nothing
         let accepted = frame(&[0xA0, 0x03, 0x02, 0x05, 0x11, 0x22]);
         assert_eq!(p.apply(&p.identify[0].ok, 3, &accepted), Some(None));
+    }
+
+    #[test]
+    fn outcome_is_found_behind_the_accepted_and_working_frames_of_one_read() {
+        let p = profile();
+        let step = &p.identify[1];
+        let taken = frame(&[0xA0, 0x03, 0x00, 0x06]);
+        let working = frame(&[0xA0, 0x03, 0x00, 0x04]);
+        let result = frame(&[0xA0, 0x03, 0x04, 0x45, 0xDE, 0xAD, 0xBE, 0xEF]);
+        let id = Some(Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        for lead in [vec![], taken.clone(), working.clone(), [taken.clone(), working.clone()].concat()] {
+            let reply = [lead, result.clone()].concat();
+            assert_eq!(p.apply(&step.ok, 3, p.outcome_part(step, 3, &reply)), id);
+        }
+        // a lone accepted frame is the reply itself, not something to skip
+        assert_eq!(p.outcome_part(step, 3, &taken), &taken[..]);
+        // frames of another slot are not skipped
+        let foreign = [frame(&[0xA0, 0x04, 0x00, 0x06]), result.clone()].concat();
+        assert_eq!(p.apply(&step.ok, 3, p.outcome_part(step, 3, &foreign)), None);
     }
 
     #[test]
