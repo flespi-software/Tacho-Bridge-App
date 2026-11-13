@@ -29,7 +29,7 @@ const state = reactive<{ readers: Reader[]; cards: Record<string, SmartCard> }>(
 // deep-proxied on every push.
 const racks = shallowRef<RackState[]>([])
 
-// Registered Tauri listeners. Kept in an array so we can detach them all
+// Registered Tauri listeners, detached together when the component unmounts.
 const { on } = useTauriListeners()
 const layoutListenersReady = inject(LAYOUT_LISTENERS_READY, Promise.resolve())
 
@@ -154,7 +154,8 @@ function isRackSlotsPayload(raw: unknown): boolean {
     typeof states === 'object' &&
     SLOT_CLASSES.every(
       (k) => Array.isArray(states[k]) && states[k].every((n) => typeof n === 'number'),
-    )
+    ) &&
+    (p.errors === undefined || Array.isArray(p.errors))
   )
 }
 
@@ -168,7 +169,7 @@ function handleRackState(raw: unknown): void {
   racks.value = raw
 }
 
-///////////////////////////// Dialog window for entering the Card Number value /////////////////////////////
+///////////////////////////// Saving and removing cards /////////////////////////////
 
 const saveCardNumber = async (cardNumber: string, content: SmartCard): Promise<boolean> => {
   console.log(`Card Number: ${cardNumber}, Card iccid: ${content.iccid}`)

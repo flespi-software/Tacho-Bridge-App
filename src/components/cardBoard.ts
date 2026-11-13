@@ -75,7 +75,8 @@ export interface CardGroup {
   rack?: RackState | undefined
 }
 
-function plural(n: number, one: string, many = `${one}s`): string {
+/** "1 card", "3 cards". */
+export function plural(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`
 }
 

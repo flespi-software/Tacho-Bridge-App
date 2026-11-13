@@ -680,7 +680,10 @@ body.body--dark {
   background: var(--cb-surface2);
 }
 
-.cb-row--warn .cb-row__line {
+// The hover rule of the line is more specific; it must not grey out the
+// tint of an open unknown card.
+.cb-row--warn .cb-row__line,
+.cb-row--warn .cb-row__line:hover:not(:disabled) {
   background: var(--cb-warn-surface);
 }
 

@@ -87,8 +87,6 @@ const { on } = useTauriListeners()
 const ACCESS_NOTIFICATION_TEXT =
   "The application cannot access the directory '~/Documents/tba' and cannot continue to operate. Perhaps such a directory has already been created by another version of the program, therefore it has local access restrictions. A possible solution may be: rename the current directory, for example, to tba1 and restart the application. It will create a new directory with the necessary access rights."
 
-/// Notification kinds the backend can raise, and how each is surfaced.
-/// Keyed lookup rather than an if/else ladder so adding a kind is one entry.
 /// The update toast. Clicking an action dismisses it, so a failed install
 /// brings it back: the backend announces a version only once.
 function showUpdateNotification(message: string): void {
@@ -128,6 +126,8 @@ function showUpdateNotification(message: string): void {
 // so the latest create() result always closes the one on screen.
 let dismissAccess: (() => void) | null = null
 
+/// Notification kinds the backend can raise, and how each is surfaced.
+/// Keyed lookup rather than an if/else ladder so adding a kind is one entry.
 const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
   access: () => {
     dismissAccess = Notify.create({

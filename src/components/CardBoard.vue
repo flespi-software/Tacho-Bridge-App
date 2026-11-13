@@ -125,7 +125,7 @@
           @toggle="toggleGroup(v.group.id, !v.open)"
           @show-all="showAll[v.group.id] = true"
           @row-toggle="(key) => (openRow = openRow === key ? null : key)"
-          @row-close="openRow = null"
+          @row-close="(key) => openRow === key && (openRow = null)"
         />
         <div v-if="narrowing && !views.some((v) => v.visible)" class="cb-nothing">
           No cards match the filter.
@@ -211,6 +211,7 @@ import {
   viewSlot,
   NOT_INSERTED_GROUP,
   SORTERS,
+  plural,
   type CardView,
   type SortKey,
   type StatusFilter,
@@ -281,6 +282,10 @@ function loadOpenGroups(): Record<string, boolean> {
 }
 
 function toggleGroup(id: string, open: boolean): void {
+  // A filtered view shows every matching group open whatever was saved, so a
+  // click there would save "collapsed" for a group that stays open on screen
+  // and then comes back folded once the filter is cleared.
+  if (narrowing.value) return
   openGroups[id] = open
   try {
     localStorage.setItem(OPEN_GROUPS_KEY, JSON.stringify(openGroups))
@@ -400,10 +405,6 @@ const views = computed(() => {
     }
   })
 })
-
-function plural(n: number, one: string): string {
-  return `${n} ${n === 1 ? one : `${one}s`}`
-}
 
 const totalLine = computed(() => {
   const total = groups.value.reduce(

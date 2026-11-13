@@ -122,7 +122,7 @@
           :save="save"
           :remove="remove"
           @toggle="emit('row-toggle', e.key)"
-          @close="emit('row-close')"
+          @close="emit('row-close', e.key)"
         />
       </div>
       <div v-if="rows.length === 0" class="cb-group__empty">{{ emptyText }}</div>
@@ -151,6 +151,7 @@ import CardRow from './CardRow.vue'
 import SlotBlinkDialog from './SlotBlinkDialog.vue'
 import type { SmartCard } from './models'
 import {
+  plural,
   slotBlocks,
   slotsLine,
   summarize,
@@ -179,7 +180,8 @@ const emit = defineEmits<{
   (e: 'toggle'): void
   (e: 'show-all'): void
   (e: 'row-toggle', key: string): void
-  (e: 'row-close'): void
+  // the row that asked: another row opened meanwhile stays open
+  (e: 'row-close', key: string): void
 }>()
 
 // An opened card stays rendered even past the limit: the limit shrinks when
@@ -240,7 +242,7 @@ const segments = computed(() => {
 const countLine = computed(() => {
   const { counts, total } = summary.value
   const online = counts.online + counts.active
-  if (props.group.kind === 'none') return `${total} ${total === 1 ? 'card' : 'cards'}`
+  if (props.group.kind === 'none') return plural(total, 'card')
   if (props.group.kind === 'reader') return `${online} online`
   return `${online} / ${total} online`
 })

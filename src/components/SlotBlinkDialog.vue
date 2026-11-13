@@ -18,7 +18,7 @@
       </q-card-section>
 
       <q-card-section class="q-pt-xs">
-        <div v-if="phase === 'ask'" class="cb-blink__text">
+        <div v-if="phase === 'ask' || phase === 'starting'" class="cb-blink__text">
           The indicator of slot {{ slotNumber }} on {{ rackName }} blinks for a few seconds so you
           can find it on the rack.
         </div>
@@ -105,10 +105,14 @@ function close(): void {
 
 // Every opening starts from the question. The blink itself keeps running on
 // the rack if the dialog is closed early; only the progress line goes away.
+// Each opening has its own number, so the answer to a request sent from an
+// earlier opening (closed and reopened on the same slot meanwhile) is ignored.
+let opening = 0
 watch(
   () => props.slotNumber,
   (slot) => {
     stopTimer()
+    opening++
     if (slot === null) return
     phase.value = 'ask'
     progress.value = 0
@@ -121,19 +125,20 @@ onUnmounted(stopTimer)
 async function start(): Promise<void> {
   const slot = props.slotNumber
   if (slot === null || phase.value !== 'ask') return
+  const mine = opening
   phase.value = 'starting'
   let length: number
   try {
     length = await invoke<number>('blink_rack_slot', { rackId: props.rackId, slot })
   } catch (e) {
-    if (props.slotNumber !== slot) return
+    if (opening !== mine) return
     const code = String(e)
     error.value = ERRORS[code] ?? `The slot could not blink (${code}).`
     phase.value = 'error'
     return
   }
-  // the dialog was closed or moved to another slot while the rack answered
-  if (props.slotNumber !== slot) return
+  // the dialog was closed (or reopened) while the rack answered
+  if (opening !== mine) return
   phase.value = 'running'
   // A plain interval rather than requestAnimationFrame, which WebKit pauses
   // for a window that is not on screen: the dialog must still close on time.

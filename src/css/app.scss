@@ -39,12 +39,6 @@
   }
 }
 
-// Better chip styling
-.q-chip {
-  font-size: 11px;
-  border-radius: 4px;
-}
-
 // Rack scan bar: a calmer take on Quasar's indeterminate animation.
 // The default runs two overlapping dashes on a 2.1s cycle with a sharp
 // cubic-bezier — reads as urgent foreground work and is tiring to sit next to.
