@@ -47,12 +47,21 @@ export interface RackSlotStates {
   absent: number[] // addressing gap between DIP-set blocks, not a slot
 }
 
+// Why a slot is in error: 'rack_error' when the rack itself reports the card
+// in error, otherwise the reason its identification failed ('unexpected_reply',
+// 'no_reply', ...).
+export interface RackSlotError {
+  slot: number
+  reason: string
+}
+
 export interface RackSlots {
   hi: number // highest address that answered: the end of the reader chain
   total: number // readers in the chain, gaps excluded
   occupied: number // readers holding a card, in any state
   free: number // total - occupied: working and faulty empty readers alike
   states: RackSlotStates
+  errors?: RackSlotError[] // one per slot of states.error; absent on older backends
 }
 
 // State of one connected card rack. The backend pushes the full rack list as

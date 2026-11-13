@@ -214,6 +214,15 @@ pub struct RackSlotStates {
     pub absent: Vec<u16>,
 }
 
+/// Why a slot of the rack is in error: `rack_error` when the rack reports the
+/// card in error itself, otherwise the reason its identification failed
+/// (`unexpected_reply`, `no_reply`, ...).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RackSlotError {
+    pub slot: u16,
+    pub reason: String,
+}
+
 /// Slot table of one rack: what every address of its reader chain holds and
 /// the counters the UI shows. Informational: nothing is opened or closed
 /// through it. `None` for a rack the server drives itself.
@@ -228,6 +237,8 @@ pub struct RackSlots {
     /// `total - occupied`: working and faulty empty readers alike.
     pub free: u16,
     pub states: RackSlotStates,
+    /// One entry per slot of `states.error`.
+    pub errors: Vec<RackSlotError>,
 }
 
 /// State of one connected card rack, pushed to the frontend. Carries only

@@ -42,19 +42,7 @@
         >
           {{ slotsLineText }}
         </button>
-        <span class="cb-group__issues">
-          <button
-            v-for="i in issues"
-            :key="i.status"
-            type="button"
-            class="cb-issue"
-            :class="`cb-issue--${i.status}`"
-            @click="emit('pick-issue', i.status)"
-          >
-            {{ i.label }}
-          </button>
-          <span v-if="allGood" class="cb-tone--ok">all good</span>
-        </span>
+        <span v-if="allGood" class="cb-tone--ok">all good</span>
       </div>
     </div>
     <!-- Indeterminate: the server sends no total, so there is no honest
@@ -79,12 +67,23 @@
         <fieldset class="cb-slots__block">
           <legend class="cb-slots__caption">{{ b.from }} – {{ b.to }}</legend>
           <div v-for="row in b.rows" :key="row[0]!.slot" class="cb-slots__row">
+            <!-- A span with a button role rather than a button: the board's
+                 button reset would override the cell colours. -->
             <span
               v-for="c in row"
               :key="c.slot"
               class="cb-slot"
-              :class="[`cb-slot--${c.cls}`, c.status ? `cb-slot--${c.status}` : '']"
-              :title="c.title"
+              :class="[
+                `cb-slot--${c.cls}`,
+                c.status ? `cb-slot--${c.status}` : '',
+                { 'cb-slot--pick': canBlink(c) },
+              ]"
+              :title="canBlink(c) ? `${c.title} · click to blink it on the rack` : c.title"
+              :role="canBlink(c) ? 'button' : undefined"
+              :tabindex="canBlink(c) ? 0 : undefined"
+              @click="canBlink(c) && (blinkSlot = c.slot)"
+              @keydown.enter.prevent="canBlink(c) && (blinkSlot = c.slot)"
+              @keydown.space.prevent="canBlink(c) && (blinkSlot = c.slot)"
             >
               {{ c.slot }}
             </span>
@@ -92,6 +91,7 @@
           <div class="cb-slots__summary">{{ b.summary }}</div>
         </fieldset>
       </template>
+      <div class="cb-slots__hint">Click a slot to blink it on the rack.</div>
       <div class="cb-slots__legend">
         <span><i class="cb-slot cb-slot--free" /> free</span>
         <span><i class="cb-slot cb-slot--faulty" /> reader not answering</span>
@@ -135,12 +135,20 @@
         Show all {{ rows.length }} cards
       </button>
     </div>
+    <SlotBlinkDialog
+      v-if="group.rack"
+      :rack-id="group.rack.id"
+      :rack-name="group.rack.name"
+      :slot-number="blinkSlot"
+      @close="blinkSlot = null"
+    />
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
 import CardRow from './CardRow.vue'
+import SlotBlinkDialog from './SlotBlinkDialog.vue'
 import type { SmartCard } from './models'
 import {
   slotBlocks,
@@ -149,7 +157,7 @@ import {
   type CardEntry,
   type CardGroup,
   type CardView,
-  type StatusFilter,
+  type SlotCell,
 } from './cardBoard'
 
 const props = defineProps<{
@@ -170,7 +178,6 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'toggle'): void
   (e: 'show-all'): void
-  (e: 'pick-issue', status: StatusFilter): void
   (e: 'row-toggle', key: string): void
   (e: 'row-close'): void
 }>()
@@ -188,6 +195,14 @@ const summary = computed(() => summarize(props.group, props.now))
 // replacing the rack list on every `rack-state` event: the toggle lives here,
 // the blocks are recomputed from the fresh table.
 const slotsOpen = ref(false)
+
+// A slot can be blinked on the rack to find it there: any working reader of a
+// connected rack, except one whose card is authenticating right now (the
+// indicator writes must not slip into its session).
+const blinkSlot = ref<number | null>(null)
+function canBlink(c: SlotCell): boolean {
+  return !props.group.down && c.cls !== 'faulty' && c.status !== 'active'
+}
 const slotsLineText = computed(() => (props.group.rack ? slotsLine(props.group.rack) : ''))
 const blocks = computed(() =>
   props.group.rack ? slotBlocks(props.group.rack, props.group.entries) : [],
@@ -215,6 +230,7 @@ const segments = computed(() => {
       { status: 'active', n: c.active },
       { status: 'online', n: c.online },
       { status: 'unlinked', n: c.unlinked },
+      { status: 'error', n: c.error },
       { status: 'offline', n: c.offline },
       { status: 'absent', n: c.absent },
     ] as const
@@ -229,22 +245,13 @@ const countLine = computed(() => {
   return `${online} / ${total} online`
 })
 
-// Shortcuts into the filters: each badge narrows the list to this group and
-// that status. A disconnected rack is offline as a whole, so its per-card
-// offline/attention counts would only repeat the header.
-const issues = computed(() => {
-  const { counts, attention } = summary.value
-  const out: { status: StatusFilter; label: string }[] = []
-  if (counts.unlinked) out.push({ status: 'unlinked', label: `${counts.unlinked} unknown` })
-  if (attention && !props.group.down)
-    out.push({ status: 'attention', label: `${attention} attention` })
-  if (counts.offline && props.group.kind !== 'none' && !props.group.down)
-    out.push({ status: 'offline', label: `${counts.offline} offline` })
-  return out
-})
+// The header carries no per-status badges: the status chips on top of the
+// list filter by status. It only says so when nothing in the group needs a look.
 const allGood = computed(
   () =>
-    issues.value.length === 0 &&
+    summary.value.attention === 0 &&
+    summary.value.counts.unlinked === 0 &&
+    summary.value.counts.offline === 0 &&
     !props.group.down &&
     props.group.kind !== 'none' &&
     summary.value.total > 0,

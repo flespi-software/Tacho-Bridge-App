@@ -297,7 +297,7 @@ describe('summarize', () => {
       NOW,
     )
     expect(s.total).toBe(3)
-    expect(s.counts).toEqual({ active: 0, online: 1, offline: 1, unlinked: 1, absent: 0 })
+    expect(s.counts).toEqual({ active: 0, online: 1, offline: 1, unlinked: 1, absent: 0, error: 0 })
     expect(s.attention).toBe(1)
   })
 })
@@ -499,5 +499,66 @@ describe('slotBlocks', () => {
       [1, 1, undefined],
       [3, 3, [2, 2]],
     ])
+  })
+})
+
+describe('slots in error', () => {
+  const table = (error: number[], errors?: { slot: number; reason: string }[]) => ({
+    hi: 6,
+    total: 6,
+    occupied: 3,
+    free: 3,
+    states: { free: [1, 3, 5], faulty: [], card: [], discovered: [2, 6], error, absent: [] },
+    ...(errors ? { errors } : {}),
+  })
+  const cards: Record<string, SmartCard> = { AAAA000000000006: { name: 'Fleet 6', iccid: 'I6' } }
+  const entriesOf = (r: RackState) => buildGroups([], [r], cards).find((g) => g.id === 'rack:r1')!
+
+  it('gives a slot in error without an identified card its own row', () => {
+    const r = rack({
+      cards: [
+        { slot: 2, iccid: 'I2' },
+        { slot: 6, iccid: 'I6', card_number: 'AAAA000000000006', online: true },
+      ],
+      slots: table([4], [{ slot: 4, reason: 'unexpected_reply' }]),
+    })
+    const group = entriesOf(r)
+    expect(group.entries.map((e) => [e.slot, e.status])).toEqual([
+      [2, 'unlinked'],
+      [4, 'error'],
+      [6, 'online'],
+    ])
+    const row = group.entries[1]!
+    expect(row.slotLabel).toBe('004')
+    expect(row.iccid).toBe('')
+    expect(row.fault).toBe('unexpected_reply')
+    expect(needsAttention(row, NOW)).toBe(true)
+    expect(matchesStatus(row, 'attention', NOW)).toBe(true)
+    expect(matchesStatus(row, 'unlinked', NOW)).toBe(false)
+    expect(authLine(row, NOW)).toEqual({ text: 'identification failed', tone: 'danger' })
+    expect(expiryLine(row, NOW).text).toBe('')
+    expect(tileLine(row, NOW)).toEqual({ text: 'identification failed', tone: 'danger' })
+    expect(summarize(group, NOW).counts.error).toBe(1)
+    const cell = slotBlocks(r, group.entries)[0]!.rows[0]![3]!
+    expect(cell.title).toBe(
+      'Slot 4 · card in error · the reader of the slot answered with an unexpected reply',
+    )
+  })
+
+  it('marks an identified card whose slot the rack reports in error', () => {
+    const r = rack({
+      cards: [{ slot: 6, iccid: 'I6', card_number: 'AAAA000000000006', online: true }],
+      slots: table([6], [{ slot: 6, reason: 'rack_error' }]),
+    })
+    const [row] = entriesOf(r).entries
+    expect(row!.status).toBe('online')
+    expect(row!.fault).toBe('rack_error')
+    expect(authLine(row!, NOW)).toEqual({ text: 'card error', tone: 'danger' })
+  })
+
+  it('works without reasons and ignores the table of a disconnected rack', () => {
+    const noReasons = entriesOf(rack({ slots: table([4]) })).entries
+    expect(noReasons.map((e) => [e.slot, e.status, e.fault])).toEqual([[4, 'error', '']])
+    expect(entriesOf(rack({ connected: false, slots: table([4]) })).entries).toEqual([])
   })
 })

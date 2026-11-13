@@ -23,10 +23,11 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::async_runtime::{self, JoinHandle};
 
-use crate::global_app_handle::{rack_update_slots, RackSlotStates, RackSlots};
+use crate::global_app_handle::{rack_update_slots, RackSlotError, RackSlotStates, RackSlots};
 
 use super::cards::{handle_cards_set, inventory, RACK_CARDS_UI};
 use super::transport::{
@@ -50,6 +51,13 @@ const IDENTIFY_RETRY_MAX: Duration = Duration::from_secs(600);
 
 /// Ceiling of the status poll interval while its exchanges keep failing.
 const POLL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// A slot blink the user asked for to find a slot on the rack: the indicator
+/// alternates every `BLINK_HALF` (2 Hz), `BLINK_HALVES` times (3 seconds).
+/// One indicator write is a one-shot exchange of a few tens of milliseconds,
+/// so the rhythm keeps steady even while other slots authenticate.
+const BLINK_HALF: Duration = Duration::from_millis(250);
+const BLINK_HALVES: u32 = 12;
 
 /// Integrity rule every reply of the device satisfies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -452,6 +460,8 @@ struct SlotState {
     card: Option<String>,
     /// The last identification of the card in the slot failed.
     failed: bool,
+    /// Why it failed, for the slot table of the UI.
+    fail_reason: Option<&'static str>,
     failures: u32,
     retry_at: Option<Instant>,
     led: Option<Led>,
@@ -467,6 +477,7 @@ impl Default for SlotState {
             seen: 0,
             card: None,
             failed: false,
+            fail_reason: None,
             failures: 0,
             retry_at: None,
             led: None,
@@ -503,6 +514,7 @@ fn slot_table(slots: &[SlotState], gap: usize) -> RackSlots {
         .map(|index| index + 1)
         .unwrap_or(0);
     let mut states = RackSlotStates::default();
+    let mut errors = Vec::new();
     for (index, state) in slots.iter().enumerate().take(hi) {
         let slot = (index + 1) as u16;
         let in_gap = gap > 0 && {
@@ -515,6 +527,13 @@ fn slot_table(slots: &[SlotState], gap: usize) -> RackSlots {
             states.absent.push(slot);
         } else if state.class == Class::Error || (state.failed && state.class.has_card()) {
             states.error.push(slot);
+            // a failed identification says more than the status byte behind it
+            let reason = match (state.failed, state.fail_reason) {
+                (true, Some(reason)) => reason,
+                (true, None) => "identify_failed",
+                (false, _) => "rack_error",
+            };
+            errors.push(RackSlotError { slot, reason: reason.to_string() });
         } else if state.card.is_some() {
             states.discovered.push(slot);
         } else if state.class.has_card() {
@@ -533,6 +552,7 @@ fn slot_table(slots: &[SlotState], gap: usize) -> RackSlots {
         occupied: occupied as u16,
         free: (total - occupied) as u16,
         states,
+        errors,
     }
 }
 
@@ -558,7 +578,7 @@ async fn identify(
     let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     let mut lease = None;
     let mut id = None;
-    for step in &profile.identify {
+    for (step_index, step) in profile.identify.iter().enumerate() {
         // Taken anew before every step: an authentication that owns the slot
         // refuses it, and a lease dropped in between (the application
         // connection changed) is restored before the card is touched again.
@@ -575,7 +595,19 @@ async fn identify(
         match profile.apply(&step.ok, slot, &reply) {
             Some(Some(bytes)) => id = Some(hex::encode_upper(bytes)),
             Some(None) => {}
-            None => return Err("unexpected_reply"),
+            None => {
+                // The reply is what tells a damaged or foreign card from a
+                // profile that does not fit the reader, so it goes to the log.
+                log::warn!(
+                    "{} [LOCAL] status=identify_reply_rejected slot={} step={} rx_bytes={} reply={}",
+                    log_header,
+                    slot,
+                    step_index + 1,
+                    reply.len(),
+                    exchange.resp_hex.get(..128).unwrap_or(&exchange.resp_hex)
+                );
+                return Err("unexpected_reply");
+            }
         }
     }
     id.ok_or("no_card_id")
@@ -676,7 +708,7 @@ fn identify_retry_delay(failures: u32) -> Duration {
 /// the port of the rack goes away.
 // index loops: every pass awaits serial exchanges and writes the slot back
 #[allow(clippy::needless_range_loop)]
-async fn run(profile: Profile, rack_id: String, port: SharedPort) {
+async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
     let log_header = format!("RACK {} |", rack_id);
     let mut slots = vec![SlotState::default(); profile.status_length];
     // Sessions that outlived the previous engine (or a server-driven period)
@@ -737,6 +769,7 @@ async fn run(profile: Profile, rack_id: String, port: SharedPort) {
             if !slots[index].class.has_card() {
                 // nothing to retry on a slot without a card
                 slots[index].failed = false;
+                slots[index].fail_reason = None;
                 slots[index].failures = 0;
                 slots[index].retry_at = None;
             }
@@ -772,6 +805,7 @@ async fn run(profile: Profile, rack_id: String, port: SharedPort) {
                 || !matches!(state.class, Class::Idle | Class::Error)
                 || state.retry_at.is_some_and(|at| at > now)
                 || super::access::auth_active(&port, slot)
+                || blink_state(&rack_id, slot) == Some(true)
             {
                 continue;
             }
@@ -790,6 +824,7 @@ async fn run(profile: Profile, rack_id: String, port: SharedPort) {
                     let state = &mut slots[index];
                     state.card = Some(id);
                     state.failed = false;
+                    state.fail_reason = None;
                     state.failures = 0;
                     state.retry_at = None;
                     state.led = None;
@@ -800,6 +835,7 @@ async fn run(profile: Profile, rack_id: String, port: SharedPort) {
                     // a slot an authentication owns is not a failure of the card
                     if reason != "card_busy" {
                         state.failed = true;
+                        state.fail_reason = Some(reason);
                         state.failures = state.failures.saturating_add(1);
                     }
                     let delay = identify_retry_delay(state.failures);
@@ -829,6 +865,16 @@ async fn run(profile: Profile, rack_id: String, port: SharedPort) {
         let served = served_slots(&rack_id);
         for index in 0..slots.len() {
             let slot = (index + 1) as u16;
+            // A blink owns the indicator while it runs; once it has ended the
+            // indicator of the slot is written anew.
+            match blink_state(&rack_id, slot) {
+                Some(true) => continue,
+                Some(false) => {
+                    lock(&BLINKS).remove(&(rack_id.clone(), slot));
+                    slots[index].led = None;
+                }
+                None => {}
+            }
             let state = &slots[index];
             let wanted = match &state.card {
                 Some(id) if served.iter().any(|(s, i)| *s == slot && i == id) => Led::Served,
@@ -867,6 +913,7 @@ async fn run(profile: Profile, rack_id: String, port: SharedPort) {
 struct Engine {
     arming: u64,
     profile_text: Vec<u8>,
+    profile: Arc<Profile>,
     port: SharedPort,
     handle: JoinHandle<()>,
 }
@@ -877,6 +924,86 @@ lazy_static::lazy_static! {
     /// Engines of the racks in local mode, keyed by rack id.
     static ref ENGINES: std::sync::Mutex<HashMap<String, Engine>> =
         std::sync::Mutex::new(HashMap::new());
+    /// Slot blinks by rack id and slot: `true` while one runs, `false` once it
+    /// ended and the engine has not written the indicator of the slot again.
+    static ref BLINKS: std::sync::Mutex<HashMap<(String, u16), bool>> =
+        std::sync::Mutex::new(HashMap::new());
+}
+
+fn blink_state(rack_id: &str, slot: u16) -> Option<bool> {
+    lock(&BLINKS).get(&(rack_id.to_string(), slot)).copied()
+}
+
+/// Blinks the indicator of one slot so the operator finds it on the rack.
+/// Returns once the first indicator write was taken, with the length of the
+/// whole blink; the rest runs in the background. Refused for a rack that is
+/// not run locally, a slot an authentication owns, or a slot already blinking.
+pub(super) async fn blink(rack_id: &str, slot: u16) -> Result<Duration, &'static str> {
+    let (profile, port) = {
+        let engines = lock(&ENGINES);
+        let engine = engines
+            .get(rack_id)
+            .filter(|engine| !engine.handle.inner().is_finished())
+            .ok_or("not_local")?;
+        (engine.profile.clone(), engine.port.clone())
+    };
+    if slot == 0 || usize::from(slot) > profile.status_length {
+        return Err("bad_slot");
+    }
+    // The served indicator alternates with the unserved one, or with dark
+    // when the profile has no unserved indicator.
+    let on = profile.led_served.clone().ok_or("no_indicator")?;
+    let other = profile
+        .led_unserved
+        .clone()
+        .or_else(|| profile.led_off.clone())
+        .ok_or("no_indicator")?;
+    if super::access::auth_active(&port, slot) {
+        return Err("card_busy");
+    }
+    let key = (rack_id.to_string(), slot);
+    {
+        let mut blinks = lock(&BLINKS);
+        if blinks.get(&key) == Some(&true) {
+            return Err("already_blinking");
+        }
+        blinks.insert(key.clone(), true);
+    }
+    let log_header = format!("RACK {} |", rack_id);
+    if !write_led(&profile, &port, Some(&on), slot, &log_header).await {
+        lock(&BLINKS).insert(key, false);
+        log::warn!("{} [LOCAL] status=blink_failed slot={} reason=led_rejected", log_header, slot);
+        return Err("led_rejected");
+    }
+    log::info!("{} [LOCAL] status=blink_started slot={}", log_header, slot);
+    let rack = rack_id.to_string();
+    async_runtime::spawn(async move {
+        let start = tokio::time::Instant::now();
+        let mut ended = "done";
+        for half in 1..BLINK_HALVES {
+            tokio::time::sleep_until(start + BLINK_HALF * half).await;
+            if !rack_port_is_live(&rack, &port) {
+                ended = "rack_gone";
+                break;
+            }
+            // an authentication that took the slot meanwhile goes first
+            if super::access::auth_active(&port, slot) {
+                ended = "card_busy";
+                break;
+            }
+            let template = if half % 2 == 0 { &on } else { &other };
+            write_led(&profile, &port, Some(template), slot, &log_header).await;
+        }
+        if ended == "done" {
+            tokio::time::sleep_until(start + BLINK_HALF * BLINK_HALVES).await;
+            // Dark until the engine writes the indicator of the slot again: a
+            // slot without a card stays dark, a card gets its own colour back.
+            write_led(&profile, &port, profile.led_off.as_deref(), slot, &log_header).await;
+        }
+        lock(&BLINKS).insert(key, false);
+        log::info!("{} [LOCAL] status=blink_finished slot={} reason={}", log_header, slot, ended);
+    });
+    Ok(BLINK_HALF * BLINK_HALVES)
 }
 
 /// Whether the rack is run locally right now.
@@ -920,10 +1047,12 @@ pub(super) fn start(payload: &[u8], rack_id: &str, port: &SharedPort, log_header
         profile.status_interval.as_millis()
     );
     let arming = NEXT_ARMING.fetch_add(1, Ordering::Relaxed);
+    let profile = Arc::new(profile);
+    let task_profile = profile.clone();
     let task_rack = rack_id.to_string();
     let task_port = port.clone();
     let handle = async_runtime::spawn(async move {
-        run(profile, task_rack.clone(), task_port).await;
+        run(task_profile, task_rack.clone(), task_port).await;
         let mut engines = lock(&ENGINES);
         if engines.get(&task_rack).is_some_and(|engine| engine.arming == arming) {
             engines.remove(&task_rack);
@@ -934,6 +1063,7 @@ pub(super) fn start(payload: &[u8], rack_id: &str, port: &SharedPort, log_header
         Engine {
             arming,
             profile_text: payload.to_vec(),
+            profile,
             port: port.clone(),
             handle,
         },
@@ -1125,6 +1255,8 @@ mod tests {
         assert_eq!(table.states.discovered, vec![4]);
         assert_eq!(table.states.absent, vec![5, 6, 7, 8]);
         assert_eq!(table.states.error, vec![9, 10]);
+        let reasons: Vec<_> = table.errors.iter().map(|e| (e.slot, e.reason.as_str())).collect();
+        assert_eq!(reasons, vec![(9, "rack_error"), (10, "identify_failed")]);
         assert_eq!((table.total, table.occupied, table.free), (6, 4, 2));
         assert_eq!(slot_table(&vec![SlotState::default(); 12], 4).hi, 0);
     }

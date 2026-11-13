@@ -124,7 +124,6 @@
           :remove="remove"
           @toggle="toggleGroup(v.group.id, !v.open)"
           @show-all="showAll[v.group.id] = true"
-          @pick-issue="(st) => pickIssue(v.group.id, st)"
           @row-toggle="(key) => (openRow = openRow === key ? null : key)"
           @row-close="openRow = null"
         />
@@ -416,13 +415,6 @@ const totalLine = computed(() => {
   parts.push(plural(props.readers.length, 'reader'))
   return parts.join(' · ')
 })
-
-function pickIssue(groupId: string, st: StatusFilter): void {
-  search.value = ''
-  location.value = groupId
-  status.value = st
-  openRow.value = null
-}
 
 function resetFilters(): void {
   search.value = ''

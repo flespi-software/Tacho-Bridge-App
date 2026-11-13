@@ -22,8 +22,9 @@ export const EXPIRY_WARN_DAYS = 30
  *   unlinked — inserted, but its ICCID is not in the configuration
  *   absent   — configured, but not inserted anywhere
  *   empty    — a reader with no card in it
+ *   error    — a rack slot holds a card that could not be identified
  */
-export type CardStatus = 'active' | 'online' | 'offline' | 'unlinked' | 'absent' | 'empty'
+export type CardStatus = 'active' | 'online' | 'offline' | 'unlinked' | 'absent' | 'empty' | 'error'
 
 /** Status filter of the chip row; `attention` is a cross-cutting check. */
 export type StatusFilter = 'all' | 'active' | 'online' | 'offline' | 'unlinked' | 'attention'
@@ -53,6 +54,12 @@ export interface CardEntry {
   card?: SmartCard | undefined
   /** The card sits in a rack that is disconnected. */
   rackDown: boolean
+  /**
+   * The rack slot of the card is in error: the reason code from the slot
+   * table ('' when the backend gave none). Set on every `error` row, and on
+   * an identified card whose slot the rack reports in error.
+   */
+  fault?: string | undefined
 }
 
 export interface CardGroup {
@@ -110,34 +117,72 @@ function readerEntry(reader: Reader, index: number, cards: Record<string, SmartC
   }
 }
 
+/** Short text of a slot fault, for the row and the tile. */
+export function faultShort(reason: string): string {
+  return reason === 'rack_error' ? 'card error' : 'identification failed'
+}
+
+/** What went wrong in a slot, in a sentence fragment for the opened row. */
+export function faultDetail(reason: string): string {
+  switch (reason) {
+    case 'rack_error':
+      return 'the rack reports the card in this slot in error'
+    case 'unexpected_reply':
+      return 'the reader of the slot answered with an unexpected reply'
+    case 'no_reply':
+    case 'serial_queue_timeout':
+      return 'the reader of the slot did not answer'
+    case 'truncated':
+      return 'the reply of the reader was cut off'
+    default:
+      return 'the card in this slot could not be read'
+  }
+}
+
 function rackEntries(rack: RackState, cards: Record<string, SmartCard>): CardEntry[] {
   const groupId = rackGroupId(rack)
-  return [...rack.cards]
-    .sort((a, b) => a.slot - b.slot)
-    .map((rc) => {
-      const slotLabel = String(rc.slot).padStart(3, '0')
-      const base = {
-        key: `${groupId}:${rc.slot}`,
-        groupId,
-        slot: rc.slot,
-        slotLabel,
-        place: `${rack.name}, slot ${slotLabel}`,
-        iccid: rc.iccid ?? '',
-        rackDown: !rack.connected,
-      }
-      if (!rc.card_number) {
-        return { ...base, status: 'unlinked' as const, number: '', name: '' }
-      }
-      const card = cards[rc.card_number]
-      return {
-        ...base,
-        status: rack.connected ? sessionStatus(rc.online, rc.authentication) : ('offline' as const),
-        number: rc.card_number,
-        // The live config wins over the name the rack snapshot carried.
-        name: card?.name ?? rc.name ?? '',
-        card,
-      }
-    })
+  // Slots in error, with their reasons. Only a connected rack has a live
+  // table; a disconnected one keeps its card rows, nothing more.
+  const faults = new Map<number, string>()
+  if (rack.connected && rack.slots) {
+    for (const slot of rack.slots.states.error) faults.set(slot, '')
+    for (const e of rack.slots.errors ?? []) if (faults.has(e.slot)) faults.set(e.slot, e.reason)
+  }
+  const base = (slot: number, iccid: string) => {
+    const slotLabel = String(slot).padStart(3, '0')
+    return {
+      key: `${groupId}:${slot}`,
+      groupId,
+      slot,
+      slotLabel,
+      place: `${rack.name}, slot ${slotLabel}`,
+      iccid,
+      rackDown: !rack.connected,
+      fault: faults.get(slot),
+    }
+  }
+  const rows: CardEntry[] = rack.cards.map((rc): CardEntry => {
+    const b = base(rc.slot, rc.iccid ?? '')
+    if (!rc.card_number) {
+      return { ...b, status: 'unlinked', number: '', name: '' }
+    }
+    const card = cards[rc.card_number]
+    return {
+      ...b,
+      status: rack.connected ? sessionStatus(rc.online, rc.authentication) : 'offline',
+      number: rc.card_number,
+      // The live config wins over the name the rack snapshot carried.
+      name: card?.name ?? rc.name ?? '',
+      card,
+    }
+  })
+  // A slot in error without an identified card still gets a row: the card is
+  // physically there, and the operator has to find and fix it.
+  const taken = new Set(rows.map((e) => e.slot))
+  for (const slot of faults.keys()) {
+    if (!taken.has(slot)) rows.push({ ...base(slot, ''), status: 'error', number: '', name: '' })
+  }
+  return rows.sort((a, b) => a.slot - b.slot)
 }
 
 /** Class of one slot of the rack's slot table, as the backend sent it. */
@@ -230,9 +275,10 @@ export function slotBlocks(rack: RackState, entries: CardEntry[]): SlotBlock[] {
       continue
     }
     const c = cls.get(slot) as SlotClass
-    const entry = c === 'discovered' ? bySlot.get(slot) : undefined
-    const status = entry?.status
+    const entry = c === 'discovered' || c === 'error' ? bySlot.get(slot) : undefined
+    const status = c === 'discovered' ? entry?.status : undefined
     const parts = [`Slot ${slot}`, SLOT_CLASS_TEXT[c]]
+    if (c === 'error' && entry?.fault !== undefined) parts.push(faultDetail(entry.fault))
     if (entry) {
       if (entry.number) parts.push(entry.name ? `${entry.number} (${entry.name})` : entry.number)
       const text = status ? SESSION_TEXT[status] : undefined
@@ -378,6 +424,7 @@ export function daysToExpiry(entry: CardEntry, now: number): number | null {
 
 /** Expired or expiring soon, or the last authentication failed. */
 export function needsAttention(entry: CardEntry, now: number): boolean {
+  if (entry.fault !== undefined) return true
   if (entry.status === 'unlinked' || entry.status === 'empty') return false
   const days = daysToExpiry(entry, now)
   if (days !== null && days <= EXPIRY_WARN_DAYS) return true
@@ -448,6 +495,7 @@ export function authLine(entry: CardEntry, now: number): ToneText {
   if (entry.status === 'empty') return { text: '', tone: 'muted' }
   if (entry.rackDown) return { text: 'rack disconnected', tone: 'danger' }
   if (entry.status === 'active') return { text: 'authenticating…', tone: 'active' }
+  if (entry.fault !== undefined) return { text: faultShort(entry.fault), tone: 'danger' }
   if (entry.status === 'unlinked') return { text: 'not in configuration', tone: 'muted' }
   const last = entry.card?.last_auth
   if (!last) return { text: 'no auth yet', tone: 'muted' }
@@ -463,7 +511,8 @@ export function authLine(entry: CardEntry, now: number): ToneText {
 /** The right-hand bottom line of a collapsed row: card expiry. */
 export function expiryLine(entry: CardEntry, now: number): ToneText {
   const days = daysToExpiry(entry, now)
-  if (days === null || entry.status === 'unlinked') return { text: '', tone: 'muted' }
+  if (days === null || entry.status === 'unlinked' || entry.status === 'error')
+    return { text: '', tone: 'muted' }
   const date = formatExpire(entry.card?.expire)
   if (days < 0) return { text: `expired ${date}`, tone: 'danger' }
   if (days <= EXPIRY_WARN_DAYS) return { text: `expires in ${days} d`, tone: 'warn' }
@@ -477,7 +526,8 @@ export function expiryLine(entry: CardEntry, now: number): ToneText {
  */
 export function tileLine(entry: CardEntry, now: number): ToneText {
   if (entry.status === 'empty') return { text: 'empty reader', tone: 'muted' }
-  if (entry.status === 'unlinked') {
+  if (entry.status === 'error') return authLine(entry, now)
+  if (entry.status === 'unlinked' && entry.fault === undefined) {
     return { text: entry.iccid ? 'not configured · click to link' : 'ICCID not read', tone: 'warn' }
   }
   const session = authLine(entry, now)
@@ -558,7 +608,7 @@ export interface GroupSummary {
 }
 
 export function summarize(group: CardGroup, now: number): GroupSummary {
-  const counts = { active: 0, online: 0, offline: 0, unlinked: 0, absent: 0 }
+  const counts = { active: 0, online: 0, offline: 0, unlinked: 0, absent: 0, error: 0 }
   let total = 0
   let attention = 0
   for (const e of group.entries) {

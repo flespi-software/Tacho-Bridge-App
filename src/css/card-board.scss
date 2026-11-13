@@ -38,12 +38,6 @@ body {
   --cb-warn-surface: #fff9f2;
   --cb-warn-body: #5c2a00;
   --cb-radio-on: #eef3f6;
-  --cb-unk-bg: #fff0dc;
-  --cb-unk-fg: #7a3500;
-  --cb-att-bg: #fbe4e4;
-  --cb-att-fg: #a61b1b;
-  --cb-off-bg: #eceff1;
-  --cb-off-fg: #37474f;
   --cb-chip-on-bg: #37474f;
   --cb-chip-on-fg: #ffffff;
 }
@@ -82,12 +76,6 @@ body.body--dark {
   --cb-warn-surface: #433f39;
   --cb-warn-body: #ffe0b2;
   --cb-radio-on: #455a64;
-  --cb-unk-bg: rgba(255, 167, 38, 0.18);
-  --cb-unk-fg: #ffcc80;
-  --cb-att-bg: rgba(239, 83, 80, 0.22);
-  --cb-att-fg: #ffaba6;
-  --cb-off-bg: #4a5d66;
-  --cb-off-fg: #dfe6e9;
   --cb-chip-on-bg: #90a4ae;
   --cb-chip-on-fg: #1c262b;
 }
@@ -250,6 +238,10 @@ body.body--dark {
   &--empty {
     background: var(--cb-surface);
     border-color: var(--cb-empty-dot);
+  }
+  &--error {
+    background: var(--cb-danger);
+    border-color: var(--cb-danger);
   }
   &--attention {
     background: var(--cb-danger);
@@ -428,6 +420,9 @@ body.body--dark {
 .cb-seg--absent {
   background: var(--cb-absent);
 }
+.cb-seg--error {
+  background: var(--cb-danger);
+}
 
 .cb-group__stats {
   display: flex;
@@ -442,34 +437,6 @@ body.body--dark {
 
 .cb-group__count {
   font-weight: 500;
-}
-
-.cb-group__issues {
-  display: flex;
-  gap: 4px;
-}
-
-.cb-issue {
-  height: 22px;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 11px;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-
-  &--unlinked {
-    background: var(--cb-unk-bg);
-    color: var(--cb-unk-fg) !important;
-  }
-  &--attention {
-    background: var(--cb-att-bg);
-    color: var(--cb-att-fg) !important;
-  }
-  &--offline {
-    background: var(--cb-off-bg);
-    color: var(--cb-off-fg) !important;
-  }
 }
 
 .cb-group__empty {
@@ -594,6 +561,64 @@ body.body--dark {
   }
 }
 
+.cb-slot--pick {
+  cursor: pointer;
+  transition:
+    transform 0.12s ease,
+    box-shadow 0.12s ease;
+
+  &:hover,
+  &:focus-visible {
+    outline: none;
+    transform: translateY(-1px);
+    box-shadow: 0 0 0 2px var(--cb-primary);
+  }
+}
+
+.cb-slots__hint {
+  font-size: 11px;
+  color: var(--cb-text2);
+}
+
+.cb-blink {
+  width: 400px;
+  max-width: 100%;
+}
+
+// The bulb glyph painted in the indicator colours: green on the left half,
+// red on the right.
+.cb-blink__bulb::before {
+  background: linear-gradient(90deg, var(--cb-online) 0 50%, var(--cb-danger) 50% 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+// While the slot blinks the whole bulb alternates, every 250 ms like the rack.
+.cb-blink__bulb--on::before {
+  background: none;
+  -webkit-text-fill-color: currentColor;
+  color: var(--cb-online);
+  animation: cbBulb 0.5s steps(1, end) infinite;
+}
+
+@keyframes cbBulb {
+  50% {
+    color: var(--cb-danger);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cb-blink__bulb--on::before {
+    animation: none;
+  }
+}
+
+.cb-blink__text {
+  font-size: 14px;
+  line-height: 1.45;
+}
+
 .cb-slots__legend {
   display: flex;
   flex-wrap: wrap;
@@ -684,6 +709,9 @@ body.body--dark {
   &--warn {
     color: var(--cb-warn-text);
   }
+  &--danger {
+    color: var(--cb-danger);
+  }
   &--muted {
     color: var(--cb-text2);
     font-weight: 400;
@@ -721,6 +749,14 @@ body.body--dark {
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
+
+  // A card without an ICCID cannot be linked: the pill stays in place for a
+  // steady layout, greyed out.
+  &--off {
+    border-color: var(--cb-input-bd);
+    color: var(--cb-text2);
+    opacity: 0.6;
+  }
 }
 
 // Expanded panels
@@ -1008,10 +1044,17 @@ body.body--dark {
   &--absent::before {
     background: var(--cb-absent);
   }
+  &--error::before {
+    background: var(--cb-danger);
+  }
 
   &--unlinked {
     background: var(--cb-warn-surface);
     border-color: var(--cb-unlinked);
+  }
+
+  &--error {
+    border-color: var(--cb-danger-bd);
   }
 
   &--empty {
@@ -1044,6 +1087,13 @@ body.body--dark {
   font-family: 'Roboto Mono', ui-monospace, Menlo, Consolas, monospace;
   font-size: 11px;
   color: var(--cb-text2);
+}
+
+// The slot of a card the rack has a problem with: the number the operator
+// looks for on the rack itself.
+.cb-row__slot--danger {
+  color: var(--cb-danger);
+  font-weight: 700;
 }
 
 .cb-dot--small {

@@ -221,6 +221,17 @@ fn link_rack(rack_id: String, port: SharedPort, io_key: usize) -> Vec<(String, b
     vec![(rack_id, true)]
 }
 
+/// Blinks the indicator of one slot of a rack the app runs locally, so the
+/// operator finds that slot on the rack. Resolves once the rack took the first
+/// indicator write, with the length of the whole blink in milliseconds.
+#[tauri::command]
+pub async fn blink_rack_slot(rack_id: String, slot: u16) -> Result<u64, String> {
+    local::blink(&rack_id, slot)
+        .await
+        .map(|length| length.as_millis() as u64)
+        .map_err(String::from)
+}
+
 /// Tears down the sessions of every rack so they are rebuilt with fresh
 /// config, and asks the server to walk every rack again. The card session
 /// loops resolve the broker host once at start, so a server-host change must

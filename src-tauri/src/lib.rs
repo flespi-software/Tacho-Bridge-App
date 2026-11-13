@@ -458,6 +458,7 @@ pub fn run() {
             updater::get_changelog,     // bundled CHANGELOG.md for the settings dialog
             autostart_get,              // is the app registered to start at login
             autostart_set,              // register/unregister launch at login
+            com_port::blink_rack_slot,  // blink a rack slot from the slot grid
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
