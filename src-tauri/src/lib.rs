@@ -351,6 +351,19 @@ pub fn run() {
                 Err(e) => log::error!("Tray icon unavailable, window close will quit the app: {e}"),
             }
 
+            // The main window is created here, not by Tauri from the config
+            // (`create: false`), so it is born with the version in its title:
+            // a title set after creation is not shown on every platform.
+            let title = format!("tba v{}", env!("CARGO_PKG_VERSION"));
+            match app.config().app.windows.first() {
+                Some(window_config) => {
+                    tauri::WebviewWindowBuilder::from_config(app_handle, window_config)?
+                        .title(title)
+                        .build()?;
+                }
+                None => log::error!("No main window in the Tauri config"),
+            }
+
             if let Some(window) = app.get_webview_window("main") {
                 // Auto-started at login: stay in the tray instead of popping
                 // the window up over whatever the user is doing. Only when the
@@ -360,16 +373,6 @@ pub fn run() {
                     && TRAY_ACTIVE.load(Ordering::SeqCst)
                 {
                     let _ = window.hide();
-                }
-
-                // getting Application version foriom the Cargo.toml file
-                let version = env!("CARGO_PKG_VERSION");
-                // Form new Title with the version
-                let title = format!("v{}", version);
-                // Set new title to the window. A failure here is cosmetic —
-                // not worth panicking the whole app over.
-                if let Err(e) = window.set_title(&title) {
-                    log::error!("Failed to set window title: {e}");
                 }
 
                 let front_app_handle = app_handle.clone();
