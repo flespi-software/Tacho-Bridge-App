@@ -459,9 +459,18 @@ fn spawn_rack_card(
 
 /// The rack link report of a card session: `{"iccid","slot","rack"}`. The
 /// server binds the session to its slot from `iccid` and `slot`; `rack` (the
-/// rack id) is diagnostics only, the server ignores it.
+/// rack id) is diagnostics only, the server ignores it. `local_ops` tells the
+/// server the rack is run locally (see `local.rs`), so the slot indicator is
+/// written here and the server sends no indicator frames of its own.
 fn link_report(iccid: &str, slot: u16, rack_id: &str) -> String {
-    serde_json::json!({ "iccid": iccid, "slot": slot, "rack": rack_id, "serial_transactions": true }).to_string()
+    serde_json::json!({
+        "iccid": iccid,
+        "slot": slot,
+        "rack": rack_id,
+        "serial_transactions": true,
+        "local_ops": super::local::is_active(rack_id),
+    })
+    .to_string()
 }
 
 /// Task aborts (card removed/moved or a rack restart) release local ownership.

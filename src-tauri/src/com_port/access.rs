@@ -103,6 +103,17 @@ pub(super) fn release(port: &SharedPort, slot: u16, discovery: bool, token: Opti
     );
 }
 
+/// Whether an authentication owns the slot right now.
+pub(super) fn auth_active(port: &SharedPort, slot: u16) -> bool {
+    let now = Instant::now();
+    slots(port)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .leases
+        .get(&slot)
+        .is_some_and(|(discovery, until, _)| !*discovery && *until > now)
+}
+
 /// Every live slot lease — part of the state snapshot the extended debug log
 /// starts with.
 pub(super) fn log_leases_snapshot() {

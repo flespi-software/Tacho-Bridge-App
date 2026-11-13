@@ -5,7 +5,7 @@
 //! connection under the `rack/<id>/` topic prefix, `<id>` being the rack id
 //! (the device serial, see `discovery.rs`). This module owns that prefix:
 //! the link reports (`rack/<id>/link`), the dispatch of the server's rack
-//! publishes (`request/<n>`, `watch`, `cards`) and the reply path of the
+//! publishes (`request/<n>`, `watch`, `cards`, `profile`) and the reply path of the
 //! serial exchanges. Per-card sessions live in `cards.rs`; the wire is in
 //! `transport.rs`.
 //!
@@ -13,7 +13,8 @@
 //! `rack/<id>/response/<n>` (reply to `request/<n>`), `rack/<id>/watch`
 //! (presence watch report). Server -> TBA: `rack/<id>/request/<n>` (one serial
 //! exchange), `rack/<id>/watch` (arm the presence watch), `rack/<id>/cards`
-//! (the set of cards to serve). No `/<sender>` tail on this path: the sender
+//! (the set of cards to serve), `rack/<id>/profile` (the rack is run locally
+//! from now on, see `local.rs`). No `/<sender>` tail on this path: the sender
 //! is always the server.
 
 use rumqttc::v5::mqttbytes::QoS;
@@ -210,8 +211,9 @@ async fn publish_links(client: &AsyncClient, links: Vec<(String, bool)>) {
     for (rack_id, up) in links {
         let state = if up { "up" } else { "down" };
         let payload = if up {
+                // `local_ops`: this build runs a rack by itself from a server profile (see `local.rs`)
                 serde_json::json!({"state": state, "guarded_discovery": true, "serial_transactions": true,
-                    "cards": super::cards::inventory(&rack_id)})
+                    "local_ops": true, "cards": super::cards::inventory(&rack_id)})
             } else {
                 serde_json::json!({"state": state})
             }
@@ -312,6 +314,16 @@ pub fn handle_app_publish(client: &AsyncClient, topic: &str, payload: &[u8]) -> 
     // The server instance behind this publish: a reply is delivered to it or
     // not at all (see `app_link_is`).
     let generation = app_generation();
+    if tail == "profile" {
+        // the server hands the rack over: it is polled, its cards identified
+        // and its indicators written locally from now on
+        super::local::start(payload, rack_id, &rack.port, &log_header);
+        return true;
+    }
+    if tail.starts_with("request/") || tail == "watch" || tail == "cards" {
+        // a server that sends its own rack commands drives the rack itself
+        super::local::stop(rack_id, "server_driven");
+    }
     if tail.starts_with("request/") {
         // Enqueue before yielding so a new hold cannot overtake its preceding release.
         let requests = rack.requests.clone();

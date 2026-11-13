@@ -27,6 +27,7 @@
 mod access;
 mod cards;
 mod discovery;
+mod local;
 mod rack;
 mod state;
 mod transport;
@@ -307,6 +308,7 @@ fn unlink_rack(rack_id: &str, links: &mut Vec<(String, bool)>) -> Option<SharedP
         rack.port
     });
     stop_rack_watch(rack_id);
+    local::stop(rack_id, "rack_gone");
     stop_rack_cards(rack_id);
     if port.is_some() {
         links.push((rack_id.to_string(), false));
@@ -375,6 +377,7 @@ fn stop_all_racks() {
     }
     announce_links(links);
     stop_all_rack_watches();
+    local::stop_all();
     stop_all_rack_cards();
 }
 

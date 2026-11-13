@@ -195,6 +195,41 @@ pub struct RackCard {
     pub authentication: Option<bool>,
 }
 
+/// Slots of one rack per class, as the local rack engine classes them from
+/// the status polls (`com_port/local.rs`): every address of the reader chain
+/// is in exactly one list. Slot numbers, not wire bytes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RackSlotStates {
+    /// A working reader without a card: a card can go here.
+    pub free: Vec<u16>,
+    /// An empty reader that does not answer the rack.
+    pub faulty: Vec<u16>,
+    /// A card the server has not identified (yet): discovery pending, or busy.
+    pub card: Vec<u16>,
+    /// A card the server identified and handed over in the card set.
+    pub discovered: Vec<u16>,
+    /// A card in error: the rack reports it failed, or its discovery did.
+    pub error: Vec<u16>,
+    /// A gap in the addressing (a DIP-set block boundary), not a slot.
+    pub absent: Vec<u16>,
+}
+
+/// Slot table of one rack: what every address of its reader chain holds and
+/// the counters the UI shows. Informational: nothing is opened or closed
+/// through it. `None` for a rack the server drives itself.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RackSlots {
+    /// Highest address that answered: the end of the reader chain.
+    pub hi: u16,
+    /// Readers in the chain (addressing gaps excluded).
+    pub total: u16,
+    /// Readers holding a card, in any state.
+    pub occupied: u16,
+    /// `total - occupied`: working and faulty empty readers alike.
+    pub free: u16,
+    pub states: RackSlotStates,
+}
+
 /// State of one connected card rack, pushed to the frontend. Carries only
 /// device identity + presence + the (eventual) card list — no wire protocol.
 #[derive(Clone, Serialize)]
@@ -216,6 +251,9 @@ pub struct RackState {
     /// timeout. Set when the server publishes the rack's card set, which
     /// closes its discovery chain (see `handle_cards_set`).
     pub scan_complete: bool,
+    /// The slot table of this rack, built by its local engine; `None` until
+    /// the first status poll, and for a rack the server drives itself.
+    pub slots: Option<RackSlots>,
 }
 
 // Last known state of every rack reported this session, keyed by rack id.
@@ -277,6 +315,19 @@ pub fn rack_update_cards(rack_id: &str, cards: Vec<RackCard>) {
             true
         }
         None => false,
+    });
+}
+
+/// Replaces the slot table of one rack and re-emits the full list; a no-op
+/// when that rack has never been reported, or the table did not change (the
+/// engine hands one over after every status poll).
+pub fn rack_update_slots(rack_id: &str, slots: RackSlots) {
+    mutate_rack_states_and_emit(|states| match states.get_mut(rack_id) {
+        Some(state) if state.slots.as_ref() != Some(&slots) => {
+            state.slots = Some(slots);
+            true
+        }
+        _ => false,
     });
 }
 

@@ -173,6 +173,9 @@ impl RackInfo {
             // A freshly (re)connected rack has not been enumerated yet; the
             // server's `watch` instruction flips this once discovery is done.
             scan_complete: false,
+            // The server publishes the table at the end of the discovery
+            // that follows the link report; nothing to show before that.
+            slots: None,
         }
     }
 }
