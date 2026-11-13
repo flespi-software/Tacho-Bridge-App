@@ -203,3 +203,12 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed rack cards not being identified in local mode when the rack answers a command with two frames in one read.
+
+### [0.8.1-beta.4] - 2026-11-13
+
+🛠 Fixes
+
+- Fixed rack cards moved between slots being lost or not identified, slot lights staying on without a card, and the scan indicator stopping before the cards appear.
+- Fixed the pause in the rack scan indicator between sweeps.
+- Fixed card groups staying collapsed after clearing a filter, an opened card closing by itself, an empty slot blink dialog while it starts, and the unknown card highlight vanishing on hover.
+- Fixed rack cards losing their sessions after a settings change in local mode, card identification being interrupted by an app reconnect, and removed card rows coming back after a late session end.
