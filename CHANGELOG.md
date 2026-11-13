@@ -184,3 +184,9 @@ All notable changes to this project will be documented in this file.
 - Logging: compact one-line events with correct severity, runtime rotation at 50 MB with a zipped archive (10 generations kept), TBA_LOG environment variable for verbosity, extended debug log on demand, driver names kept out of logs.
 - Performance: the smart card monitor and all disk I/O run off the UI and network threads; a failed PC/SC context retries with backoff instead of spinning at full CPU; rack UI updates are emitted outside locks; log records are formatted before taking the logger lock.
 - Internal: the rack module split into discovery, transport, connection, sessions and state; one shared reconnect backoff for all connections; standard Rust formatting; about 160 backend unit tests and a first frontend test suite; updated Rust and frontend dependencies including security advisories; CI builds signed installers and publishes releases with notes automatically.
+
+### [0.8.1-beta.1] - 2026-11-13
+
+🆕 Features / Improvements
+
+- Rack slot table: address blocks with used, free, faulty and error counters.
