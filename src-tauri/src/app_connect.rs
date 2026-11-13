@@ -1,6 +1,6 @@
-//! Module for working with MQTT connections.
-//!
-//! This module provides functionality for creating and managing MQTT connections.
+//! The application's own MQTT connection to the broker: server commands,
+//! settings reports and the rack traffic ride it, unlike the per-card
+//! connections of `mqtt.rs`.
 
 // ───── Std Lib ─────
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -139,7 +139,7 @@ pub async fn app_connection() {
     // them the new client right away, so a rack linking before the first
     // CONNACK queues its report into the right connection.
     crate::com_port::register_app_client(&mqtt_client);
-    let mqtt_clinet_cloned = mqtt_client.clone();
+    let mqtt_client_cloned = mqtt_client.clone();
     let mqtt_client_for_task = mqtt_client.clone();
     let log_header: String = format!("{} |", client_id);
     let client_id_for_task = client_id.clone();
@@ -308,7 +308,7 @@ pub async fn app_connection() {
         session_id,
         reader_name: None,
         atr: None,
-        mqtt_client: mqtt_clinet_cloned,
+        mqtt_client: mqtt_client_cloned,
         task_handle: handle,
     });
 

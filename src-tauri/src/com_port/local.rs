@@ -32,12 +32,12 @@ use crate::global_app_handle::{rack_update_slots, RackSlotError, RackSlotStates,
 use super::cards::{apply_cards_set, inventory, RACK_CARDS_UI};
 use super::transport::{
     execute_envelope, normalize_hex, take_unsolicited, PollSpec, SerialEnvelope, SharedPort,
-    SERIAL_MS_MAX, SERIAL_MS_MIN,
+    SERIAL_ERR_CARD_BUSY, SERIAL_MS_MAX, SERIAL_MS_MIN,
 };
 use super::{lock, rack_port_is_live};
 
 /// Highest slot address a rack can have.
-const SLOT_MAX: usize = 240;
+const SLOT_MAX: usize = super::SLOT_MAX as usize;
 
 /// Cards identified per status poll before the card set is applied and the
 /// status is read again: the first walk of a full rack then serves its cards
@@ -456,7 +456,6 @@ impl Profile {
         }
     }
 
-    /// A one-shot exchange with one slot.
     /// The part of a step reply its rule judges. The device may deliver the
     /// frames of one operation in a single read: the "accepted" frame of the
     /// step, or a "still working" frame of its poll, ahead of the outcome.
@@ -478,6 +477,7 @@ impl Profile {
         rest
     }
 
+    /// A one-shot exchange with one slot.
     fn slot_envelope(&self, template: &str, slot: u16) -> Option<SerialEnvelope> {
         Some(SerialEnvelope {
             cmd_hex: hex::encode_upper(fill(template, slot, self.check)?),
@@ -605,11 +605,16 @@ fn on_reading_change(state: &mut SlotState, to: Class) {
             state.suspect = true;
         }
     } else if to.has_card() {
-        state.failed = false;
-        state.fail_reason = None;
-        state.failures = 0;
-        state.retry_at = None;
+        clear_failure(state);
     }
+}
+
+/// Forgets the failed identifications of a slot and their retry schedule.
+fn clear_failure(state: &mut SlotState) {
+    state.failed = false;
+    state.fail_reason = None;
+    state.failures = 0;
+    state.retry_at = None;
 }
 
 /// An event the rack sent on its own about a slot: a card went in or out.
@@ -634,13 +639,8 @@ fn assign_card(slots: &mut [SlotState], index: usize, id: String) -> Vec<usize> 
         }
     }
     let state = &mut slots[index];
+    forget_card(state);
     state.card = Some(id);
-    state.failed = false;
-    state.fail_reason = None;
-    state.suspect = false;
-    state.failures = 0;
-    state.retry_at = None;
-    state.led = None;
     moved
 }
 
@@ -648,11 +648,8 @@ fn assign_card(slots: &mut [SlotState], index: usize, id: String) -> Vec<usize> 
 fn forget_card(state: &mut SlotState) {
     state.card = None;
     state.suspect = false;
-    state.failed = false;
-    state.fail_reason = None;
-    state.failures = 0;
-    state.retry_at = None;
     state.led = None;
+    clear_failure(state);
 }
 
 /// The slot table of the UI. The end of the reader chain is the highest
@@ -717,7 +714,7 @@ impl Drop for IdentifyLease<'_> {
 }
 
 /// Owner tokens of the identification leases of the engines.
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1 << 40);
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(super::access::LOCAL_TOKEN_BASE);
 
 /// Runs the identification sequence on one slot and returns the card id.
 async fn identify(
@@ -734,7 +731,7 @@ async fn identify(
         // refuses it, and a lease dropped in between (the application
         // connection changed) is restored before the card is touched again.
         if !super::access::acquire(port, slot, true, token).await {
-            return Err("card_busy");
+            return Err(SERIAL_ERR_CARD_BUSY);
         }
         lease.get_or_insert_with(|| IdentifyLease(port, slot, token));
         let envelope = profile.step_envelope(step, slot).ok_or("bad_template")?;
@@ -862,9 +859,7 @@ fn served_slots(rack_id: &str) -> Vec<(u16, String)> {
 /// The pause before the next status poll: the profile interval, doubled per
 /// consecutive failure up to `POLL_BACKOFF_MAX` (never below the interval).
 fn poll_delay(interval: Duration, failures: u32) -> Duration {
-    interval
-        .saturating_mul(1u32 << failures.min(10))
-        .min(POLL_BACKOFF_MAX.max(interval))
+    super::backoff_delay(interval, failures, POLL_BACKOFF_MAX)
 }
 
 /// 2, 4, 8 … seconds after the 1st, 2nd, 3rd … failure, up to the ceiling.
@@ -997,10 +992,7 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
             let slot = (index + 1) as u16;
             if !slots[index].class.has_card() {
                 // nothing to retry on a slot without a card
-                slots[index].failed = false;
-                slots[index].fail_reason = None;
-                slots[index].failures = 0;
-                slots[index].retry_at = None;
+                clear_failure(&mut slots[index]);
             }
             if slots[index].card.is_none() || slots[index].class.has_card() {
                 continue;
@@ -1064,7 +1056,7 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
                 Err(reason) => {
                     let state = &mut slots[index];
                     // a slot an authentication owns is not a failure of the card
-                    if reason != "card_busy" {
+                    if reason != SERIAL_ERR_CARD_BUSY {
                         state.failed = true;
                         state.fail_reason = Some(reason);
                         state.failures = state.failures.saturating_add(1);
@@ -1200,7 +1192,7 @@ pub(super) async fn blink(rack_id: &str, slot: u16) -> Result<Duration, &'static
         .or_else(|| profile.led_off.clone())
         .ok_or("no_indicator")?;
     if super::access::auth_active(&port, slot) {
-        return Err("card_busy");
+        return Err(SERIAL_ERR_CARD_BUSY);
     }
     let key = (rack_id.to_string(), slot);
     {
@@ -1229,7 +1221,7 @@ pub(super) async fn blink(rack_id: &str, slot: u16) -> Result<Duration, &'static
             }
             // an authentication that took the slot meanwhile goes first
             if super::access::auth_active(&port, slot) {
-                ended = "card_busy";
+                ended = SERIAL_ERR_CARD_BUSY;
                 break;
             }
             let template = if half % 2 == 0 { &on } else { &other };

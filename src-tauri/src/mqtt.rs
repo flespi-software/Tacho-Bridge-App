@@ -387,7 +387,7 @@ fn report_auth_rejection(log_header: &str, code: &str) {
 /// Rewrites a `request/...` topic to its matching `response/...` topic.
 /// Replaces only the leading segment so substrings deeper in the topic
 /// (in client_id, parcel id, etc.) cannot be accidentally mangled.
-/// Shared with the rack path in `com_port.rs` — one wire contract, one parser.
+/// Shared with the rack path in `com_port/` — one wire contract, one parser.
 pub(crate) fn request_to_response_topic(topic: &str) -> String {
     if let Some(rest) = topic.strip_prefix("request/") {
         format!("response/{}", rest)
@@ -494,7 +494,7 @@ fn publish_ack(
     }
 }
 
-// /// Ensures an MQTT connection for the specified client ID.
+/// Ensures an MQTT connection for the specified client ID.
 pub async fn ensure_connection(
     reader_name: &CStr,
     client_id: String,
@@ -607,10 +607,10 @@ pub async fn ensure_connection(
     );
     let (mqtt_client, mut eventloop) = build_mqtt_client(&client_id, &host, port);
 
-    let mqtt_clinet_cloned = mqtt_client.clone();
+    let mqtt_client_cloned = mqtt_client.clone();
     let client_id_cloned = client_id.clone();
 
-    let reader_name = reader_name.to_owned(); // clonning the reader name for the async task
+    let reader_name = reader_name.to_owned(); // cloning the reader name for the async task
     let reader_name_str = reader_name.to_string_lossy().into_owned(); // for using outside async_runtime task
 
     let atr_clone = atr.clone(); // Using ATR inside async_runtime
@@ -619,15 +619,14 @@ pub async fn ensure_connection(
     let log_header: String = format!("{} |", client_id);
 
     let mut is_online: bool = false; // flag to control the card connection (to the server) status
-    let mut was_online = false; // Flag to track the previous connection status
-                                // Two distinct pieces of state that used to share one flag:
-                                //  * `auth_process` — the card has been driven mid-authentication and its
-                                //    security state is dirty, so a new session must reset it first. Only a
-                                //    real card exchange sets it; only an explicit session boundary
-                                //    (`finish`, or the reset at session start) clears it.
-                                //  * `busy_announced` — whether the frontend has already been told this
-                                //    session is active. Purely cosmetic, and cleared by the keep-alive
-                                //    self-heal, which must NOT make the card look clean to the reset gate.
+    // Two distinct pieces of state that used to share one flag:
+    //  * `auth_process` — the card has been driven mid-authentication and its
+    //    security state is dirty, so a new session must reset it first. Only a
+    //    real card exchange sets it; only an explicit session boundary
+    //    (`finish`, or the reset at session start) clears it.
+    //  * `busy_announced` — whether the frontend has already been told this
+    //    session is active. Purely cosmetic, and cleared by the keep-alive
+    //    self-heal, which must NOT make the card look clean to the reset gate.
     let mut auth_process: bool = false;
     let mut busy_announced: bool = false;
     let mut backoff = Backoff::new();
@@ -718,27 +717,24 @@ pub async fn ensure_connection(
                         is_online = true;
                         // Successful poll: the backoff resets once the link holds.
                         backoff.connected();
-                        if !was_online {
-                            was_online = true;
-                            // Send the global-cards-sync event to the frontend that card is connected.
-                            // Not for a retired session: one retired during the
-                            // reconnect backoff reconnects once more to flush its
-                            // DISCONNECT, and must not resurrect its removed row.
-                            if !session_retired(session_id) {
-                                emit_card_sync_event(
-                                    &iccid,
-                                    &reader_name,
-                                    &client_id_cloned,
-                                    Some(true),
-                                    None,
-                                );
-                            }
-
-                            log::info!(
-                                "{} [CONN] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
-                                log_header
+                        // Send the global-cards-sync event to the frontend that card is connected.
+                        // Not for a retired session: one retired during the
+                        // reconnect backoff reconnects once more to flush its
+                        // DISCONNECT, and must not resurrect its removed row.
+                        if !session_retired(session_id) {
+                            emit_card_sync_event(
+                                &iccid,
+                                &reader_name,
+                                &client_id_cloned,
+                                Some(true),
+                                None,
                             );
                         }
+
+                        log::info!(
+                            "{} [CONN] state=OFFLINE->ONLINE cause=eventloop_poll_ok",
+                            log_header
+                        );
                     }
 
                     log::trace!("{} Notification: {:?}", log_header, notification);
@@ -859,14 +855,19 @@ pub async fn ensure_connection(
 
                                         // Processing the "finish" parameter depending on its value
                                         if finish_value {
-                                            // Send the global-cards-sync event to the frontend that card is connected
-                                            emit_card_sync_event(
-                                                &iccid,
-                                                &reader_name,
-                                                &client_id_cloned,
-                                                Some(true),
-                                                Some(false),
-                                            );
+                                            // The card is online again. Not for a session the
+                                            // reader sweep has already retired: the card is gone
+                                            // and its row was removed, a late finish must not
+                                            // bring the row back.
+                                            if !session_retired(session_id) {
+                                                emit_card_sync_event(
+                                                    &iccid,
+                                                    &reader_name,
+                                                    &client_id_cloned,
+                                                    Some(true),
+                                                    Some(false),
+                                                );
+                                            }
 
                                             log::info!(
                                                 "{} Authentication process is finished",
@@ -1030,14 +1031,17 @@ pub async fn ensure_connection(
                                                             log_header
                                                         );
 
-                                                        // Send the global-cards-sync event to the frontend that card is connected
-                                                        emit_card_sync_event(
-                                                            &iccid,
-                                                            &reader_name,
-                                                            &client_id_cloned,
-                                                            Some(true),
-                                                            Some(false),
-                                                        );
+                                                        // The card is online (not for a retired
+                                                        // session: its row is already gone)
+                                                        if !session_retired(session_id) {
+                                                            emit_card_sync_event(
+                                                                &iccid,
+                                                                &reader_name,
+                                                                &client_id_cloned,
+                                                                Some(true),
+                                                                Some(false),
+                                                            );
+                                                        }
 
                                                         atr_clone.clone()
                                                     } else {
@@ -1062,7 +1066,7 @@ pub async fn ensure_connection(
                                                         }
                                                     }
 
-                                                    // // Otherwise, the logic for exchanging messages with the card.
+                                                    // Otherwise, the logic for exchanging messages with the card.
                                                     if !auth_process {
                                                         log::info!(
                                                             "{} Authentication APDU exchange started",
@@ -1307,7 +1311,6 @@ pub async fn ensure_connection(
                         "OFFLINE"
                     };
                     is_online = false;
-                    was_online = false; // Reset the flag when the connection is lost
 
                     // One line per failed poll: kind + retry delay; full error
                     // details only for genuinely unexpected failures.
@@ -1331,7 +1334,7 @@ pub async fn ensure_connection(
         session_id,
         reader_name: Some(reader_name_str),
         atr: Some(atr),
-        mqtt_client: mqtt_clinet_cloned,
+        mqtt_client: mqtt_client_cloned,
         task_handle: handle,
     });
 

@@ -5,14 +5,15 @@
 //! connection under the `rack/<id>/` topic prefix, `<id>` being the rack id
 //! (the device serial, see `discovery.rs`). This module owns that prefix:
 //! the link reports (`rack/<id>/link`), the dispatch of the server's rack
-//! publishes (`request/<n>`, `watch`, `cards`, `profile`) and the reply path of the
+//! publishes (`request/<n>`, `release`, `watch`, `cards`, `profile`) and the reply path of the
 //! serial exchanges. Per-card sessions live in `cards.rs`; the wire is in
 //! `transport.rs`.
 //!
 //! Topics, TBA -> server: `rack/<id>/link` (`{"state":"up"|"down"}`),
 //! `rack/<id>/response/<n>` (reply to `request/<n>`), `rack/<id>/watch`
 //! (presence watch report). Server -> TBA: `rack/<id>/request/<n>` (one serial
-//! exchange), `rack/<id>/watch` (arm the presence watch), `rack/<id>/cards`
+//! exchange), `rack/<id>/release` (end the discovery lease of a slot),
+//! `rack/<id>/watch` (arm the presence watch), `rack/<id>/cards`
 //! (the set of cards to serve), `rack/<id>/profile` (the rack is run locally
 //! from now on, see `local.rs`). No `/<sender>` tail on this path: the sender
 //! is always the server.
@@ -349,7 +350,7 @@ pub fn handle_app_publish(client: &AsyncClient, topic: &str, payload: &[u8]) -> 
             if let Some(slot) = json
                 .get("slot")
                 .and_then(|v| v.as_u64())
-                .filter(|s| (1..=240).contains(s))
+                .filter(|s| (1..=u64::from(super::SLOT_MAX)).contains(s))
             {
                 if let Some(request_id) = json.get("request_id").and_then(|v| v.as_u64()) {
                     // Queued behind the rack's requests: a release that answers
@@ -759,7 +760,7 @@ pub(super) async fn run_serial_request(
             let discovery_slot = json
                 .get("discovery_slot")
                 .and_then(|v| v.as_u64())
-                .filter(|s| (1..=240).contains(s))
+                .filter(|s| (1..=u64::from(super::SLOT_MAX)).contains(s))
                 .map(|s| s as u16);
             // Debug log identity of this exchange, taken before the envelope
             // is consumed: what the server can match against its own copy.

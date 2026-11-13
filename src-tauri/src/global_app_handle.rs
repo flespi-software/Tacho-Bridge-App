@@ -57,8 +57,7 @@ fn emit_to_frontend<P: Serialize + Clone>(event_name: &str, payload: P) {
 ///
 /// # Fields
 ///
-/// * `atr` - A string representing the Answer To Reset (ATR) of the card. The ATR is a sequence
-///   of bytes returned by the card upon reset, identifying the card's communication parameters.
+/// * `iccid` - The card's extended serial number read from `EF_ICC`.
 /// * `reader_name` - The name of the smart card reader through which the card is being accessed.
 /// * `card_state` - A string describing the current state of the card (e.g., "Inserted", "Removed").
 /// * `card_number` - The identification number of the tachograph card.
@@ -70,6 +69,13 @@ pub struct TachoState {
     pub card_number: String,
     pub online: Option<bool>,
     pub authentication: Option<bool>,
+}
+
+/// Whether a reader state means the reader left the bus: its UI row goes for
+/// good. One rule for the replay map here and the sweep's list of reported
+/// readers (`smart_card::note_reported_reader`).
+pub fn is_reader_gone_state(card_state: &str) -> bool {
+    card_state.contains("UNKNOWN") || card_state.contains("IGNORE")
 }
 
 pub fn card_emit_event(
@@ -95,7 +101,7 @@ pub fn card_emit_event(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A reader that left the bus is dropped from the UI for good.
-        if payload.card_state.contains("UNKNOWN") || payload.card_state.contains("IGNORE") {
+        if is_reader_gone_state(&payload.card_state) {
             readers.remove(&payload.reader_name);
         } else {
             readers.insert(payload.reader_name.clone(), payload.clone());

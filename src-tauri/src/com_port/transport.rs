@@ -146,8 +146,7 @@ type HeldPort = Arc<std::sync::Mutex<Option<PortGuard>>>;
 
 /// Locks the cell of a retained port, recovering from poisoning: the guard inside is safe to reuse.
 fn held(cell: &HeldPort) -> std::sync::MutexGuard<'_, Option<PortGuard>> {
-    cell.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    super::lock(cell)
 }
 
 /// An opaque serial operation retained across server round trips, scoped to one MQTT owner.
@@ -455,7 +454,7 @@ pub(super) fn parse_envelope(
 }
 
 /// A server-supplied timing field in milliseconds, capped at `SERIAL_MS_MAX`.
-fn ms_field(json: &serde_json::Value, key: &str) -> Option<u64> {
+pub(super) fn ms_field(json: &serde_json::Value, key: &str) -> Option<u64> {
     json.get(key)
         .and_then(|v| v.as_u64())
         .map(|v| v.min(SERIAL_MS_MAX))

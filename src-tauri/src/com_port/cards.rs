@@ -24,7 +24,7 @@ use super::rack::{
 };
 use super::state::{mutate_rack_rows, set_rack_card_state, update_rack_card_ui};
 use super::transport::{
-    execute_envelope, normalize_hex, SerialEnvelope, SharedPort, SERIAL_MS_MAX, SERIAL_MS_MIN,
+    execute_envelope, ms_field, normalize_hex, SerialEnvelope, SharedPort, SERIAL_MS_MIN,
     SERIAL_READ_DEADLINE, SERIAL_REPLY_TIMEOUT,
 };
 use super::{linked_rack_ports, lock, rack_port_is_live, Backoff, RECONNECT_DELAY_INITIAL_SECS};
@@ -882,11 +882,7 @@ pub(super) fn start_rack_watch(
             return;
         }
     };
-    let ms = |key: &str| {
-        json.get(key)
-            .and_then(|v| v.as_u64())
-            .map(|v| v.min(SERIAL_MS_MAX))
-    };
+    let ms = |key: &str| ms_field(&json, key);
     let interval = Duration::from_millis(ms("interval_ms").unwrap_or(1000).max(SERIAL_MS_MIN));
     let refresh = Duration::from_millis(ms("refresh_ms").unwrap_or(30_000).max(1000));
     let idle = ms("idle_ms")
@@ -1030,8 +1026,7 @@ const WATCH_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// The pause before the next watch exchange: the armed interval, doubled per
 /// consecutive failure up to `WATCH_BACKOFF_MAX` (never below the interval).
 fn watch_delay(interval: Duration, failures: u32) -> Duration {
-    let backoff = interval.saturating_mul(1u32 << failures.min(10));
-    backoff.min(WATCH_BACKOFF_MAX.max(interval))
+    super::backoff_delay(interval, failures, WATCH_BACKOFF_MAX)
 }
 
 /// Stops one rack's card presence watch task, if armed.
@@ -1252,7 +1247,7 @@ fn parse_cards_set(payload: &[u8]) -> Result<Vec<(u16, String)>, String> {
     for item in items {
         let slot = item.get("slot").and_then(|v| v.as_u64()).unwrap_or(0);
         let iccid = item.get("iccid").and_then(|v| v.as_str()).unwrap_or("");
-        if iccid.is_empty() || !(1..=240).contains(&slot) {
+        if iccid.is_empty() || !(1..=u64::from(super::SLOT_MAX)).contains(&slot) {
             return Err(format!("invalid_iccid_or_slot slot={slot}"));
         }
         if cards.iter().any(|(s, _)| u64::from(*s) == slot) {
@@ -1266,16 +1261,9 @@ fn parse_cards_set(payload: &[u8]) -> Result<Vec<(u16, String)>, String> {
     Ok(cards)
 }
 
-/// The set of cards of one rack the server wants served (`rack/<id>/cards`,
-/// published at the end of every discovery chain). The set is the desired
-/// state, not a notice: the rack's sessions are reconciled with it — a listed
-/// card without a session gets one (ICCID resolved to the card number through
-/// the local config; an unknown ICCID is shown in the UI, unserved), a session
-/// of this rack whose (slot, ICCID) the set does not list is closed. The key is
-/// the pair, not the ICCID alone: the server binds a session to its slot, so a
-/// card that moved to another slot gets a new session there.
-/// A card set of the server: reconciles the card sessions, then tells the UI
-/// the scan of the rack is over.
+/// A card set of the server (`rack/<id>/cards`, published at the end of every
+/// discovery chain): reconciles the card sessions, then tells the UI the scan
+/// of the rack is over.
 pub(super) async fn handle_cards_set(
     payload: Vec<u8>,
     rack_id: String,
@@ -1293,6 +1281,13 @@ pub(super) async fn handle_cards_set(
 /// Reconciles the card sessions of a rack with a card set; `false` when the
 /// set was ignored or superseded. Says nothing about the scan of the rack: a
 /// set of the local engine can come before its cards are identified.
+///
+/// The set is the desired state, not a notice: a listed card without a
+/// session gets one (ICCID resolved to the card number through the local
+/// config; an unknown ICCID is shown in the UI, unserved), a session of this
+/// rack whose (slot, ICCID) the set does not list is closed. The key is the
+/// pair, not the ICCID alone: a session is bound to its slot, so a card that
+/// moved to another slot gets a new session there.
 pub(super) async fn apply_cards_set(
     payload: Vec<u8>,
     rack_id: String,

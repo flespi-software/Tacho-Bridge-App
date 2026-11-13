@@ -40,10 +40,7 @@ impl Slots {
 type Registry = Vec<(PortWeak, Arc<Mutex<Slots>>)>;
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 fn slots(port: &SharedPort) -> Arc<Mutex<Slots>> {
-    let mut registry = REGISTRY
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut registry = super::lock(REGISTRY.get_or_init(Mutex::default));
     registry.retain(|(port, _)| port.strong_count() > 0);
     let weak = Arc::downgrade(port);
     if let Some((_, slots)) = registry.iter().find(|(p, _)| p.ptr_eq(&weak)) {
@@ -57,10 +54,7 @@ pub(super) async fn acquire(port: &SharedPort, slot: u16, discovery: bool, token
     let slots = slots(port);
     let started = Instant::now();
     let granted = loop {
-        if slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .acquire(slot, discovery, Instant::now(), token)
+        if super::lock(&slots).acquire(slot, discovery, Instant::now(), token)
         {
             break true;
         }
@@ -84,10 +78,7 @@ pub(super) async fn acquire(port: &SharedPort, slot: u16, discovery: bool, token
     granted
 }
 pub(super) fn release(port: &SharedPort, slot: u16, discovery: bool, token: Option<u64>) {
-    let released = slots(port)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .release(slot, discovery, token);
+    let released = super::lock(&slots(port)).release(slot, discovery, token);
     log::debug!(
         "SLOT {} owner={} token={} status={}",
         slot,
@@ -106,9 +97,7 @@ pub(super) fn release(port: &SharedPort, slot: u16, discovery: bool, token: Opti
 /// Whether an authentication owns the slot right now.
 pub(super) fn auth_active(port: &SharedPort, slot: u16) -> bool {
     let now = Instant::now();
-    slots(port)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    super::lock(&slots(port))
         .leases
         .get(&slot)
         .is_some_and(|(discovery, until, _)| !*discovery && *until > now)
@@ -117,16 +106,11 @@ pub(super) fn auth_active(port: &SharedPort, slot: u16) -> bool {
 /// Every live slot lease — part of the state snapshot the extended debug log
 /// starts with.
 pub(super) fn log_leases_snapshot() {
-    let registry = REGISTRY
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = super::lock(REGISTRY.get_or_init(Mutex::default));
     let now = Instant::now();
     let mut rows = Vec::new();
     for (port, slots) in registry.iter().filter(|(port, _)| port.strong_count() > 0) {
-        let slots = slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slots = super::lock(slots);
         for (slot, (discovery, until, token)) in slots.leases.iter() {
             rows.push(format!(
                 "{:p}/{}:{}:token={}:left_ms={}",
@@ -145,18 +129,21 @@ pub(super) fn log_leases_snapshot() {
         rows.join(",")
     );
 }
+/// Owner tokens from here up belong to the identification leases of the local
+/// engines (`local::identify`); the server's request ids stay below.
+pub(super) const LOCAL_TOKEN_BASE: u64 = 1 << 40;
+
+/// Drops the leases of server discoveries: the server instance that asked for
+/// them is gone with the application connection. The local engines' leases
+/// stay — local identification does not run over that connection, and dropping
+/// one mid-sequence would let an authentication onto a half-selected card.
 pub(super) fn cancel_discovery() {
-    let mut registry = REGISTRY
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut registry = super::lock(REGISTRY.get_or_init(Mutex::default));
     registry.retain(|(port, _)| port.strong_count() > 0);
     for (_, slots) in registry.iter() {
-        slots
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::lock(slots)
             .leases
-            .retain(|_, (discovery, _, _)| !*discovery);
+            .retain(|_, (discovery, _, token)| !*discovery || *token >= LOCAL_TOKEN_BASE);
     }
 }
 #[cfg(test)]

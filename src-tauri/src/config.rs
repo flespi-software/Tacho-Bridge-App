@@ -458,7 +458,6 @@ fn update_card_config(
                 content.expire
             );
             config.cards.insert(card_number.to_string(), content);
-            // needs_restart = true;
             changed = true;
         }
     }
@@ -480,12 +479,6 @@ fn update_card_config(
                 Some(card_config.clone()),
             );
         }
-
-        // // Restart connection if necessary
-        // if needs_restart {
-        //     log::info!("Restarting connection for card: {}", card_number);
-        //     manual_sync_cards(card_number.to_string(), true).await;
-        // }
     }
 
     Ok(())
@@ -515,14 +508,6 @@ fn persist_card(card_number: &str, content: CardConfig) -> Result<(), String> {
     }
 }
 
-/// Applies `mutate` to one card entry under the global config write lock:
-/// fresh load from disk → mutate → save → refresh cache → emit the frontend
-/// event. The closure returns whether it actually changed anything; when it
-/// returns false the save is skipped entirely.
-///
-/// This is the safe primitive for "change one field" writers (sniffer, auth
-/// results): mutating fresh file state under the lock means concurrent writers
-/// cannot revert each other's fields, which a cache-read + full-write would do.
 /// Outcome of `mutate_card_config`. "The card is not in the config" is a
 /// routine condition (a rack card whose ICCID is not linked to a number yet),
 /// not a failure — collapsing it into the same `false` as a failed write made
@@ -548,6 +533,15 @@ impl CardMutation {
     }
 }
 
+/// Applies `mutate` to one card entry under the global config write lock:
+/// fresh load from disk → mutate → save → refresh cache → emit the frontend
+/// event. The closure returns whether it actually changed anything; when it
+/// returns false the save is skipped entirely.
+///
+/// This is the safe primitive for "change one field" writers (sniffer, auth
+/// results): mutating fresh file state under the lock means concurrent writers
+/// cannot revert each other's fields, which a cache-read + full-write would do.
+///
 /// Blocking (file I/O + fsync) — call from a blocking thread.
 pub fn mutate_card_config<F>(card_number: &str, mutate: F) -> CardMutation
 where
@@ -627,8 +621,6 @@ pub async fn update_card(cardnumber: String, content: CardConfig) -> Result<(), 
     updated
 }
 
-/// Updates the server address in the configuration.
-/// This function updates the configuration file with a new server address.
 /// Maps the frontend's theme label to the config enum; unknown values fall back
 /// to Auto, mirroring the deserialization default.
 fn dark_theme_from_label(theme: &str) -> DarkTheme {
@@ -658,6 +650,8 @@ fn update_appearance_config(
     Ok(())
 }
 
+/// Saves the settings dialog: server address, app ident, theme and update
+/// options, under the config write lock.
 fn update_server_config(
     config_path: &Path,
     host: &str,
@@ -678,9 +672,9 @@ fn update_server_config(
 
     let mut config = load_config(config_path)?;
 
-    // The settings dialog knows nothing about the MQTT credentials (no UI for
-    // them yet) — carry the hand-edited values over so saving the dialog does
-    // not silently strip authentication from the config.
+    // The server settings carry no MQTT credentials (they are saved on their
+    // own, see `credentials.rs`) — carry the stored values over so saving the
+    // dialog does not silently strip authentication from the config.
     let previous = config.server.take();
     config.server = Some(ServerConfig {
         host: host.to_string(),
@@ -918,13 +912,7 @@ pub async fn update_theme(theme: String) -> bool {
     })
 }
 
-/*
-  HashMap. ATR = Card number
-
-  initializing a global cache (HashMap<String, String>) using Mutex.
-  Mapping card keys and matching them with the real company card number,
-  which can only be entered manually
-*/
+/// In-memory copy of config.yaml, refreshed after every save.
 #[derive(Default, Debug)]
 pub struct CacheConfigData {
     pub cards: HashMap<String, CardConfig>,
@@ -937,10 +925,7 @@ pub struct CacheConfigData {
 }
 
 lazy_static! {
-    /// Global cache for card ATRs and numbers.
-    /// Initializing a global cache (HashMap<String, String>) using Mutex.
-    /// Mapping card keys and matching them with the real company card number,
-    /// which can only be entered manually.
+    /// Global cache of the config (see `CacheConfigData`).
     static ref CACHE: Mutex<CacheConfigData> = Mutex::new(CacheConfigData::default());
 }
 
@@ -1251,8 +1236,8 @@ pub fn set_server_host(host: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The credentials saved in the config, when both the switch and a username
-/// are set.
+/// The credentials saved in the config, when a username is set. The switch
+/// (`auth_enabled`) is not checked here: the callers do that.
 pub fn saved_credentials() -> Option<(String, String)> {
     let cache = cache_guard();
     let server = cache.server.as_ref()?;
@@ -1344,8 +1329,8 @@ pub fn init_config() -> io::Result<()> {
     // Whether the file on disk still matches what we would write. A config that
     // parsed cleanly and needs no field change is left byte-for-byte alone:
     // rewriting it round-trips through serde_yaml, which drops comments and
-    // reorders keys in a file the user is expected to hand-edit (the MQTT
-    // credentials have no UI). Only a real change earns a write.
+    // reorders keys in a file the user may hand-edit. Only a real change
+    // earns a write.
     let mut needs_save = true;
 
     // Only a definite "not found" means a first run. `Path::exists()` is also

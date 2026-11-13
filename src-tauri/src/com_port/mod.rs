@@ -1,10 +1,11 @@
 //! Card racks over COM (serial) ports.
 //!
-//! This module is intentionally a **thin wrapper**: it watches the USB-serial
-//! bus for supported devices, logs connect/disconnect transitions, and bridges
-//! bytes between the server and each serial port. It contains **no command/wire
-//! protocol** — every command is built and interpreted by the server; the
-//! client only forwards raw bytes.
+//! This module watches the USB-serial bus for supported devices, logs
+//! connect/disconnect transitions, and bridges bytes between the server and
+//! each serial port. It holds **no device wire protocol of its own**: the
+//! server either builds every command and the client forwards raw bytes, or
+//! hands over a profile (byte templates and reply rules) that the local engine
+//! runs (`local`).
 //!
 //! A rack is a peripheral of the application, like a PC/SC reader: it has no
 //! MQTT connection of its own. Its traffic rides the application connection
@@ -23,6 +24,8 @@
 //! - `rack` — the rack traffic of the application connection (link, requests)
 //! - `cards` — per-card MQTT sessions and the per-rack presence watches
 //! - `state` — the per-rack card lists shown in the UI
+//! - `access` — slot ownership between discovery and authentication
+//! - `local` — the rack run locally from a server profile
 
 mod access;
 mod cards;
@@ -147,8 +150,23 @@ pub(super) fn set_active_rack_port_for_test(rack_id: &str, port_name: Option<&st
 /// permanently kill the rack stack. Every guarded value in this module is safe
 /// to reuse after a panic — plain collections replaced in whole assignments,
 /// never left half-updated. Shared by all `com_port` submodules.
-fn lock<T>(m: &'static std::sync::Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Highest slot address a rack can have.
+const SLOT_MAX: u16 = 240;
+
+/// `interval`, doubled per consecutive failure up to `cap` (never below the
+/// interval): the pause of a poll loop whose exchanges keep failing.
+fn backoff_delay(
+    interval: std::time::Duration,
+    failures: u32,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    interval
+        .saturating_mul(1u32 << failures.min(10))
+        .min(cap.max(interval))
 }
 
 /// The linked rack with this id, if its port is open.
@@ -259,6 +277,10 @@ pub fn restart_rack_links(reason: &str) {
     );
     for id in &ids {
         stop_rack_watch(id);
+        // The local engine goes too: the server re-sends the same profile,
+        // which an engine still running would take as nothing new and never
+        // hand the cards over again, leaving the rack without sessions.
+        local::stop(id, "links_restarted");
         stop_rack_cards(id);
     }
     reset_all_rack_idempotency();

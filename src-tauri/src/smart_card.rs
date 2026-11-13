@@ -386,8 +386,8 @@ fn rescan_when_reader_idle(reader_name: &CStr) {
 }
 
 /// PC/SC readers that currently have a row in the UI (the last state the
-/// sweep emitted for them was not a removal). Mirrors the rule
-/// `card_emit_event` applies to its replay map, so `evict_vanished_readers`
+/// sweep emitted for them was not a removal). Same rule as the replay map of
+/// `card_emit_event` (`is_reader_gone_state`), so `evict_vanished_readers`
 /// can retire the rows of readers that disappeared while no context watched
 /// them — not only the ones that had a card session.
 static REPORTED_READERS: std::sync::Mutex<BTreeSet<String>> =
@@ -395,7 +395,7 @@ static REPORTED_READERS: std::sync::Mutex<BTreeSet<String>> =
 
 fn note_reported_reader(reader: &str, card_state: &str) {
     let mut reported = lock_map(&REPORTED_READERS);
-    if card_state.contains("UNKNOWN") || card_state.contains("IGNORE") {
+    if crate::global_app_handle::is_reader_gone_state(card_state) {
         reported.remove(reader);
     } else {
         reported.insert(reader.to_owned());
