@@ -1274,24 +1274,43 @@ fn parse_cards_set(payload: &[u8]) -> Result<Vec<(u16, String)>, String> {
 /// of this rack whose (slot, ICCID) the set does not list is closed. The key is
 /// the pair, not the ICCID alone: the server binds a session to its slot, so a
 /// card that moved to another slot gets a new session there.
+/// A card set of the server: reconciles the card sessions, then tells the UI
+/// the scan of the rack is over.
 pub(super) async fn handle_cards_set(
     payload: Vec<u8>,
     rack_id: String,
     serial_port: SharedPort,
     log_header: String,
 ) {
+    if apply_cards_set(payload, rack_id.clone(), serial_port, log_header).await {
+        // The set closes a discovery chain of the server: the UI can stop showing
+        // a scan in progress. Treated as a hint, not a contract: the frontend
+        // still has its own timeout in case a set never arrives.
+        crate::global_app_handle::rack_mark_scan_complete(&rack_id);
+    }
+}
+
+/// Reconciles the card sessions of a rack with a card set; `false` when the
+/// set was ignored or superseded. Says nothing about the scan of the rack: a
+/// set of the local engine can come before its cards are identified.
+pub(super) async fn apply_cards_set(
+    payload: Vec<u8>,
+    rack_id: String,
+    serial_port: SharedPort,
+    log_header: String,
+) -> bool {
     let cards = match parse_cards_set(&payload) {
         Ok(cards) => cards,
         Err(reason) => {
             log::warn!("{} [CARDS] status=ignored reason={}", log_header, reason);
-            return;
+            return false;
         }
     };
     // A set dispatched before an unlink/relink belongs to the previous life of
     // the rack: taking an epoch would let it write that life's rows.
     if !rack_port_is_live(&rack_id, &serial_port) {
         log::info!("{} [CARDS] status=ignored reason=port_replaced", log_header);
-        return;
+        return false;
     }
     let epoch = bump_card_epoch(&rack_id);
     // a set that follows a `link up` closes a full re-discovery: the sessions it
@@ -1365,7 +1384,7 @@ pub(super) async fn handle_cards_set(
                 "{} [CARDS] status=superseded reason=newer_card_set",
                 log_header
             );
-            return;
+            return false;
         }
         // one INFO line per card: the rack inventory is readable straight from the trace
         let card_number = crate::config::find_card_number_by_iccid(iccid);
@@ -1402,10 +1421,7 @@ pub(super) async fn handle_cards_set(
         .await;
     }
 
-    // The set closes a discovery chain of the server: the UI can stop showing
-    // a scan in progress. Treated as a hint, not a contract: the frontend
-    // still has its own timeout in case a set never arrives.
-    crate::global_app_handle::rack_mark_scan_complete(&rack_id);
+    true
 }
 
 /// Final spawn step shared by the card set handler and the pending-card retry:

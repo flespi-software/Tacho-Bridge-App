@@ -53,6 +53,31 @@ pub(super) fn port_key(port: &dyn SerialPort) -> usize {
     port as *const dyn SerialPort as *const () as usize
 }
 
+/// Bytes a rack sent on its own, outside any operation, kept per port (by
+/// `port_key`) until the local engine of the rack takes them: a rack in
+/// event-driven mode reports a card inserted into or removed from a slot this
+/// way, which is the one sign of a card swapped faster than a status poll can
+/// see. Bounded, since a rack the server drives has no engine to drain them.
+static UNSOLICITED: std::sync::Mutex<Vec<(usize, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+const UNSOLICITED_MAX: usize = 64;
+
+fn record_unsolicited(key: usize, bytes: &[u8]) {
+    let mut list = super::lock(&UNSOLICITED);
+    if list.len() >= UNSOLICITED_MAX {
+        list.remove(0);
+    }
+    list.push((key, bytes.to_vec()));
+}
+
+/// Takes the bytes the rack on this port sent on its own since the last call,
+/// one entry per burst, oldest first.
+pub(super) fn take_unsolicited(key: usize) -> Vec<Vec<u8>> {
+    let mut list = super::lock(&UNSOLICITED);
+    let (mine, rest): (Vec<_>, Vec<_>) = list.drain(..).partition(|(k, _)| *k == key);
+    *list = rest;
+    mine.into_iter().map(|(_, bytes)| bytes).collect()
+}
+
 /// Starts tracking a freshly opened port. Only registered ports are counted,
 /// so a fault recorded after `untrack_port` cannot leave a stale entry for an
 /// address a later port may reuse.
@@ -822,6 +847,7 @@ fn settle_line(
         log_header,
         pending.len()
     );
+    record_unsolicited(port_key(&**port), &pending);
     if !resync_line(port, log_header) {
         log::warn!("{} [SERIAL] tx skipped reason=line_not_quiet", log_header);
         return Err((

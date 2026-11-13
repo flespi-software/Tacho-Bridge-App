@@ -29,10 +29,10 @@ use tauri::async_runtime::{self, JoinHandle};
 
 use crate::global_app_handle::{rack_update_slots, RackSlotError, RackSlotStates, RackSlots};
 
-use super::cards::{handle_cards_set, inventory, RACK_CARDS_UI};
+use super::cards::{apply_cards_set, inventory, RACK_CARDS_UI};
 use super::transport::{
-    execute_envelope, normalize_hex, PollSpec, SerialEnvelope, SharedPort, SERIAL_MS_MAX,
-    SERIAL_MS_MIN,
+    execute_envelope, normalize_hex, take_unsolicited, PollSpec, SerialEnvelope, SharedPort,
+    SERIAL_MS_MAX, SERIAL_MS_MIN,
 };
 use super::{lock, rack_port_is_live};
 
@@ -45,8 +45,9 @@ const SLOT_MAX: usize = 240;
 const IDENTIFY_BATCH: usize = 8;
 
 /// Pause before a failed identification of a slot is tried again, doubled per
-/// failure up to the ceiling.
-const IDENTIFY_RETRY_INITIAL: Duration = Duration::from_secs(10);
+/// failure up to the ceiling. Short at first: a freshly inserted card often
+/// fails its first initialisation and reads fine a moment later.
+const IDENTIFY_RETRY_INITIAL: Duration = Duration::from_secs(2);
 const IDENTIFY_RETRY_MAX: Duration = Duration::from_secs(600);
 
 /// Ceiling of the status poll interval while its exchanges keep failing.
@@ -179,6 +180,10 @@ struct Profile {
     led_off: Option<String>,
     poll: Option<PollTemplates>,
     identify: Vec<Step>,
+    /// The bytes every reply frame starts with before its slot address byte,
+    /// taken from the profile's own reply templates: what tells the slot of
+    /// a frame the rack sent on its own.
+    frame_head: Option<Vec<u8>>,
 }
 
 fn text<'a>(json: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -348,9 +353,48 @@ impl Profile {
             led_served: led_template("served")?,
             led_unserved: led_template("unserved")?,
             led_off: led_template("off")?,
+            frame_head: None,
             poll,
             identify,
-        })
+        }
+        .with_frame_head())
+    }
+
+    /// Fills `frame_head` from the first reply template of the profile that
+    /// carries the slot address: the hex before its `{a}` placeholder.
+    fn with_frame_head(mut self) -> Self {
+        let templates = self
+            .identify
+            .iter()
+            .filter_map(|step| step.expect.clone())
+            .chain(self.poll.as_ref().map(|p| p.while_reply.clone()))
+            .chain(self.probe_empty.iter().cloned());
+        self.frame_head = templates
+            .filter_map(|t| t.find("{a}").and_then(|at| hex::decode(&t[..at]).ok()))
+            .find(|head| !head.is_empty());
+        self
+    }
+
+    /// Slots named by frames in bytes the rack sent on its own: every place
+    /// the frame head is followed by an address of this rack. A false hit
+    /// inside a frame body only costs one more identification.
+    fn event_slots(&self, bytes: &[u8]) -> Vec<u16> {
+        let Some(head) = self.frame_head.as_deref() else {
+            return Vec::new();
+        };
+        let mut slots = Vec::new();
+        for at in 0..bytes.len() {
+            if !bytes[at..].starts_with(head) {
+                continue;
+            }
+            if let Some(&addr) = bytes.get(at + head.len()) {
+                let slot = u16::from(addr);
+                if slot >= 1 && usize::from(slot) <= self.status_length && !slots.contains(&slot) {
+                    slots.push(slot);
+                }
+            }
+        }
+        slots
     }
 
     fn classify(&self, raw: u8) -> Class {
@@ -468,6 +512,22 @@ impl Profile {
 enum Led {
     Served,
     Unserved,
+    Off,
+}
+
+/// The indicator a slot should show, `None` to leave it as it is: a served
+/// card, a card nobody serves (or that could not be identified), and dark on
+/// a working reader without a card — the rack keeps an indicator lit after
+/// its card is gone, and across restarts of the app. A card still waiting
+/// for its identification keeps what it has.
+fn wanted_led(state: &SlotState, served: bool) -> Option<Led> {
+    match &state.card {
+        Some(_) if served => Some(Led::Served),
+        Some(_) => Some(Led::Unserved),
+        None if state.failed && state.class.has_card() => Some(Led::Unserved),
+        None if state.class == Class::Free => Some(Led::Off),
+        None => None,
+    }
 }
 
 /// What the engine knows about one slot.
@@ -483,6 +543,10 @@ struct SlotState {
     failed: bool,
     /// Why it failed, for the slot table of the UI.
     fail_reason: Option<&'static str>,
+    /// The identified card may have been swapped: the slot read as empty for
+    /// a moment, or the rack reported an event on it. The card is identified
+    /// again as soon as the slot reads as holding one.
+    suspect: bool,
     failures: u32,
     retry_at: Option<Instant>,
     led: Option<Led>,
@@ -499,6 +563,7 @@ impl Default for SlotState {
             card: None,
             failed: false,
             fail_reason: None,
+            suspect: false,
             failures: 0,
             retry_at: None,
             led: None,
@@ -510,12 +575,17 @@ impl Default for SlotState {
 /// Feeds one status reading into the slots: a class becomes the slot's own
 /// once it was read `stable` polls in a row, so a one-poll flicker of a
 /// served slot is never acted upon.
-fn observe(slots: &mut [SlotState], profile: &Profile, region: &[u8]) {
-    for (state, raw) in slots.iter_mut().zip(region) {
+/// Returns every slot whose reading changed class in this poll, with the old
+/// and the new class: also a one-poll flicker, which is what a quick card swap
+/// looks like.
+fn observe(slots: &mut [SlotState], profile: &Profile, region: &[u8]) -> Vec<(usize, Class, Class)> {
+    let mut changes = Vec::new();
+    for (index, (state, raw)) in slots.iter_mut().zip(region).enumerate() {
         let class = profile.classify(*raw);
         if class == state.candidate {
             state.seen = state.seen.saturating_add(1);
         } else {
+            changes.push((index, state.candidate, class));
             state.candidate = class;
             state.seen = 1;
         }
@@ -523,6 +593,66 @@ fn observe(slots: &mut [SlotState], profile: &Profile, region: &[u8]) {
             state.class = state.candidate;
         }
     }
+    changes
+}
+
+/// A change in the reading of a slot: a known card that read as gone, even
+/// for one poll, may have been swapped and is identified again; a card that
+/// just came in is identified at once, whatever failed before.
+fn on_reading_change(state: &mut SlotState, to: Class) {
+    if state.card.is_some() {
+        if !to.has_card() {
+            state.suspect = true;
+        }
+    } else if to.has_card() {
+        state.failed = false;
+        state.fail_reason = None;
+        state.failures = 0;
+        state.retry_at = None;
+    }
+}
+
+/// An event the rack sent on its own about a slot: a card went in or out.
+fn on_rack_event(state: &mut SlotState) {
+    if state.card.is_some() {
+        state.suspect = true;
+    } else {
+        state.failures = 0;
+        state.retry_at = None;
+    }
+}
+
+/// Records the card identified in slot `index`. A card has one place only: a
+/// slot still listing the same id lost it to a move the polls did not see,
+/// and is cleared so its real card is identified. Returns those slots.
+fn assign_card(slots: &mut [SlotState], index: usize, id: String) -> Vec<usize> {
+    let mut moved = Vec::new();
+    for (other, state) in slots.iter_mut().enumerate() {
+        if other != index && state.card.as_deref() == Some(id.as_str()) {
+            forget_card(state);
+            moved.push(other);
+        }
+    }
+    let state = &mut slots[index];
+    state.card = Some(id);
+    state.failed = false;
+    state.fail_reason = None;
+    state.suspect = false;
+    state.failures = 0;
+    state.retry_at = None;
+    state.led = None;
+    moved
+}
+
+/// Drops the identity of the card of a slot, to be identified anew.
+fn forget_card(state: &mut SlotState) {
+    state.card = None;
+    state.suspect = false;
+    state.failed = false;
+    state.fail_reason = None;
+    state.failures = 0;
+    state.retry_at = None;
+    state.led = None;
 }
 
 /// The slot table of the UI. The end of the reader chain is the highest
@@ -679,23 +809,41 @@ async fn write_led(
 /// Hands the identified cards of the rack to the session reconcile, exactly
 /// as a server card set would.
 async fn apply_cards(slots: &[SlotState], rack_id: &str, port: &SharedPort, log_header: &str) {
+    // One place per card: a set listing an id twice is refused as a whole by
+    // the reconcile, which would freeze every card of the rack.
+    let mut seen = std::collections::HashSet::new();
     let cards: Vec<serde_json::Value> = slots
         .iter()
         .enumerate()
         .filter_map(|(index, state)| {
-            state
-                .card
-                .as_ref()
-                .map(|id| serde_json::json!({"slot": index + 1, "iccid": id}))
+            let id = state.card.as_ref()?;
+            if !seen.insert(id.as_str()) {
+                log::warn!("{} [LOCAL] status=duplicate_skipped slot={}", log_header, index + 1);
+                return None;
+            }
+            Some(serde_json::json!({"slot": index + 1, "iccid": id}))
         })
         .collect();
-    handle_cards_set(
+    apply_cards_set(
         serde_json::Value::Array(cards).to_string().into_bytes(),
         rack_id.to_string(),
         port.clone(),
         log_header.to_string(),
     )
     .await;
+}
+
+/// Whether the first identification walk of the rack is over: the status was
+/// read often enough for every slot to hold a settled class, and every card
+/// that can be identified either was or failed once (its row then shows the
+/// error). Until then the UI keeps showing the scan, so it never stops with
+/// the cards the user waits for still missing.
+fn first_walk_done(slots: &[SlotState], polls: u32, stable: u32, identifies: bool) -> bool {
+    polls >= stable.max(1)
+        && (!identifies
+            || slots.iter().all(|s| {
+                s.card.is_some() || s.failed || !matches!(s.class, Class::Idle | Class::Error)
+            }))
 }
 
 /// Slots of the rack whose card session is up, by the UI rows of the rack.
@@ -719,9 +867,10 @@ fn poll_delay(interval: Duration, failures: u32) -> Duration {
         .min(POLL_BACKOFF_MAX.max(interval))
 }
 
+/// 2, 4, 8 … seconds after the 1st, 2nd, 3rd … failure, up to the ceiling.
 fn identify_retry_delay(failures: u32) -> Duration {
     IDENTIFY_RETRY_INITIAL
-        .saturating_mul(1u32 << failures.min(10))
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(10))
         .min(IDENTIFY_RETRY_MAX)
 }
 
@@ -745,8 +894,19 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
             }
         }
     }
+    // The port's identity for the rack events the transport keeps for us;
+    // whatever it kept before this engine started is about a past state.
+    // Taken from the rack record, not from the port: an authentication can
+    // hold the port lock for a long time.
+    let Some(events_key) = super::rack_io_key(&rack_id, &port) else {
+        log::info!("{} [LOCAL] status=ended reason=link_down", log_header);
+        return;
+    };
+    take_unsolicited(events_key);
     let mut failures: u32 = 0;
     let mut first_pass = true;
+    let mut polls: u32 = 0;
+    let mut scan_reported = false;
     loop {
         tokio::time::sleep(poll_delay(profile.status_interval, failures)).await;
         if !rack_port_is_live(&rack_id, &port) {
@@ -778,10 +938,58 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
             );
             continue;
         };
-        observe(&mut slots, &profile, region);
+        for (index, from, to) in observe(&mut slots, &profile, region) {
+            // a card at work flips between idle and busy all the time
+            if !matches!((from, to), (Class::Idle, Class::Busy) | (Class::Busy, Class::Idle)) {
+                log::info!(
+                    "{} [LOCAL] status=slot_reading slot={} from={:?} to={:?} card_id={}",
+                    log_header,
+                    index + 1,
+                    from,
+                    to,
+                    slots[index].card.as_deref().unwrap_or("-")
+                );
+            }
+            on_reading_change(&mut slots[index], to);
+        }
+        polls = polls.saturating_add(1);
+        for bytes in take_unsolicited(events_key) {
+            let named = profile.event_slots(&bytes);
+            log::info!(
+                "{} [LOCAL] status=rack_event bytes={} slots={:?}",
+                log_header,
+                bytes.len(),
+                named
+            );
+            for slot in named {
+                on_rack_event(&mut slots[usize::from(slot) - 1]);
+            }
+        }
 
         let mut changed = false;
         let now = Instant::now();
+
+        // A card that may have been swapped is identified again once its slot
+        // reads as holding a card: the identity of a slot is never assumed.
+        for index in 0..slots.len() {
+            let slot = (index + 1) as u16;
+            let state = &slots[index];
+            if !state.suspect || state.card.is_none() || !state.class.has_card() {
+                continue;
+            }
+            // an authentication owns the card; checked again after it
+            if super::access::auth_active(&port, slot) {
+                continue;
+            }
+            log::info!(
+                "{} [LOCAL] status=card_recheck slot={} card_id={}",
+                log_header,
+                slot,
+                state.card.as_deref().unwrap_or("-")
+            );
+            forget_card(&mut slots[index]);
+            changed = true;
+        }
 
         // Removals: a known card whose slot reads empty leaves only once the
         // reader of that slot confirms it.
@@ -807,9 +1015,10 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
                     slot,
                     slots[index].card.as_deref().unwrap_or("-")
                 );
-                slots[index].card = None;
-                slots[index].led = None;
-                write_led(&profile, &port, profile.led_off.as_deref(), slot, &log_header).await;
+                forget_card(&mut slots[index]);
+                if write_led(&profile, &port, profile.led_off.as_deref(), slot, &log_header).await {
+                    slots[index].led = Some(Led::Off);
+                }
                 changed = true;
             }
         }
@@ -842,13 +1051,14 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
                         slot,
                         id
                     );
-                    let state = &mut slots[index];
-                    state.card = Some(id);
-                    state.failed = false;
-                    state.fail_reason = None;
-                    state.failures = 0;
-                    state.retry_at = None;
-                    state.led = None;
+                    for other in assign_card(&mut slots, index, id) {
+                        log::warn!(
+                            "{} [LOCAL] status=card_moved from_slot={} to_slot={}",
+                            log_header,
+                            other + 1,
+                            slot
+                        );
+                    }
                     changed = true;
                 }
                 Err(reason) => {
@@ -880,6 +1090,14 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
             apply_cards(&slots, &rack_id, &port, &log_header).await;
             first_pass = false;
         }
+        // after the cards of this pass are handed over, so the rows are on
+        // screen by the time the scan indicator goes away
+        if !scan_reported
+            && first_walk_done(&slots, polls, profile.stable, !profile.identify.is_empty())
+        {
+            crate::global_app_handle::rack_mark_scan_complete(&rack_id);
+            scan_reported = true;
+        }
 
         // Indicators: a served card, a card nobody serves (yet), and a repaint
         // after every authentication, which drops what was written before it.
@@ -897,11 +1115,12 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
                 None => {}
             }
             let state = &slots[index];
-            let wanted = match &state.card {
-                Some(id) if served.iter().any(|(s, i)| *s == slot && i == id) => Led::Served,
-                Some(_) => Led::Unserved,
-                None if state.failed && state.class.has_card() => Led::Unserved,
-                None => continue,
+            let is_served = state
+                .card
+                .as_ref()
+                .is_some_and(|id| served.iter().any(|(s, i)| *s == slot && i == id));
+            let Some(wanted) = wanted_led(state, is_served) else {
+                continue;
             };
             if super::access::auth_active(&port, slot) {
                 slots[index].was_active = true;
@@ -917,6 +1136,7 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
             let template = match wanted {
                 Led::Served => profile.led_served.as_deref(),
                 Led::Unserved => profile.led_unserved.as_deref(),
+                Led::Off => profile.led_off.as_deref(),
             };
             if template.is_none() || write_led(&profile, &port, template, slot, &log_header).await {
                 slots[index].led = Some(wanted);
@@ -1302,12 +1522,101 @@ mod tests {
     }
 
     #[test]
+    fn a_card_found_in_another_slot_frees_the_slot_that_still_listed_it() {
+        let mut slots = vec![SlotState::default(); 6];
+        slots[1].card = Some("A".to_string());
+        slots[3].card = Some("B".to_string());
+        // card A was moved from slot 2 to slot 1 without the polls seeing it
+        assert_eq!(assign_card(&mut slots, 0, "A".to_string()), vec![1]);
+        assert_eq!(slots[0].card.as_deref(), Some("A"));
+        assert_eq!(slots[1].card, None);
+        assert_eq!(slots[3].card.as_deref(), Some("B"));
+        assert!(assign_card(&mut slots, 5, "C".to_string()).is_empty());
+    }
+
+    #[test]
+    fn a_flicker_or_a_rack_event_puts_the_card_up_for_a_recheck() {
+        let mut state = SlotState { card: Some("A".to_string()), ..SlotState::default() };
+        on_reading_change(&mut state, Class::Busy);
+        assert!(!state.suspect);
+        on_reading_change(&mut state, Class::Free);
+        assert!(state.suspect);
+        let mut state = SlotState { card: Some("A".to_string()), ..SlotState::default() };
+        on_rack_event(&mut state);
+        assert!(state.suspect);
+        // a new card in an empty slot is identified at once, past failures aside
+        let mut state = SlotState {
+            failed: true,
+            failures: 3,
+            retry_at: Some(Instant::now() + Duration::from_secs(60)),
+            ..SlotState::default()
+        };
+        on_reading_change(&mut state, Class::Idle);
+        assert!(!state.failed && state.failures == 0 && state.retry_at.is_none());
+    }
+
+    #[test]
+    fn rack_events_name_their_slots_by_the_profile_frame_head() {
+        let p = profile();
+        assert_eq!(p.frame_head.as_deref(), Some(&[0xA0u8][..]));
+        // two frames back to back: slot 3 emptied, slot 5 got a card
+        let bytes = [frame(&[0xA0, 0x03, 0x00, 0x01]), frame(&[0xA0, 0x05, 0x00, 0x05])].concat();
+        assert_eq!(p.event_slots(&bytes), vec![3, 5]);
+        // an address past the rack is not a slot
+        assert!(p.event_slots(&frame(&[0xA0, 0xF0, 0x00, 0x01])).is_empty());
+    }
+
+    #[test]
+    fn an_empty_working_reader_is_kept_dark() {
+        let mut state = SlotState { class: Class::Free, ..SlotState::default() };
+        assert_eq!(wanted_led(&state, false), Some(Led::Off));
+        // a failed card that was pulled out: its warning goes dark too
+        state.failed = true;
+        assert_eq!(wanted_led(&state, false), Some(Led::Off));
+        state.class = Class::Idle;
+        assert_eq!(wanted_led(&state, false), Some(Led::Unserved));
+        // a card waiting for its identification keeps what it has
+        state.failed = false;
+        assert_eq!(wanted_led(&state, false), None);
+        state.card = Some("A".to_string());
+        assert_eq!(wanted_led(&state, true), Some(Led::Served));
+        assert_eq!(wanted_led(&state, false), Some(Led::Unserved));
+        // no reader at the address: nothing to write to
+        let none = SlotState::default();
+        assert_eq!(wanted_led(&none, false), None);
+    }
+
+    #[test]
+    fn first_walk_waits_for_settled_classes_and_every_card() {
+        let mut slots = vec![SlotState::default(); 4];
+        // nothing read yet: classes are not settled
+        assert!(!first_walk_done(&slots, 1, 2, true));
+        assert!(first_walk_done(&slots, 2, 2, true));
+        slots[0].class = Class::Idle;
+        slots[1].class = Class::Error;
+        slots[2].class = Class::Busy;
+        slots[3].class = Class::Free;
+        // two cards not identified yet; a busy card is not waited for
+        assert!(!first_walk_done(&slots, 3, 2, true));
+        slots[0].card = Some("AA".to_string());
+        assert!(!first_walk_done(&slots, 3, 2, true));
+        // a failed identification ends the wait too: its row shows the error
+        slots[1].failed = true;
+        assert!(first_walk_done(&slots, 3, 2, true));
+        // a profile without identification has nothing to wait for
+        slots[1].failed = false;
+        assert!(first_walk_done(&slots, 3, 2, false));
+    }
+
+    #[test]
     fn delays_grow_with_failures_up_to_their_ceilings() {
         let interval = Duration::from_secs(2);
         assert_eq!(poll_delay(interval, 0), interval);
         assert_eq!(poll_delay(interval, 2), Duration::from_secs(8));
         assert_eq!(poll_delay(interval, 30), POLL_BACKOFF_MAX);
         assert_eq!(identify_retry_delay(0), IDENTIFY_RETRY_INITIAL);
+        assert_eq!(identify_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(identify_retry_delay(3), Duration::from_secs(8));
         assert_eq!(identify_retry_delay(30), IDENTIFY_RETRY_MAX);
     }
 }

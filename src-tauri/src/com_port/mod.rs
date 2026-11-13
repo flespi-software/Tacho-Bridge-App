@@ -183,6 +183,15 @@ fn rack_port_is_live(rack_id: &str, port: &SharedPort) -> bool {
         .unwrap_or(false)
 }
 
+/// The `transport::port_key` of the rack's open port, while `port` is still
+/// that port.
+fn rack_io_key(rack_id: &str, port: &SharedPort) -> Option<usize> {
+    lock(&RACKS)
+        .get(rack_id)
+        .filter(|rack| Arc::ptr_eq(&rack.port, port))
+        .map(|rack| rack.io_key)
+}
+
 /// Forgets the cached replies of every rack. Called on every CONNACK of the
 /// application connection: the server starts a new instance per connection,
 /// and with it every rack's request id counter restarts at 1.
