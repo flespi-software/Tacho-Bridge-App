@@ -48,8 +48,11 @@
 // Rack scan bar: a calmer take on Quasar's indeterminate animation.
 // The default runs two overlapping dashes on a 2.1s cycle with a sharp
 // cubic-bezier — reads as urgent foreground work and is tiring to sit next to.
-// This is a passive background status, so we slow the sweep down, ease it
-// symmetrically, and drop the second dash entirely (`:after`).
+// This is a passive background status: one dash (the second, `:after`, is
+// dropped) sweeps across at an even pace. Quasar's own keyframes park the dash
+// past the right edge for the last 40% of the cycle, which read as a stall, so
+// the dash runs on keyframes of its own: it enters on the left the moment it
+// has left on the right.
 // The animation lives on the inner `__model` element, not on the root the
 // class is applied to — the root only ever carries `q-linear-progress`.
 .rack-scan-bar {
@@ -57,8 +60,7 @@
 
   .q-linear-progress__model--indeterminate {
     &:before {
-      animation-duration: 3.6s;
-      animation-timing-function: ease-in-out;
+      animation: rackScanSweep 2.2s linear infinite;
     }
 
     // The trailing dash is what makes the default feel busy — one travelling
@@ -67,6 +69,18 @@
       animation: none;
       opacity: 0;
     }
+  }
+}
+
+// A dash a third of the track wide, from just outside the left edge to just
+// outside the right one. The pseudo-element spans the track and scales from
+// its left edge, so the translation is in track widths.
+@keyframes rackScanSweep {
+  from {
+    transform: translate3d(-35%, 0, 0) scale3d(0.35, 1, 1);
+  }
+  to {
+    transform: translate3d(100%, 0, 0) scale3d(0.35, 1, 1);
   }
 }
 
