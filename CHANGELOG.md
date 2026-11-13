@@ -190,3 +190,10 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Rack slot table: address blocks with used, free, faulty and error counters.
+
+### [0.8.1-beta.2] - 2026-11-13
+
+🆕 Features / Improvements
+
+- Rack slots in error are listed with the reason the card could not be identified, any slot can be blinked from the rack grid to find it, and the status badges left the group headers.
+- The main window opens taller to show more cards at once.
