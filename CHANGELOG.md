@@ -212,3 +212,9 @@ All notable changes to this project will be documented in this file.
 - Fixed the pause in the rack scan indicator between sweeps.
 - Fixed card groups staying collapsed after clearing a filter, an opened card closing by itself, an empty slot blink dialog while it starts, and the unknown card highlight vanishing on hover.
 - Fixed rack cards losing their sessions after a settings change in local mode, card identification being interrupted by an app reconnect, and removed card rows coming back after a late session end.
+
+### [0.8.1-beta.5] - 2026-11-15
+
+🛠 Fixes
+
+- Fixed rack cards losing their sessions after a brief misread or a late reply in local mode, identification retries bypassing their backoff, and slow status polls while empty slot lights are switched off.
