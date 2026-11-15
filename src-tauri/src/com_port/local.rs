@@ -12,7 +12,7 @@
 //! round trip per step: the status poll, the slot table of the UI, card
 //! identification, the removal check and the slot indicators. Card sessions
 //! are opened and closed through the same reconcile a server card set uses
-//! (`cards::handle_cards_set`), so everything downstream is unchanged. The
+//! (`cards::apply_cards_set`), so everything downstream is unchanged. The
 //! server keeps what must stay remote: the exchanges of the card sessions.
 //!
 //! The engine of a rack lives as long as its port and does not depend on the
@@ -49,6 +49,16 @@ const IDENTIFY_BATCH: usize = 8;
 /// fails its first initialisation and reads fine a moment later.
 const IDENTIFY_RETRY_INITIAL: Duration = Duration::from_secs(2);
 const IDENTIFY_RETRY_MAX: Duration = Duration::from_secs(600);
+
+/// Failed identifications of a card that may have been swapped before its
+/// session is closed. Until then the session keeps running: a card that was
+/// not swapped at all must not lose it to one failed attempt.
+const RECHECK_ATTEMPTS: u32 = 2;
+
+/// Indicators of empty readers written per status poll. Every empty reader is
+/// darkened once after the engine starts; a full pass over a large rack in one
+/// poll would keep card sessions waiting for the port.
+const LED_OFF_BATCH: usize = 16;
 
 /// Ceiling of the status poll interval while its exchanges keep failing.
 const POLL_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -545,7 +555,8 @@ struct SlotState {
     fail_reason: Option<&'static str>,
     /// The identified card may have been swapped: the slot read as empty for
     /// a moment, or the rack reported an event on it. The card is identified
-    /// again as soon as the slot reads as holding one.
+    /// again as soon as the slot reads as holding one, and keeps its session
+    /// unless that shows another card (or fails `RECHECK_ATTEMPTS` times).
     suspect: bool,
     failures: u32,
     retry_at: Option<Instant>,
@@ -598,13 +609,15 @@ fn observe(slots: &mut [SlotState], profile: &Profile, region: &[u8]) -> Vec<(us
 
 /// A change in the reading of a slot: a known card that read as gone, even
 /// for one poll, may have been swapped and is identified again; a card that
-/// just came in is identified at once, whatever failed before.
-fn on_reading_change(state: &mut SlotState, to: Class) {
+/// just came into an empty slot is identified at once, whatever failed
+/// before. A card that only changes its state (idle, busy, error) keeps the
+/// retry schedule of its failed identifications.
+fn on_reading_change(state: &mut SlotState, from: Class, to: Class) {
     if state.card.is_some() {
         if !to.has_card() {
             state.suspect = true;
         }
-    } else if to.has_card() {
+    } else if to.has_card() && !from.has_card() {
         clear_failure(state);
     }
 }
@@ -618,12 +631,16 @@ fn clear_failure(state: &mut SlotState) {
 }
 
 /// An event the rack sent on its own about a slot: a card went in or out.
-fn on_rack_event(state: &mut SlotState) {
+/// On a slot whose card failed its identification the event brings the next
+/// attempt closer, but never closer than the first pause after a failure, and
+/// the failure count stays: the "event" may be the late reply of the very
+/// identification that failed, and must not turn the backoff into a retry on
+/// every poll.
+fn on_rack_event(state: &mut SlotState, now: Instant) {
     if state.card.is_some() {
         state.suspect = true;
-    } else {
-        state.failures = 0;
-        state.retry_at = None;
+    } else if let Some(at) = state.retry_at {
+        state.retry_at = Some(at.min(now + IDENTIFY_RETRY_INITIAL));
     }
 }
 
@@ -945,7 +962,7 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
                     slots[index].card.as_deref().unwrap_or("-")
                 );
             }
-            on_reading_change(&mut slots[index], to);
+            on_reading_change(&mut slots[index], from, to);
         }
         polls = polls.saturating_add(1);
         for bytes in take_unsolicited(events_key) {
@@ -956,35 +973,14 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
                 bytes.len(),
                 named
             );
+            let now = Instant::now();
             for slot in named {
-                on_rack_event(&mut slots[usize::from(slot) - 1]);
+                on_rack_event(&mut slots[usize::from(slot) - 1], now);
             }
         }
 
         let mut changed = false;
         let now = Instant::now();
-
-        // A card that may have been swapped is identified again once its slot
-        // reads as holding a card: the identity of a slot is never assumed.
-        for index in 0..slots.len() {
-            let slot = (index + 1) as u16;
-            let state = &slots[index];
-            if !state.suspect || state.card.is_none() || !state.class.has_card() {
-                continue;
-            }
-            // an authentication owns the card; checked again after it
-            if super::access::auth_active(&port, slot) {
-                continue;
-            }
-            log::info!(
-                "{} [LOCAL] status=card_recheck slot={} card_id={}",
-                log_header,
-                slot,
-                state.card.as_deref().unwrap_or("-")
-            );
-            forget_card(&mut slots[index]);
-            changed = true;
-        }
 
         // Removals: a known card whose slot reads empty leaves only once the
         // reader of that slot confirms it.
@@ -1015,7 +1011,10 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
             }
         }
 
-        // Identification of cards not known yet, a batch per poll.
+        // Identification of cards not known yet, a batch per poll. A card that
+        // may have been swapped is identified again the same way once its slot
+        // reads as holding a card: the identity of a slot is never assumed, but
+        // the card keeps its session until another card is found there.
         let mut identified = 0;
         for index in 0..slots.len() {
             if identified >= IDENTIFY_BATCH || profile.identify.is_empty() {
@@ -1023,7 +1022,8 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
             }
             let slot = (index + 1) as u16;
             let state = &slots[index];
-            if state.card.is_some()
+            let recheck = state.suspect && state.card.is_some();
+            if (state.card.is_some() && !recheck)
                 || !matches!(state.class, Class::Idle | Class::Error)
                 || state.retry_at.is_some_and(|at| at > now)
                 || super::access::auth_active(&port, slot)
@@ -1035,7 +1035,26 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
                 break;
             }
             identified += 1;
+            if recheck {
+                log::info!(
+                    "{} [LOCAL] status=card_recheck slot={} card_id={}",
+                    log_header,
+                    slot,
+                    state.card.as_deref().unwrap_or("-")
+                );
+            }
             match identify(&profile, &port, slot, &log_header).await {
+                Ok(id) if slots[index].card.as_deref() == Some(id.as_str()) => {
+                    // the same card: it was never swapped, its session stays
+                    slots[index].suspect = false;
+                    clear_failure(&mut slots[index]);
+                    log::info!(
+                        "{} [LOCAL] status=card_confirmed slot={} card_id={}",
+                        log_header,
+                        slot,
+                        id
+                    );
+                }
                 Ok(id) => {
                     log::info!(
                         "{} [LOCAL] status=card_identified slot={} card_id={}",
@@ -1057,13 +1076,31 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
                     let state = &mut slots[index];
                     // a slot an authentication owns is not a failure of the card
                     if reason != SERIAL_ERR_CARD_BUSY {
-                        state.failed = true;
-                        state.fail_reason = Some(reason);
                         state.failures = state.failures.saturating_add(1);
+                        if recheck && state.failures >= RECHECK_ATTEMPTS {
+                            // whatever is in the slot cannot be told from the
+                            // card served there: its session goes
+                            log::warn!(
+                                "{} [LOCAL] status=card_recheck_failed slot={} card_id={}",
+                                log_header,
+                                slot,
+                                state.card.as_deref().unwrap_or("-")
+                            );
+                            state.card = None;
+                            state.suspect = false;
+                            changed = true;
+                        }
+                        // a card kept for its recheck is not shown as failed
+                        if state.card.is_none() {
+                            state.failed = true;
+                            state.fail_reason = Some(reason);
+                        }
                     }
                     let delay = identify_retry_delay(state.failures);
                     state.retry_at = Some(Instant::now() + delay);
-                    state.led = None;
+                    if state.card.is_none() {
+                        state.led = None;
+                    }
                     log::warn!(
                         "{} [LOCAL] status=identify_failed slot={} reason={} retry_secs={}",
                         log_header,
@@ -1094,6 +1131,7 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
         // Indicators: a served card, a card nobody serves (yet), and a repaint
         // after every authentication, which drops what was written before it.
         let served = served_slots(&rack_id);
+        let mut off_writes = 0;
         for index in 0..slots.len() {
             let slot = (index + 1) as u16;
             // A blink owns the indicator while it runs; once it has ended the
@@ -1130,6 +1168,18 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
                 Led::Unserved => profile.led_unserved.as_deref(),
                 Led::Off => profile.led_off.as_deref(),
             };
+            if wanted == Led::Off && template.is_some() {
+                // Darkening an empty reader is cosmetic: a few per poll, and
+                // one attempt each — a reader that does not take it is not
+                // asked again on every poll, each time waiting out its deadline.
+                if off_writes >= LED_OFF_BATCH {
+                    continue;
+                }
+                off_writes += 1;
+                write_led(&profile, &port, template, slot, &log_header).await;
+                slots[index].led = Some(Led::Off);
+                continue;
+            }
             if template.is_none() || write_led(&profile, &port, template, slot, &log_header).await {
                 slots[index].led = Some(wanted);
             }
@@ -1529,22 +1579,48 @@ mod tests {
     #[test]
     fn a_flicker_or_a_rack_event_puts_the_card_up_for_a_recheck() {
         let mut state = SlotState { card: Some("A".to_string()), ..SlotState::default() };
-        on_reading_change(&mut state, Class::Busy);
+        on_reading_change(&mut state, Class::Idle, Class::Busy);
         assert!(!state.suspect);
-        on_reading_change(&mut state, Class::Free);
+        on_reading_change(&mut state, Class::Idle, Class::Free);
         assert!(state.suspect);
+        // the card itself stays: it keeps its session until its recheck
+        assert_eq!(state.card.as_deref(), Some("A"));
         let mut state = SlotState { card: Some("A".to_string()), ..SlotState::default() };
-        on_rack_event(&mut state);
+        on_rack_event(&mut state, Instant::now());
         assert!(state.suspect);
         // a new card in an empty slot is identified at once, past failures aside
-        let mut state = SlotState {
+        let failed = || SlotState {
             failed: true,
             failures: 3,
             retry_at: Some(Instant::now() + Duration::from_secs(60)),
             ..SlotState::default()
         };
-        on_reading_change(&mut state, Class::Idle);
+        let mut state = failed();
+        on_reading_change(&mut state, Class::Free, Class::Idle);
         assert!(!state.failed && state.failures == 0 && state.retry_at.is_none());
+        // a failed card that only changes its state keeps its backoff
+        let mut state = failed();
+        on_reading_change(&mut state, Class::Idle, Class::Error);
+        assert!(state.failed && state.failures == 3 && state.retry_at.is_some());
+    }
+
+    #[test]
+    fn a_rack_event_never_brings_a_failed_identification_closer_than_the_first_pause() {
+        let now = Instant::now();
+        let mut state = SlotState {
+            failed: true,
+            failures: 5,
+            retry_at: Some(now + Duration::from_secs(60)),
+            ..SlotState::default()
+        };
+        on_rack_event(&mut state, now);
+        assert_eq!(state.retry_at, Some(now + IDENTIFY_RETRY_INITIAL));
+        assert_eq!(state.failures, 5);
+        // a retry already due sooner is left alone
+        let soon = now + Duration::from_millis(500);
+        state.retry_at = Some(soon);
+        on_rack_event(&mut state, now);
+        assert_eq!(state.retry_at, Some(soon));
     }
 
     #[test]

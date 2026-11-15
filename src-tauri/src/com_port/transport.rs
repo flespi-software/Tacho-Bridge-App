@@ -27,6 +27,10 @@ struct PortHealth {
     op_faulted: bool,
     /// Consecutive operations that ended with an I/O error.
     failed_ops: u32,
+    /// When the last operation on the port ended without a usable reply: the
+    /// rack may still answer it, and bytes found on the line soon after are
+    /// that late answer rather than an event of the rack.
+    last_failed_op: Option<Instant>,
 }
 
 lazy_static::lazy_static! {
@@ -60,6 +64,12 @@ pub(super) fn port_key(port: &dyn SerialPort) -> usize {
 /// see. Bounded, since a rack the server drives has no engine to drain them.
 static UNSOLICITED: std::sync::Mutex<Vec<(usize, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
 const UNSOLICITED_MAX: usize = 64;
+
+/// How long after a failed operation stale bytes on its port are taken for
+/// its late reply and kept out of the rack events: a timed-out card operation
+/// still answers, and that answer starts with the frame head and the address
+/// of its slot exactly like an event of the rack would.
+const LATE_REPLY_WINDOW: Duration = Duration::from_secs(10);
 
 fn record_unsolicited(key: usize, bytes: &[u8]) {
     let mut list = super::lock(&UNSOLICITED);
@@ -121,6 +131,23 @@ fn note_io_fault(port: &dyn SerialPort) {
     if let Some(health) = super::lock(&PORT_HEALTH).get_mut(&port_key(port)) {
         health.op_faulted = true;
     }
+}
+
+/// Records an operation that ended without a usable reply (see
+/// `PortHealth::last_failed_op`).
+fn note_failed_op(port: &dyn SerialPort) {
+    if let Some(health) = super::lock(&PORT_HEALTH).get_mut(&port_key(port)) {
+        health.last_failed_op = Some(Instant::now());
+    }
+}
+
+/// Whether stale bytes on the port may be the late reply of an operation that
+/// failed shortly before.
+fn late_reply_possible(port: &dyn SerialPort) -> bool {
+    super::lock(&PORT_HEALTH)
+        .get(&port_key(port))
+        .and_then(|health| health.last_failed_op)
+        .is_some_and(|at| at.elapsed() < LATE_REPLY_WINDOW)
 }
 
 fn note_io_ok(port: &dyn SerialPort) {
@@ -846,7 +873,14 @@ fn settle_line(
         log_header,
         pending.len()
     );
-    record_unsolicited(port_key(&**port), &pending);
+    if late_reply_possible(&**port) {
+        log::debug!(
+            "{} [SERIAL] stale bytes taken for a late reply, not a rack event",
+            log_header
+        );
+    } else {
+        record_unsolicited(port_key(&**port), &pending);
+    }
     if !resync_line(port, log_header) {
         log::warn!("{} [SERIAL] tx skipped reason=line_not_quiet", log_header);
         return Err((
@@ -1020,6 +1054,7 @@ fn run_envelope_inner(
     // to answer it. Those bytes are drained here, under the same port lock, so the next
     // operation starts on a quiet line instead of reading someone else's frame first.
     if !outcome.exchange.is_ok() {
+        note_failed_op(&**port);
         resync_line(port, log_header);
     }
     outcome
@@ -1255,6 +1290,18 @@ mod tests {
 
         untrack_port(key);
         assert_eq!(port_failed_ops(key), 0);
+    }
+
+    #[test]
+    fn stale_bytes_after_a_failed_operation_are_taken_for_its_late_reply() {
+        let port: Box<dyn SerialPort> = Box::new(ScriptedPort::new(&[]));
+        let key = port_key(&*port);
+        track_port(key);
+        assert!(!late_reply_possible(&*port));
+        note_failed_op(&*port);
+        assert!(late_reply_possible(&*port));
+        untrack_port(key);
+        assert!(!late_reply_possible(&*port));
     }
     use std::time::Duration;
 
