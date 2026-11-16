@@ -88,11 +88,10 @@
       <div class="cb-slots__legend">
         <span><i class="cb-slot cb-slot--free" /> free</span>
         <span><i class="cb-slot cb-slot--faulty" /> reader not answering</span>
-        <span><i class="cb-slot cb-slot--card" /> card, not identified</span>
+        <span><i class="cb-slot cb-slot--card" /> unknown / not identified</span>
         <span><i class="cb-slot cb-slot--discovered cb-slot--online" /> card online</span>
         <span><i class="cb-slot cb-slot--discovered cb-slot--active" /> authenticating</span>
         <span><i class="cb-slot cb-slot--discovered cb-slot--offline" /> card offline</span>
-        <span><i class="cb-slot cb-slot--discovered cb-slot--unlinked" /> unknown card</span>
         <span><i class="cb-slot cb-slot--error" /> error</span>
       </div>
     </div>

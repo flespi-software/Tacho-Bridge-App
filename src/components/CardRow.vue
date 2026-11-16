@@ -24,6 +24,9 @@
           {{ rowTitle }}
         </span>
         <span v-if="rowSub" class="cb-row__sub">{{ rowSub }}</span>
+        <span v-if="entry.readerModel" class="cb-row__reader-model" :title="entry.readerName">
+          {{ entry.readerModel }}
+        </span>
       </span>
       <span class="cb-row__meta">
         <span
@@ -65,7 +68,10 @@
       v-else
       type="button"
       class="cb-tile"
-      :class="[`cb-tile--${entry.status}`, { 'cb-tile--open': open }]"
+      :class="[
+        `cb-tile--${entry.status}`,
+        { 'cb-tile--open': open, 'cb-tile--reader': !!entry.readerModel },
+      ]"
       :aria-expanded="isEmpty ? undefined : open"
       :disabled="isEmpty"
       :title="tileTip"
@@ -85,6 +91,9 @@
         <span v-if="attention" class="cb-tile__att" role="img" aria-label="Needs attention">!</span>
       </span>
       <span class="cb-tile__sub">{{ rowSub }}</span>
+      <span v-if="entry.readerModel" class="cb-tile__reader-model" :title="entry.readerName">
+        {{ entry.readerModel }}
+      </span>
       <span v-if="view === 'tiles'" class="cb-tile__note" :class="`cb-tone--${note.tone}`">
         {{ note.text }}
       </span>
@@ -437,6 +446,10 @@ const facts = computed(() => {
     },
     { k: 'Location', v: props.entry.place },
   ]
+  if (props.entry.readerModel) {
+    out.push({ k: 'Reader model', v: props.entry.readerModel })
+    out.push({ k: 'Reader device', v: props.entry.readerName || props.entry.readerModel })
+  }
   if (props.entry.fault !== undefined) {
     out.push({ k: 'Problem', v: faultDetail(props.entry.fault), tone: 'danger' })
   }

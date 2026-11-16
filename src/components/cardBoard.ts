@@ -50,6 +50,10 @@ export interface CardEntry {
   /** Configured card number; empty for an unlinked card or an empty reader. */
   number: string
   name: string
+  /** Reader model as reported by PC/SC, without common instance suffixes. */
+  readerModel?: string
+  /** Full PC/SC device name, retained to distinguish identical readers. */
+  readerName?: string
   /** Configuration entry, when the card is configured. */
   card?: SmartCard | undefined
   /** The card sits in a rack that is disconnected. */
@@ -90,15 +94,33 @@ function sessionStatus(
   return authentication ? 'active' : 'online'
 }
 
+export function readerModelName(name: string): string {
+  return (
+    name
+      .trim()
+      .replace(/\s+\d{2}\s+\d{2}$/, '')
+      .replace(/(\breader)\s+\d{1,2}$/i, '$1')
+      .replace(/\s+/g, ' ')
+      .trim() || 'Unknown reader'
+  )
+}
+
+export function readerGroupId(model: string): string {
+  return `${READERS_GROUP}:${encodeURIComponent(model.toLowerCase())}`
+}
+
 function readerEntry(reader: Reader, index: number, cards: Record<string, SmartCard>): CardEntry {
+  const model = readerModelName(reader.name)
   const base = {
     key: `${READERS_GROUP}:${reader.name}`,
-    groupId: READERS_GROUP,
+    groupId: readerGroupId(model),
     slot: index + 1,
     slotLabel: `R${index + 1}`,
     place: `${reader.name} reader`,
     iccid: reader.iccid,
     rackDown: false,
+    readerModel: model,
+    readerName: reader.name,
   }
   // A reader that PC/SC no longer knows, or one without a readable card, is
   // shown as an empty slot — the same rule the old readers list applied.
@@ -234,7 +256,7 @@ function countsLine(c: SlotCounts): string {
 const SLOT_CLASS_TEXT: Record<SlotClass, string> = {
   free: 'free',
   faulty: 'empty reader, not answering',
-  card: 'card, not identified yet',
+  card: 'unknown / not identified',
   discovered: 'card',
   error: 'card in error',
 }
@@ -243,7 +265,7 @@ const SESSION_TEXT: Partial<Record<CardStatus, string>> = {
   active: 'authenticating',
   online: 'online',
   offline: 'offline',
-  unlinked: 'unknown card',
+  unlinked: 'unknown / not identified',
 }
 
 /**
@@ -336,7 +358,7 @@ export function rackGroupId(rack: RackState): string {
 }
 
 /**
- * Builds the location groups: USB readers first, then every rack, then the
+ * Builds the location groups: USB reader models first, then every rack, then the
  * configured cards that are not inserted anywhere (only when there are any).
  */
 export function buildGroups(
@@ -345,20 +367,39 @@ export function buildGroups(
   cards: Record<string, SmartCard>,
 ): CardGroup[] {
   const readerRows = readers.map((r, i) => readerEntry(r, i, cards))
-  const withCard = readerRows.filter((e) => e.status !== 'empty').length
-  const groups: CardGroup[] = [
-    {
+  const readerGroups = new Map<string, CardGroup>()
+  for (const entry of readerRows) {
+    let group = readerGroups.get(entry.groupId)
+    if (!group) {
+      group = {
+        id: entry.groupId,
+        kind: 'reader',
+        title: 'USB Readers',
+        label: `USB · ${entry.readerModel!}`,
+        subtitle: '',
+        down: false,
+        entries: [],
+      }
+      readerGroups.set(entry.groupId, group)
+    }
+    group.entries.push(entry)
+  }
+  const groups = [...readerGroups.values()].sort((a, b) => a.label.localeCompare(b.label))
+  for (const group of groups) {
+    const withCard = group.entries.filter((e) => e.status !== 'empty').length
+    group.subtitle = `${plural(group.entries.length, 'reader')} · ${withCard} with a card`
+  }
+  if (!groups.length) {
+    groups.push({
       id: READERS_GROUP,
       kind: 'reader',
-      title: 'USB readers',
+      title: 'USB Readers',
       label: 'USB readers',
-      subtitle: readers.length
-        ? `${plural(readers.length, 'reader')} · ${withCard} with a card`
-        : 'no readers connected',
+      subtitle: 'no readers connected',
       down: false,
       entries: readerRows,
-    },
-  ]
+    })
+  }
 
   const nameCount = new Map<string, number>()
   for (const rack of racks) nameCount.set(rack.name, (nameCount.get(rack.name) ?? 0) + 1)
@@ -450,6 +491,8 @@ export function matchesSearch(entry: CardEntry, query: string): boolean {
     entry.card?.company_name ?? '',
     entry.place,
     entry.slotLabel,
+    entry.readerModel ?? '',
+    entry.readerName ?? '',
   ]
     .join(' ')
     .toLowerCase()

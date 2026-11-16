@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import {
   buildGroups,
+  readerModelName,
+  readerGroupId,
   needsAttention,
   matchesSearch,
   matchesStatus,
@@ -50,7 +52,7 @@ describe('buildGroups', () => {
       [],
       cards,
     )
-    expect(groups.map((g) => g.id)).toEqual(['readers'])
+    expect(groups.map((g) => g.id)).toEqual([readerGroupId('ACS ACR39U')])
   })
 
   it('maps reader states to row statuses', () => {
@@ -72,7 +74,10 @@ describe('buildGroups', () => {
       ],
       [],
       cards,
-    )[0]!.entries
+    )
+      .filter((g) => g.kind === 'reader')
+      .flatMap((g) => g.entries)
+      .sort((a, b) => a.slot - b.slot)
     expect(rows.map((e) => e.status)).toEqual([
       'empty',
       'unlinked',
@@ -92,6 +97,30 @@ describe('buildGroups', () => {
       {},
     )[0]!.entries
     expect(rows[0]?.status).toBe('offline')
+  })
+
+  it('groups matching reader models while retaining physical reader identities and statuses', () => {
+    const inputs = [
+      reader({ name: 'ACS ACR39U ICC Reader 00 00', iccid: '01', card_number: 'A', online: true }),
+      reader({ name: 'Alcor Micro AU9540 00 00', iccid: '02' }),
+      reader({ name: 'ACS ACR39U ICC Reader 01 00' }),
+    ]
+    const groups = buildGroups(inputs, [], { A: { name: 'Card A', iccid: '01' } })
+    const acs = groups.find((g) => g.id === readerGroupId('ACS ACR39U ICC Reader'))!
+    expect(acs.entries.map((e) => e.slotLabel)).toEqual(['R1', 'R3'])
+    expect(acs.title).toBe('USB Readers')
+    expect(acs.subtitle).toBe('2 readers · 1 with a card')
+    expect(acs.entries[0]?.readerModel).toBe('ACS ACR39U ICC Reader')
+    expect(acs.entries[0]?.readerName).toBe(inputs[0]!.name)
+    expect(acs.entries[0]?.status).toBe('online')
+    expect(acs.entries[1]?.status).toBe('empty')
+    const alcor = groups.find((g) => g.id === readerGroupId('Alcor Micro AU9540'))!
+    expect(alcor.title).toBe('USB Readers')
+    expect(alcor.entries[0]?.status).toBe('unlinked')
+    expect(matchesSearch(acs.entries[0]!, 'acr39u')).toBe(true)
+    expect(matchesSearch(acs.entries[0]!, '00 00')).toBe(true)
+    const afterRemoval = buildGroups(inputs.slice(0, 2), [], { A: { iccid: '01' } })
+    expect(afterRemoval.find((g) => g.id === acs.id)?.entries[0]?.key).toBe(acs.entries[0]?.key)
   })
 
   it('sorts rack slots and marks the cards of a disconnected rack offline', () => {
@@ -149,6 +178,17 @@ describe('buildGroups', () => {
     // Sorted by name for the default (slot) order.
     expect(none.entries.map((e) => e.number)).toEqual(['YYY0000000000001', 'ZZZ0000000000001'])
     expect(none.entries.every((e) => e.status === 'absent')).toBe(true)
+  })
+})
+
+describe('readerModelName', () => {
+  it('removes common instance suffixes without removing numeric model versions', () => {
+    expect(readerModelName('Alcor Micro AU9540 01 00')).toBe('Alcor Micro AU9540')
+    expect(readerModelName('ACS ACR39U ICC Reader 2')).toBe('ACS ACR39U ICC Reader')
+    expect(readerModelName('OMNIKEY CardMan 3121')).toBe('OMNIKEY CardMan 3121')
+    expect(readerModelName('Identiv SCR3310 v2.0')).toBe('Identiv SCR3310 v2.0')
+    expect(readerModelName('Generic USB2.0-CRW')).toBe('Generic USB2.0-CRW')
+    expect(readerModelName('')).toBe('Unknown reader')
   })
 })
 

@@ -214,6 +214,7 @@ import {
   nextViewSlot,
   viewSlot,
   NOT_INSERTED_GROUP,
+  READERS_GROUP,
   SORTERS,
   plural,
   type CardView,
@@ -301,7 +302,11 @@ function toggleGroup(id: string, open: boolean): void {
 // Readers and racks start expanded, the not-inserted list collapsed — the
 // same as the old screen, where the card list was folded.
 function isGroupOpen(id: string): boolean {
-  return openGroups[id] ?? id !== NOT_INSERTED_GROUP
+  return (
+    openGroups[id] ??
+    (id.startsWith(`${READERS_GROUP}:`) ? openGroups[READERS_GROUP] : undefined) ??
+    id !== NOT_INSERTED_GROUP
+  )
 }
 
 // The view is remembered separately for a normal and a stretched window, so

@@ -22,6 +22,7 @@ body {
   --cb-unlinked: #a5661f;
   --cb-warn-text: #8c5112;
   --cb-danger: #b7333b;
+  --cb-slot-error: #c92d3c;
   --cb-danger-text: #a02e38;
   --cb-danger-bd: #e9bac0;
   --cb-offline-dot: #7b889b;
@@ -78,6 +79,7 @@ body.body--dark {
   --cb-unlinked: #efc184;
   --cb-warn-text: #f4cb90;
   --cb-danger: #ffadb3;
+  --cb-slot-error: #dc3545;
   --cb-danger-text: #ffb6bf;
   --cb-danger-bd: #73505a;
   --cb-offline-dot: #9baabd;
@@ -724,8 +726,8 @@ $cb-scrollbar: 10px;
   }
   &--error {
     border-color: transparent;
-    background: var(--cb-danger);
-    color: var(--cb-status-fill-fg);
+    background: var(--cb-slot-error);
+    color: #ffffff;
   }
 }
 
@@ -915,6 +917,19 @@ $cb-scrollbar: 10px;
   font-size: 11px;
   white-space: nowrap;
   flex-shrink: 0;
+}
+
+.cb-row__reader-model,
+.cb-tile__reader-model {
+  color: var(--cb-text2);
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 13px;
+  font-weight: 400;
+  flex-shrink: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .cb-link-pill {
@@ -1203,6 +1218,14 @@ $cb-scrollbar: 10px;
 
   .cb-tiles--mini & {
     height: 46px;
+  }
+
+  &--reader {
+    height: 81px;
+  }
+
+  .cb-tiles--mini &--reader {
+    height: 61px;
   }
 
   // Status stripe on the left edge.
