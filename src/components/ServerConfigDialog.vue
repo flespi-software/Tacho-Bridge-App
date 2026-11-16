@@ -4,241 +4,243 @@
     persistent
     @update:model-value="$emit('update:modelValue', $event)"
   >
-    <q-card style="width: 560px; max-width: 95vw">
-      <q-card-section class="row items-center q-pb-sm">
+    <q-card class="app-settings-dialog">
+      <q-card-section class="app-settings-dialog__header row items-center">
         <q-icon name="mdi-cog" size="28px" color="primary" class="q-mr-sm" />
         <div class="text-h6">Settings</div>
         <q-space />
-        <q-btn flat round dense icon="mdi-close" v-close-popup />
+        <q-btn flat round dense icon="mdi-close" aria-label="Close settings" v-close-popup />
       </q-card-section>
 
       <q-separator />
 
-      <q-card-section class="q-pt-md q-pb-sm">
-        <div class="text-subtitle2 text-grey-7 q-mb-sm">Server</div>
-        <q-input
-          label="App ident"
-          outlined
-          dense
-          v-model="identInput"
-          autofocus
-          maxlength="16"
-          @keyup.enter="saveServerConfig"
-          :error="!isIdentValid"
-          error-message="Must be TBA + 13 digits, e.g. TBA0000000000001"
-          hide-bottom-space
-          class="q-mb-sm"
-        >
-          <template v-slot:prepend>
-            <q-icon name="mdi-identifier" size="xs" />
-          </template>
-        </q-input>
-        <q-input
-          label="Server address"
-          outlined
-          dense
-          v-model="hostValue"
-          :error="hostValue.trim() !== '' && !isHostValid"
-          error-message="Expected host:port, e.g. mqtt.flespi.io:8883"
-          hide-bottom-space
-          @keyup.enter="saveServerConfig"
-        >
-          <template v-slot:prepend>
-            <q-icon name="mdi-server-network" size="xs" />
-          </template>
-        </q-input>
-      </q-card-section>
-
-      <q-separator inset />
-
-      <q-card-section class="q-py-sm">
-        <div class="text-subtitle2 text-grey-7 q-mb-sm">Authentication</div>
-        <q-toggle v-model="authEnabled" label="Server authentication" dense class="q-mb-sm">
-          <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
-            Signs every connection to the server in with a username and password (a flespi token
-            goes into the username). Off: anonymous connection.
-          </q-tooltip>
-        </q-toggle>
-        <template v-if="authEnabled">
+      <div class="app-settings-dialog__body">
+        <q-card-section class="q-pt-md q-pb-sm">
+          <div class="app-settings-dialog__heading q-mb-sm">Server</div>
           <q-input
-            label="Username"
+            label="App ident"
             outlined
             dense
-            v-model="authUsername"
-            autocomplete="off"
-            class="q-mb-sm"
-            :error="!isUsernameValid"
-            error-message="Username is required"
+            v-model="identInput"
+            autofocus
+            maxlength="16"
+            @keyup.enter="saveServerConfig"
+            :error="!isIdentValid"
+            error-message="Must be TBA + 13 digits, e.g. TBA0000000000001"
             hide-bottom-space
-            @update:model-value="credentialsDirty = true"
+            class="q-mb-sm"
           >
             <template v-slot:prepend>
-              <q-icon name="mdi-account-key" size="xs" />
+              <q-icon name="mdi-identifier" size="xs" />
             </template>
           </q-input>
           <q-input
-            label="Password"
+            label="Server address"
             outlined
             dense
-            v-model="authPassword"
-            :type="authPasswordVisible ? 'text' : 'password'"
-            autocomplete="new-password"
-            class="q-mb-sm"
-            @update:model-value="credentialsDirty = true"
+            v-model="hostValue"
+            :error="hostValue.trim() !== '' && !isHostValid"
+            error-message="Expected host:port, e.g. mqtt.flespi.io:8883"
+            hide-bottom-space
+            @keyup.enter="saveServerConfig"
           >
             <template v-slot:prepend>
-              <q-icon name="mdi-form-textbox-password" size="xs" />
-            </template>
-            <template v-slot:append>
-              <q-icon
-                :name="authPasswordVisible ? 'mdi-eye-off' : 'mdi-eye'"
-                class="cursor-pointer"
-                @click="authPasswordVisible = !authPasswordVisible"
-              />
+              <q-icon name="mdi-server-network" size="xs" />
             </template>
           </q-input>
-          <q-checkbox
-            v-model="saveCredentials"
-            label="Save to config and use for sign-in"
+        </q-card-section>
+
+        <q-separator inset />
+
+        <q-card-section class="q-py-sm">
+          <div class="app-settings-dialog__heading q-mb-sm">Authentication</div>
+          <q-toggle v-model="authEnabled" label="Server authentication" dense class="q-mb-sm">
+            <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
+              Signs every connection to the server in with a username and password (a flespi token
+              goes into the username). Off: anonymous connection.
+            </q-tooltip>
+          </q-toggle>
+          <template v-if="authEnabled">
+            <q-input
+              label="Username"
+              outlined
+              dense
+              v-model="authUsername"
+              autocomplete="off"
+              class="q-mb-sm"
+              :error="!isUsernameValid"
+              error-message="Username is required"
+              hide-bottom-space
+              @update:model-value="credentialsDirty = true"
+            >
+              <template v-slot:prepend>
+                <q-icon name="mdi-account-key" size="xs" />
+              </template>
+            </q-input>
+            <q-input
+              label="Password"
+              outlined
+              dense
+              v-model="authPassword"
+              :type="authPasswordVisible ? 'text' : 'password'"
+              autocomplete="new-password"
+              class="q-mb-sm"
+              @update:model-value="credentialsDirty = true"
+            >
+              <template v-slot:prepend>
+                <q-icon name="mdi-form-textbox-password" size="xs" />
+              </template>
+              <template v-slot:append>
+                <q-icon
+                  :name="authPasswordVisible ? 'mdi-eye-off' : 'mdi-eye'"
+                  class="cursor-pointer"
+                  @click="authPasswordVisible = !authPasswordVisible"
+                />
+              </template>
+            </q-input>
+            <q-checkbox
+              v-model="saveCredentials"
+              label="Save to config and use for sign-in"
+              dense
+              class="q-mb-sm"
+            >
+              <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
+                Unchecked: the credentials are kept in memory for this run only and never written to
+                config.yaml. The application asks for them again at the next launch.
+              </q-tooltip>
+            </q-checkbox>
+          </template>
+        </q-card-section>
+
+        <q-separator inset />
+
+        <q-card-section class="q-py-sm">
+          <div class="app-settings-dialog__heading q-mb-sm">Appearance</div>
+          <q-btn-toggle
+            :model-value="themeMode"
+            dense
+            unelevated
+            toggle-color="primary"
+            :options="[
+              { label: 'Auto', value: 'Auto', icon: 'mdi-brightness-auto' },
+              { label: 'Light', value: 'Light', icon: 'mdi-white-balance-sunny' },
+              { label: 'Dark', value: 'Dark', icon: 'mdi-weather-night' },
+            ]"
+            @update:model-value="onThemeSelected"
+          />
+        </q-card-section>
+
+        <q-separator inset />
+
+        <q-card-section class="q-py-sm">
+          <div class="app-settings-dialog__heading q-mb-sm">System</div>
+          <!-- Applies immediately (like the theme), no Save needed: the OS is
+             the source of truth, the state is re-read every dialog open. -->
+          <q-toggle
+            :model-value="autostartEnabled"
+            label="Launch at system startup"
+            dense
+            class="q-mb-sm"
+            :disable="autostartBusy"
+            @update:model-value="onAutostartToggled"
+          >
+            <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
+              Starts the application automatically when you log in, minimized to the tray.
+              Recommended for unattended machines with a card rack.
+            </q-tooltip>
+          </q-toggle>
+        </q-card-section>
+
+        <q-separator inset />
+
+        <q-card-section class="q-py-sm">
+          <div class="app-settings-dialog__heading q-mb-sm">Updates</div>
+          <q-toggle
+            v-model="betaUpdates"
+            label="Receive pre-release updates (alpha/beta)"
+            dense
+            class="q-mb-sm"
+          />
+          <q-toggle
+            v-model="autoInstallUpdates"
+            label="Automatically install new updates"
             dense
             class="q-mb-sm"
           >
             <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
-              Unchecked: the credentials are kept in memory for this run only and never written to
-              config.yaml. The application asks for them again at the next launch.
+              Checks for updates hourly and installs them without asking. The application restarts
+              on its own, waiting for a pause in card activity so an authentication in progress is
+              never interrupted.
             </q-tooltip>
-          </q-checkbox>
-        </template>
-      </q-card-section>
-
-      <q-separator inset />
-
-      <q-card-section class="q-py-sm">
-        <div class="text-subtitle2 text-grey-7 q-mb-sm">Appearance</div>
-        <q-btn-toggle
-          :model-value="themeMode"
-          dense
-          unelevated
-          toggle-color="primary"
-          :options="[
-            { label: 'Auto', value: 'Auto', icon: 'mdi-brightness-auto' },
-            { label: 'Light', value: 'Light', icon: 'mdi-white-balance-sunny' },
-            { label: 'Dark', value: 'Dark', icon: 'mdi-weather-night' },
-          ]"
-          @update:model-value="onThemeSelected"
-        />
-      </q-card-section>
-
-      <q-separator inset />
-
-      <q-card-section class="q-py-sm">
-        <div class="text-subtitle2 text-grey-7 q-mb-sm">System</div>
-        <!-- Applies immediately (like the theme), no Save needed: the OS is
-             the source of truth, the state is re-read every dialog open. -->
-        <q-toggle
-          :model-value="autostartEnabled"
-          label="Launch at system startup"
-          dense
-          class="q-mb-sm"
-          :disable="autostartBusy"
-          @update:model-value="onAutostartToggled"
-        >
-          <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
-            Starts the application automatically when you log in, minimized to the tray. Recommended
-            for unattended machines with a card rack.
-          </q-tooltip>
-        </q-toggle>
-      </q-card-section>
-
-      <q-separator inset />
-
-      <q-card-section class="q-py-sm">
-        <div class="text-subtitle2 text-grey-7 q-mb-sm">Updates</div>
-        <q-toggle
-          v-model="betaUpdates"
-          label="Receive pre-release updates (alpha/beta)"
-          dense
-          class="q-mb-sm"
-        />
-        <q-toggle
-          v-model="autoInstallUpdates"
-          label="Automatically install new updates"
-          dense
-          class="q-mb-sm"
-        >
-          <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
-            Checks for updates hourly and installs them without asking. The application restarts on
-            its own, waiting for a pause in card activity so an authentication in progress is never
-            interrupted.
-          </q-tooltip>
-        </q-toggle>
-        <div class="row q-gutter-sm">
-          <q-btn
-            outline
-            dense
-            no-caps
-            color="primary"
-            icon="mdi-update"
-            label="Check for updates"
-            :loading="checking"
-            @click="checkForUpdates"
-          />
-          <q-btn
-            outline
-            dense
-            no-caps
-            color="grey-7"
-            icon="mdi-text-box-outline"
-            label="Changelog"
-            @click="openChangelog"
-          />
-        </div>
-      </q-card-section>
-
-      <q-separator inset />
-
-      <q-card-section class="q-py-sm">
-        <div class="text-subtitle2 text-grey-7 q-mb-sm">Diagnostics</div>
-        <q-toggle
-          v-model="debugLogEnabled"
-          label="Extended debug log"
-          dense
-          class="q-mb-sm"
-          @update:model-value="debugLogDirty = true"
-        >
-          <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
-            Writes detailed card rack and connection diagnostics to the log file for the chosen
-            time, then switches itself off. The log grows faster while it is on.
-          </q-tooltip>
-        </q-toggle>
-        <div v-if="debugLogEnabled" class="row items-center q-gutter-sm">
-          <q-select
-            v-model="debugLogDuration"
-            :options="DEBUG_LOG_DURATIONS"
-            label="Duration"
-            outlined
-            dense
-            emit-value
-            map-options
-            style="min-width: 160px"
-            @update:model-value="debugLogDirty = true"
-          />
-          <div v-if="debugLogActiveHint && !debugLogDirty" class="text-caption text-grey-7">
-            {{ debugLogActiveHint }}
+          </q-toggle>
+          <div class="row q-gutter-sm">
+            <q-btn
+              outline
+              dense
+              no-caps
+              color="primary"
+              icon="mdi-update"
+              label="Check for updates"
+              :loading="checking"
+              @click="checkForUpdates"
+            />
+            <q-btn
+              outline
+              dense
+              no-caps
+              color="grey-7"
+              icon="mdi-text-box-outline"
+              label="Changelog"
+              @click="openChangelog"
+            />
           </div>
-        </div>
-      </q-card-section>
+        </q-card-section>
 
-      <q-card-actions align="right" class="q-px-md q-pb-md">
-        <q-btn flat label="Cancel" color="grey-7" v-close-popup />
+        <q-separator inset />
+
+        <q-card-section class="q-py-sm">
+          <div class="app-settings-dialog__heading q-mb-sm">Diagnostics</div>
+          <q-toggle
+            v-model="debugLogEnabled"
+            label="Extended debug log"
+            dense
+            class="q-mb-sm"
+            @update:model-value="debugLogDirty = true"
+          >
+            <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
+              Writes detailed card rack and connection diagnostics to the log file for the chosen
+              time, then switches itself off. The log grows faster while it is on.
+            </q-tooltip>
+          </q-toggle>
+          <div v-if="debugLogEnabled" class="row items-center q-gutter-sm">
+            <q-select
+              v-model="debugLogDuration"
+              :options="DEBUG_LOG_DURATIONS"
+              label="Duration"
+              outlined
+              dense
+              emit-value
+              map-options
+              style="min-width: 160px"
+              @update:model-value="debugLogDirty = true"
+            />
+            <div v-if="debugLogActiveHint && !debugLogDirty" class="text-caption text-grey-7">
+              {{ debugLogActiveHint }}
+            </div>
+          </div>
+        </q-card-section>
+      </div>
+
+      <q-card-actions align="right" class="app-settings-dialog__actions">
+        <q-btn flat no-caps label="Cancel" class="app-dialog-cancel" v-close-popup />
         <!-- No v-close-popup: the dialog closes from saveServerConfig only after
              the settings are confirmed persisted; on failure it stays open so
              the user can see the error and retry. -->
         <q-btn
           unelevated
-          rounded
+          no-caps
           label="Save"
-          color="primary"
+          class="cb-btn-primary"
           :loading="saving"
           :disable="!canSave"
           @click="saveServerConfig"
