@@ -218,3 +218,12 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed rack cards losing their sessions after a brief misread or a late reply in local mode, identification retries bypassing their backoff, and slow status polls while empty slot lights are switched off.
+
+### [0.8.1-beta.6] - 2026-11-16
+
+🆕 Features / Improvements
+
+- Refreshed the card list design: equal side margins with a scrollbar, a more visible slot map button.
+- refresh themes, board layout and responsive slot map.
+- improve settings readability and scrolling.
+- unify card names, identifiers and status display.
