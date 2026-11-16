@@ -40,6 +40,12 @@ body {
   --cb-radio-on: #eef3f6;
   --cb-chip-on-bg: #37474f;
   --cb-chip-on-fg: #ffffff;
+  --cb-accent-bg: #e8f1fc;
+  --cb-accent-bg-hover: #d6e7fa;
+  --cb-accent-bd: #a9cbf1;
+  --cb-shadow: 0 1px 2px rgba(16, 24, 40, 0.05), 0 2px 6px rgba(16, 24, 40, 0.05);
+  --cb-thumb: rgba(55, 71, 79, 0.28);
+  --cb-thumb-hover: rgba(55, 71, 79, 0.5);
 }
 
 body.body--dark {
@@ -78,7 +84,19 @@ body.body--dark {
   --cb-radio-on: #455a64;
   --cb-chip-on-bg: #90a4ae;
   --cb-chip-on-fg: #1c262b;
+  --cb-accent-bg: rgba(144, 202, 249, 0.14);
+  --cb-accent-bg-hover: rgba(144, 202, 249, 0.24);
+  --cb-accent-bd: rgba(144, 202, 249, 0.45);
+  --cb-shadow: 0 1px 2px rgba(0, 0, 0, 0.18), 0 2px 8px rgba(0, 0, 0, 0.12);
+  --cb-thumb: rgba(207, 216, 220, 0.25);
+  --cb-thumb-hover: rgba(207, 216, 220, 0.45);
 }
+
+// Side margin of the board, and the width the scroll area gives its
+// scrollbar. The scrollbar sits inside the right margin (see .cb-scroll), so
+// both have to be known here rather than left to the platform.
+$cb-gutter: 14px;
+$cb-scrollbar: 10px;
 
 .cb-mono {
   font-family: 'Roboto Mono', ui-monospace, Menlo, Consolas, monospace;
@@ -116,7 +134,7 @@ body.body--dark {
   flex-shrink: 0;
   background: var(--cb-surface);
   border-bottom: 1px solid var(--cb-border);
-  padding: 10px 12px;
+  padding: 12px $cb-gutter;
 }
 
 .cb-toolbar__inner,
@@ -168,8 +186,8 @@ body.body--dark {
 
 .cb-chip {
   height: 30px;
-  padding: 0 10px;
-  border: 1px solid var(--cb-input-bd);
+  padding: 0 11px 0 10px;
+  border: 1px solid var(--cb-border);
   border-radius: 15px;
   background: var(--cb-surface);
   font-size: 13px;
@@ -177,9 +195,19 @@ body.body--dark {
   align-items: center;
   gap: 6px;
   cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease;
 
   b {
-    font-weight: 500;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.85;
+  }
+
+  &:hover:not(.cb-chip--on) {
+    background: var(--cb-surface2);
+    border-color: var(--cb-input-bd);
   }
 
   &--on {
@@ -297,18 +325,44 @@ body.body--dark {
 .cb-scroll {
   flex: 1 1 auto;
   min-height: 0;
-  overflow-y: auto;
-  // Classic scrollbars take width: keep their room reserved, so the list does
-  // not shift sideways (and tiles do not reflow) when the scrollbar comes and
-  // goes as filters change or the window is resized.
+  // The scrollbar always has its room, so the list does not shift sideways
+  // (and tiles do not reflow) when it comes and goes as filters change or
+  // the window is resized. Its width is fixed by the styling below and it
+  // sits inside the right margin: the right padding is the margin minus the
+  // scrollbar, so the gaps on both sides of the groups are equal whether or
+  // not the list scrolls, with overlay and classic scrollbars alike, and the
+  // groups line up with the toolbar above.
+  overflow-y: scroll;
   scrollbar-gutter: stable;
-  padding: 10px 12px 16px;
+  padding: 12px ($cb-gutter - $cb-scrollbar) 16px $cb-gutter;
+
+  &::-webkit-scrollbar {
+    width: $cb-scrollbar;
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  // A thin rounded thumb: the transparent border insets it in the gutter.
+  &::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: $cb-scrollbar;
+    background: var(--cb-thumb);
+    background-clip: padding-box;
+
+    &:hover {
+      background: var(--cb-thumb-hover);
+      background-clip: padding-box;
+    }
+  }
 }
 
 .cb-scroll__inner {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
 
 .cb-nothing {
@@ -322,7 +376,8 @@ body.body--dark {
   flex-shrink: 0;
   background: var(--cb-surface);
   border: 1px solid var(--cb-border);
-  border-radius: 10px;
+  border-radius: 12px;
+  box-shadow: var(--cb-shadow);
   // clip, not hidden: hidden would make the group the scroll container and
   // break the sticky header.
   overflow: clip;
@@ -355,6 +410,19 @@ body.body--dark {
   cursor: pointer;
 }
 
+// The location icon on a soft tile of its own tone.
+.cb-group__icon {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--cb-track);
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+
 .cb-group__chevron {
   color: var(--cb-icon);
   transition: transform 0.15s ease;
@@ -369,7 +437,7 @@ body.body--dark {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 6px;
 }
 
 .cb-group__titleline {
@@ -394,7 +462,7 @@ body.body--dark {
 
 .cb-segs {
   display: flex;
-  height: 6px;
+  height: 5px;
   border-radius: 3px;
   overflow: hidden;
   background: var(--cb-track);
@@ -428,7 +496,7 @@ body.body--dark {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 2px;
+  gap: 3px;
   padding: 8px 12px 8px 8px;
   font-size: 12px;
   white-space: nowrap;
@@ -446,20 +514,43 @@ body.body--dark {
 }
 
 // Slot table of a rack: the counters toggle in the header, the grid below it.
+// The slot map toggle is how operators find the slot map at all, so it reads
+// as a button: accent tint, a grid icon and a chevron that turns when open.
 .cb-slots-toggle {
-  height: 22px;
-  padding: 0 8px;
-  border: 1px solid var(--cb-border);
-  border-radius: 11px;
-  background: var(--cb-surface2);
-  color: var(--cb-text3);
+  height: 26px;
+  padding: 0 6px 0 9px;
+  border: 1px solid var(--cb-accent-bd);
+  border-radius: 13px;
+  background: var(--cb-accent-bg);
+  color: var(--cb-link) !important;
   font-size: 12px;
   font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease;
+
+  &:hover {
+    background: var(--cb-accent-bg-hover);
+    border-color: var(--cb-link);
+  }
 
   &--open {
-    background: var(--cb-radio-on);
-    border-color: var(--cb-primary);
+    background: var(--cb-accent-bg-hover);
+    border-color: var(--cb-link);
+  }
+}
+
+.cb-slots-toggle__chevron {
+  margin-left: -1px;
+  transition: transform 0.15s ease;
+
+  .cb-slots-toggle--open & {
+    transform: rotate(180deg);
   }
 }
 
@@ -467,7 +558,8 @@ body.body--dark {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 8px 12px 10px 44px;
+  // Starts under the location icon.
+  padding: 8px 12px 10px 38px;
   border-top: 1px solid var(--cb-divider);
   background: var(--cb-surface2);
 }
@@ -653,6 +745,10 @@ body.body--dark {
 
 .cb-row {
   border-bottom: 1px solid var(--cb-divider);
+
+  &:last-child {
+    border-bottom: 0;
+  }
 }
 
 .cb-row__line {
@@ -660,12 +756,13 @@ body.body--dark {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 48px;
-  padding: 5px 12px;
+  min-height: 50px;
+  padding: 6px 12px;
   border: 0;
   background: var(--cb-surface);
   text-align: left;
   cursor: pointer;
+  transition: background-color 0.12s ease;
 
   &:hover:not(:disabled) {
     background: var(--cb-surface2);
@@ -688,10 +785,14 @@ body.body--dark {
 }
 
 .cb-row__slot {
-  width: 30px;
+  width: 32px;
   flex-shrink: 0;
+  padding: 2px 0;
+  border-radius: 6px;
+  background: var(--cb-track);
+  text-align: center;
   font-family: 'Roboto Mono', ui-monospace, Menlo, Consolas, monospace;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--cb-text2);
 }
 
@@ -752,6 +853,12 @@ body.body--dark {
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
+  transition: background-color 0.12s ease;
+
+  .cb-row__line:hover & {
+    background: var(--cb-accent-bg);
+    background: color-mix(in srgb, var(--cb-unlinked) 14%, transparent);
+  }
 
   // A card without an ICCID cannot be linked: the pill stays in place for a
   // steady layout, greyed out.
@@ -759,13 +866,16 @@ body.body--dark {
     border-color: var(--cb-input-bd);
     color: var(--cb-text2);
     opacity: 0.6;
+    .cb-row__line:hover & {
+      background: transparent;
+    }
   }
 }
 
 // Expanded panels
 
 .cb-panel {
-  padding: 4px 12px 12px 52px;
+  padding: 4px 12px 12px 54px;
   background: var(--cb-surface2);
   display: flex;
   flex-direction: column;

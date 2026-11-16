@@ -10,7 +10,9 @@
           class="cb-group__chevron"
           :class="{ 'cb-group__chevron--open': open }"
         />
-        <q-icon :name="icon" size="22px" :class="iconClass" />
+        <span class="cb-group__icon" :class="iconClass">
+          <q-icon :name="icon" size="20px" />
+        </span>
         <span class="cb-group__titles">
           <span class="cb-group__titleline">
             <span class="cb-group__title">{{ group.title }}</span>
@@ -38,9 +40,12 @@
           class="cb-slots-toggle"
           :class="{ 'cb-slots-toggle--open': slotsOpen }"
           :aria-expanded="slotsOpen"
+          :title="slotsOpen ? 'Hide the slot map' : 'Show the slot map'"
           @click="slotsOpen = !slotsOpen"
         >
-          {{ slotsLineText }}
+          <q-icon name="mdi-view-grid-outline" size="14px" />
+          <span>{{ slotsLineText }}</span>
+          <q-icon name="mdi-chevron-down" size="16px" class="cb-slots-toggle__chevron" />
         </button>
         <span v-if="allGood" class="cb-tone--ok">all good</span>
       </div>
