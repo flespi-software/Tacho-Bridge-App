@@ -26,9 +26,24 @@
         <span v-if="rowSub" class="cb-row__sub">{{ rowSub }}</span>
       </span>
       <span class="cb-row__meta">
-        <span :class="`cb-tone--${auth.tone}`">{{ auth.text }}</span>
+        <span
+          v-if="!isEmpty && !unlinked && !unread"
+          class="cb-status"
+          :class="`cb-status--${entry.status}`"
+        >
+          {{ statusLabel }}
+        </span>
+        <span v-if="entry.status !== 'active'" :class="`cb-tone--${auth.tone}`">{{
+          auth.text
+        }}</span>
         <span :class="`cb-tone--${expiry.tone}`">{{ expiry.text }}</span>
       </span>
+      <q-icon
+        v-if="!isEmpty"
+        :name="open ? 'mdi-chevron-up' : 'mdi-chevron-down'"
+        size="16px"
+        class="cb-row__chevron"
+      />
       <!-- Every card the configuration does not know carries the pill, so the
            rows line up; without an ICCID there is nothing to link, and the
            pill is greyed out. -->
@@ -69,7 +84,7 @@
         </span>
         <span v-if="attention" class="cb-tile__att" role="img" aria-label="Needs attention">!</span>
       </span>
-      <span v-if="rowSub" class="cb-tile__sub">{{ rowSub }}</span>
+      <span class="cb-tile__sub">{{ rowSub }}</span>
       <span v-if="view === 'tiles'" class="cb-tile__note" :class="`cb-tone--${note.tone}`">
         {{ note.text }}
       </span>
@@ -348,23 +363,40 @@ const isEmpty = computed(() => props.entry.status === 'empty')
 const unread = computed(() => props.entry.status === 'error')
 // The slot of the card is in error, identified card or not.
 const faulty = computed(() => props.entry.fault !== undefined)
+const unnamed = computed(
+  () => !isEmpty.value && !unread.value && !unlinked.value && !props.entry.name.trim(),
+)
+const statusLabel = computed(() => {
+  switch (props.entry.status) {
+    case 'active':
+      return 'Authenticating'
+    case 'online':
+      return 'Online'
+    case 'offline':
+      return 'Offline'
+    case 'absent':
+      return 'Not inserted'
+    default:
+      return ''
+  }
+})
 
 const titleClass = computed(() => ({
   'cb-row__title--danger': unread.value,
   'cb-row__title--warn': unlinked.value,
-  'cb-row__title--muted': isEmpty.value,
+  'cb-row__title--muted': isEmpty.value || unnamed.value,
 }))
 
 const rowTitle = computed(() => {
   if (unread.value) return 'Unreadable card'
   if (unlinked.value) return 'Unknown card'
-  return props.entry.name || props.entry.number
+  return props.entry.name.trim() || 'No name'
 })
 const rowSub = computed(() => {
   if (isEmpty.value) return 'no card inserted'
-  if (unread.value) return 'ICCID cannot be determined'
-  if (unlinked.value) return props.entry.iccid ? `ICCID ${props.entry.iccid}` : 'ICCID not read'
-  return props.entry.name ? props.entry.number : ''
+  if (props.entry.number) return `SN: ${props.entry.number}`
+  if (props.entry.iccid) return `ICCID: ${props.entry.iccid}`
+  return 'ICCID: not read'
 })
 
 const tiled = computed(() => props.view !== 'list')
