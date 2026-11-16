@@ -20,14 +20,6 @@
               {{ scanning ? 'scanning slots…' : group.subtitle }}
             </span>
           </span>
-          <span class="cb-segs">
-            <span
-              v-for="s in segments"
-              :key="s.status"
-              :class="`cb-seg--${s.status}`"
-              :style="{ flexGrow: s.n }"
-            />
-          </span>
         </span>
       </button>
       <div class="cb-group__stats">
@@ -40,6 +32,7 @@
           class="cb-slots-toggle"
           :class="{ 'cb-slots-toggle--open': slotsOpen }"
           :aria-expanded="slotsOpen"
+          :aria-label="slotsOpen ? 'Hide the slot map' : 'Show the slot map'"
           :title="slotsOpen ? 'Hide the slot map' : 'Show the slot map'"
           @click="slotsOpen = !slotsOpen"
         >
@@ -49,6 +42,14 @@
         </button>
         <span v-if="allGood" class="cb-tone--ok">all good</span>
       </div>
+      <span class="cb-segs" aria-hidden="true">
+        <span
+          v-for="s in segments"
+          :key="s.status"
+          :class="`cb-seg--${s.status}`"
+          :style="{ flexGrow: s.n }"
+        />
+      </span>
     </div>
     <!-- Indeterminate: the server sends no total, so there is no honest
          percentage to show while the rack is still being enumerated. -->
@@ -60,42 +61,29 @@
       class="rack-scan-bar"
     />
 
-    <!-- Slot grid: one framed block per contiguous run of readers, its slot
-         range cut into the top line of the frame; rows of ten in address
-         order, every cell numbered. The gaps between DIP-set blocks are
-         captions between the frames, not cells, so the rows never shift. -->
-    <div v-if="slotsOpen && blocks.length" class="cb-slots">
-      <template v-for="b in blocks" :key="b.from">
-        <div v-if="b.gapBefore" class="cb-slots__gap">
-          no readers at {{ b.gapBefore[0] }}–{{ b.gapBefore[1] }}
-        </div>
-        <fieldset class="cb-slots__block">
-          <legend class="cb-slots__caption">{{ b.from }} – {{ b.to }}</legend>
-          <div v-for="row in b.rows" :key="row[0]!.slot" class="cb-slots__row">
-            <!-- A span with a button role rather than a button: the board's
-                 button reset would override the cell colours. -->
-            <span
-              v-for="c in row"
-              :key="c.slot"
-              class="cb-slot"
-              :class="[
-                `cb-slot--${c.cls}`,
-                c.status ? `cb-slot--${c.status}` : '',
-                { 'cb-slot--pick': canBlink(c) },
-              ]"
-              :title="canBlink(c) ? `${c.title} · click to blink it on the rack` : c.title"
-              :role="canBlink(c) ? 'button' : undefined"
-              :tabindex="canBlink(c) ? 0 : undefined"
-              @click="canBlink(c) && (blinkSlot = c.slot)"
-              @keydown.enter.prevent="canBlink(c) && (blinkSlot = c.slot)"
-              @keydown.space.prevent="canBlink(c) && (blinkSlot = c.slot)"
-            >
-              {{ c.slot }}
-            </span>
-          </div>
-          <div class="cb-slots__summary">{{ b.summary }}</div>
-        </fieldset>
-      </template>
+    <!-- A single wrapping map: cells keep their size and address order. -->
+    <div v-if="slotsOpen && slotCells.length" class="cb-slots">
+      <div class="cb-slots__grid">
+        <!-- Spans keep their status colours instead of the board's button reset. -->
+        <span
+          v-for="c in slotCells"
+          :key="c.slot"
+          class="cb-slot"
+          :class="[
+            `cb-slot--${c.cls}`,
+            c.status ? `cb-slot--${c.status}` : '',
+            { 'cb-slot--pick': canBlink(c) },
+          ]"
+          :title="canBlink(c) ? `${c.title} · click to blink it on the rack` : c.title"
+          :role="canBlink(c) ? 'button' : undefined"
+          :tabindex="canBlink(c) ? 0 : undefined"
+          @click="canBlink(c) && (blinkSlot = c.slot)"
+          @keydown.enter.prevent="canBlink(c) && (blinkSlot = c.slot)"
+          @keydown.space.prevent="canBlink(c) && (blinkSlot = c.slot)"
+        >
+          {{ c.slot }}
+        </span>
+      </div>
       <div class="cb-slots__hint">Click a slot to blink it on the rack.</div>
       <div class="cb-slots__legend">
         <span><i class="cb-slot cb-slot--free" /> free</span>
@@ -200,7 +188,7 @@ const summary = computed(() => summarize(props.group, props.now))
 
 // The slot grid of a rack is opened per group and survives the parent
 // replacing the rack list on every `rack-state` event: the toggle lives here,
-// the blocks are recomputed from the fresh table.
+// the cells are recomputed from the fresh table.
 const slotsOpen = ref(false)
 
 // A slot can be blinked on the rack to find it there: any working reader of a
@@ -211,8 +199,10 @@ function canBlink(c: SlotCell): boolean {
   return !props.group.down && c.cls !== 'faulty' && c.status !== 'active'
 }
 const slotsLineText = computed(() => (props.group.rack ? slotsLine(props.group.rack) : ''))
-const blocks = computed(() =>
-  props.group.rack ? slotBlocks(props.group.rack, props.group.entries) : [],
+const slotCells = computed(() =>
+  props.group.rack
+    ? slotBlocks(props.group.rack, props.group.entries).flatMap((block) => block.rows.flat())
+    : [],
 )
 
 const icon = computed(() =>
@@ -227,7 +217,9 @@ const iconClass = computed(() =>
     ? 'cb-tone--icon'
     : props.group.down
       ? 'cb-tone--danger'
-      : 'cb-tone--ok',
+      : props.group.kind === 'rack'
+        ? 'cb-tone--active'
+        : 'cb-tone--ok',
 )
 
 const segments = computed(() => {

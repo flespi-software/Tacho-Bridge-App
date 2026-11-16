@@ -1,9 +1,13 @@
 <template>
   <q-layout view="lHh Lpr lFf">
-    <q-header elevated>
-      <q-toolbar>
-        <q-icon name="mdi-steering" size="24px" class="q-ml-md q-mr-sm" style="opacity: 0.8" />
-        <q-toolbar-title> Tacho Bridge </q-toolbar-title>
+    <q-header class="app-header">
+      <q-toolbar class="app-toolbar">
+        <div class="app-brand">
+          <q-icon name="mdi-steering" size="22px" class="app-brand__icon" />
+          <span>Tacho Bridge</span>
+          <span class="app-brand__version">v{{ appVersion }}</span>
+        </div>
+        <q-space />
 
         <q-btn
           v-if="!appConnected && serverConfigured"
@@ -12,21 +16,31 @@
           icon="mdi-refresh"
           color="warning"
           size="sm"
+          aria-label="Reconnect"
           @click="reconnect"
         >
           <q-tooltip>Reconnect</q-tooltip>
         </q-btn>
-        <q-icon
-          :name="appConnected ? 'mdi-server-network' : 'mdi-server-network-off'"
-          :color="appConnected ? 'light-green-13' : 'grey-5'"
-          size="20px"
-          class="q-mr-xs"
+        <span
+          class="app-connection"
+          :class="{ 'app-connection--offline': !appConnected }"
+          role="status"
         >
-          <q-tooltip>{{ appConnected ? 'Connected' : 'Disconnected' }}</q-tooltip>
-        </q-icon>
-        <q-btn flat round icon="mdi-cog" color="grey-4" size="sm" @click="configOpen = true">
-          <q-tooltip>Settings</q-tooltip>
-        </q-btn>
+          <q-icon
+            :name="appConnected ? 'mdi-server-network' : 'mdi-server-network-off'"
+            size="16px"
+          />
+          <span>{{ appConnected ? 'Connected' : 'Disconnected' }}</span>
+        </span>
+        <q-btn
+          flat
+          no-caps
+          dense
+          icon="mdi-cog-outline"
+          label="Settings"
+          class="app-settings-button"
+          @click="configOpen = true"
+        />
         <ServerConfigDialog v-model="configOpen" :config="serverConfig" />
         <CredentialsPromptDialog v-model="credentialsPromptOpen" />
       </q-toolbar>
@@ -52,6 +66,7 @@ import { invoke } from '@tauri-apps/api/core'
 import 'animate.css'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
 import CredentialsPromptDialog from 'src/components/CredentialsPromptDialog.vue'
+import { version as appVersion } from '../../package.json'
 
 defineOptions({
   name: 'MainLayout',

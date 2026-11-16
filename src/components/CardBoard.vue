@@ -4,38 +4,42 @@
   <div class="card-board" :class="{ 'card-board--tiles': cardView !== 'list' }">
     <div class="cb-toolbar">
       <div class="cb-toolbar__inner">
-        <div class="row no-wrap items-center q-gutter-x-sm">
-          <div class="col cb-toolbar__total">{{ totalLine }}</div>
-          <div class="cb-viewswitch" role="group" aria-label="View">
-            <button
-              v-for="v in VIEW_BUTTONS"
-              :key="v.id"
-              type="button"
-              :class="{ 'cb-viewswitch__on': cardView === v.id }"
-              :aria-pressed="cardView === v.id"
-              :aria-label="v.label"
-              :title="v.label"
-              @click="pickView(v.id)"
-            >
-              <q-icon :name="v.icon" size="18px" />
-            </button>
+        <div class="cb-toolbar__heading">
+          <div class="cb-toolbar__summary">
+            <h1 class="cb-toolbar__title">Cards</h1>
+            <div class="cb-toolbar__total">{{ totalLine }}</div>
           </div>
-          <q-btn
-            unelevated
-            rounded
-            no-caps
-            dense
-            color="positive"
-            icon="mdi-plus"
-            label="Add card"
-            class="q-px-md"
-            @click="openAddDialog"
-          />
+          <div class="cb-toolbar__actions">
+            <div class="cb-viewswitch" role="group" aria-label="View">
+              <button
+                v-for="v in VIEW_BUTTONS"
+                :key="v.id"
+                type="button"
+                :class="{ 'cb-viewswitch__on': cardView === v.id }"
+                :aria-pressed="cardView === v.id"
+                :aria-label="v.label"
+                :title="v.label"
+                @click="pickView(v.id)"
+              >
+                <q-icon :name="v.icon" size="18px" />
+                <span>{{ v.id === 'mini' ? 'Mini' : v.label }}</span>
+              </button>
+            </div>
+            <q-btn
+              unelevated
+              no-caps
+              dense
+              icon="mdi-plus"
+              label="Add card"
+              class="cb-btn-primary cb-add-button"
+              @click="openAddDialog"
+            />
+          </div>
         </div>
-        <div class="row no-wrap q-gutter-x-sm">
+        <div class="cb-toolbar__filters">
           <q-input
             v-model="search"
-            class="col"
+            class="cb-toolbar__search"
             outlined
             dense
             clearable
@@ -89,7 +93,7 @@
             :key="c.id"
             type="button"
             class="cb-chip"
-            :class="{ 'cb-chip--on': status === c.id }"
+            :class="[`cb-chip--${c.id}`, { 'cb-chip--on': status === c.id }]"
             :aria-pressed="status === c.id"
             @click="status = status === c.id ? 'all' : c.id"
           >
@@ -135,7 +139,7 @@
     </div>
 
     <q-dialog v-model="addOpen">
-      <q-card style="min-width: 420px">
+      <q-card class="cb-add-dialog">
         <q-card-section class="row items-center q-pb-sm">
           <q-icon name="mdi-card-plus" size="28px" color="primary" class="q-mr-sm" />
           <div class="text-h6">Add card</div>
