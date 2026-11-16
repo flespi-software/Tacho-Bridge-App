@@ -227,3 +227,10 @@ All notable changes to this project will be documented in this file.
 - refresh themes, board layout and responsive slot map.
 - improve settings readability and scrolling.
 - unify card names, identifiers and status display.
+
+### [0.8.1-beta.7] - 2026-11-16
+
+🆕 Features / Improvements
+
+- feat: add safe shutdown progress and controllable rack indicators.
+- show reader models and improve slot map statuses.
