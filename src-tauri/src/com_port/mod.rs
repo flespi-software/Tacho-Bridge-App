@@ -66,6 +66,16 @@ static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 /// serial ports after `shutdown()` released them (its self-heal branch would
 /// grab a port again within one poll tick).
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+pub struct ShutdownEstimate {
+    pub slots: usize,
+    pub estimated_ms: u64,
+}
+
+pub fn shutdown_estimate() -> ShutdownEstimate {
+    local::shutdown_estimate()
+}
 
 /// One rack linked to the server: its open serial port plus the request
 /// idempotency of its exchanges. The server counts request ids per rack, so
@@ -252,10 +262,21 @@ fn link_rack(rack_id: String, port: SharedPort, io_key: usize) -> Vec<(String, b
 /// operator finds that slot on the rack. Resolves once the rack took the first
 /// indicator write, with the length of the whole blink in milliseconds.
 #[tauri::command]
-pub async fn blink_rack_slot(rack_id: String, slot: u16) -> Result<u64, String> {
-    local::blink(&rack_id, slot)
+pub async fn blink_rack_slot(
+    rack_id: String,
+    slot: u16,
+    until_stopped: Option<bool>,
+) -> Result<u64, String> {
+    local::blink(&rack_id, slot, until_stopped.unwrap_or(false))
         .await
         .map(|length| length.as_millis() as u64)
+        .map_err(String::from)
+}
+
+#[tauri::command]
+pub async fn stop_blink_rack_slot(rack_id: String, slot: u16) -> Result<(), String> {
+    local::stop_blink(&rack_id, slot)
+        .await
         .map_err(String::from)
 }
 
@@ -287,13 +308,19 @@ pub fn restart_rack_links(reason: &str) {
     announce_links(ids.into_iter().map(|id| (id, true)).collect());
 }
 
-/// Releases the serial ports and stops all rack tasks. Called when the app is
-/// closing: the process may linger briefly (WebView children, blocking PC/SC
-/// thread), and an undisposed COM handle makes a relaunched instance fail with
-/// "Access is denied" until the old process fully dies.
-pub fn shutdown() {
+/// Darkens the indicators, releases serial ports and stops all rack tasks.
+/// Called when the app is closing: it may linger briefly (WebView children,
+/// blocking PC/SC thread), and an undisposed COM handle makes a relaunched
+/// instance fail with "Access is denied" until the old process fully dies.
+pub async fn shutdown() {
+    // Quit during updater preparation must wait for its LED cleanup too.
+    let _shutdown = SHUTDOWN_LOCK.lock().await;
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    let indicators = local::prepare_indicator_shutdown();
     stop_all_racks();
+    // Snapshot handles keep ports open until the final off commands finish.
+    // Normal traffic is now blocked, so nothing can light them again.
+    local::turn_off_indicators(indicators).await;
     log::info!("RACK | phase=shutdown status=ports_released");
 }
 

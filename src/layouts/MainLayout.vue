@@ -49,6 +49,7 @@
     <q-page-container>
       <router-view />
     </q-page-container>
+    <ShutdownDialog :state="shutdownState" />
   </q-layout>
 </template>
 
@@ -66,6 +67,8 @@ import { invoke } from '@tauri-apps/api/core'
 import 'animate.css'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
 import CredentialsPromptDialog from 'src/components/CredentialsPromptDialog.vue'
+import ShutdownDialog from 'src/components/ShutdownDialog.vue'
+import { isShutdownState, type ShutdownState } from 'src/components/shutdownProgress'
 import { version as appVersion } from '../../package.json'
 
 defineOptions({
@@ -74,6 +77,16 @@ defineOptions({
 
 const $q = useQuasar()
 const configOpen = ref(false)
+const shutdownState = shallowRef<ShutdownState | null>(null)
+let shutdownEventSeen = false
+function handleShutdown(raw: unknown): void {
+  if (raw !== null && !isShutdownState(raw)) return
+  shutdownState.value = raw
+  if (raw) {
+    configOpen.value = false
+    credentialsPromptOpen.value = false
+  }
+}
 // Startup sign-in: shown once per webview load when authentication is on but
 // no credentials are in effect (they were entered for a previous run only).
 const credentialsPromptOpen = ref(false)
@@ -251,11 +264,20 @@ const listenersReady = Promise.all([
     appConnected.value = raw === true
   }),
   on('global-notification', handleGlobalNotification),
+  on('app-shutdown', (raw) => {
+    shutdownEventSeen = true
+    handleShutdown(raw)
+  }),
 ]).then(() => undefined)
 provide(LAYOUT_LISTENERS_READY, listenersReady)
 
 onMounted(async () => {
   await listenersReady
+  void invoke<unknown>('get_shutdown_state')
+    .then((raw) => {
+      if (!shutdownEventSeen) handleShutdown(raw)
+    })
+    .catch((error) => console.error('get_shutdown_state failed:', error))
   try {
     const online = await invoke<boolean>('get_app_connection_status')
     if (!statusEventSeen) appConnected.value = online === true

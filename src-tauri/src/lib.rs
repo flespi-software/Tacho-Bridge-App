@@ -13,6 +13,7 @@ mod logs_upload; // Log upload to the server (fetch_logs command).
 mod mqtt; // MQTT communication.
 mod server_address; // Server address change pushed by the server (set_server command).
 mod smart_card; // PCSC module for smart card operations.
+mod shutdown; // Exit preparation and progress, without blocking the UI.
 mod updater; // Self-update from GitHub releases.
 
 // ───── External Crates ─────
@@ -82,14 +83,47 @@ fn shutdown_cleanup() {
     if CLEANUP_DONE.swap(true, Ordering::SeqCst) {
         return;
     }
-    // Release the rack's COM port before the process winds down — a lingering
-    // handle keeps the port "Access is denied" for the next launch.
-    com_port::shutdown();
-    // Close the app/card MQTT connections with clean DISCONNECTs so the
-    // server logs normal closes instead of internal errors; bounded by the
-    // shutdown flush timeout, so quitting stays snappy even when offline.
-    tauri::async_runtime::block_on(mqtt::remove_connections_all());
+    // Darken the racks before releasing COM ports, then close app/card MQTT
+    // connections with clean DISCONNECTs. Both cleanup stages are bounded,
+    // including when a controller or the broker no longer answers.
+    if !shutdown::is_prepared() {
+        // Fallback for an exit that cannot be deferred (e.g. a restart).
+        tauri::async_runtime::block_on(shutdown::prepare());
+    }
     log::info!("-== Application is closed by user ==-\n");
+}
+
+/// Terminal interrupts/termination do not produce Tauri's Exit event on
+/// their own. Route catchable signals through the same ordered cleanup as Quit.
+/// Forced termination (SIGKILL / TerminateProcess) cannot run application code.
+fn install_shutdown_signals(app: tauri::AppHandle) {
+    async_runtime::spawn(async move {
+        #[cfg(unix)]
+        let signal = {
+            use tokio::signal::unix::{signal, SignalKind};
+            let (Ok(mut interrupt), Ok(mut terminate)) = (
+                signal(SignalKind::interrupt()),
+                signal(SignalKind::terminate()),
+            ) else {
+                log::error!("[SHUTDOWN] status=signal_handler_failed");
+                return;
+            };
+            tokio::select! {
+                _ = interrupt.recv() => "SIGINT",
+                _ = terminate.recv() => "SIGTERM",
+            }
+        };
+        #[cfg(not(unix))]
+        let signal = {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                log::error!("[SHUTDOWN] status=signal_handler_failed err={}", e);
+                return;
+            }
+            "Ctrl+C"
+        };
+        log::info!("[SHUTDOWN] phase=request signal={}", signal);
+        app.exit(0);
+    });
 }
 
 /// Starts every backend subsystem: logging, configuration, the PC/SC card
@@ -343,6 +377,7 @@ pub fn run() {
             // once, which is also why none of the subsystems below need their
             // own duplicate-spawn latch any more.
             initialize_backend(app_handle.clone());
+            install_shutdown_signals(app_handle.clone());
 
             // System tray: with it active, closing the window hides the app
             // to the tray and card bridging keeps running in the background.
@@ -426,16 +461,21 @@ pub fn run() {
                 });
 
                 // With an active tray, the close button only hides the window
-                // and the APDU bridge keeps working; the real shutdown runs on
-                // RunEvent::Exit (tray Quit, Cmd+Q, updater restart). Without
-                // a tray, the close proceeds and quits the app as before.
+                // and the APDU bridge keeps working. An actual quit is
+                // deferred while asynchronous preparation shows progress.
+                // Without a tray, closing the window starts that preparation.
                 let close_window = window.clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
-                        if TRAY_ACTIVE.load(Ordering::SeqCst) {
+                        if shutdown::is_exiting() {
+                            api.prevent_close();
+                        } else if TRAY_ACTIVE.load(Ordering::SeqCst) {
                             api.prevent_close();
                             let _ = close_window.hide();
                             log::info!("Window hidden to tray; background bridging continues.");
+                        } else {
+                            api.prevent_close();
+                            shutdown::request_exit(close_window.app_handle().clone(), 0);
                         }
                     }
                 });
@@ -459,10 +499,18 @@ pub fn run() {
             autostart_get,              // is the app registered to start at login
             autostart_set,              // register/unregister launch at login
             com_port::blink_rack_slot,  // blink a rack slot from the slot grid
+            com_port::stop_blink_rack_slot,
+            shutdown::get_shutdown_state,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|_app_handle, event| match event {
+            RunEvent::ExitRequested { api, code, .. }
+                if code != Some(tauri::RESTART_EXIT_CODE) && !shutdown::exit_ready() =>
+            {
+                api.prevent_exit();
+                shutdown::request_exit(_app_handle.clone(), code.unwrap_or(0));
+            }
             // Single exit point for every quit path: tray Quit, Cmd+Q on
             // macOS, window close without a tray, updater restart.
             RunEvent::Exit => shutdown_cleanup(),

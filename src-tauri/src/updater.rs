@@ -525,8 +525,8 @@ async fn install_parked(app: &AppHandle) -> Result<(), InstallError> {
     // Release the rack's serial port and close the broker sessions before
     // installing: on Windows the NSIS install exits the process from inside
     // `install`, so the regular exit cleanup never runs there.
-    crate::com_port::shutdown();
-    crate::mqtt::remove_connections_all().await;
+    crate::shutdown::prepare().await;
+    crate::shutdown::set_phase(crate::shutdown::Phase::Installing);
 
     // Unpacking and replacing the bundle takes seconds of blocking file I/O.
     let installed = tauri::async_runtime::spawn_blocking(move || update.install(bytes))
@@ -536,8 +536,10 @@ async fn install_parked(app: &AppHandle) -> Result<(), InstallError> {
     if let Err(e) = installed {
         log::error!("{TAG} phase=install status=failed step=install err={e}");
         // Bring back what was torn down for the install.
-        crate::com_port::resume();
-        crate::app_connect::reconnect_everything("update_install_failed").await;
+        if crate::shutdown::reset_after_failed_update().await {
+            crate::com_port::resume();
+            crate::app_connect::reconnect_everything("update_install_failed").await;
+        }
         return Err(InstallError::Failed(e));
     }
 

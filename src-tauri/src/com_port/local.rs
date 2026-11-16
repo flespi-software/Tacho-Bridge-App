@@ -21,19 +21,22 @@
 //! rack itself (an older one, or local mode switched off) sends its own rack
 //! commands instead, which stops the engine (see `rack::handle_app_publish`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::async_runtime::{self, JoinHandle};
+use tauri::Emitter;
 
 use crate::global_app_handle::{rack_update_slots, RackSlotError, RackSlotStates, RackSlots};
 
 use super::cards::{apply_cards_set, inventory, RACK_CARDS_UI};
 use super::transport::{
-    execute_envelope, normalize_hex, take_unsolicited, PollSpec, SerialEnvelope, SharedPort,
-    SERIAL_ERR_CARD_BUSY, SERIAL_MS_MAX, SERIAL_MS_MIN,
+    execute_envelope, execute_envelope_timed, normalize_hex, take_unsolicited, PollSpec,
+    ReplyComplete, SerialEnvelope, SharedPort, ShutdownCommand, SERIAL_ERR_CARD_BUSY,
+    SERIAL_MS_MAX, SERIAL_MS_MIN,
 };
+
 use super::{lock, rack_port_is_live};
 
 /// Highest slot address a rack can have.
@@ -64,11 +67,11 @@ const LED_OFF_BATCH: usize = 16;
 const POLL_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// A slot blink the user asked for to find a slot on the rack: the indicator
-/// alternates every `BLINK_HALF` (2 Hz), `BLINK_HALVES` times (3 seconds).
+/// alternates every `BLINK_HALF` (2 Hz), `BLINK_HALVES` times (6 seconds).
 /// One indicator write is a one-shot exchange of a few tens of milliseconds,
 /// so the rhythm keeps steady even while other slots authenticate.
 const BLINK_HALF: Duration = Duration::from_millis(250);
-const BLINK_HALVES: u32 = 12;
+const BLINK_HALVES: u32 = 24;
 
 /// Integrity rule every reply of the device satisfies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -814,10 +817,21 @@ async fn write_led(
     let Some(envelope) = template.and_then(|t| profile.slot_envelope(t, slot)) else {
         return false;
     };
-    execute_envelope(port, envelope, log_header, false)
-        .await
-        .0
-        .is_ok()
+    let (reply, _, wire) = execute_envelope_timed(port, envelope, log_header, false).await;
+    if reply.is_ok() {
+        // The normal reader includes its silence bound. Final cleanup ends at
+        // the complete frame, so exclude that bound from the response estimate.
+        let rtt = wire
+            .saturating_sub(profile.slot_idle)
+            .max(Duration::from_millis(1));
+        if let Some(engine) = lock(&ENGINES)
+            .values()
+            .find(|engine| Arc::ptr_eq(&engine.port, port))
+        {
+            lock(&engine.shutdown_slots).timing.record(rtt);
+        }
+    }
+    reply.is_ok()
 }
 
 /// Hands the identified cards of the rack to the session reconcile, exactly
@@ -890,7 +904,12 @@ fn identify_retry_delay(failures: u32) -> Duration {
 /// the port of the rack goes away.
 // index loops: every pass awaits serial exchanges and writes the slot back
 #[allow(clippy::needless_range_loop)]
-async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
+async fn run(
+    profile: Arc<Profile>,
+    rack_id: String,
+    port: SharedPort,
+    shutdown_slots: Arc<std::sync::Mutex<ShutdownSlots>>,
+) {
     let log_header = format!("RACK {} |", rack_id);
     let mut slots = vec![SlotState::default(); profile.status_length];
     // Sessions that outlived the previous engine (or a server-driven period)
@@ -903,6 +922,7 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
                 card.get("iccid").and_then(|v| v.as_str()),
             ) {
                 state.card = Some(id.to_string());
+                lock(&shutdown_slots).addresses.insert(slot as u16);
             }
         }
     }
@@ -950,6 +970,7 @@ async fn run(profile: Arc<Profile>, rack_id: String, port: SharedPort) {
             );
             continue;
         };
+        lock(&shutdown_slots).remember_status(&profile, region);
         for (index, from, to) in observe(&mut slots, &profile, region) {
             // a card at work flips between idle and busy all the time
             if !matches!((from, to), (Class::Idle, Class::Busy) | (Class::Busy, Class::Idle)) {
@@ -1198,7 +1219,48 @@ struct Engine {
     profile_text: Vec<u8>,
     profile: Arc<Profile>,
     port: SharedPort,
+    shutdown_slots: Arc<std::sync::Mutex<ShutdownSlots>>,
     handle: JoinHandle<()>,
+}
+
+/// Addresses actually seen on this port, or explicitly signalled by the user.
+/// Keep the history: an emptied or temporarily silent reader may still be lit.
+/// The profile's status_length is a protocol capacity, not a physical inventory.
+#[derive(Default)]
+struct ShutdownSlots {
+    addresses: BTreeSet<u16>,
+    timing: ReplyTiming,
+}
+
+#[derive(Default)]
+struct ReplyTiming {
+    total_ms: f64,
+    samples: usize,
+}
+
+impl ReplyTiming {
+    fn record(&mut self, duration: Duration) {
+        self.total_ms += duration.as_secs_f64() * 1000.0;
+        self.samples += 1;
+    }
+
+    fn average_ms(&self) -> f64 {
+        if self.samples == 0 {
+            15.0
+        } else {
+            self.total_ms / self.samples as f64
+        }
+    }
+}
+
+impl ShutdownSlots {
+    fn remember_status(&mut self, profile: &Profile, region: &[u8]) {
+        for (index, &raw) in region.iter().take(profile.status_length).enumerate() {
+            if profile.classify(raw) != Class::None {
+                self.addresses.insert((index + 1) as u16);
+            }
+        }
+    }
 }
 
 static NEXT_ARMING: AtomicU64 = AtomicU64::new(1);
@@ -1209,32 +1271,61 @@ lazy_static::lazy_static! {
         std::sync::Mutex::new(HashMap::new());
     /// Slot blinks by rack id and slot: `true` while one runs, `false` once it
     /// ended and the engine has not written the indicator of the slot again.
-    static ref BLINKS: std::sync::Mutex<HashMap<(String, u16), bool>> =
+    static ref BLINKS: std::sync::Mutex<HashMap<(String, u16), BlinkControl>> =
         std::sync::Mutex::new(HashMap::new());
 }
 
-fn blink_state(rack_id: &str, slot: u16) -> Option<bool> {
-    lock(&BLINKS).get(&(rack_id.to_string(), slot)).copied()
+#[derive(Clone)]
+struct BlinkControl {
+    cancel: tokio::sync::watch::Sender<bool>,
+    done: tokio::sync::watch::Receiver<Option<&'static str>>,
 }
 
-/// Blinks the indicator of one slot so the operator finds it on the rack.
-/// Returns once the first indicator write was taken, with the length of the
-/// whole blink; the rest runs in the background. Refused for a rack that is
-/// not run locally, a slot an authentication owns, or a slot already blinking.
-pub(super) async fn blink(rack_id: &str, slot: u16) -> Result<Duration, &'static str> {
-    let (profile, port) = {
+fn blink_state(rack_id: &str, slot: u16) -> Option<bool> {
+    lock(&BLINKS)
+        .get(&(rack_id.to_string(), slot))
+        .map(|control| control.done.borrow().is_none())
+}
+
+fn finish_blink(
+    done: &tokio::sync::watch::Sender<Option<&'static str>>,
+    rack_id: &str,
+    slot: u16,
+    reason: &'static str,
+) {
+    if let Some(app) = crate::global_app_handle::get_app_handle() {
+        let _ = app.emit(
+            "rack-slot-blink-ended",
+            serde_json::json!({
+                "rack_id": rack_id, "slot": slot, "reason": reason,
+            }),
+        );
+    }
+    let _ = done.send(Some(reason));
+}
+
+/// Starts a six-second blink, or a continuous blink with an explicit stop.
+/// A zero duration tells the frontend that no automatic end is scheduled.
+pub(super) async fn blink(
+    rack_id: &str,
+    slot: u16,
+    until_stopped: bool,
+) -> Result<Duration, &'static str> {
+    let (profile, port, shutdown_slots) = {
         let engines = lock(&ENGINES);
         let engine = engines
             .get(rack_id)
             .filter(|engine| !engine.handle.inner().is_finished())
             .ok_or("not_local")?;
-        (engine.profile.clone(), engine.port.clone())
+        (
+            engine.profile.clone(),
+            engine.port.clone(),
+            engine.shutdown_slots.clone(),
+        )
     };
     if slot == 0 || usize::from(slot) > profile.status_length {
         return Err("bad_slot");
     }
-    // The served indicator alternates with the unserved one, or with dark
-    // when the profile has no unserved indicator.
     let on = profile.led_served.clone().ok_or("no_indicator")?;
     let other = profile
         .led_unserved
@@ -1245,48 +1336,105 @@ pub(super) async fn blink(rack_id: &str, slot: u16) -> Result<Duration, &'static
         return Err(SERIAL_ERR_CARD_BUSY);
     }
     let key = (rack_id.to_string(), slot);
+    let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+    let (done, done_rx) = tokio::sync::watch::channel(None);
     {
         let mut blinks = lock(&BLINKS);
-        if blinks.get(&key) == Some(&true) {
+        if blinks
+            .get(&key)
+            .is_some_and(|control| control.done.borrow().is_none())
+        {
             return Err("already_blinking");
         }
-        blinks.insert(key.clone(), true);
+        blinks.insert(
+            key,
+            BlinkControl {
+                cancel,
+                done: done_rx,
+            },
+        );
     }
     let log_header = format!("RACK {} |", rack_id);
+    lock(&shutdown_slots).addresses.insert(slot);
     if !write_led(&profile, &port, Some(&on), slot, &log_header).await {
-        lock(&BLINKS).insert(key, false);
-        log::warn!("{} [LOCAL] status=blink_failed slot={} reason=led_rejected", log_header, slot);
+        finish_blink(&done, rack_id, slot, "led_rejected");
         return Err("led_rejected");
     }
-    log::info!("{} [LOCAL] status=blink_started slot={}", log_header, slot);
+    log::info!(
+        "{} [LOCAL] status=blink_started slot={} continuous={}",
+        log_header,
+        slot,
+        until_stopped
+    );
     let rack = rack_id.to_string();
     async_runtime::spawn(async move {
-        let start = tokio::time::Instant::now();
-        let mut ended = "done";
-        for half in 1..BLINK_HALVES {
-            tokio::time::sleep_until(start + BLINK_HALF * half).await;
+        let mut ticks =
+            tokio::time::interval_at(tokio::time::Instant::now() + BLINK_HALF, BLINK_HALF);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut halves = 1u32;
+        let mut show_on = true;
+        let ended = loop {
+            if *cancelled.borrow() {
+                break "stopped";
+            }
+            tokio::select! {
+                _ = cancelled.changed() => { break "stopped"; }
+                _ = ticks.tick() => {}
+            }
             if !rack_port_is_live(&rack, &port) {
-                ended = "rack_gone";
-                break;
+                break "rack_gone";
             }
-            // an authentication that took the slot meanwhile goes first
             if super::access::auth_active(&port, slot) {
-                ended = SERIAL_ERR_CARD_BUSY;
-                break;
+                break SERIAL_ERR_CARD_BUSY;
             }
-            let template = if half % 2 == 0 { &on } else { &other };
-            write_led(&profile, &port, Some(template), slot, &log_header).await;
+            if !until_stopped && halves >= BLINK_HALVES {
+                break "done";
+            }
+            show_on = !show_on;
+            let template = if show_on { &on } else { &other };
+            if !write_led(&profile, &port, Some(template), slot, &log_header).await {
+                break "led_rejected";
+            }
+            halves = halves.saturating_add(1);
+        };
+        // Do not touch an indicator now owned by authentication or a dead rack.
+        if rack_port_is_live(&rack, &port) && !super::access::auth_active(&port, slot) {
+            write_led(
+                &profile,
+                &port,
+                profile.led_off.as_deref(),
+                slot,
+                &log_header,
+            )
+            .await;
         }
-        if ended == "done" {
-            tokio::time::sleep_until(start + BLINK_HALF * BLINK_HALVES).await;
-            // Dark until the engine writes the indicator of the slot again: a
-            // slot without a card stays dark, a card gets its own colour back.
-            write_led(&profile, &port, profile.led_off.as_deref(), slot, &log_header).await;
-        }
-        lock(&BLINKS).insert(key, false);
-        log::info!("{} [LOCAL] status=blink_finished slot={} reason={}", log_header, slot, ended);
+        finish_blink(&done, &rack, slot, ended);
+        log::info!(
+            "{} [LOCAL] status=blink_finished slot={} reason={}",
+            log_header,
+            slot,
+            ended
+        );
     });
-    Ok(BLINK_HALF * BLINK_HALVES)
+    Ok(if until_stopped {
+        Duration::ZERO
+    } else {
+        BLINK_HALF * BLINK_HALVES
+    })
+}
+
+pub(super) async fn stop_blink(rack_id: &str, slot: u16) -> Result<(), &'static str> {
+    let control = lock(&BLINKS).get(&(rack_id.to_string(), slot)).cloned();
+    let Some(mut control) = control else {
+        return Ok(());
+    };
+    let _ = control.cancel.send(true);
+    while control.done.borrow().is_none() {
+        if control.done.changed().await.is_err() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Whether the rack is run locally right now.
@@ -1334,8 +1482,15 @@ pub(super) fn start(payload: &[u8], rack_id: &str, port: &SharedPort, log_header
     let task_profile = profile.clone();
     let task_rack = rack_id.to_string();
     let task_port = port.clone();
+    // A refreshed profile on the same live port must retain previously lit slots.
+    let shutdown_slots = engines
+        .get(rack_id)
+        .filter(|engine| Arc::ptr_eq(&engine.port, port))
+        .map(|engine| engine.shutdown_slots.clone())
+        .unwrap_or_default();
+    let task_shutdown_slots = shutdown_slots.clone();
     let handle = async_runtime::spawn(async move {
-        run(task_profile, task_rack.clone(), task_port).await;
+        run(task_profile, task_rack.clone(), task_port, task_shutdown_slots).await;
         let mut engines = lock(&ENGINES);
         if engines.get(&task_rack).is_some_and(|engine| engine.arming == arming) {
             engines.remove(&task_rack);
@@ -1348,6 +1503,7 @@ pub(super) fn start(payload: &[u8], rack_id: &str, port: &SharedPort, log_header
             profile_text: payload.to_vec(),
             profile,
             port: port.clone(),
+            shutdown_slots,
             handle,
         },
     ) {
@@ -1372,9 +1528,213 @@ pub(super) fn stop_all() {
     }
 }
 
+pub(super) struct IndicatorShutdown {
+    rack_id: String,
+    port: SharedPort,
+    commands: Vec<ShutdownCommand>,
+    idle: Duration,
+    reply_timeout: Duration,
+}
+
+impl Profile {
+    /// Learn a short-reply boundary from the server's own exact reply templates.
+    /// Different known short replies must share a prefix beyond the address;
+    /// the configured integrity check must validate the entire candidate frame.
+    /// Profiles without enough evidence retain their silence-based read bound.
+    fn short_reply_complete(&self, slot: u16) -> Option<ReplyComplete> {
+        if self.check != Check::Sum8 {
+            return None;
+        }
+        let head = self.frame_head.as_deref()?;
+        let addressed: Vec<u8> = head.iter().copied().chain([slot as u8]).collect();
+        let mut frames: Vec<_> = self
+            .probe_empty
+            .iter()
+            .map(String::as_str)
+            .chain(
+                self.identify
+                    .iter()
+                    .filter_map(|step| step.expect.as_deref()),
+            )
+            .chain(self.poll.as_ref().map(|poll| poll.while_reply.as_str()))
+            .filter_map(|template| fill(template, slot, self.check))
+            .filter(|frame| frame.starts_with(&addressed) && self.check.passes(frame))
+            .collect();
+        let len = frames.iter().map(Vec::len).min()?;
+        frames.retain(|frame| frame.len() == len);
+        frames.sort();
+        frames.dedup();
+        if frames.len() < 2 {
+            return None;
+        }
+        let prefix: Vec<u8> = frames[0]
+            .iter()
+            .enumerate()
+            .take_while(|(index, byte)| frames.iter().all(|frame| frame[*index] == **byte))
+            .map(|(_, byte)| *byte)
+            .collect();
+        if prefix.len() <= addressed.len() {
+            return None;
+        }
+        Some(Box::new(move |bytes| {
+            bytes
+                .windows(len)
+                .any(|frame| frame.starts_with(&prefix) && sum8(frame) == 0)
+        }))
+    }
+
+    fn shutdown_commands(&self, slots: &ShutdownSlots) -> Vec<ShutdownCommand> {
+        self.led_off.as_deref().map_or_else(Vec::new, |template| {
+            slots
+                .addresses
+                .iter()
+                .copied()
+                .filter(|slot| *slot > 0 && usize::from(*slot) <= self.status_length)
+                .filter_map(|slot| {
+                    Some(ShutdownCommand {
+                        bytes: fill(template, slot, self.check)?,
+                        complete: self.short_reply_complete(slot),
+                    })
+                })
+                .collect()
+        })
+    }
+}
+
+/// Snapshot before stop_all discards the in-memory profiles and port handles.
+pub(super) fn prepare_indicator_shutdown() -> Vec<IndicatorShutdown> {
+    lock(&ENGINES)
+        .iter()
+        .filter_map(|(rack_id, engine)| {
+            if engine.profile.led_off.is_none() {
+                log::warn!(
+                    "RACK {} | [LED] phase=shutdown status=skipped reason=no_off_template",
+                    rack_id
+                );
+                return None;
+            }
+            let commands = engine.profile.shutdown_commands(&lock(&engine.shutdown_slots));
+            if commands.is_empty() {
+                return None;
+            }
+            Some(IndicatorShutdown {
+                rack_id: rack_id.clone(),
+                port: engine.port.clone(),
+                commands,
+                idle: engine
+                    .profile
+                    .slot_idle
+                    .max(Duration::from_millis(SERIAL_MS_MIN)),
+                reply_timeout: engine
+                    .profile
+                    .slot_deadline
+                    .max(Duration::from_millis(SERIAL_MS_MIN)),
+            })
+        })
+        .collect()
+}
+
+/// Controllers run in parallel; estimate the longest serial queue, not the
+/// sum across controllers. Count reader indicators, including empty slots.
+pub(super) fn shutdown_estimate() -> super::ShutdownEstimate {
+    estimate_cleanup(lock(&ENGINES).values().filter_map(|engine| {
+        engine.profile.led_off.as_ref()?;
+        let slots = lock(&engine.shutdown_slots);
+        let count = slots
+            .addresses
+            .iter()
+            .filter(|slot| **slot > 0 && usize::from(**slot) <= engine.profile.status_length)
+            .count();
+        let framed = engine.profile.short_reply_complete(1).is_some();
+        let mean = slots.timing.average_ms()
+            + if framed {
+                0.0
+            } else {
+                engine.profile.slot_idle.as_secs_f64() * 1000.0
+            };
+        Some((count, mean))
+    }))
+}
+
+fn estimate_cleanup(racks: impl IntoIterator<Item = (usize, f64)>) -> super::ShutdownEstimate {
+    let mut slots = 0;
+    let mut longest_ms: f64 = 0.0;
+    for (count, mean_ms) in racks {
+        slots += count;
+        longest_ms = longest_ms.max(count as f64 * mean_ms);
+    }
+    super::ShutdownEstimate {
+        slots,
+        estimated_ms: (longest_ms * 1.15 + 250.0).ceil().max(500.0) as u64,
+    }
+}
+
+pub(super) async fn turn_off_indicators(plans: Vec<IndicatorShutdown>) {
+    // Separate controllers are independent. A missing controller must not
+    // prevent the others being darkened, or multiply the exit timeout.
+    let mut tasks = tokio::task::JoinSet::new();
+    for plan in plans {
+        tasks.spawn(super::transport::write_shutdown_commands(
+            plan.port,
+            plan.commands,
+            plan.idle,
+            plan.reply_timeout,
+            Duration::from_secs(20),
+            format!("RACK {} |", plan.rack_id),
+        ));
+    }
+    while let Some(result) = tasks.join_next().await {
+        if let Err(e) = result {
+            log::error!("Indicator cleanup failed: {}", e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_estimate_uses_measured_latency_and_parallel_controller_queues() {
+        let mut timing = ReplyTiming::default();
+        assert_eq!(timing.average_ms(), 15.0);
+        timing.record(Duration::from_millis(10));
+        timing.record(Duration::from_millis(20));
+        assert_eq!(timing.average_ms(), 15.0);
+        let single = estimate_cleanup([(200, timing.average_ms())]);
+        let parallel = estimate_cleanup([(200, 15.0), (200, 15.0)]);
+        assert_eq!(single.slots, 200);
+        assert_eq!(single.estimated_ms, 3700);
+        assert_eq!(parallel.slots, 400);
+        assert_eq!(parallel.estimated_ms, single.estimated_ms);
+        assert_eq!(estimate_cleanup([]).estimated_ms, 500);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_continuous_blink_waits_for_indicator_cleanup_and_is_repeatable() {
+        let rack = "TEST-CONTINUOUS-STOP";
+        let slot = 1;
+        let key = (rack.to_string(), slot);
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let (done, done_rx) = tokio::sync::watch::channel(None);
+        lock(&BLINKS).insert(
+            key.clone(),
+            BlinkControl {
+                cancel,
+                done: done_rx,
+            },
+        );
+        assert_eq!(blink_state(rack, slot), Some(true));
+        let stopping = tokio::spawn(stop_blink(rack, slot));
+        cancelled.changed().await.unwrap();
+        assert!(*cancelled.borrow());
+        assert!(!stopping.is_finished());
+        done.send(Some("stopped")).unwrap();
+        stopping.await.unwrap().unwrap();
+        assert_eq!(blink_state(rack, slot), Some(false));
+        stop_blink(rack, slot).await.unwrap();
+        lock(&BLINKS).remove(&key);
+    }
 
     // A made-up device: frames are `A0 <addr> <len> <code> <data..> <checksum>`.
     const PROFILE: &str = r#"{
@@ -1403,6 +1763,85 @@ mod tests {
 
     fn profile() -> Profile {
         Profile::parse(PROFILE.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn shutdown_darkens_every_address_in_a_large_rack_using_its_profile() {
+        let mut profile = profile();
+        profile.status_length = 240;
+        let mut slots = ShutdownSlots::default();
+        let mut region = vec![0; 240];
+        region[..180].fill(2);
+        slots.remember_status(&profile, &region);
+        let commands = profile.shutdown_commands(&slots);
+        assert_eq!(commands.len(), 180);
+        for (index, command) in commands.iter().enumerate() {
+            assert_eq!(command.bytes[1], (index + 1) as u8);
+            assert_eq!(command.bytes[3], 0x20); // The made-up profile's off command.
+            assert_eq!(sum8(&command.bytes), 0);
+            assert!(command.complete.is_some());
+        }
+        // No assumed device bytes if the server has supplied no off template.
+        profile.led_off = None;
+        assert!(profile.shutdown_commands(&slots).is_empty());
+    }
+
+    #[test]
+    fn shutdown_skips_unused_capacity_but_keeps_empty_error_and_previously_seen_slots() {
+        let mut profile = profile();
+        profile.status_length = 240;
+        let mut slots = ShutdownSlots::default();
+        assert!(profile.shutdown_commands(&slots).is_empty());
+        let mut region = vec![0; 240];
+        // Six physical readers: empty, card, error, busy, empty, card.
+        region[..6].copy_from_slice(&[1, 2, 3, 4, 1, 2]);
+        slots.remember_status(&profile, &region);
+        assert_eq!(profile.shutdown_commands(&slots).len(), 6);
+        // Remember removed cards / readers, and a manual blink in an address gap.
+        region[5] = 0;
+        slots.remember_status(&profile, &region);
+        slots.addresses.insert(20);
+        slots.addresses.insert(0); // Invalid addresses are never emitted.
+        slots.addresses.insert(241);
+        let addresses: Vec<_> = profile
+            .shutdown_commands(&slots)
+            .iter()
+            .map(|command| command.bytes[1])
+            .collect();
+        assert_eq!(addresses, [1, 2, 3, 4, 5, 6, 20]);
+    }
+
+    #[test]
+    fn shutdown_reply_boundary_requires_a_complete_addressed_intact_short_frame() {
+        let profile = profile();
+        let complete = profile.short_reply_complete(3).unwrap();
+        let reply = frame(&[0xA0, 3, 0, 0x26]);
+        for end in 0..reply.len() {
+            assert!(!complete(&reply[..end]));
+        }
+        assert!(complete(&reply));
+        assert!(!complete(&frame(&[0xA0, 4, 0, 0x26])));
+        let mut damaged = reply.clone();
+        *damaged.last_mut().unwrap() ^= 1;
+        assert!(!complete(&damaged));
+        assert!(!complete(&frame(&[0xA0, 3, 2, 0x26, 0xBE, 0xEF])));
+        let mut with_event = frame(&[0xA0, 4, 0, 0x01]);
+        with_event.extend(reply);
+        assert!(complete(&with_event));
+    }
+
+    #[test]
+    fn shutdown_reply_boundary_falls_back_without_consistent_checked_templates() {
+        let mut profile = profile();
+        profile.check = Check::None;
+        assert!(profile.short_reply_complete(3).is_none());
+        profile.check = Check::Sum8;
+        profile.probe_empty = vec!["A0{a}0111{c}".into()];
+        assert!(profile.short_reply_complete(3).is_none());
+        profile.probe_empty = vec!["A0{a}0001{c}".into()];
+        profile.identify.clear();
+        profile.poll = None;
+        assert!(profile.short_reply_complete(3).is_none());
     }
 
     /// A frame of the made-up device with its checksum appended.
