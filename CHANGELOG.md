@@ -234,3 +234,16 @@ All notable changes to this project will be documented in this file.
 
 - feat: add safe shutdown progress and controllable rack indicators.
 - show reader models and improve slot map statuses.
+
+### [0.8.1-beta.8] - 2026-11-18
+
+🛠 Fixes
+
+- Fixed card metadata reading missing files answered through GET RESPONSE (61 XX).
+- Fixed cards with an unquoted numeric ICCID or name in config.yaml being unreadable, and a failed version stamp or repeated corrupt-file backup breaking the config load.
+- Fixed review findings: sessions started or reconnected during shutdown, exit during an update install, stale busy indicator and blink states, event replay order, rack lease leaks and serial timing floors, malformed command replies.
+
+🆕 Features / Improvements
+
+- set_server and set_credentials with the values already in effect no longer reconnect the application and its cards.
+- A card that is not created on the server or has a wrong device type is no longer shown as connected: red rack slot, the reason and a hint in its row, picked up automatically after the device is created.
