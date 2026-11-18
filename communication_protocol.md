@@ -302,12 +302,37 @@ of the tracker exchanges — on a full rack that is minutes of the serial link
 per set, and a set closes every discovery pass:
 
 ```json
-{ "iccid": "<16 hex>", "slot": 3, "rack": "<serial>", "serial_transactions": true, "local_ops": false }
+{ "iccid": "<16 hex>", "slot": 3, "rack": "<serial>", "serial_transactions": true, "local_ops": false, "status": true }
 ```
 
 `local_ops` is `true` when the rack of the card is run in local mode: the
 slot indicator is then written by TBA, and the server sends no indicator
 frames on this connection.
+
+`status` asks the server to answer the report on the `status` topic of the
+card connection:
+
+```json
+{ "served": true }
+{ "served": false, "reason": "not_registered" }
+```
+
+`reason` is `not_registered` (no device for the card number) or
+`wrong_device_type` (the device is not a 'Tacho Bridge Card'). The server
+accepts the connection of such a card and only warns about it, so CONNACK
+alone does not mean the card is served. When the rack profile carries
+`"card_status": true`, TBA shows a card as served (slot indicator, row state)
+only after `served: true`; until then, and after a refusal, the slot is shown
+unserved and the row names the reason. With no answer by the next keep-alive
+ping TBA repeats the report. A refused card reconnects to ask again
+after 60 s, doubling up to 300 s, because the server binds a connection to its
+device at connect only. Without `card_status` in the profile (an older
+server) a card is served from its CONNACK, as before.
+
+A reader-backed card session has no link report and asks the same question
+with a publish of `{}` to the `status` topic right after every CONNACK; the
+answer is the same. Such a card is shown online from its CONNACK and turns
+unserved, with the reason, on a refusal; it retries on the same schedule.
 
 It binds the card session to its slot on the server; without it the server
 treats the card as reader-backed. `rack` is diagnostics only. On this

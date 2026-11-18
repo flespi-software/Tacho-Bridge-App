@@ -197,6 +197,9 @@ struct Profile {
     /// taken from the profile's own reply templates: what tells the slot of
     /// a frame the rack sent on its own.
     frame_head: Option<Vec<u8>>,
+    /// The server answers the link report of every card session with a
+    /// `status` publish: a slot is shown as served only once confirmed.
+    card_status: bool,
 }
 
 fn text<'a>(json: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -373,6 +376,10 @@ impl Profile {
             led_unserved: led_template("unserved")?,
             led_off: led_template("off")?,
             frame_head: None,
+            card_status: json
+                .get("card_status")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             poll,
             identify,
         }
@@ -880,13 +887,14 @@ fn first_walk_done(slots: &[SlotState], polls: u32, stable: u32, identifies: boo
             }))
 }
 
-/// Slots of the rack whose card session is up, by the UI rows of the rack.
+/// Slots of the rack whose card session is up and not refused by the server,
+/// by the UI rows of the rack.
 fn served_slots(rack_id: &str) -> Vec<(u16, String)> {
     lock(&RACK_CARDS_UI)
         .get(rack_id)
         .map(|rows| {
             rows.iter()
-                .filter(|row| row.online == Some(true))
+                .filter(|row| row.online == Some(true) && row.problem.is_none())
                 .filter_map(|row| row.iccid.clone().map(|id| (row.slot, id)))
                 .collect()
         })
@@ -1470,6 +1478,14 @@ pub(super) fn is_active(rack_id: &str) -> bool {
     lock(&ENGINES)
         .get(rack_id)
         .is_some_and(|engine| !engine.handle.inner().is_finished())
+}
+
+/// Whether the server of this rack confirms its card sessions (`card_status`
+/// of the profile): a card is then unserved until its confirmation arrives.
+pub(super) fn confirms_cards(rack_id: &str) -> bool {
+    lock(&ENGINES)
+        .get(rack_id)
+        .is_some_and(|engine| engine.profile.card_status)
 }
 
 /// A `rack/<id>/profile` of the server: starts the engine of the rack. The

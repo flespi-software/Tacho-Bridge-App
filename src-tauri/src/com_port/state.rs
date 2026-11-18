@@ -98,11 +98,11 @@ pub(super) fn update_rack_card_ui(
         // session is kept as-is (`spawn_rack_card` skips it as already_running),
         // so no ConnAck follows to repaint a reset row, and a connected card
         // would show grey until the next keep-alive ping.
-        let (online, authentication) = list
+        let (online, authentication, problem) = list
             .iter()
             .find(|c| c.slot == slot && c.iccid.as_deref() == Some(iccid))
-            .map(|c| (c.online, c.authentication))
-            .unwrap_or((None, None));
+            .map(|c| (c.online, c.authentication, c.problem.clone()))
+            .unwrap_or((None, None, None));
         list.retain(|c| c.slot != slot && c.iccid.as_deref() != Some(iccid));
         list.push(RackCard {
             slot,
@@ -114,6 +114,7 @@ pub(super) fn update_rack_card_ui(
             // keeps the state of its live session.
             online,
             authentication,
+            problem,
         });
         list.sort_by_key(|c| c.slot);
         updates.push((rack_id.to_string(), list.clone()));
@@ -149,6 +150,30 @@ pub(super) fn set_rack_card_state(iccid: &str, online: bool, authentication: boo
             }
             card.online = Some(online);
             card.authentication = Some(authentication);
+            update = Some((rack_id.clone(), list.clone()));
+            break;
+        }
+        update
+    };
+    if let Some((rack_id, cards)) = update {
+        rack_update_cards(&rack_id, cards);
+    }
+}
+
+/// Sets or clears the reason the server does not serve a rack card (see
+/// `RackCard::problem`). Same lookup and no-op rules as `set_rack_card_state`.
+pub(super) fn set_rack_card_problem(iccid: &str, problem: Option<&str>) {
+    let update = {
+        let mut ui = lock(&RACK_CARDS_UI);
+        let mut update = None;
+        for (rack_id, list) in ui.iter_mut() {
+            let Some(card) = list.iter_mut().find(|c| c.iccid.as_deref() == Some(iccid)) else {
+                continue;
+            };
+            if card.problem.as_deref() == problem {
+                return;
+            }
+            card.problem = problem.map(str::to_string);
             update = Some((rack_id.clone(), list.clone()));
             break;
         }

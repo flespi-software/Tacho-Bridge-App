@@ -338,6 +338,7 @@ import {
   daysToExpiry,
   expiryLine,
   faultDetail,
+  unservedDetail,
   linkableCards,
   needsAttention,
   tileLine,
@@ -452,6 +453,13 @@ const facts = computed(() => {
   }
   if (props.entry.fault !== undefined) {
     out.push({ k: 'Problem', v: faultDetail(props.entry.fault), tone: 'danger' })
+  }
+  if (props.entry.unserved !== undefined) {
+    out.push({
+      k: 'Server',
+      v: unservedDetail(props.entry.unserved),
+      ...(props.entry.unserved === 'unconfirmed' ? {} : { tone: 'danger' as const }),
+    })
   }
   return out
 })

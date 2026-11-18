@@ -18,6 +18,9 @@ export interface Reader {
   card_number: string
   online?: boolean | undefined
   authentication?: boolean | undefined
+  // Why the server does not serve the card although its session is up:
+  // 'not_registered', 'wrong_device_type'. Unset when it does.
+  problem?: string | undefined
 }
 
 // One card held in a rack slot, as reported by the server's rack discovery.
@@ -34,6 +37,9 @@ export interface RackCard {
   // Both absent for a card the rack reports but TBA does not serve.
   online?: boolean | null
   authentication?: boolean | null
+  // Why the server does not serve the card although its session is up:
+  // 'unconfirmed', 'not_registered', 'wrong_device_type'. Unset once confirmed.
+  problem?: string | null
 }
 
 // Slot table of a rack, as the backend classes the rack's status polls:

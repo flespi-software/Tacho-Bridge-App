@@ -22,7 +22,9 @@ use crate::smart_card::TASK_POOL;
 use super::rack::{
     app_link_is, publish_reply, rack_topic, run_serial_request, take_rebind, IdempotencySlot,
 };
-use super::state::{mutate_rack_rows, set_rack_card_state, update_rack_card_ui};
+use super::state::{
+    mutate_rack_rows, set_rack_card_problem, set_rack_card_state, update_rack_card_ui,
+};
 use super::transport::{
     execute_envelope, ms_field, normalize_hex, SerialEnvelope, SharedPort, SERIAL_MS_MIN,
     SERIAL_READ_DEADLINE, SERIAL_REPLY_TIMEOUT,
@@ -461,7 +463,9 @@ fn spawn_rack_card(
 /// server binds the session to its slot from `iccid` and `slot`; `rack` (the
 /// rack id) is diagnostics only, the server ignores it. `local_ops` tells the
 /// server the rack is run locally (see `local.rs`), so the slot indicator is
-/// written here and the server sends no indicator frames of its own.
+/// written here and the server sends no indicator frames of its own. `status`
+/// asks the server to answer the report on the `status` topic (see
+/// `card_status`).
 fn link_report(iccid: &str, slot: u16, rack_id: &str) -> String {
     serde_json::json!({
         "iccid": iccid,
@@ -469,9 +473,13 @@ fn link_report(iccid: &str, slot: u16, rack_id: &str) -> String {
         "rack": rack_id,
         "serial_transactions": true,
         "local_ops": super::local::is_active(rack_id),
+        "status": true,
     })
     .to_string()
 }
+
+/// Shown on a card whose session is up but not confirmed by the server yet.
+const PROBLEM_UNCONFIRMED: &str = "unconfirmed";
 
 /// Task aborts (card removed/moved or a rack restart) release local ownership.
 /// Only this session's own lease: the abort can land after a successor in the
@@ -643,6 +651,10 @@ async fn rack_card_mqtt_loop(
 
     let mut is_online = false;
     let mut backoff = Backoff::new();
+    // Refusals of the server in a row (see `card_status`), for the retry pause.
+    let mut refusals: u32 = 0;
+    // The server confirms its card sessions and has not answered this one yet.
+    let mut awaiting_status = false;
 
     loop {
         match eventloop.poll().await {
@@ -663,7 +675,15 @@ async fn rack_card_mqtt_loop(
                         if !enqueue(CardJob::Reset) {
                             return;
                         }
-                        // Session is up: show the card as served and idle.
+                        // Session is up. With a server that confirms its card
+                        // sessions the card stays unserved until the answer to
+                        // the link report; set before the session shows up, so
+                        // the slot never flashes as served in between.
+                        awaiting_status = super::local::confirms_cards(&rack_id);
+                        set_rack_card_problem(
+                            &iccid,
+                            awaiting_status.then_some(PROBLEM_UNCONFIRMED),
+                        );
                         set_rack_card_state(&iccid, true, false);
                         // Rack link report: must be the first publish of the
                         // session. `try_publish`, never `publish().await`: this
@@ -745,6 +765,55 @@ async fn rack_card_mqtt_loop(
                             log_header,
                             String::from_utf8_lossy(&publish.payload)
                         );
+                        // The answer to the link report: served, or the
+                        // reason the server will command nothing here.
+                        if topic == "status" {
+                            awaiting_status = false;
+                            match crate::mqtt::card_status(&publish.payload) {
+                                None => {
+                                    refusals = 0;
+                                    set_rack_card_problem(&iccid, None);
+                                    log::info!("{} [MQTT] status=served slot={}", log_header, slot);
+                                }
+                                Some(reason) => {
+                                    refusals = refusals.saturating_add(1);
+                                    let retry_secs = crate::mqtt::unserved_retry_secs(refusals);
+                                    set_rack_card_problem(&iccid, Some(&reason));
+                                    log::warn!(
+                                        "{} [MQTT] status=not_served reason={} slot={} retry_secs={}",
+                                        log_header,
+                                        reason,
+                                        slot,
+                                        retry_secs
+                                    );
+                                    // The server binds a connection to its device
+                                    // at connect only: ask again on a new one, so
+                                    // a device created meanwhile is picked up.
+                                    let client = mqtt_client.clone();
+                                    let connection = connection.clone();
+                                    let asked_on = connection.load(Ordering::SeqCst);
+                                    let log_header = log_header.clone();
+                                    async_runtime::spawn(async move {
+                                        tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+                                        if connection.load(Ordering::SeqCst) != asked_on {
+                                            return;
+                                        }
+                                        log::info!(
+                                            "{} [MQTT] status=reconnecting reason=not_served",
+                                            log_header
+                                        );
+                                        if let Err(e) = client.try_disconnect() {
+                                            log::warn!(
+                                                "{} [MQTT] status=reconnect_failed err={:?}",
+                                                log_header,
+                                                e
+                                            );
+                                        }
+                                    });
+                                }
+                            }
+                            continue;
+                        }
                         // Only `request/...` publishes are serial envelopes —
                         // same guard as the rack path: anything else (a future
                         // control topic, a retained stray) must not be written
@@ -779,6 +848,23 @@ async fn rack_card_mqtt_loop(
                         if !in_flight.load(Ordering::SeqCst) {
                             set_rack_card_state(&iccid, true, false);
                             log::debug!("{} [MQTT] event=ping_resp status=idle", log_header);
+                        }
+                        // Still no answer to the link report a keep-alive later:
+                        // ask again, or the slot would show unserved for as long
+                        // as the session lives. The server takes a repeated report.
+                        if awaiting_status {
+                            let report = link_report(&iccid, slot, &rack_id);
+                            match mqtt_client.try_publish("rack", QoS::AtLeastOnce, false, report) {
+                                Ok(()) => log::info!(
+                                    "{} [MQTT] status=link_report_repeated reason=no_status_answer",
+                                    log_header
+                                ),
+                                Err(e) => log::warn!(
+                                    "{} [MQTT] status=link_report_repeat_failed err={:?}",
+                                    log_header,
+                                    e
+                                ),
+                            }
                         }
                     }
                     other => {

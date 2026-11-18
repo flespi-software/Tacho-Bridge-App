@@ -69,6 +69,9 @@ pub struct TachoState {
     pub card_number: String,
     pub online: Option<bool>,
     pub authentication: Option<bool>,
+    /// Why the server does not serve this card although its session is up
+    /// (`not_registered`, `wrong_device_type`); `None` when it does.
+    pub problem: Option<String>,
 }
 
 /// Whether a reader state means the reader left the bus: its UI row goes for
@@ -87,6 +90,11 @@ pub fn card_emit_event(
     online: Option<bool>,
     authentication: Option<bool>,
 ) {
+    let problem = CARD_PROBLEMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&card_number)
+        .cloned();
     let payload = TachoState {
         iccid,
         reader_name,
@@ -94,6 +102,7 @@ pub fn card_emit_event(
         card_number,
         online,
         authentication,
+        problem,
     };
 
     // Emitted under the lock: a replay must not land an older state after this one.
@@ -116,6 +125,40 @@ pub fn card_emit_event(
 lazy_static! {
     static ref READER_STATES: Mutex<std::collections::BTreeMap<String, TachoState>> =
         Mutex::new(std::collections::BTreeMap::new());
+}
+
+lazy_static! {
+    /// Reader cards the server refused to serve, by card number, with the
+    /// reason. Kept apart from the reader states: every state event of the
+    /// card carries it, whichever task emits the event.
+    static ref CARD_PROBLEMS: Mutex<std::collections::HashMap<String, String>> =
+        Mutex::new(std::collections::HashMap::new());
+}
+
+/// Sets or clears the reason the server does not serve a reader card and
+/// re-emits the state of the reader that holds it.
+pub fn set_card_problem(card_number: &str, problem: Option<String>) {
+    {
+        let mut problems = CARD_PROBLEMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if problems.get(card_number) == problem.as_ref() {
+            return;
+        }
+        match &problem {
+            Some(reason) => problems.insert(card_number.to_string(), reason.clone()),
+            None => problems.remove(card_number),
+        };
+    }
+    let mut readers = READER_STATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for state in readers.values_mut() {
+        if state.card_number == card_number {
+            state.problem = problem.clone();
+            emit_to_frontend("global-cards-sync", state.clone());
+        }
+    }
 }
 
 /// Re-emits the last reported state of every reader (`global-cards-sync`).
@@ -204,6 +247,11 @@ pub struct RackCard {
     /// the blinking activity icon, same as `Reader.authentication` does for a
     /// card in a plain PC/SC reader.
     pub authentication: Option<bool>,
+    /// Why the server does not serve this card although its session is up:
+    /// `unconfirmed` until the server answers the link report, then the reason
+    /// it gave (`not_registered`, `wrong_device_type`). `None` once the server
+    /// confirmed the card, and with a server that sends no confirmations.
+    pub problem: Option<String>,
 }
 
 /// Slots of one rack per class, as the local rack engine classes them from

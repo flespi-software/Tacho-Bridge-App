@@ -44,6 +44,7 @@ type CardsSyncPayload = {
   card_number: string
   online?: boolean
   authentication?: boolean
+  problem?: string | null
 }
 function isCardsSyncPayload(raw: unknown): raw is CardsSyncPayload {
   if (!raw || typeof raw !== 'object') return false
@@ -108,6 +109,8 @@ function handleCardsSync(raw: unknown): void {
       raw.online === false
         ? false
         : (raw.authentication ?? (sameCard ? prev?.authentication : undefined)),
+    // every event carries it: the backend keeps it per card, not per emitter
+    problem: raw.problem ?? undefined,
   }
   if (index !== -1) {
     // The card's MQTT session repeats its state on every keep-alive: an
@@ -125,7 +128,8 @@ function sameReader(a: Reader, b: Reader): boolean {
     a.iccid === b.iccid &&
     a.card_number === b.card_number &&
     a.online === b.online &&
-    a.authentication === b.authentication
+    a.authentication === b.authentication &&
+    a.problem === b.problem
   )
 }
 
@@ -237,6 +241,7 @@ function handleCardConfigUpdated(raw: unknown): void {
           card_number: '',
           online: undefined,
           authentication: undefined,
+          problem: undefined,
         }
       }
     })

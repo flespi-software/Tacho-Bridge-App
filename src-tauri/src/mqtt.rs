@@ -406,6 +406,37 @@ pub(crate) fn request_id_from_topic(topic: &str) -> Option<u64> {
         .and_then(|id| id.parse::<u64>().ok())
 }
 
+/// First pause before a card the server refused reconnects to ask again; it
+/// doubles per refusal in a row up to `UNSERVED_RETRY_MAX_SECS`.
+const UNSERVED_RETRY_INITIAL_SECS: u64 = 60;
+const UNSERVED_RETRY_MAX_SECS: u64 = 300;
+
+/// The pause before the reconnect that follows the `refusals`-th refusal in a row.
+pub(crate) fn unserved_retry_secs(refusals: u32) -> u64 {
+    UNSERVED_RETRY_INITIAL_SECS
+        .saturating_mul(1 << refusals.saturating_sub(1).min(8))
+        .min(UNSERVED_RETRY_MAX_SECS)
+}
+
+/// The server's answer to the status question of a card session (the rack
+/// link report, or the `status` publish of a reader card), `{"served":true}` or
+/// `{"served":false,"reason":"not_registered"}`: `None` for a served card,
+/// else the reason. An answer that cannot be read counts as a refusal, so a
+/// slot never shows as served on anything but an explicit confirmation.
+pub(crate) fn card_status(payload: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(payload).unwrap_or_default();
+    if json.get("served").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    Some(
+        json.get("reason")
+            .and_then(serde_json::Value::as_str)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("not_served")
+            .to_string(),
+    )
+}
+
 fn emit_card_sync_event(
     iccid: &str,
     reader_name: &CStr,
@@ -644,6 +675,12 @@ pub async fn ensure_connection(
     // When the last request arrived: the keep-alive ping is periodic, not a sign of silence.
     let mut last_request_at = Instant::now();
     let mut backoff = Backoff::new();
+    // Refusals of the server in a row (see `card_status`), for the retry pause.
+    let mut refusals: u32 = 0;
+    // Bumped on every CONNACK and connection loss: a retry scheduled on one connection must not close the next.
+    let connection = std::sync::Arc::new(AtomicU64::new(0));
+    // Set by the retry of a refused card: its DISCONNECT is a reconnect, not the teardown of the session.
+    let requery = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Idempotency state for the current MQTT connection. The server re-sends a command with the
     // same request_id when it does not get a timely reply. We remember the last id we answered and
@@ -754,6 +791,65 @@ pub async fn ensure_connection(
                     log::trace!("{} Notification: {:?}", log_header, notification);
 
                     match notification {
+                        Event::Incoming(Incoming::Publish(publish))
+                            if &publish.topic[..] == b"status" =>
+                        {
+                            // The answer to the status question sent on CONNACK:
+                            // served, or the reason the server commands nothing here.
+                            match card_status(&publish.payload) {
+                                None => {
+                                    refusals = 0;
+                                    crate::global_app_handle::set_card_problem(
+                                        &client_id_cloned,
+                                        None,
+                                    );
+                                    log::info!("{} [CONN] status=served", log_header);
+                                }
+                                Some(reason) => {
+                                    refusals = refusals.saturating_add(1);
+                                    let retry_secs = unserved_retry_secs(refusals);
+                                    log::warn!(
+                                        "{} [CONN] status=not_served reason={} retry_secs={}",
+                                        log_header,
+                                        reason,
+                                        retry_secs
+                                    );
+                                    crate::global_app_handle::set_card_problem(
+                                        &client_id_cloned,
+                                        Some(reason),
+                                    );
+                                    // The server binds a connection to its device
+                                    // at connect only: ask again on a new one, so
+                                    // a device created meanwhile is picked up.
+                                    let client = mqtt_client.clone();
+                                    let connection = connection.clone();
+                                    let requery = requery.clone();
+                                    let asked_on = connection.load(Ordering::SeqCst);
+                                    let log_header = log_header.clone();
+                                    async_runtime::spawn(async move {
+                                        tokio::time::sleep(Duration::from_secs(retry_secs)).await;
+                                        if connection.load(Ordering::SeqCst) != asked_on
+                                            || session_retired(session_id)
+                                        {
+                                            return;
+                                        }
+                                        log::info!(
+                                            "{} [CONN] status=reconnecting reason=not_served",
+                                            log_header
+                                        );
+                                        requery.store(true, Ordering::SeqCst);
+                                        if let Err(e) = client.try_disconnect() {
+                                            requery.store(false, Ordering::SeqCst);
+                                            log::warn!(
+                                                "{} [CONN] status=reconnect_failed err={:?}",
+                                                log_header,
+                                                e
+                                            );
+                                        }
+                                    });
+                                }
+                            }
+                        }
                         Event::Incoming(Incoming::Publish(publish)) => {
                             // Every publish on a card connection is a VU-driven
                             // exchange: mark card activity so the auto-updater
@@ -1249,6 +1345,14 @@ pub async fn ensure_connection(
                             // drop the idempotency slot to avoid mistaking a fresh request for a duplicate.
                             last_request_id = None;
                             last_response_payload = None;
+                            connection.fetch_add(1, Ordering::SeqCst);
+                            // Ask whether the server serves this card: it accepts the
+                            // connection of a card without a device and only warns about it.
+                            if let Err(e) =
+                                mqtt_client.try_publish("status", QoS::AtLeastOnce, false, "{}")
+                            {
+                                log::warn!("{} [CONN] status=status_question_failed err={:?}", log_header, e);
+                            }
                             // The OFFLINE->ONLINE transition is already logged
                             // at info; CONNACK itself is a detail.
                             log::debug!("{} [CONN] event=CONNACK status=received", log_header)
@@ -1294,6 +1398,13 @@ pub async fn ensure_connection(
                                 );
                             }
                         }
+                        Event::Outgoing(Outgoing::Disconnect)
+                            if requery.swap(false, Ordering::SeqCst) =>
+                        {
+                            // The retry of a refused card: the server closes the
+                            // connection and the error path below reconnects.
+                            log::debug!("{} [CONN] event=disconnect_sent reason=not_served", log_header);
+                        }
                         Event::Outgoing(Outgoing::Disconnect) => {
                             // graceful teardown: the DISCONNECT packet is already flushed to the
                             // socket, so exit instead of letting the loop treat the closing
@@ -1336,6 +1447,7 @@ pub async fn ensure_connection(
                         "OFFLINE"
                     };
                     is_online = false;
+                    connection.fetch_add(1, Ordering::SeqCst);
 
                     // One line per failed poll: kind + retry delay; full error
                     // details only for genuinely unexpected failures.
@@ -1408,6 +1520,8 @@ pub async fn shutdown_connections(cards: Vec<ProcessingCard>, reason: &str) {
         // sniffer state here so no path (e.g. physical card extraction) leaks
         // an entry in the sniffer's global map. No-op when absent.
         crate::apdu_sniffer::forget(&card.client_id);
+        // Same choke point for the refusal of the server: it belongs to the session that ends here.
+        crate::global_app_handle::set_card_problem(&card.client_id, None);
         // The app-level connection (the one entry with no reader) never emits
         // its own offline transition when force-aborted mid-backoff — tell the
         // frontend explicitly so the UI cannot keep showing a dead connection

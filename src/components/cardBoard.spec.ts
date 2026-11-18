@@ -602,3 +602,60 @@ describe('slots in error', () => {
     expect(entriesOf(rack({ connected: false, slots: table([4]) })).entries).toEqual([])
   })
 })
+
+describe('a rack card the server does not serve', () => {
+  const cards: Record<string, SmartCard> = { AAAA000000000001: { name: 'A', iccid: '01' } }
+  const row = (problem: string | null) =>
+    buildGroups(
+      [],
+      [
+        rack({
+          cards: [
+            { slot: 1, iccid: '01', card_number: 'AAAA000000000001', online: true, problem },
+          ],
+        }),
+      ],
+      cards,
+    )
+      .flatMap((g) => g.entries)
+      .find((e) => e.slot === 1) as CardEntry
+
+  it('is online once the server confirmed it', () => {
+    const e = row(null)
+    expect(e.status).toBe('online')
+    expect(e.unserved).toBeUndefined()
+  })
+
+  it('is offline, explained and needs attention when the server has no device for it', () => {
+    const e = row('not_registered')
+    expect(e.status).toBe('offline')
+    expect(authLine(e, NOW)).toEqual({ text: 'not created on the server', tone: 'danger' })
+    expect(needsAttention(e, NOW)).toBe(true)
+  })
+
+  it('waits quietly for the confirmation', () => {
+    const e = row('unconfirmed')
+    expect(e.status).toBe('offline')
+    expect(authLine(e, NOW)).toEqual({ text: 'waiting for the server', tone: 'muted' })
+    expect(needsAttention(e, NOW)).toBe(false)
+  })
+})
+
+describe('a reader card the server does not serve', () => {
+  it('is offline and explained instead of online', () => {
+    const e = buildGroups(
+      [
+        reader({
+          iccid: '01',
+          card_number: 'AAAA000000000001',
+          online: true,
+          problem: 'not_registered',
+        }),
+      ],
+      [],
+      { AAAA000000000001: { name: 'A', iccid: '01' } },
+    ).flatMap((g) => g.entries)[0] as CardEntry
+    expect(e.status).toBe('offline')
+    expect(authLine(e, NOW)).toEqual({ text: 'not created on the server', tone: 'danger' })
+  })
+})

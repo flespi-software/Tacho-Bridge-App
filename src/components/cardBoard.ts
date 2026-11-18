@@ -18,7 +18,7 @@ export const EXPIRY_WARN_DAYS = 30
  * State of one row:
  *   active   — an APDU exchange is running right now
  *   online   — its MQTT session is up, idle
- *   offline  — inserted and configured, but no session
+ *   offline  — inserted and configured, but no session, or the server does not serve it
  *   unlinked — inserted, but its ICCID is not in the configuration
  *   absent   — configured, but not inserted anywhere
  *   empty    — a reader with no card in it
@@ -64,6 +64,11 @@ export interface CardEntry {
    * an identified card whose slot the rack reports in error.
    */
   fault?: string | undefined
+  /**
+   * The session of the card is up but the server does not serve it: the
+   * reason code it gave, or 'unconfirmed' while its answer is awaited.
+   */
+  unserved?: string | undefined
 }
 
 export interface CardGroup {
@@ -131,9 +136,12 @@ function readerEntry(reader: Reader, index: number, cards: Record<string, SmartC
     return { ...base, status: 'unlinked', number: '', name: '' }
   }
   const card = cards[reader.card_number]
+  // A card the server does not serve is not online, whatever its session says.
+  const unserved = reader.online && reader.problem ? reader.problem : undefined
   return {
     ...base,
-    status: sessionStatus(reader.online, reader.authentication),
+    status: unserved ? 'offline' : sessionStatus(reader.online, reader.authentication),
+    unserved,
     number: reader.card_number,
     name: card?.name ?? '',
     card,
@@ -159,6 +167,34 @@ export function faultDetail(reason: string): string {
       return 'the reply of the reader was cut off'
     default:
       return 'the card in this slot could not be read'
+  }
+}
+
+/** Short text of why the server does not serve a card, for the row and the tile. */
+export function unservedShort(reason: string): string {
+  switch (reason) {
+    case 'unconfirmed':
+      return 'waiting for the server'
+    case 'not_registered':
+      return 'not created on the server'
+    case 'wrong_device_type':
+      return 'wrong device type on the server'
+    default:
+      return 'not served by the server'
+  }
+}
+
+/** What is wrong on the server side and what to do about it, for the opened row. */
+export function unservedDetail(reason: string): string {
+  switch (reason) {
+    case 'unconfirmed':
+      return 'The server has not confirmed this card yet.'
+    case 'not_registered':
+      return "There is no device for this card on the server. Create a device of the 'Tacho Bridge Card' type with the card number as its ident; the app asks the server again every few minutes."
+    case 'wrong_device_type':
+      return "The device of this card on the server has another device type. It must be 'Tacho Bridge Card'; the app asks the server again every few minutes."
+    default:
+      return 'The server does not serve this card. Check its device on the server.'
   }
 }
 
@@ -190,9 +226,13 @@ function rackEntries(rack: RackState, cards: Record<string, SmartCard>): CardEnt
       return { ...b, status: 'unlinked', number: '', name: '' }
     }
     const card = cards[rc.card_number]
+    // A card the server does not serve is not online, whatever its session says.
+    const unserved = rack.connected && rc.online && rc.problem ? rc.problem : undefined
     return {
       ...b,
-      status: rack.connected ? sessionStatus(rc.online, rc.authentication) : 'offline',
+      status:
+        rack.connected && !unserved ? sessionStatus(rc.online, rc.authentication) : 'offline',
+      unserved,
       number: rc.card_number,
       // The live config wins over the name the rack snapshot carried.
       name: card?.name ?? rc.name ?? '',
@@ -467,6 +507,7 @@ export function daysToExpiry(entry: CardEntry, now: number): number | null {
 /** Expired or expiring soon, or the last authentication failed. */
 export function needsAttention(entry: CardEntry, now: number): boolean {
   if (entry.fault !== undefined) return true
+  if (entry.unserved !== undefined && entry.unserved !== 'unconfirmed') return true
   if (entry.status === 'unlinked' || entry.status === 'empty') return false
   const days = daysToExpiry(entry, now)
   if (days !== null && days <= EXPIRY_WARN_DAYS) return true
@@ -540,6 +581,11 @@ export function authLine(entry: CardEntry, now: number): ToneText {
   if (entry.rackDown) return { text: 'rack disconnected', tone: 'danger' }
   if (entry.status === 'active') return { text: 'authenticating…', tone: 'active' }
   if (entry.fault !== undefined) return { text: faultShort(entry.fault), tone: 'danger' }
+  if (entry.unserved !== undefined)
+    return {
+      text: unservedShort(entry.unserved),
+      tone: entry.unserved === 'unconfirmed' ? 'muted' : 'danger',
+    }
   if (entry.status === 'unlinked') return { text: 'not in configuration', tone: 'muted' }
   const last = entry.card?.last_auth
   if (!last) return { text: 'no auth yet', tone: 'muted' }
