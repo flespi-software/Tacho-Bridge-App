@@ -177,6 +177,8 @@ pub fn handle(client: &AsyncClient, log_header: &str, request_id: u64, payload: 
     let client = client.clone();
     let log_header = log_header.to_string();
     async_runtime::spawn(async move {
+        // The pair in effect: setting the same one again changes nothing to reconnect for.
+        let before = crate::mqtt::resolved_credentials();
         let reply = match parsed {
             Err(e) => json!({"error": e}),
             Ok((enable, username, password, save)) => {
@@ -200,6 +202,7 @@ pub fn handle(client: &AsyncClient, log_header: &str, request_id: u64, payload: 
             &done_topic,
             reply,
             "set_credentials_command",
+            crate::mqtt::resolved_credentials() != before,
         )
         .await;
     });
