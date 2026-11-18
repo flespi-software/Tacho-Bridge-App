@@ -23,9 +23,9 @@ follow one rule:
 
 - MQTT v5 (`rumqttc`), host and port taken from the app configuration
   (`server.host`, entered in the UI).
-- Keep-alive: 120 seconds.
-- Reconnect: exponential backoff, 10 s initial, doubling up to a 300 s cap,
-  reset after a successful connection.
+- Keep-alive: 60 seconds.
+- Reconnect: exponential backoff with jitter, 10 s initial, doubling up to a
+  300 s cap, reset once a connection has held for 60 seconds.
 
 ## 3. Connection types
 
@@ -566,8 +566,10 @@ becomes the command failure reason on the server:
 { "error": "no log entries for the last 1 day(s)" }
 ```
 
-Idempotency: while an upload is running, a re-sent `fetch_logs` with any
-`request_id` is dropped — the upload in flight produces the reply. Chunks of
+Idempotency: while an upload is running, a re-sent `fetch_logs` with the same
+`request_id` is dropped — the upload in flight produces the reply; one with
+another `request_id` is answered at once with
+`{ "error": "another log upload is already in progress" }`. Chunks of
 an abandoned exchange are discarded by the server via the `request_id` check.
 
 ### Extended debug log (`debug_log`)
@@ -633,7 +635,8 @@ command arrived on **before** every connection is rebuilt with the new pair:
 There is no rollback: what the server pushes is what the application uses
 from then on. A pair that does not match the channel configuration locks the
 application out until the fields are fixed in its settings dialog or on the
-channel.
+channel. A command that sets the pair already in effect is answered the same
+way and reconnects nothing.
 
 ### Server address (`set_server`)
 
@@ -656,7 +659,9 @@ arrived on **before** every connection is rebuilt against the new address:
 
 The address is persisted in `server.host` of config.yaml. There is no
 rollback: after the reply the application, its cards and racks reconnect to
-the new address and the old server hears nothing from them any more.
+the new address and the old server hears nothing from them any more. A
+command carrying the address already in effect is answered the same way and
+reconnects nothing.
 
 ### Command replies
 

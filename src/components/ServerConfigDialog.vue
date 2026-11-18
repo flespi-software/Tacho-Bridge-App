@@ -408,6 +408,9 @@ watch(
     debugLogDirty.value = false
     authPasswordVisible.value = false
     if (props.config) seedFromPayload(props.config, true)
+    // The theme persists on its own without refreshing `config`: the mode in
+    // effect is the truth, or a later Save would send the stale one back.
+    themeMode.value = $q.dark.mode === 'auto' ? 'Auto' : $q.dark.mode ? 'Dark' : 'Light'
     void refreshAutostartState()
   },
 )
@@ -498,14 +501,16 @@ const canSave = computed(() => isIdentValid.value && isHostValid.value && isUser
 const saveServerConfig = async () => {
   if (saving.value || !canSave.value) return
   const theme = themeMode.value
-  console.log(`server_address: ${hostValue.value}, ident: ${identInput.value}, theme: ${theme}`)
+  // Validation runs on the trimmed values, so the same ones are sent.
+  const host = hostValue.value.trim()
+  console.log(`server_address: ${host}, ident: ${identInput.value}, theme: ${theme}`)
 
   // Snapshot what the user typed before the first backend call: update_server
   // re-emits `global-config-server` (with the pair still in effect), and that
   // event may reach the listener below before this function resumes.
   const credentials = {
     enabled: authEnabled.value,
-    username: credentialsDirty.value ? authUsername.value : null,
+    username: credentialsDirty.value ? authUsername.value.trim() : null,
     password: credentialsDirty.value ? authPassword.value : null,
     save: saveCredentials.value,
   }
@@ -517,7 +522,7 @@ const saveServerConfig = async () => {
   // the update channel must not abort an authentication in progress.
   const before = props.config
   const serverChanged =
-    !before || (before.host ?? '') !== hostValue.value || (before.ident ?? '') !== identInput.value
+    !before || (before.host ?? '') !== host || (before.ident ?? '') !== identInput.value
   const credentialsChanged =
     !before || (before.auth_enabled === 'true') !== credentials.enabled || credentialsDirty.value
 
@@ -527,7 +532,7 @@ const saveServerConfig = async () => {
     // config dir, disk error) instead of rejecting — a bare await would show
     // the green toast over an unsaved config.
     const ok = await invoke<boolean>('update_server', {
-      host: hostValue.value,
+      host,
       ident: identInput.value,
       theme,
       betaUpdates: betaUpdates.value,

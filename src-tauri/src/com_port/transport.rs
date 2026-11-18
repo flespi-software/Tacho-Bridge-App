@@ -97,6 +97,8 @@ pub(super) fn track_port(key: usize) {
 
 pub(super) fn untrack_port(key: usize) {
     super::lock(&PORT_HEALTH).remove(&key);
+    // Events of a closed port have no engine left to take them.
+    super::lock(&UNSOLICITED).retain(|(k, _)| *k != key);
 }
 
 /// Marks the port of an unlinked rack: an operation still running on it stops
@@ -727,7 +729,8 @@ fn read_reply_inner(
         if wait.is_zero() {
             break; // line went silent: the reply (or its absence) is complete
         }
-        let slice = wait.min(SERIAL_READ_SLICE);
+        // A sub-millisecond timeout rounds down to zero in the serial driver.
+        let slice = wait.min(SERIAL_READ_SLICE).max(Duration::from_millis(1));
         if let Err(e) = port.set_timeout(slice) {
             log::warn!(
                 "{} [SERIAL] set_timeout({:?}) failed: {}",

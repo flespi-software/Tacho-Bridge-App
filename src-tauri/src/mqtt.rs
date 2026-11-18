@@ -538,6 +538,18 @@ pub async fn ensure_connection(
     // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
 
+    // The shutdown closes every session with a card reset, which the reader
+    // monitor sees as a card to serve: it must not get a new session.
+    if crate::shutdown::in_progress() {
+        log::info!(
+            "[CONN] phase=ensure_connection status=skip_shutdown reader={} client_id={}",
+            reader_name.to_string_lossy(),
+            client_id
+        );
+        managed_card.release();
+        return;
+    }
+
     // Only one connection per client_id. An existing entry blocks a new one
     // unless it is unusable: a finished task (returned early or panicked) will
     // never serve the card again, and an entry bound to a DIFFERENT reader
@@ -629,6 +641,8 @@ pub async fn ensure_connection(
     //    self-heal, which must NOT make the card look clean to the reset gate.
     let mut auth_process: bool = false;
     let mut busy_announced: bool = false;
+    // When the last request arrived: the keep-alive ping is periodic, not a sign of silence.
+    let mut last_request_at = Instant::now();
     let mut backoff = Backoff::new();
 
     // Idempotency state for the current MQTT connection. The server re-sends a command with the
@@ -745,6 +759,7 @@ pub async fn ensure_connection(
                             // exchange: mark card activity so the auto-updater
                             // never restarts the app mid-authentication.
                             touch_card_activity();
+                            last_request_at = Instant::now();
                             // Extracting the topic from the incoming data
                             let topic_str = match std::str::from_utf8(&publish.topic) {
                                 Ok(str) => str,
@@ -816,7 +831,7 @@ pub async fn ensure_connection(
                                 Ok(json_payload) => {
                                     log::trace!("Parsed JSON payload: {:?}", json_payload);
 
-                                    let mut payload_ack = String::new();
+                                    let payload_ack: String;
                                     // Set when the card exchange itself failed (send_apdu
                                     // returned a transport error and SW_TECHNICAL_PROBLEM was
                                     // substituted on the wire). Such a reply must never be
@@ -876,11 +891,14 @@ pub async fn ensure_connection(
 
                                             // Persist successful auth timestamp (detached: the
                                             // config write must not park the bridge on disk I/O
-                                            // between `finish` and our reply).
-                                            crate::config::record_auth_result_detached(
-                                                &client_id_cloned,
-                                                true,
-                                            );
+                                            // between `finish` and our reply). Only for a session
+                                            // that reached the card: a bare finish authenticated nothing.
+                                            if auth_process {
+                                                crate::config::record_auth_result_detached(
+                                                    &client_id_cloned,
+                                                    true,
+                                                );
+                                            }
 
                                             // One budget for the reset and the card check,
                                             // as at session start: the loop does not poll
@@ -1166,6 +1184,11 @@ pub async fn ensure_connection(
                                                     "{} Hex value not found or is not a string",
                                                     log_header
                                                 );
+                                                // An empty reply is not JSON and makes the server close the connection.
+                                                exchange_failed = true;
+                                                payload_ack = process_rapdu_mqtt_hex(
+                                                    SW_TECHNICAL_PROBLEM.to_string(),
+                                                );
                                             }
 
                                             log::trace!(
@@ -1178,9 +1201,9 @@ pub async fn ensure_connection(
                                         // Cache this reply so a re-sent request with the same id is
                                         // answered from cache without re-running the card exchange.
                                         // Only real card replies are cached:
-                                        //  * a malformed request leaves payload_ack empty, and
-                                        //    pinning that against the id would answer the server's
-                                        //    corrected retry from cache without touching the card;
+                                        //  * a malformed request is answered with an error (or left
+                                        //    empty), and pinning that against the id would answer the
+                                        //    server's corrected retry from cache without touching the card;
                                         //  * a failed exchange (SW_TECHNICAL_PROBLEM, the card was
                                         //    never reached) must be retried on the card when the
                                         //    server re-sends — caching it would pin the failure to
@@ -1233,9 +1256,9 @@ pub async fn ensure_connection(
                         Event::Incoming(Incoming::PingResp(..)) => {
                             log::debug!("{} Ping response received from the server.", log_header);
 
-                            // A keep-alive ping means this connection exchanged
-                            // nothing for the whole keep-alive window, so no APDU
-                            // is in flight and the card is idle. Clearing the busy
+                            // A keep-alive ping with no request for the whole
+                            // keep-alive window means no APDU is in flight and
+                            // the card is idle. Clearing the busy
                             // indicator here is the only recovery when the closing
                             // `finish:true` never arrives (tracker aborted the
                             // session, message lost, older server): without it the
@@ -1249,17 +1272,19 @@ pub async fn ensure_connection(
                             // alone: a ping is not a session boundary, and
                             // clearing it would skip the reset a resumed session
                             // needs.
-                            if busy_announced {
+                            let idle = last_request_at.elapsed()
+                                >= Duration::from_secs(MQTT_KEEP_ALIVE_SECS);
+                            if idle && busy_announced {
                                 log::debug!(
                                     "{} [CONN] event=ping_resp status=idle action=clear_busy",
                                     log_header
                                 );
+                                busy_announced = false;
                             }
-                            busy_announced = false;
                             // A ping still in flight when the session was taken
                             // out of the pool must not resurrect the row the
                             // monitor just removed (same gate as the error path).
-                            if !session_retired(session_id) {
+                            if idle && !session_retired(session_id) {
                                 emit_card_sync_event(
                                     &iccid,
                                     &reader_name,
@@ -1324,6 +1349,10 @@ pub async fn ensure_connection(
                     );
 
                     tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
+                    // Retired during the sleep: a reconnect would kick its successor.
+                    if session_retired(session_id) {
+                        break;
+                    }
                 }
             }
         }

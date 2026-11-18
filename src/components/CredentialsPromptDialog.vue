@@ -111,12 +111,14 @@ function reset() {
 // Applies the pair and rebuilds every server connection with it. On failure
 // the dialog stays open with the error so the user can correct and retry.
 async function connect() {
-  if (connecting.value || username.value.trim().length === 0) return
+  // A pasted token often carries a trailing space or newline.
+  const name = username.value.trim()
+  if (connecting.value || name.length === 0) return
   connecting.value = true
   try {
     await invoke('apply_credentials', {
       enabled: true,
-      username: username.value,
+      username: name,
       password: password.value,
       save: save.value,
       reconnect: true,

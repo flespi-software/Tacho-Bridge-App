@@ -439,6 +439,7 @@ pub fn run() {
 
                     // Notifications raised before the webview listened.
                     logger::replay_access_warning();
+                    com_port::replay_port_busy();
 
                     // Still running on an empty config (the startup load
                     // failed): say so again, and retry the load right away —

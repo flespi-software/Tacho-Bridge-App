@@ -30,7 +30,7 @@ use super::cards::{handle_cards_set, start_rack_watch, stop_all_rack_watches};
 use super::state::set_rack_card_state;
 use super::transport::{
     execute_envelope, parse_envelope, SerialEnvelope, SerialExchange, SerialLease, SharedPort,
-    SERIAL_ERR_BAD_CONTROL, SERIAL_ERR_BAD_JSON, SERIAL_ERR_BAD_REQUEST_ID, SERIAL_ERR_CARD_BUSY,
+    SERIAL_ERR_BAD_CONTROL, SERIAL_ERR_BAD_HEX, SERIAL_ERR_BAD_JSON, SERIAL_ERR_BAD_REQUEST_ID, SERIAL_ERR_CARD_BUSY,
     SERIAL_ERR_REQUEST_CONFLICT, SERIAL_ERR_STALE_REQUEST, SERIAL_ERR_TRANSACTION_ACTIVE,
     SERIAL_ERR_TRANSACTION_EXPIRED,
 };
@@ -145,6 +145,8 @@ pub fn on_app_offline() {
     super::access::cancel_discovery();
     if APP_ONLINE.swap(false, Ordering::SeqCst) {
         log::info!("RACK | [LINK] status=app_offline");
+        // The owner of a retained rack operation is gone: nobody can continue or release it.
+        super::drop_idle_rack_leases();
     }
 }
 
@@ -750,6 +752,10 @@ pub(super) async fn run_serial_request(
         None => {}
     }
     let Some(parsed) = parse_envelope(&json) else {
+        // A `serial_cmd` of the wrong type is still a request: it gets its reply.
+        if json.get("serial_cmd").is_some() {
+            return failure(&resp_topic, SERIAL_ERR_BAD_HEX);
+        }
         log::warn!("{} [MQTT] status=ignored reason=no_serial_cmd", log_header);
         return None;
     };

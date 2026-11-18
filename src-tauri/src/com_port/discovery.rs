@@ -656,6 +656,19 @@ fn notify_port_busy(port_name: &str) {
         }
         notified.push(port_name.to_string());
     }
+    emit_port_busy(port_name);
+}
+
+/// Repeats the "COM port busy" notification of every port still busy: one
+/// raised before the webview listened (the discovery starts first) was lost.
+pub fn replay_port_busy() {
+    let ports = super::lock(&BUSY_PORT_NOTICES).clone();
+    for port_name in &ports {
+        emit_port_busy(port_name);
+    }
+}
+
+fn emit_port_busy(port_name: &str) {
     emit_notification_event(
         "global-notification",
         NotificationPayload {

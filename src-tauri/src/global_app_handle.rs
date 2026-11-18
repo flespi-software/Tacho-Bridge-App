@@ -96,16 +96,15 @@ pub fn card_emit_event(
         authentication,
     };
 
-    {
-        let mut readers = READER_STATES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A reader that left the bus is dropped from the UI for good.
-        if is_reader_gone_state(&payload.card_state) {
-            readers.remove(&payload.reader_name);
-        } else {
-            readers.insert(payload.reader_name.clone(), payload.clone());
-        }
+    // Emitted under the lock: a replay must not land an older state after this one.
+    let mut readers = READER_STATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A reader that left the bus is dropped from the UI for good.
+    if is_reader_gone_state(&payload.card_state) {
+        readers.remove(&payload.reader_name);
+    } else {
+        readers.insert(payload.reader_name.clone(), payload.clone());
     }
     emit_to_frontend(event_name, payload);
 }
@@ -121,14 +120,12 @@ lazy_static! {
 
 /// Re-emits the last reported state of every reader (`global-cards-sync`).
 pub fn emit_current_reader_states() {
-    let states: Vec<TachoState> = READER_STATES
+    // Emitted under the lock, in order with `card_emit_event`.
+    let readers = READER_STATES
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .cloned()
-        .collect();
-    for state in states {
-        emit_to_frontend("global-cards-sync", state);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for state in readers.values() {
+        emit_to_frontend("global-cards-sync", state.clone());
     }
 }
 
@@ -158,9 +155,14 @@ pub struct NotificationPayload {
 // listener and be lost — the status is cached here and replayed on
 // `frontend-loaded` (and pulled via the `get_app_connection_status` command).
 static APP_ONLINE: AtomicBool = AtomicBool::new(false);
+// Orders the status emits: a replay must not land an older status after a live one.
+static APP_STATUS_ORDER: Mutex<()> = Mutex::new(());
 
 /// Emits the app connection status to the frontend and caches it for replay.
 pub fn app_emit_event(online: bool) {
+    let _order = APP_STATUS_ORDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     APP_ONLINE.store(online, Ordering::SeqCst);
     emit_to_frontend("app-connection-status", online);
 }
@@ -169,6 +171,9 @@ pub fn app_emit_event(online: bool) {
 /// freshly loaded webview shows the real status without waiting for the next
 /// OFFLINE<->ONLINE transition.
 pub fn emit_current_app_connection() {
+    let _order = APP_STATUS_ORDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     emit_to_frontend("app-connection-status", APP_ONLINE.load(Ordering::SeqCst));
 }
 
@@ -186,7 +191,7 @@ pub fn emit_notification_event(event_name: &str, payload: NotificationPayload) {
 /// One card currently held in a rack slot, as reported by the server's rack
 /// discovery. `card_number`/`name` are `None` when the card's ICCID is not in
 /// the local config — the card is visible in the rack but not served.
-#[derive(Clone, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct RackCard {
     pub slot: u16,
     pub iccid: Option<String>,
@@ -293,22 +298,19 @@ fn emit_rack_states(states: Vec<RackState>) {
 
 /// Applies one mutation to the rack map under its lock and emits the full list
 /// when the mutation reports a change. The single lock-mutate-snapshot-emit
-/// sequence every per-rack update goes through — the snapshot is taken inside
+/// sequence every per-rack update goes through — the list is emitted inside
 /// the lock, so concurrent updates cannot emit lists that reorder each other's
 /// changes.
 fn mutate_rack_states_and_emit(
     mutate: impl FnOnce(&mut std::collections::BTreeMap<String, RackState>) -> bool,
 ) {
-    let states = {
-        let mut guard = RACK_STATES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !mutate(&mut guard) {
-            return;
-        }
-        guard.values().cloned().collect::<Vec<_>>()
-    };
-    emit_rack_states(states);
+    let mut guard = RACK_STATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !mutate(&mut guard) {
+        return;
+    }
+    emit_rack_states(guard.values().cloned().collect());
 }
 
 /// Upserts one rack's state (keyed by its rack id) and emits the full rack
@@ -324,14 +326,15 @@ pub fn rack_emit_event(state: RackState) {
 
 /// Updates the card list of one rack and re-emits the full list. Called by the
 /// rack module as rack-backed card sessions are spawned and closed; a no-op
-/// when that rack has never been reported.
+/// when that rack has never been reported, or the list did not change (every
+/// card set re-lists the cards that stayed where they were).
 pub fn rack_update_cards(rack_id: &str, cards: Vec<RackCard>) {
     mutate_rack_states_and_emit(|states| match states.get_mut(rack_id) {
-        Some(state) => {
+        Some(state) if state.cards != cards => {
             state.cards = cards;
             true
         }
-        None => false,
+        _ => false,
     });
 }
 
@@ -363,17 +366,38 @@ pub fn rack_mark_scan_complete(rack_id: &str) {
     });
 }
 
+/// Drops one rack's slot table: its local engine stopped, and a table nobody
+/// updates would keep showing stale slot states.
+pub fn rack_clear_slots(rack_id: &str) {
+    mutate_rack_states_and_emit(|states| match states.get_mut(rack_id) {
+        Some(state) if state.slots.is_some() => {
+            state.slots = None;
+            true
+        }
+        _ => false,
+    });
+}
+
+/// Marks one rack's scan as running again: its cards are being re-discovered.
+pub fn rack_mark_scan_started(rack_id: &str) {
+    mutate_rack_states_and_emit(|states| match states.get_mut(rack_id) {
+        Some(state) if state.scan_complete => {
+            state.scan_complete = false;
+            true
+        }
+        _ => false,
+    });
+}
+
 /// Re-emits the cached rack list to the frontend, if any. Called on
 /// `frontend-loaded` so the UI shows the racks immediately on (re)load, without
 /// waiting for the next connect/disconnect transition.
 pub fn emit_current_rack_state() {
-    let states: Vec<RackState> = RACK_STATES
+    // Emitted under the lock, in order with `mutate_rack_states_and_emit`.
+    let guard = RACK_STATES
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .cloned()
-        .collect();
-    if !states.is_empty() {
-        emit_rack_states(states);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !guard.is_empty() {
+        emit_rack_states(guard.values().cloned().collect());
     }
 }

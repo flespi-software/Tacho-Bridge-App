@@ -140,8 +140,19 @@ function closeLocal(): void {
 }
 async function requestClose(): Promise<void> {
   if (busy.value) return
-  if (activeTarget?.continuous) await stopBlink()
-  else closeLocal()
+  if (activeTarget?.continuous) {
+    await stopBlink()
+    return
+  }
+  // A timed blink closed early keeps running in the backend: stop it, or the
+  // slot answers "already blinking" until its time is up.
+  const target = activeTarget
+  if (target && phase.value === 'running') {
+    void invoke('stop_blink_rack_slot', { rackId: target.rackId, slot: target.slot }).catch((e) =>
+      console.error('Stopping slot blink failed:', e),
+    )
+  }
+  closeLocal()
 }
 async function stopBlink(): Promise<void> {
   const target = activeTarget
@@ -215,6 +226,14 @@ async function start(): Promise<void> {
     })
   } catch (e) {
     if (opening !== mine) return
+    if (String(e) === 'already_blinking') {
+      // A blink this dialog did not start (webview reload, closed dialog):
+      // attach to it so it can be stopped from here.
+      target.continuous = true
+      untilStopped.value = true
+      phase.value = 'running'
+      return
+    }
     activeTarget = undefined
     error.value = ERRORS[String(e)] ?? `The slot could not blink (${String(e)}).`
     phase.value = 'error'

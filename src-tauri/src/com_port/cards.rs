@@ -524,6 +524,9 @@ fn spawn_serial_worker(
     let (jobs, mut queue) = tokio::sync::mpsc::unbounded_channel::<CardJob>();
     let (iccid, card_number, slot, session) = card;
     let worker = async_runtime::spawn(async move {
+        // Held by the worker, the one that takes the lease: released when it is really
+        // gone, so a request it dequeued while being aborted cannot leave a lease behind.
+        let _ownership = AuthCleanup(serial_port.clone(), slot, session);
         let mut idempotency = IdempotencySlot::default();
         while let Some(job) = queue.recv().await {
             let (topic, payload, arrived_on) = match job {
@@ -587,7 +590,6 @@ async fn rack_card_mqtt_loop(
     session_online: Arc<AtomicBool>,
 ) {
     let session = NEXT_AUTH_SESSION.fetch_add(1, Ordering::Relaxed);
-    let _ownership = AuthCleanup(serial_port.clone(), slot, session);
     let log_header = format!("RACKCARD {} |", card_number);
 
     // same waiting policy as the rack loop: the server may not be configured yet
@@ -886,10 +888,10 @@ pub(super) fn start_rack_watch(
     let interval = Duration::from_millis(ms("interval_ms").unwrap_or(1000).max(SERIAL_MS_MIN));
     let refresh = Duration::from_millis(ms("refresh_ms").unwrap_or(30_000).max(1000));
     let idle = ms("idle_ms")
-        .map(Duration::from_millis)
+        .map(|ms| Duration::from_millis(ms.max(SERIAL_MS_MIN)))
         .unwrap_or(SERIAL_REPLY_TIMEOUT);
     let deadline = ms("deadline_ms")
-        .map(Duration::from_millis)
+        .map(|ms| Duration::from_millis(ms.max(SERIAL_MS_MIN)))
         .unwrap_or(SERIAL_READ_DEADLINE);
 
     let armed_port = serial_port.clone();
@@ -923,6 +925,14 @@ pub(super) fn start_rack_watch(
             // rack gets a watch of its own from the server's next `watch`.
             if !rack_port_is_live(&watched_rack, &serial_port) {
                 log::info!("{} [WATCH] status=ended reason=link_down", log_header);
+                break;
+            }
+            // The server instance that armed this watch is gone for good: the next one arms its own.
+            if !app_link_is(generation) {
+                log::info!(
+                    "{} [WATCH] status=ended reason=app_connection_changed",
+                    log_header
+                );
                 break;
             }
             let envelope = SerialEnvelope {
@@ -1308,6 +1318,11 @@ pub(super) async fn apply_cards_set(
         return false;
     }
     let epoch = bump_card_epoch(&rack_id);
+    // Unlinked and relinked between the check and the bump: the epoch taken belongs to the new life.
+    if !rack_port_is_live(&rack_id, &serial_port) {
+        log::info!("{} [CARDS] status=ignored reason=port_replaced", log_header);
+        return false;
+    }
     // a set that follows a `link up` closes a full re-discovery: the sessions it
     // lists re-publish their link reports, every other set leaves them alone
     let rebind = take_rebind(&rack_id);

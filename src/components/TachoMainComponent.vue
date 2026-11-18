@@ -103,7 +103,11 @@ function handleCardsSync(raw: unknown): void {
     iccid,
     card_number,
     online: raw.online ?? (sameCard ? prev?.online : undefined),
-    authentication: raw.authentication ?? (sameCard ? prev?.authentication : undefined),
+    // An offline session authenticates nothing: its flag is not inherited.
+    authentication:
+      raw.online === false
+        ? false
+        : (raw.authentication ?? (sameCard ? prev?.authentication : undefined)),
   }
   if (index !== -1) {
     // The card's MQTT session repeats its state on every keep-alive: an
@@ -225,6 +229,17 @@ function handleCardConfigUpdated(raw: unknown): void {
     state.cards[payload.card_number] = { ...(payload.content as SmartCard) }
   } else {
     delete state.cards[payload.card_number]
+    // The reader keeps the inserted card but no longer its number and session.
+    state.readers.forEach((reader, i) => {
+      if (reader.card_number === payload.card_number) {
+        state.readers[i] = {
+          ...reader,
+          card_number: '',
+          online: undefined,
+          authentication: undefined,
+        }
+      }
+    })
   }
 }
 

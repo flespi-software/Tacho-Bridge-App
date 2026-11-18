@@ -63,6 +63,14 @@ pub fn set_phase(phase: Phase) {
     emit_state();
 }
 
+/// True from the start of `prepare` until the exit or `reset_after_failed_update`.
+pub fn in_progress() -> bool {
+    STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+}
+
 pub fn is_prepared() -> bool {
     PREPARED.load(Ordering::SeqCst)
 }
@@ -75,6 +83,9 @@ pub fn exit_ready() -> bool {
     EXIT_READY.load(Ordering::SeqCst)
 }
 
+/// How long an exit waits for an update install in progress before leaving anyway.
+const INSTALL_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub fn request_exit(app: tauri::AppHandle, code: i32) {
     if EXIT_STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -82,7 +93,15 @@ pub fn request_exit(app: tauri::AppHandle, code: i32) {
     // A Quit from the tray must make its progress visible too.
     crate::show_main_window(&app);
     tauri::async_runtime::spawn(async move {
-        prepare().await;
+        // Run as its own task: a panic in the cleanup must still let the app exit.
+        if let Err(e) = tauri::async_runtime::spawn(prepare()).await {
+            log::error!("[SHUTDOWN] status=prepare_failed err={}", e);
+        }
+        // An update being installed finishes replacing the bundle first.
+        let waiting = Instant::now();
+        while crate::updater::is_installing() && waiting.elapsed() < INSTALL_WAIT {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
         EXIT_READY.store(true, Ordering::SeqCst);
         app.exit(code);
     });

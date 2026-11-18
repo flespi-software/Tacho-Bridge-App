@@ -242,6 +242,10 @@ fn parse_rule(json: &serde_json::Value) -> Result<Rule, String> {
         }
     }
     if let (Some(at), Some(len)) = (number(json, "take_at"), number(json, "take_len")) {
+        // An empty take would identify every card as "".
+        if len == 0 {
+            return Err("bad_rule_take".to_string());
+        }
         rule.take = Some((at as usize, len as usize));
     }
     Ok(rule)
@@ -281,7 +285,9 @@ impl Profile {
         let status_len = number(status, "len").ok_or("no_status_len")? as usize;
         if status_length == 0
             || status_length > SLOT_MAX
-            || status_offset + status_length > status_len
+            || status_offset
+                .checked_add(status_length)
+                .is_none_or(|end| end > status_len)
             || status_len > 4096
         {
             return Err("bad_status_region".to_string());
@@ -450,7 +456,7 @@ impl Profile {
             return None;
         }
         for (at, mask, expected) in &rule.matches {
-            let part = frame.get(*at..*at + expected.len())?;
+            let part = frame.get(*at..at.checked_add(expected.len())?)?;
             let equal = part.iter().zip(expected).enumerate().all(|(i, (got, want))| {
                 let m = match mask {
                     Some(m) if m.len() == 1 => m[0],
@@ -464,7 +470,7 @@ impl Profile {
             }
         }
         match rule.take {
-            Some((at, len)) => Some(Some(frame.get(at..at + len)?.to_vec())),
+            Some((at, len)) => Some(Some(frame.get(at..at.checked_add(len)?)?.to_vec())),
             None => Some(None),
         }
     }
@@ -939,6 +945,8 @@ async fn run(
     let mut first_pass = true;
     let mut polls: u32 = 0;
     let mut scan_reported = false;
+    // Consecutive status replies the profile did not accept.
+    let mut rejected: u32 = 0;
     loop {
         tokio::time::sleep(poll_delay(profile.status_interval, failures)).await;
         if !rack_port_is_live(&rack_id, &port) {
@@ -968,8 +976,19 @@ async fn run(
                 reply.len(),
                 end
             );
+            // One cut reading is a missed poll; a streak means the profile does not fit the rack.
+            rejected = rejected.saturating_add(1);
+            if rejected == 3 {
+                log::warn!(
+                    "{} [LOCAL] status=reading_rejected_repeatedly rx_bytes={} end={}",
+                    log_header,
+                    reply.len(),
+                    end
+                );
+            }
             continue;
         };
+        rejected = 0;
         lock(&shutdown_slots).remember_status(&profile, region);
         for (index, from, to) in observe(&mut slots, &profile, region) {
             // a card at work flips between idle and busy all the time
@@ -1157,12 +1176,21 @@ async fn run(
             let slot = (index + 1) as u16;
             // A blink owns the indicator while it runs; once it has ended the
             // indicator of the slot is written anew.
-            match blink_state(&rack_id, slot) {
-                Some(true) => continue,
-                Some(false) => {
-                    lock(&BLINKS).remove(&(rack_id.clone(), slot));
-                    slots[index].led = None;
+            // Checked and removed under one lock: a blink started in between must keep its entry.
+            let blinking = {
+                let mut blinks = lock(&BLINKS);
+                let key = (rack_id.clone(), slot);
+                let running = blinks
+                    .get(&key)
+                    .map(|control| control.done.borrow().is_none());
+                if running == Some(false) {
+                    blinks.remove(&key);
                 }
+                running
+            };
+            match blinking {
+                Some(true) => continue,
+                Some(false) => slots[index].led = None,
                 None => {}
             }
             let state = &slots[index];
@@ -1269,8 +1297,8 @@ lazy_static::lazy_static! {
     /// Engines of the racks in local mode, keyed by rack id.
     static ref ENGINES: std::sync::Mutex<HashMap<String, Engine>> =
         std::sync::Mutex::new(HashMap::new());
-    /// Slot blinks by rack id and slot: `true` while one runs, `false` once it
-    /// ended and the engine has not written the indicator of the slot again.
+    /// Slot blinks by rack id and slot: an entry stays after its blink ended
+    /// until the engine has written the indicator of the slot again.
     static ref BLINKS: std::sync::Mutex<HashMap<(String, u16), BlinkControl>> =
         std::sync::Mutex::new(HashMap::new());
 }
@@ -1514,9 +1542,22 @@ pub(super) fn start(payload: &[u8], rack_id: &str, port: &SharedPort, log_header
 /// Stops the engine of one rack, if it runs: the rack went away, or the
 /// server drives it itself.
 pub(super) fn stop(rack_id: &str, reason: &str) {
-    if let Some(engine) = lock(&ENGINES).remove(rack_id) {
+    let engine = lock(&ENGINES).remove(rack_id);
+    if let Some(engine) = engine {
         engine.handle.abort();
+        // The indicators and the slot table belong to the engine: neither outlives it.
+        cancel_blinks(rack_id);
+        crate::global_app_handle::rack_clear_slots(rack_id);
         log::info!("RACK {} | [LOCAL] status=stopped reason={}", rack_id, reason);
+    }
+}
+
+/// Cancels every running slot blink of a rack: each darkens its slot and ends as stopped.
+fn cancel_blinks(rack_id: &str) {
+    for ((rack, _), control) in lock(&BLINKS).iter() {
+        if rack == rack_id {
+            let _ = control.cancel.send(true);
+        }
     }
 }
 

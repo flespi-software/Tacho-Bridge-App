@@ -53,6 +53,7 @@ use transport::SharedPort;
 pub use cards::abort_rack_card_session;
 pub use cards::connect_pending_rack_cards;
 pub use cards::disconnect_rack_card;
+pub use discovery::replay_port_busy;
 pub use rack::{handle_app_publish, on_app_connack, on_app_offline, register_app_client};
 
 use crate::backoff::{Backoff, RECONNECT_DELAY_INITIAL_SECS};
@@ -230,6 +231,17 @@ fn reset_all_rack_idempotency() {
     }
 }
 
+/// Ends the retained serial operation parked in every rack's slot, freeing the
+/// ports for the card sessions queued behind them. A slot locked by a request
+/// in flight is skipped, as in `unlink_rack`.
+fn drop_idle_rack_leases() {
+    for rack in lock(&RACKS).values() {
+        if let Ok(mut slot) = rack.idempotency.try_lock() {
+            slot.drop_lease();
+        }
+    }
+}
+
 /// Registers a rack whose port just opened and tells the server about it.
 fn link_rack(rack_id: String, port: SharedPort, io_key: usize) -> Vec<(String, bool)> {
     let mut racks = lock(&RACKS);
@@ -303,6 +315,8 @@ pub fn restart_rack_links(reason: &str) {
         // hand the cards over again, leaving the rack without sessions.
         local::stop(id, "links_restarted");
         stop_rack_cards(id);
+        // The card list is empty until the re-discovery ends: show it as a scan.
+        crate::global_app_handle::rack_mark_scan_started(id);
     }
     reset_all_rack_idempotency();
     announce_links(ids.into_iter().map(|id| (id, true)).collect());

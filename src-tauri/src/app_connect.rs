@@ -287,6 +287,10 @@ pub async fn app_connection() {
                     );
 
                     tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
+                    // Replaced during the sleep: a reconnect would kick its successor.
+                    if !is_current_app_session(session_id) {
+                        break;
+                    }
                 }
             }
         }

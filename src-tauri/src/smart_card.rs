@@ -1229,8 +1229,13 @@ pub fn parse_atr_and_get_protocol(atr: &str) -> AtrProtocol {
         return AtrProtocol::Indeterminate(Protocols::T0);
     }
 
-    // TD2 present → it names the preferred protocol.
-    AtrProtocol::Resolved(protocol_from_td(atr_bytes[index]))
+    // TD2 present → it names the preferred protocol, unless it is T=15
+    // (global interface bytes follow), which leaves TD1 as the only one.
+    let td2 = atr_bytes[index];
+    if td2 & 0x0F == 0x0F {
+        return AtrProtocol::Resolved(protocol_from_td(td1));
+    }
+    AtrProtocol::Resolved(protocol_from_td(td2))
 }
 
 // Manual card sync function.
@@ -1842,12 +1847,13 @@ impl ManagedCard {
                 *pool = keep;
                 stale
             };
-            // After the cleanup: an entry left in the pool would make the
-            // rescan ignore the inserted card.
-            request_rescan();
             if !stale.is_empty() {
                 crate::mqtt::shutdown_connections(stale, "card_swapped").await;
             }
+            // After the cleanup: an entry left in the pool would make the
+            // rescan ignore the inserted card, and the reset closing the old
+            // handle would fail the ICCID read of a probe racing it.
+            request_rescan();
         });
         false
     }
