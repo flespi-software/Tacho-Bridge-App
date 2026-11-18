@@ -192,16 +192,49 @@ pub enum DarkTheme {
     Light,
 }
 
+/// A text field of a card typed in by hand without quotes (`iccid: 1122334455667788`,
+/// `name: 2024`) reads as a YAML number: taken as the text it was meant to be,
+/// or the whole card would be skipped as malformed and dropped by the next save.
+/// Only what prints back exactly as typed is taken: a float (an all-digit
+/// value with an `E` inside reads as one) has lost its original text.
+fn lenient_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match serde_yaml::Value::deserialize(deserializer)? {
+        serde_yaml::Value::Null => Ok(None),
+        serde_yaml::Value::String(text) => Ok(Some(text)),
+        serde_yaml::Value::Number(number) if number.is_u64() => Ok(Some(number.to_string())),
+        other => Err(serde::de::Error::custom(format!(
+            "expected a string, found {:?}",
+            other
+        ))),
+    }
+}
+
+/// `lenient_opt_string` for a field where an absent value is an empty string.
+fn lenient_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    lenient_opt_string(deserializer).map(Option::unwrap_or_default)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CardConfig {
-    #[serde(default)] // a card typed in by hand before its ICCID is known
+    // default: a card typed in by hand before its ICCID is known
+    #[serde(default, deserialize_with = "lenient_string")]
     pub iccid: String, // ICCID
-    pub expire: Option<u64>,                 // Expire date
-    pub name: Option<String>,                // Custom card name (for ease of user identification)
+    pub expire: Option<u64>, // Expire date
+    #[serde(default, deserialize_with = "lenient_opt_string")]
+    pub name: Option<String>, // Custom card name (for ease of user identification)
+    #[serde(default, deserialize_with = "lenient_opt_string")]
     pub t_protocol: Option<String>, // Card communication protocol "T0"/"T1"; auto-filled from ATR on first connection, may be overridden manually
     pub card_type: Option<u8>, // typeOfTachographCardId: 1=Driver, 2=Workshop, 3=Control, 4=Company
     pub structure_version: Option<(u8, u8)>, // cardStructureVersion (major, minor): major 0x00=Gen1, 0x01=Gen2; minor = data-element revision
+    #[serde(default, deserialize_with = "lenient_opt_string")]
     pub company_name: Option<String>, // Company name (from EF_Identification, Company Card only)
+    #[serde(default, deserialize_with = "lenient_opt_string")]
     pub company_address: Option<String>, // Company address (from EF_Identification, Company Card only)
     pub last_auth: Option<(u64, bool)>, // Last completed authentication: (unix_timestamp, success_flag)
 }
@@ -1332,6 +1365,8 @@ pub fn init_config() -> io::Result<()> {
     // reorders keys in a file the user may hand-edit. Only a real change
     // earns a write.
     let mut needs_save = true;
+    // Whether a failed save may be ignored: true when only the version stamp changed.
+    let mut save_optional = false;
 
     // Only a definite "not found" means a first run. `Path::exists()` is also
     // false on any metadata error (permissions, a cloud-sync placeholder not
@@ -1365,12 +1400,14 @@ pub fn init_config() -> io::Result<()> {
             Ok(mut loaded_config) => {
                 let version = env!("CARGO_PKG_VERSION");
                 needs_save = loaded_config.version != version;
+                save_optional = needs_save;
                 loaded_config.version = version.to_string();
                 // A hand-prepared config may carry only `server` and `cards`;
                 // without an ident the app never connects.
                 if loaded_config.ident.as_deref().is_none_or(str::is_empty) {
                     loaded_config.ident = Some(generate_ident());
                     needs_save = true;
+                    save_optional = false;
                 }
                 config = loaded_config;
             }
@@ -1388,9 +1425,18 @@ pub fn init_config() -> io::Result<()> {
                 // below replaces it: a crash or a full disk in between must
                 // not leave the app with no config (it would start over with
                 // a new ident). The rename is a fallback for a full disk.
-                let backed_up = fs::copy(&config_path, &backup)
-                    .map(|_| ())
-                    .or_else(|_| fs::rename(&config_path, &backup));
+                // One copy per run: a save that keeps failing brings this path
+                // back on every init retry, and the file has not changed since.
+                static BACKED_UP: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let backed_up = if BACKED_UP.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    fs::copy(&config_path, &backup)
+                        .map(|_| ())
+                        .or_else(|_| fs::rename(&config_path, &backup))
+                };
+                BACKED_UP.store(backed_up.is_ok(), std::sync::atomic::Ordering::SeqCst);
                 if let Err(backup_err) = backed_up {
                     // Never overwrite a file that has no copy: leave it for
                     // the user to repair and run without a config.
@@ -1416,8 +1462,14 @@ pub fn init_config() -> io::Result<()> {
     }
 
     if needs_save {
-        save_config(&config_path, &config).map_err(io::Error::other)?;
-        log::debug!("config: saved config");
+        match save_config(&config_path, &config) {
+            Ok(()) => log::debug!("config: saved config"),
+            // Only the version stamp is new: a file that cannot be rewritten is still a valid config.
+            Err(e) if save_optional => {
+                log::warn!("config: version stamp not saved ({}), using the file as it is", e)
+            }
+            Err(e) => return Err(io::Error::other(e)),
+        }
     } else {
         log::debug!("config: unchanged on disk, left as-is");
     }
@@ -1989,6 +2041,36 @@ cards:
         assert!(!cfg.cards.contains_key("BADCARD000000002"));
         assert_eq!(cfg.cards["1234567890123456"].iccid, "3333");
         assert!(cfg.cards.contains_key("EMPTYCARD0000003"));
+    }
+
+    #[test]
+    fn unquoted_numeric_card_fields_are_read_as_text() {
+        let yaml = r#"
+cards:
+  CARD000000000001:
+    iccid: 1122334455667788
+    name: 2024
+  CARD000000000002:
+    iccid: 0011223344556677
+  CARD000000000003:
+    iccid: "8899AABBCCDDEEFF"
+    name: Truck 7
+"#;
+        let cfg: ConfigurationFile = serde_yaml::from_str(yaml).expect("lenient parse");
+        assert_eq!(cfg.cards["CARD000000000001"].iccid, "1122334455667788");
+        assert_eq!(cfg.cards["CARD000000000001"].name.as_deref(), Some("2024"));
+        // leading zeros survive: such a scalar is a string in YAML 1.2
+        assert_eq!(cfg.cards["CARD000000000002"].iccid, "0011223344556677");
+        assert_eq!(cfg.cards["CARD000000000003"].iccid, "8899AABBCCDDEEFF");
+        assert_eq!(
+            cfg.cards["CARD000000000003"].name.as_deref(),
+            Some("Truck 7")
+        );
+        // the frontend sends the same structure as JSON
+        let card: CardConfig =
+            serde_json::from_str(r#"{"iccid":"1122334455667788","name":null}"#).expect("json");
+        assert_eq!(card.iccid, "1122334455667788");
+        assert_eq!(card.name, None);
     }
 
     #[test]
