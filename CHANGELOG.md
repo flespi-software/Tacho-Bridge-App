@@ -247,3 +247,9 @@ All notable changes to this project will be documented in this file.
 
 - set_server and set_credentials with the values already in effect no longer reconnect the application and its cards.
 - A card that is not created on the server or has a wrong device type is no longer shown as connected: red rack slot, the reason and a hint in its row, picked up automatically after the device is created.
+
+### [0.8.1-beta.9] - 2026-11-19
+
+🛠 Fixes
+
+- Fixed the application not starting on newer Linux distributions in a Wayland session ('Could not create default EGL display').
