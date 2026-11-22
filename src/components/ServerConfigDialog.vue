@@ -54,7 +54,13 @@
 
         <q-card-section class="q-py-sm">
           <div class="app-settings-dialog__heading q-mb-sm">Authentication</div>
-          <q-toggle v-model="authEnabled" label="Server authentication" dense class="q-mb-sm">
+          <q-toggle
+            v-model="authEnabled"
+            label="Server authentication"
+            dense
+            class="q-mb-sm"
+            @update:model-value="authChoiceDirty = true"
+          >
             <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
               Signs every connection to the server in with a username and password (a flespi token
               goes into the username). Off: anonymous connection.
@@ -103,6 +109,7 @@
               label="Save to config and use for sign-in"
               dense
               class="q-mb-sm"
+              @update:model-value="authChoiceDirty = true"
             >
               <q-tooltip anchor="bottom middle" self="top middle" max-width="320px">
                 Unchecked: the credentials are kept in memory for this run only and never written to
@@ -345,6 +352,9 @@ const authPasswordVisible = ref(false)
 // asked again at the next launch.
 const saveCredentials = ref(true)
 const credentialsDirty = ref(false)
+// The switch or the save choice was changed by hand: a backend push while the
+// dialog is open must not flip them back (the pair itself is `credentialsDirty`).
+const authChoiceDirty = ref(false)
 // Authentication needs a username: the field shows the one in effect, and the
 // backend rejects the switch without one.
 const isUsernameValid = computed(() => !(authEnabled.value && authUsername.value.trim() === ''))
@@ -405,6 +415,7 @@ watch(
   (open) => {
     if (!open) return
     credentialsDirty.value = false
+    authChoiceDirty.value = false
     debugLogDirty.value = false
     authPasswordVisible.value = false
     if (props.config) seedFromPayload(props.config, true)
@@ -560,6 +571,7 @@ const saveServerConfig = async () => {
     // picks the new state up, so the backend does not reconnect here.
     await invoke('apply_credentials', { ...credentials, reconnect: false })
     credentialsDirty.value = false
+    authChoiceDirty.value = false
     credentialsApplied = true
   } catch (error) {
     complete = false
@@ -622,9 +634,11 @@ function seedFromPayload(payload: GlobalConfigServerPayload, force: boolean) {
   // save in progress (or by a reconnect) carries the pair still in effect,
   // and reflecting it would drop the edit before it is applied.
   if (force || (!saving.value && !credentialsDirty.value)) {
-    authEnabled.value = payload.auth_enabled === 'true'
     authUsername.value = payload.auth_username ?? ''
     authPassword.value = payload.auth_password ?? ''
+  }
+  if (force || (!saving.value && !credentialsDirty.value && !authChoiceDirty.value)) {
+    authEnabled.value = payload.auth_enabled === 'true'
     // A pair in effect that is not in the file was entered for this run only:
     // reflect that, otherwise default to saving.
     const authActive = payload.auth_active === 'true'

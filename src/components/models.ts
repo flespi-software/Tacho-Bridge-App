@@ -99,7 +99,7 @@ export interface RackState {
 /// what counts as a valid identity.
 export const TBA_IDENT_REGEXP = /^TBA\d{13}$/
 
-// Payload of the `global-config-server` event (config.rs
+// Payload of the `global-config-server` event (the config module
 // `emit_global_config_server`): every value is a string, booleans as
 // "true"/"false", timestamps as decimal unix seconds.
 export interface GlobalConfigServerPayload {
@@ -147,4 +147,57 @@ export type ThemeMode = 'Auto' | 'Light' | 'Dark'
 /// without an appearance section) yields null so callers keep the current mode.
 export function parseThemeMode(value: string | undefined): ThemeMode | null {
   return value === 'Auto' || value === 'Light' || value === 'Dark' ? value : null
+}
+
+const SLOT_CLASSES = ['free', 'faulty', 'card', 'discovered', 'error', 'absent'] as const
+
+/// Runtime guard for the slot table of a rack: counters are numbers, every
+/// class list is a list of numbers. A malformed table fails the whole rack
+/// payload closed, like any other shape mismatch.
+function isRackSlotsPayload(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false
+  const p = raw as Record<string, unknown>
+  const states = p.states as Record<string, unknown> | undefined
+  return (
+    ['hi', 'total', 'occupied', 'free'].every((k) => typeof p[k] === 'number') &&
+    !!states &&
+    typeof states === 'object' &&
+    SLOT_CLASSES.every(
+      (k) => Array.isArray(states[k]) && states[k].every((n) => typeof n === 'number'),
+    ) &&
+    (p.errors === undefined || Array.isArray(p.errors))
+  )
+}
+
+/// Runtime guard for one rack of the `rack-state` payload — fails closed on a
+/// malformed shape.
+export function isRackStatePayload(raw: unknown): raw is RackState {
+  if (!raw || typeof raw !== 'object') return false
+  const p = raw as Record<string, unknown>
+  return (
+    typeof p.id === 'string' &&
+    typeof p.connected === 'boolean' &&
+    typeof p.name === 'string' &&
+    Array.isArray(p.cards) &&
+    (p.slots === undefined || p.slots === null || isRackSlotsPayload(p.slots))
+  )
+}
+
+/// Payload of `global-card-config-updated`: the card's config, or no content
+/// when the card was removed.
+export interface CardConfigPayload {
+  card_number: string
+  content?: SmartCard | null
+}
+
+/// Runtime guard for `global-card-config-updated`: a non-empty card number,
+/// and a content that is an object when present.
+export function isCardConfigPayload(raw: unknown): raw is CardConfigPayload {
+  if (!raw || typeof raw !== 'object') return false
+  const p = raw as Record<string, unknown>
+  return (
+    typeof p.card_number === 'string' &&
+    p.card_number.length > 0 &&
+    (p.content === undefined || p.content === null || typeof p.content === 'object')
+  )
 }

@@ -182,9 +182,12 @@ const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
   update: showUpdateNotification,
 
   // Backend message names the COM port occupied by another application.
+  // Grouped: every webview reload replays it, and one toast is enough.
   port_busy: (message) =>
     Notify.create({
       message: message || 'The card rack COM port is busy by another application.',
+      group: 'tba-port-busy',
+      badgeStyle: 'display: none',
       color: 'orange',
       position: 'bottom',
       timeout: 999000,
@@ -196,6 +199,8 @@ const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
   auth_rejected: (message) =>
     Notify.create({
       message: message || 'The server rejected the authentication.',
+      group: 'tba-auth-rejected',
+      badgeStyle: 'display: none',
       color: 'red',
       position: 'bottom',
       timeout: 15000,

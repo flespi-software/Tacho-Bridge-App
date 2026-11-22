@@ -59,8 +59,9 @@ describe('buildGroups', () => {
     const cards: Record<string, SmartCard> = { AAAA000000000001: { name: 'A', iccid: '01' } }
     const rows = buildGroups(
       [
-        reader({ name: 'empty' }),
+        reader({ name: 'empty', status: 'EMPTY' }),
         reader({ name: 'unknown', iccid: 'FF' }),
+        reader({ name: 'unreadable' }),
         reader({ name: 'offline', iccid: '01', card_number: 'AAAA000000000001' }),
         reader({ name: 'online', iccid: '01', card_number: 'AAAA000000000001', online: true }),
         reader({
@@ -80,6 +81,7 @@ describe('buildGroups', () => {
       .sort((a, b) => a.slot - b.slot)
     expect(rows.map((e) => e.status)).toEqual([
       'empty',
+      'unlinked',
       'unlinked',
       'offline',
       'online',
@@ -103,7 +105,7 @@ describe('buildGroups', () => {
     const inputs = [
       reader({ name: 'ACS ACR39U ICC Reader 00 00', iccid: '01', card_number: 'A', online: true }),
       reader({ name: 'Alcor Micro AU9540 00 00', iccid: '02' }),
-      reader({ name: 'ACS ACR39U ICC Reader 01 00' }),
+      reader({ name: 'ACS ACR39U ICC Reader 01 00', status: 'EMPTY' }),
     ]
     const groups = buildGroups(inputs, [], { A: { name: 'Card A', iccid: '01' } })
     const acs = groups.find((g) => g.id === readerGroupId('ACS ACR39U ICC Reader'))!
@@ -610,9 +612,7 @@ describe('a rack card the server does not serve', () => {
       [],
       [
         rack({
-          cards: [
-            { slot: 1, iccid: '01', card_number: 'AAAA000000000001', online: true, problem },
-          ],
+          cards: [{ slot: 1, iccid: '01', card_number: 'AAAA000000000001', online: true, problem }],
         }),
       ],
       cards,

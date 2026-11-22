@@ -127,10 +127,12 @@ function releaseContinuous(): void {
   const target = activeTarget
   activeTarget = undefined
   if (target?.continuous) {
-    void invoke('stop_blink_rack_slot', { rackId: target.rackId, slot: target.slot }).catch((e) =>
-      console.error('Stopping slot blink failed:', e),
-    )
+    stopInBackground(target.rackId, target.slot, 'Stopping slot blink failed:')
   }
+}
+// Fire-and-forget stop of a blink nobody waits for: a failure is only logged.
+function stopInBackground(rackId: string, slot: number, failure: string): void {
+  void invoke('stop_blink_rack_slot', { rackId, slot }).catch((e) => console.error(failure, e))
 }
 function closeLocal(): void {
   stopTimer()
@@ -148,9 +150,7 @@ async function requestClose(): Promise<void> {
   // slot answers "already blinking" until its time is up.
   const target = activeTarget
   if (target && phase.value === 'running') {
-    void invoke('stop_blink_rack_slot', { rackId: target.rackId, slot: target.slot }).catch((e) =>
-      console.error('Stopping slot blink failed:', e),
-    )
+    stopInBackground(target.rackId, target.slot, 'Stopping slot blink failed:')
   }
   closeLocal()
 }
@@ -241,9 +241,7 @@ async function start(): Promise<void> {
   }
   if (opening !== mine) {
     if (target.continuous)
-      void invoke('stop_blink_rack_slot', { rackId: target.rackId, slot }).catch((e) =>
-        console.error('Stopping stale slot blink failed:', e),
-      )
+      stopInBackground(target.rackId, slot, 'Stopping stale slot blink failed:')
     return
   }
   if (phase.value !== 'starting') return

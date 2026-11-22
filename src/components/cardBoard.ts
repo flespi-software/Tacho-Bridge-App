@@ -127,9 +127,13 @@ function readerEntry(reader: Reader, index: number, cards: Record<string, SmartC
     readerModel: model,
     readerName: reader.name,
   }
-  // A reader that PC/SC no longer knows, or one without a readable card, is
-  // shown as an empty slot — the same rule the old readers list applied.
-  if (reader.status === 'UNKNOWN' || (!reader.iccid && !reader.card_number)) {
+  // A reader that PC/SC no longer knows, or one without a card, is shown as
+  // an empty slot. A card that is present but whose ICCID could not be read
+  // is not: it stays an unlinked card with the hint to reinsert it.
+  if (
+    reader.status === 'UNKNOWN' ||
+    (reader.status !== 'PRESENT' && !reader.iccid && !reader.card_number)
+  ) {
     return { ...base, status: 'empty', iccid: '', number: '', name: reader.name }
   }
   if (!reader.card_number) {
@@ -230,8 +234,7 @@ function rackEntries(rack: RackState, cards: Record<string, SmartCard>): CardEnt
     const unserved = rack.connected && rc.online && rc.problem ? rc.problem : undefined
     return {
       ...b,
-      status:
-        rack.connected && !unserved ? sessionStatus(rc.online, rc.authentication) : 'offline',
+      status: rack.connected && !unserved ? sessionStatus(rc.online, rc.authentication) : 'offline',
       unserved,
       number: rc.card_number,
       // The live config wins over the name the rack snapshot carried.

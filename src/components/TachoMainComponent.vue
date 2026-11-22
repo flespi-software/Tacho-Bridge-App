@@ -10,6 +10,8 @@
 <script setup lang="ts">
 import CardBoard from './CardBoard.vue'
 import type { SmartCard, Reader, RackState } from './models'
+import { isCardConfigPayload, isRackStatePayload } from './models'
+import { applyReaderEvent, isCardsSyncPayload, unlinkCard } from './readerEvents'
 import { shallowRef, reactive, onMounted, inject } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { emit } from '@tauri-apps/api/event'
@@ -34,28 +36,6 @@ const { on } = useTauriListeners()
 const layoutListenersReady = inject(LAYOUT_LISTENERS_READY, Promise.resolve())
 
 ////////////////////////// Listening for the event from the backend //////////////////////////
-// Narrow runtime guard for the global-cards-sync payload. We do not trust the
-// shape blindly — if the backend ever changes the contract, this guard fails
-// closed (the event is ignored) instead of letting the UI throw at runtime.
-type CardsSyncPayload = {
-  iccid: string
-  reader_name: string
-  card_state: string
-  card_number: string
-  online?: boolean
-  authentication?: boolean
-  problem?: string | null
-}
-function isCardsSyncPayload(raw: unknown): raw is CardsSyncPayload {
-  if (!raw || typeof raw !== 'object') return false
-  const p = raw as Record<string, unknown>
-  return (
-    typeof p.iccid === 'string' &&
-    typeof p.reader_name === 'string' &&
-    typeof p.card_state === 'string' &&
-    typeof p.card_number === 'string'
-  )
-}
 
 function handleCardsSync(raw: unknown): void {
   if (!isCardsSyncPayload(raw)) {
@@ -63,108 +43,7 @@ function handleCardsSync(raw: unknown): void {
     return
   }
   console.debug('event payload: ', raw)
-
-  const name = raw.reader_name
-  const card_number = raw.card_number
-
-  // PC/SC reports UNKNOWN/IGNORE for a reader that is gone from the system —
-  // unplugged, or renamed by the OS after sleep/wake (the same physical reader
-  // often comes back under a new name). Remove the row instead of keeping a
-  // ghost entry forever; the reader's new name arrives as a separate event.
-  if (/\b(UNKNOWN|IGNORE)\b/.test(raw.card_state)) {
-    const goneIndex = state.readers.findIndex((reader) => reader.name === name)
-    if (goneIndex !== -1) {
-      state.readers.splice(goneIndex, 1)
-    }
-    return
-  }
-
-  // The PCSC monitor sends the bitflags Debug form "State(CHANGED | PRESENT)";
-  // the MQTT emitter sends a bare "PRESENT". Parse the parenthesized form and
-  // fall back to the raw string, then pick the first meaningful flag — the
-  // positional [1] this used to be broke on single-flag and no-CHANGED forms.
-  const inner = raw.card_state.match(/\(([^)]*)\)/)?.[1] ?? raw.card_state
-  const flags = inner
-    .split('|')
-    .map((s) => s.trim())
-    .filter(Boolean)
-  const status = flags.find((f) => f !== 'CHANGED') ?? flags[0] ?? ''
-
-  const iccid = raw.iccid
-  // Find the index of the reader with the same name
-  const index = state.readers.findIndex((reader) => reader.name === name)
-  // The PC/SC monitor reports a card without the session flags (null), the
-  // card's MQTT session reports only them: an event that does not carry the
-  // flags keeps those of the same card.
-  const prev = index !== -1 ? state.readers[index] : undefined
-  const sameCard = iccid !== '' && prev?.iccid === iccid
-  const next: Reader = {
-    name,
-    status,
-    iccid,
-    card_number,
-    online: raw.online ?? (sameCard ? prev?.online : undefined),
-    // An offline session authenticates nothing: its flag is not inherited.
-    authentication:
-      raw.online === false
-        ? false
-        : (raw.authentication ?? (sameCard ? prev?.authentication : undefined)),
-    // every event carries it: the backend keeps it per card, not per emitter
-    problem: raw.problem ?? undefined,
-  }
-  if (index !== -1) {
-    // The card's MQTT session repeats its state on every keep-alive: an
-    // unchanged reader is not replaced, or the whole board would rebuild.
-    if (prev && sameReader(prev, next)) return
-    state.readers[index] = next
-  } else {
-    state.readers.push(next)
-  }
-}
-
-function sameReader(a: Reader, b: Reader): boolean {
-  return (
-    a.status === b.status &&
-    a.iccid === b.iccid &&
-    a.card_number === b.card_number &&
-    a.online === b.online &&
-    a.authentication === b.authentication &&
-    a.problem === b.problem
-  )
-}
-
-// Runtime guard for one rack in the rack-state payload — fail closed on a
-// malformed shape.
-function isRackStatePayload(raw: unknown): raw is RackState {
-  if (!raw || typeof raw !== 'object') return false
-  const p = raw as Record<string, unknown>
-  return (
-    typeof p.id === 'string' &&
-    typeof p.connected === 'boolean' &&
-    typeof p.name === 'string' &&
-    Array.isArray(p.cards) &&
-    (p.slots === undefined || p.slots === null || isRackSlotsPayload(p.slots))
-  )
-}
-
-const SLOT_CLASSES = ['free', 'faulty', 'card', 'discovered', 'error', 'absent'] as const
-
-// Runtime guard for the slot table of a rack: counters are numbers, every
-// class list is a list of numbers. A malformed table fails the whole rack
-// payload closed, like any other shape mismatch.
-function isRackSlotsPayload(raw: unknown): boolean {
-  if (!raw || typeof raw !== 'object') return false
-  const p = raw as Record<string, unknown>
-  const states = p.states as Record<string, unknown> | undefined
-  return (
-    ['hi', 'total', 'occupied', 'free'].every((k) => typeof p[k] === 'number') &&
-    !!states &&
-    typeof states === 'object' &&
-    SLOT_CLASSES.every(
-      (k) => Array.isArray(states[k]) && states[k].every((n) => typeof n === 'number'),
-    ) &&
-    (p.errors === undefined || Array.isArray(p.errors))
-  )
+  applyReaderEvent(state.readers, raw)
 }
 
 function handleRackState(raw: unknown): void {
@@ -218,33 +97,17 @@ const removeCard = async (cardNumber: string): Promise<boolean> => {
 }
 
 function handleCardConfigUpdated(raw: unknown): void {
-  if (!raw || typeof raw !== 'object') {
+  if (!isCardConfigPayload(raw)) {
     console.warn('global-card-config-updated: ignoring malformed payload', raw)
-    return
-  }
-  const payload = raw as { card_number?: unknown; content?: unknown }
-  if (typeof payload.card_number !== 'string' || payload.card_number.length === 0) {
-    console.warn('global-card-config-updated: missing card_number', raw)
     return
   }
   console.debug('event payload: ', raw)
 
-  if (payload.content && typeof payload.content === 'object') {
-    state.cards[payload.card_number] = { ...(payload.content as SmartCard) }
+  if (raw.content) {
+    state.cards[raw.card_number] = { ...raw.content }
   } else {
-    delete state.cards[payload.card_number]
-    // The reader keeps the inserted card but no longer its number and session.
-    state.readers.forEach((reader, i) => {
-      if (reader.card_number === payload.card_number) {
-        state.readers[i] = {
-          ...reader,
-          card_number: '',
-          online: undefined,
-          authentication: undefined,
-          problem: undefined,
-        }
-      }
-    })
+    delete state.cards[raw.card_number]
+    unlinkCard(state.readers, raw.card_number)
   }
 }
 
