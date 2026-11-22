@@ -255,7 +255,7 @@ pub struct RackCard {
 }
 
 /// Slots of one rack per class, as the local rack engine classes them from
-/// the status polls (`com_port/local.rs`): every address of the reader chain
+/// the status polls (`com_port::local`): every address of the reader chain
 /// is in exactly one list. Slot numbers, not wire bytes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct RackSlotStates {

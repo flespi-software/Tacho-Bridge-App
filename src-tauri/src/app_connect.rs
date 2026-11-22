@@ -1,6 +1,6 @@
 //! The application's own MQTT connection to the broker: server commands,
 //! settings reports and the rack traffic ride it, unlike the per-card
-//! connections of `mqtt.rs`.
+//! connections of `mqtt`.
 
 // ───── Std Lib ─────
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -97,8 +97,15 @@ pub async fn app_connection() {
         return;
     }
 
-    // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
+
+    // Exit (or an update install) has drained the pool already: a connection
+    // registered now would outlive the teardown. Same gate as the card
+    // sessions (`mqtt::ensure_connection`).
+    if crate::shutdown::in_progress() {
+        log::info!("[CONN] phase=app_connection status=skip_shutdown");
+        return;
+    }
 
     // Take over before the predecessor is told to close, so its teardown
     // already sees itself superseded.
@@ -185,9 +192,17 @@ pub async fn app_connection() {
                         app_emit_event(true);
                     }
 
-                    // The full notification embeds publish payloads (rack
-                    // envelopes included): trace only, never in the debug log.
-                    log::trace!("App {} Notification: {:?}", log_header, notification);
+                    // A publish payload is never logged, not even at trace: it
+                    // carries rack envelopes and the `set_credentials` password.
+                    match &notification {
+                        Event::Incoming(Incoming::Publish(publish)) => log::trace!(
+                            "App {} Notification: publish topic={:?} bytes={}",
+                            log_header,
+                            publish.topic,
+                            publish.payload.len()
+                        ),
+                        other => log::trace!("App {} Notification: {:?}", log_header, other),
+                    }
 
                     match notification {
                         Event::Incoming(Incoming::Publish(publish)) => {

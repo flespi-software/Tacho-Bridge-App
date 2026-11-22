@@ -1,6 +1,6 @@
 //! Shared exponential-reconnect backoff.
 //!
-//! Every MQTT-facing loop in the app (the per-card bridge in `mqtt.rs`, the
+//! Every MQTT-facing loop in the app (the per-card bridge in `mqtt::card_session`, the
 //! app-level connection in `app_connect.rs`, and the rack/card loops under
 //! `com_port/`) retries on the same schedule: start at
 //! `RECONNECT_DELAY_INITIAL_SECS`, double on each consecutive failure, and stop

@@ -153,15 +153,15 @@ sessions, including sessions that survived the app connection:
 below); a server that supports it answers with a `profile`, any other server
 ignores the field and drives the rack as described in this section.
 
-The server restores this inventory before checking the rack. A global status
-omission must be confirmed by a per-slot status request before removing a
-known card. Failed identity reads remain pending and retry on watch refresh.
+The server restores this inventory before checking the rack. A slot missing
+from a whole-rack reading must be confirmed by a per-slot query before removing
+a known card. Failed identity reads remain pending and retry on watch refresh.
 The physical port disappearing closes its card sessions on TBA; `link down`
 parks server state and preserves request numbering. A new app connection
 starts new server state and therefore needs the inventory again.
 
-`guarded_discovery` enables slot ownership across the reset/select/read
-sequence. The server adds `discovery_slot` to its discovery envelopes. TBA
+`guarded_discovery` enables slot ownership across the server's multi-step
+discovery sequence. The server adds `discovery_slot` to its discovery envelopes. TBA
 returns `serial_err:"card_busy"` without writing to a slot in authentication;
 the server defers it without removing the card or repainting its LED. Otherwise
 TBA reserves the slot until `rack/<serial>/release` with the slot and the last
@@ -368,7 +368,7 @@ templates and byte rules that TBA applies blindly:
   "check": "sum8",
   "status": {
     "cmd": "<hex>", "interval_ms": 2000, "idle_ms": 300, "deadline_ms": 3000,
-    "head": "<hex>", "len": 245, "offset": 4, "length": 240,
+    "head": "<hex>", "len": <n>, "offset": <n>, "length": <slots>,
     "mask": "<hex byte>", "stable": 2, "gap": 10,
     "classes": { "free": "<hex bytes>", "none": "<hex bytes>", "idle": "<hex bytes>", "error": "<hex bytes>" }
   },
@@ -379,8 +379,8 @@ templates and byte rules that TBA applies blindly:
     "poll": { "cmd": "<template>", "while": "<template>", "interval_ms": 20, "deadline_ms": 5000 },
     "identify": [
       { "cmd": "<template>", "expect": "<template>", "deadline_ms": 1500,
-        "ok": { "len": 15, "head": "<template>", "match": [{ "at": 3, "mask": "<hex>", "eq": "<hex>" }],
-                "take_at": 4, "take_len": 8 } }
+        "ok": { "len": <n>, "head": "<template>", "match": [{ "at": <n>, "mask": "<hex>", "eq": "<hex>" }],
+                "take_at": <n>, "take_len": <n> } }
     ]
   }
 }
@@ -388,8 +388,8 @@ templates and byte rules that TBA applies blindly:
 
 - A **template** is a hex string with two placeholders: `{a}` is replaced
   with the slot address byte, a trailing `{c}` with the checksum byte.
-  `check` names the integrity rule of the device: `sum8` — all bytes of a
-  frame sum to zero modulo 256; it both fills `{c}` and validates replies.
+  `check` names the integrity rule the profile uses (one of the rules TBA
+  implements); it both fills `{c}` and validates replies.
 - `status`: the command polled every `interval_ms`. A reply is used only if
   its first `len` bytes pass the check and start with `head`; `length` bytes
   from `offset` are then one status byte per slot, slot 1 first. Each byte,
@@ -444,11 +444,9 @@ change or `refresh_ms` elapsed; the server re-arms the watch after every
 discovery pass to reset the baseline. The watch ends with the rack link or
 the app connection, and a new app connection arms its own.
 
-The timings are the server's to choose and are not the same for every command.
-A rack built of several blocks answers a whole-rack query (the watch command is
-one) with pauses inside the frame, while it polls its blocks: the reply is one
-frame but not one burst, so the server sends a wider `idle_ms` for it than for
-a single-reader exchange. TBA logs why each read ended (`end=silence` — the
+The timings are the server's to choose and are not the same for every command:
+a reply can arrive in several bursts with pauses between them, so the server
+sends a wider `idle_ms` for such a command than for a short exchange. TBA logs why each read ended (`end=silence` — the
 device finished, `end=deadline` — a bound cut the reply), which is what makes a
 too-narrow bound visible on the client side.
 

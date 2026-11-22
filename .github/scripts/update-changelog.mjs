@@ -27,7 +27,9 @@ const git = (cmd) => execSync(`git ${cmd}`, { encoding: 'utf8' }).trim();
 
 // Everything the user pushed since the previous bot bump. On the very first
 // run there is no previous bump — fall back to the head commit alone.
-const prevBump = git(`log --grep "^ci: version " -1 --format=%H || true`);
+// `--first-parent`: the previous bump of THIS branch, not a newer one of a
+// branch merged into it, which would cut the range short.
+const prevBump = git(`log --first-parent --grep "^ci: version " -1 --format=%H || true`);
 const range = prevBump ? `${prevBump}..HEAD` : '-1';
 const subjects = git(`log ${range} --no-merges --format=%s`)
   .split('\n')

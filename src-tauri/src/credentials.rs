@@ -2,7 +2,7 @@
 //! credentials, set from the settings dialog, from the startup prompt, or by
 //! the server's `set_credentials` command.
 //!
-//! Two ways to hold a pair (see `mqtt.rs`): saved in config.yaml (`server.
+//! Two ways to hold a pair (see `mqtt::credentials`): saved in config.yaml (`server.
 //! username` / `password`, used on every launch) or for this run only, in
 //! memory — "Save to config" unchecked. The switch itself (`server.
 //! auth_enabled`) is always persisted; with it on and no pair anywhere the

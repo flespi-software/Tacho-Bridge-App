@@ -113,7 +113,7 @@ pub fn replay_access_warning() {
 }
 
 /// Whether the "cannot write the log" warning is in effect (and replayed on
-/// `frontend-loaded`) — config.rs skips its own, identical-looking `access`
+/// `frontend-loaded`) — the config module skips its own, identical-looking `access`
 /// warning then.
 pub fn access_warning_active() -> bool {
     LOG_ACCESS_FAILED.load(std::sync::atomic::Ordering::SeqCst)

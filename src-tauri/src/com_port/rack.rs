@@ -6,8 +6,8 @@
 //! (the device serial, see `discovery.rs`). This module owns that prefix:
 //! the link reports (`rack/<id>/link`), the dispatch of the server's rack
 //! publishes (`request/<n>`, `release`, `watch`, `cards`, `profile`) and the reply path of the
-//! serial exchanges. Per-card sessions live in `cards.rs`; the wire is in
-//! `transport.rs`.
+//! serial exchanges. Per-card sessions live in `cards`; the wire is in
+//! `transport`.
 //!
 //! Topics, TBA -> server: `rack/<id>/link` (`{"state":"up"|"down"}`),
 //! `rack/<id>/response/<n>` (reply to `request/<n>`), `rack/<id>/watch`
@@ -15,7 +15,7 @@
 //! exchange), `rack/<id>/release` (end the discovery lease of a slot),
 //! `rack/<id>/watch` (arm the presence watch), `rack/<id>/cards`
 //! (the set of cards to serve), `rack/<id>/profile` (the rack is run locally
-//! from now on, see `local.rs`). No `/<sender>` tail on this path: the sender
+//! from now on, see `local`). No `/<sender>` tail on this path: the sender
 //! is always the server.
 
 use rumqttc::v5::mqttbytes::QoS;
@@ -26,7 +26,9 @@ use tauri::async_runtime;
 
 use crate::mqtt::{request_id_from_topic, request_to_response_topic};
 
-use super::cards::{handle_cards_set, start_rack_watch, stop_all_rack_watches};
+use super::cards::{
+    bump_card_epoch, handle_cards_set, parse_cards_set, start_rack_watch, stop_all_rack_watches,
+};
 use super::state::set_rack_card_state;
 use super::transport::{
     execute_envelope, parse_envelope, SerialEnvelope, SerialExchange, SerialLease, SharedPort,
@@ -214,7 +216,7 @@ async fn publish_links(client: &AsyncClient, links: Vec<(String, bool)>) {
     for (rack_id, up) in links {
         let state = if up { "up" } else { "down" };
         let payload = if up {
-                // `local_ops`: this build runs a rack by itself from a server profile (see `local.rs`)
+                // `local_ops`: this build runs a rack by itself from a server profile (see `local`)
                 serde_json::json!({"state": state, "guarded_discovery": true, "serial_transactions": true,
                     "local_ops": true, "cards": super::cards::inventory(&rack_id)})
             } else {
@@ -384,13 +386,25 @@ pub fn handle_app_publish(client: &AsyncClient, topic: &str, payload: &[u8]) -> 
             &log_header,
         );
     } else if tail == "cards" {
-        // the set of cards of this rack to serve: reconcile the card sessions
-        async_runtime::spawn(handle_cards_set(
-            payload.to_vec(),
-            rack_id.to_string(),
-            rack.port.clone(),
-            log_header,
-        ));
+        // the set of cards of this rack to serve: reconcile the card sessions.
+        // The epoch is taken here, in arrival order: the spawned tasks of two
+        // sets read in one go may start in either order, and the older one
+        // must not win by running last.
+        match parse_cards_set(payload) {
+            Ok(cards) => {
+                let epoch = bump_card_epoch(rack_id);
+                async_runtime::spawn(handle_cards_set(
+                    cards,
+                    epoch,
+                    rack_id.to_string(),
+                    rack.port.clone(),
+                    log_header,
+                ));
+            }
+            Err(reason) => {
+                log::warn!("{} [CARDS] status=ignored reason={}", log_header, reason);
+            }
+        }
     } else {
         // An unknown rack topic (a newer server feature, or a retained stray)
         // must not fall through to the serial path: its payload would be
@@ -666,10 +680,10 @@ fn slot_ownership(
 
 /// Shows the authentication activity the `finish` flag of a card envelope tells.
 /// Authentication boundaries come from the server's flag alone — the same contract the PC/SC
-/// path uses (see `auth_process` in mqtt.rs); nothing is inferred from the traffic itself. An
+/// path uses (see `auth_process` in `mqtt::card_session`); nothing is inferred from the traffic itself. An
 /// envelope without the flag is plain signalling on the same serial path (e.g. a slot
 /// indicator repaint), never shown or recorded as authentication activity. The one gap — a closing
-/// `finish:true` that never arrives — is covered by the keep-alive PingResp reset in cards.rs.
+/// `finish:true` that never arrives — is covered by the keep-alive PingResp reset in `cards::session`.
 /// The outcome of a finished session is recorded separately, once its closing exchange has run.
 fn show_card_activity(iccid: &str, finish: Option<bool>) {
     match finish {
@@ -681,7 +695,7 @@ fn show_card_activity(iccid: &str, finish: Option<bool>) {
 }
 
 /// Records the outcome of a finished session in the card config — the "Last auth" line of the
-/// UI, the same bookkeeping as the reader path (mqtt.rs) — once the closing exchange has run.
+/// UI, the same bookkeeping as the reader path (`mqtt::card_session`) — once the closing exchange has run.
 /// The closing exchange is the last word of the session: a reset the rack never answered is a
 /// failed session, not an authenticated card. Detached — the config write must not park the
 /// serial bridge before the reply.
