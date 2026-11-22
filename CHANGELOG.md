@@ -253,3 +253,10 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed the application not starting on newer Linux distributions in a Wayland session ('Could not create default EGL display').
+
+### [0.8.1-beta.10] - 2026-11-22
+
+🛠 Fixes
+
+- Fixed the card list: an unreadable card is no longer shown as an empty reader, "COM port busy" notifications no longer pile up, and a settings update from the server no longer resets  the authentication switch in Settings.
+- Fixed card sessions dropped mid-authentication by a status retry, rack card sets applied out of order, cards left unserved after a transient PC/SC error or a PC/SC service restart,  credentials sent without TLS or written to the log, and a damaged config losing the server settings; restructured the backend into smaller modules.
