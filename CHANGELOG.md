@@ -211,3 +211,9 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed invisible buttons in the update notification.
+
+### [0.8.3-beta.1] - 2026-11-23
+
+🆕 Features / Improvements
+
+- Headless mode: started with --headless the application runs the card bridge without a window, a tray icon or a logged-in user.
