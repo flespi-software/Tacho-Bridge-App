@@ -175,8 +175,10 @@ body {
 .q-notification.bg-primary {
   color: var(--cb-primary-fg) !important;
 
+  // Not `inherit`: Quasar paints `.q-notification__actions` in the primary
+  // color, so an inheriting button is primary-on-primary and invisible.
   .q-btn {
-    color: inherit !important;
+    color: var(--cb-primary-fg) !important;
   }
 }
 
