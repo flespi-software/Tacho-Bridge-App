@@ -217,3 +217,9 @@ All notable changes to this project will be documented in this file.
 🆕 Features / Improvements
 
 - Headless mode: started with --headless the application runs the card bridge without a window, a tray icon or a logged-in user.
+
+### [0.8.3-beta.2] - 2026-11-23
+
+🛠 Fixes
+
+- Fixed the card rack COM port staying locked by the previous app instance after quit or update: the app now waits for the port to close before exiting.
