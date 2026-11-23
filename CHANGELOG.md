@@ -205,3 +205,9 @@ All notable changes to this project will be documented in this file.
 - Refreshed design: themes, card board layout with equal margins and a scrollbar, responsive slot map, unified card names, identifiers and statuses, reader models in the list, more readable settings, a taller main window.
 - set_server and set_credentials with the values already in effect no longer reconnect the application and its cards.
 - Internal: the backend is restructured into smaller modules.
+
+### [0.8.2-beta.1] - 2026-11-23
+
+🆕 Features / Improvements
+
+- Headless mode: started with --headless the application runs the card bridge without a window, a tray icon or a logged-in user.
