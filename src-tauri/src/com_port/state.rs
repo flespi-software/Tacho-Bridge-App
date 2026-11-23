@@ -7,6 +7,15 @@ use crate::global_app_handle::{rack_update_cards, RackCard};
 use super::cards::RACK_CARDS_UI;
 use super::lock;
 
+/// Whether any rack card currently shows an authentication in progress (set
+/// by a `finish:false` envelope, cleared by `finish:true` or the session end).
+pub(crate) fn any_card_authenticating() -> bool {
+    lock(&RACK_CARDS_UI)
+        .values()
+        .flatten()
+        .any(|card| card.authentication == Some(true))
+}
+
 /// Applies one mutation to every rack's UI card list and emits the lists that
 /// actually changed.
 ///
