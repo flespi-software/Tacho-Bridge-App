@@ -332,11 +332,56 @@ pub async fn shutdown() {
     let _shutdown = SHUTDOWN_LOCK.lock().await;
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
     let indicators = local::prepare_indicator_shutdown();
-    stop_all_racks();
+    let ports = stop_all_racks();
     // Snapshot handles keep ports open until the final off commands finish.
     // Normal traffic is now blocked, so nothing can light them again.
     local::turn_off_indicators(indicators).await;
-    log::info!("RACK | phase=shutdown status=ports_released");
+    await_ports_closed(ports).await;
+}
+
+/// How long the exit waits for the stopped rack tasks to drop their serial
+/// port clones. A read in flight notices the stop within one read slice, so
+/// this is an upper bound for a driver that does not return in time.
+const EXIT_PORT_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Waits until nothing but this list refers to the ports of the stopped racks,
+/// then closes them. Exiting with a blocking read still in flight leaves the
+/// handle to the OS teardown, and a USB serial driver that never completes
+/// the cancelled read keeps the dead process, and the port, alive: the
+/// relaunched instance then gets "Access is denied" until the rack is
+/// replugged.
+async fn await_ports_closed(ports: Vec<(String, SharedPort)>) {
+    let deadline = std::time::Instant::now() + EXIT_PORT_RELEASE_TIMEOUT;
+    while ports.iter().any(|(_, port)| Arc::strong_count(port) > 1)
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(PORT_RELEASE_POLL).await;
+    }
+    let mut referenced = 0;
+    for (rack_id, port) in &ports {
+        let holders = Arc::strong_count(port) - 1;
+        if holders > 0 {
+            referenced += 1;
+            log::warn!(
+                "RACK {} | phase=shutdown status=port_still_referenced holders={} timeout_ms={}",
+                rack_id,
+                holders,
+                EXIT_PORT_RELEASE_TIMEOUT.as_millis()
+            );
+        }
+    }
+    let count = ports.len();
+    // Closes each OS handle whose last reference this is.
+    drop(ports);
+    if referenced == 0 {
+        log::info!("RACK | phase=shutdown status=ports_released ports={}", count);
+    } else {
+        log::warn!(
+            "RACK | phase=shutdown status=ports_not_released ports={} referenced={}",
+            count,
+            referenced
+        );
+    }
 }
 
 /// Undoes `shutdown()` when the exit it prepared for did not happen (a failed
@@ -453,16 +498,23 @@ async fn stop_rack_and_await_port_release(rack_id: &str) {
 /// Stops every rack. The trailing all-variants are a backstop for watchers and
 /// card sessions whose rack entry was already reaped (e.g. a task that died
 /// and was cleared before its siblings were stopped).
-fn stop_all_racks() {
+///
+/// Returns the port handles of the stopped racks, for a caller that has to
+/// know when they are really closed (see `await_ports_closed`).
+fn stop_all_racks() -> Vec<(String, SharedPort)> {
     let ids = linked_rack_ids();
     let mut links = Vec::with_capacity(ids.len());
+    let mut ports = Vec::with_capacity(ids.len());
     for id in &ids {
-        unlink_rack(id, &mut links);
+        if let Some(port) = unlink_rack(id, &mut links) {
+            ports.push((id.clone(), port));
+        }
     }
     announce_links(links);
     stop_all_rack_watches();
     local::stop_all();
     stop_all_rack_cards();
+    ports
 }
 
 /// Called when a rack transitions to connected. Logs readiness, emits the

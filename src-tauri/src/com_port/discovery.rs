@@ -227,26 +227,38 @@ static BUSY_PORT_NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(
 /// Last logged open failure per port. The monitor retries a failed open on
 /// every poll tick, so a port held by another application would otherwise
 /// write the same ERROR line every 2 s for as long as it stays held. Repeats
-/// go to debug; an entry is dropped when the port opens or leaves the bus.
-static OPEN_FAILURES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+/// are counted and logged once per `OPEN_FAILURE_REPORT_EVERY` attempts; an
+/// entry is dropped when the port opens or leaves the bus.
+static OPEN_FAILURES: std::sync::Mutex<Vec<(String, String, u32)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Every which repeated open failure of a port is logged: about once a minute
+/// at the monitor's poll period, so a port that stays held is visible in the
+/// log for as long as it lasts.
+const OPEN_FAILURE_REPORT_EVERY: u32 = 30;
 
 /// Last logged USB enumeration failure (Windows), same rule: "" once it works.
 #[cfg(windows)]
 static USB_ENUM_FAILURE: ChangeGuard = ChangeGuard::new();
 
-/// Records the open failure of a port and reports whether it is new (a
-/// different error, or the first one of this episode).
-fn open_failure_is_new(port_name: &str, err: &str) -> bool {
+/// Records the open failure of a port and returns how many times in a row it
+/// has failed with this error: 1 for a new failure (a different error, or the
+/// first one of this episode).
+fn count_open_failure(port_name: &str, err: &str) -> u32 {
     let mut failures = super::lock(&OPEN_FAILURES);
-    match failures.iter_mut().find(|(port, _)| port == port_name) {
-        Some((_, last)) if last == err => false,
-        Some((_, last)) => {
+    match failures.iter_mut().find(|(port, _, _)| port == port_name) {
+        Some((_, last, attempts)) if last == err => {
+            *attempts = attempts.saturating_add(1);
+            *attempts
+        }
+        Some((_, last, attempts)) => {
             err.clone_into(last);
-            true
+            *attempts = 1;
+            1
         }
         None => {
-            failures.push((port_name.to_string(), err.to_string()));
-            true
+            failures.push((port_name.to_string(), err.to_string(), 1));
+            1
         }
     }
 }
@@ -354,7 +366,7 @@ pub(super) fn find_racks() -> Option<Vec<RackInfo>> {
     // Busy notices only survive for ports still matched: a device that left
     // the bus notifies again on its next busy episode.
     super::lock(&BUSY_PORT_NOTICES).retain(|p| racks.iter().any(|r| r.port_name == *p));
-    super::lock(&OPEN_FAILURES).retain(|(p, _)| racks.iter().any(|r| r.port_name == *p));
+    super::lock(&OPEN_FAILURES).retain(|(p, _, _)| racks.iter().any(|r| r.port_name == *p));
 
     Some(racks)
 }
@@ -609,33 +621,44 @@ pub(super) fn open_rack(rack: &RackInfo) -> Option<Box<dyn serialport::SerialPor
             );
             // The busy episode of this port (if any) is over.
             super::lock(&BUSY_PORT_NOTICES).retain(|p| p != &rack.port_name);
-            super::lock(&OPEN_FAILURES).retain(|(p, _)| p != &rack.port_name);
+            super::lock(&OPEN_FAILURES).retain(|(p, _, _)| p != &rack.port_name);
             Some(port)
         }
         Err(e) => {
             // Access denied on Windows almost always means another process
             // holds the port exclusively — e.g. other tachograph software
-            // (Teltonika, BCE) that grabs the rack's COM port on startup.
+            // (Teltonika, BCE) that grabs the rack's COM port on startup, or a
+            // previous instance of this app that has not finished exiting.
             let busy = matches!(
                 e.kind,
                 serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied)
             );
             let hint = if busy {
-                " hint=port_held_by_another_process(other_tachograph_software_or_second_TBA_instance?)"
+                " hint=port_held_by_another_process(other_tachograph_software_or_stuck_previous_TBA_instance?)"
             } else {
                 ""
             };
-            if open_failure_is_new(&rack.port_name, &e.to_string()) {
+            let attempts = count_open_failure(&rack.port_name, &e.to_string());
+            if attempts == 1 {
                 log::error!(
                     "RACK | phase=open status=failed port={} err={}{}",
                     rack.port_name,
                     e,
                     hint
                 );
+            } else if attempts % OPEN_FAILURE_REPORT_EVERY == 0 {
+                log::info!(
+                    "RACK | phase=open status=still_failing port={} attempts={} err={}{}",
+                    rack.port_name,
+                    attempts,
+                    e,
+                    hint
+                );
             } else {
                 log::debug!(
-                    "RACK | phase=open status=failed port={} err={} repeated=true",
+                    "RACK | phase=open status=failed port={} attempts={} err={}",
                     rack.port_name,
+                    attempts,
                     e
                 );
             }
@@ -676,7 +699,9 @@ fn emit_port_busy(port_name: &str) {
             message: format!(
                 "Card rack detected on {port_name}, but the port is busy — another application \
                  is using it. Close or uninstall the application that occupies the port \
-                 (e.g. other tachograph software), then reconnect the rack."
+                 (e.g. other tachograph software), then reconnect the rack. If no such \
+                 application is running, a previous Tacho Bridge instance may still hold \
+                 the port: end it in Task Manager or replug the rack."
             ),
         },
     );
