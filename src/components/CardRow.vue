@@ -12,25 +12,51 @@
       :disabled="isEmpty"
       @click="emit('toggle')"
     >
-      <span class="cb-row__slot">{{ entry.slotLabel }}</span>
+      <span class="cb-row__slot" :class="{ 'cb-row__slot--danger': faulty }">{{
+        entry.slotLabel
+      }}</span>
       <span
         class="cb-dot"
         :class="[`cb-dot--${entry.status}`, { 'cb-dot--pulse': entry.status === 'active' }]"
       />
       <span class="cb-row__main">
-        <span
-          class="cb-row__title"
-          :class="{ 'cb-row__title--warn': unlinked, 'cb-row__title--muted': isEmpty }"
-        >
+        <span class="cb-row__title" :class="titleClass">
           {{ rowTitle }}
         </span>
         <span v-if="rowSub" class="cb-row__sub">{{ rowSub }}</span>
+        <span v-if="entry.readerModel" class="cb-row__reader-model" :title="entry.readerName">
+          {{ entry.readerModel }}
+        </span>
       </span>
       <span class="cb-row__meta">
-        <span :class="`cb-tone--${auth.tone}`">{{ auth.text }}</span>
+        <span
+          v-if="!isEmpty && !unlinked && !unread"
+          class="cb-status"
+          :class="`cb-status--${entry.status}`"
+        >
+          {{ statusLabel }}
+        </span>
+        <span v-if="entry.status !== 'active'" :class="`cb-tone--${auth.tone}`">{{
+          auth.text
+        }}</span>
         <span :class="`cb-tone--${expiry.tone}`">{{ expiry.text }}</span>
       </span>
-      <span v-if="unlinked && entry.iccid" class="cb-link-pill">
+      <q-icon
+        v-if="!isEmpty"
+        :name="open ? 'mdi-chevron-up' : 'mdi-chevron-down'"
+        size="16px"
+        class="cb-row__chevron"
+      />
+      <!-- Every card the configuration does not know carries the pill, so the
+           rows line up; without an ICCID there is nothing to link, and the
+           pill is greyed out. -->
+      <span
+        v-if="unlinked || unread"
+        class="cb-link-pill"
+        :class="{ 'cb-link-pill--off': !entry.iccid }"
+        :aria-disabled="!entry.iccid || undefined"
+        :title="entry.iccid ? undefined : 'No ICCID: the card cannot be linked'"
+      >
         <q-icon name="mdi-link-variant" size="14px" />
         Link
       </span>
@@ -42,27 +68,32 @@
       v-else
       type="button"
       class="cb-tile"
-      :class="[`cb-tile--${entry.status}`, { 'cb-tile--open': open }]"
+      :class="[
+        `cb-tile--${entry.status}`,
+        { 'cb-tile--open': open, 'cb-tile--reader': !!entry.readerModel },
+      ]"
       :aria-expanded="isEmpty ? undefined : open"
       :disabled="isEmpty"
       :title="tileTip"
       @click="emit('toggle')"
     >
       <span class="cb-tile__top">
-        <span class="cb-tile__slot">{{ entry.slotLabel }}</span>
+        <span class="cb-tile__slot" :class="{ 'cb-row__slot--danger': faulty }">{{
+          entry.slotLabel
+        }}</span>
         <span
           class="cb-dot cb-dot--small"
           :class="[`cb-dot--${entry.status}`, { 'cb-dot--pulse': entry.status === 'active' }]"
         />
-        <span
-          class="cb-tile__title"
-          :class="{ 'cb-row__title--warn': unlinked, 'cb-row__title--muted': isEmpty }"
-        >
+        <span class="cb-tile__title" :class="titleClass">
           {{ rowTitle }}
         </span>
         <span v-if="attention" class="cb-tile__att" role="img" aria-label="Needs attention">!</span>
       </span>
-      <span v-if="rowSub" class="cb-tile__sub">{{ rowSub }}</span>
+      <span class="cb-tile__sub">{{ rowSub }}</span>
+      <span v-if="entry.readerModel" class="cb-tile__reader-model" :title="entry.readerName">
+        {{ entry.readerModel }}
+      </span>
       <span v-if="view === 'tiles'" class="cb-tile__note" :class="`cb-tone--${note.tone}`">
         {{ note.text }}
       </span>
@@ -77,7 +108,7 @@
     >
       <div v-if="tiled" class="cb-panel__head">
         <span class="cb-panel__headmain">
-          <span class="cb-panel__title" :class="{ 'cb-row__title--warn': unlinked }">
+          <span class="cb-panel__title" :class="titleClass">
             {{ rowTitle }}
           </span>
           <span class="cb-panel__where">
@@ -98,8 +129,15 @@
         />
       </div>
 
+      <!-- Card in a slot in error that was never identified: nothing to link
+           or rename, only what went wrong and what to do about it. -->
+      <div v-if="unread" class="cb-panel__text">
+        The card in {{ entry.place }} could not be identified: {{ faultDetail(entry.fault ?? '') }}.
+        Reinsert the card or move it to another slot; the app keeps retrying meanwhile.
+      </div>
+
       <!-- Configured card: details, rename, remove -->
-      <template v-if="!unlinked">
+      <template v-else-if="!unlinked">
         <div class="cb-facts">
           <div v-for="f in facts" :key="f.k" class="cb-fact">
             <span class="cb-fact__k">{{ f.k }}</span>
@@ -299,6 +337,8 @@ import {
   authLine,
   daysToExpiry,
   expiryLine,
+  faultDetail,
+  unservedDetail,
   linkableCards,
   needsAttention,
   tileLine,
@@ -329,15 +369,44 @@ const emit = defineEmits<{
 
 const unlinked = computed(() => props.entry.status === 'unlinked')
 const isEmpty = computed(() => props.entry.status === 'empty')
+// A card in a slot in error that was never identified.
+const unread = computed(() => props.entry.status === 'error')
+// The slot of the card is in error, identified card or not.
+const faulty = computed(() => props.entry.fault !== undefined)
+const unnamed = computed(
+  () => !isEmpty.value && !unread.value && !unlinked.value && !props.entry.name.trim(),
+)
+const statusLabel = computed(() => {
+  switch (props.entry.status) {
+    case 'active':
+      return 'Authenticating'
+    case 'online':
+      return 'Online'
+    case 'offline':
+      return 'Offline'
+    case 'absent':
+      return 'Not inserted'
+    default:
+      return ''
+  }
+})
+
+const titleClass = computed(() => ({
+  'cb-row__title--danger': unread.value,
+  'cb-row__title--warn': unlinked.value,
+  'cb-row__title--muted': isEmpty.value || unnamed.value,
+}))
 
 const rowTitle = computed(() => {
+  if (unread.value) return 'Unreadable card'
   if (unlinked.value) return 'Unknown card'
-  return props.entry.name || props.entry.number
+  return props.entry.name.trim() || 'No name'
 })
 const rowSub = computed(() => {
   if (isEmpty.value) return 'no card inserted'
-  if (unlinked.value) return props.entry.iccid ? `ICCID ${props.entry.iccid}` : 'ICCID not read'
-  return props.entry.name ? props.entry.number : ''
+  if (props.entry.number) return `SN: ${props.entry.number}`
+  if (props.entry.iccid) return `ICCID: ${props.entry.iccid}`
+  return 'ICCID: not read'
 })
 
 const tiled = computed(() => props.view !== 'list')
@@ -378,6 +447,20 @@ const facts = computed(() => {
     },
     { k: 'Location', v: props.entry.place },
   ]
+  if (props.entry.readerModel) {
+    out.push({ k: 'Reader model', v: props.entry.readerModel })
+    out.push({ k: 'Reader device', v: props.entry.readerName || props.entry.readerModel })
+  }
+  if (props.entry.fault !== undefined) {
+    out.push({ k: 'Problem', v: faultDetail(props.entry.fault), tone: 'danger' })
+  }
+  if (props.entry.unserved !== undefined) {
+    out.push({
+      k: 'Server',
+      v: unservedDetail(props.entry.unserved),
+      ...(props.entry.unserved === 'unconfirmed' ? {} : { tone: 'danger' as const }),
+    })
+  }
   return out
 })
 

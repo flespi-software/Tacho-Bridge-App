@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import {
   buildGroups,
+  readerModelName,
+  readerGroupId,
   needsAttention,
   matchesSearch,
   matchesStatus,
@@ -17,6 +19,8 @@ import {
   parseViewPrefs,
   WIDE_WINDOW_AT,
   SORTERS,
+  slotBlocks,
+  slotsLine,
   type CardEntry,
 } from './cardBoard'
 import type { RackState, Reader, SmartCard } from './models'
@@ -48,15 +52,16 @@ describe('buildGroups', () => {
       [],
       cards,
     )
-    expect(groups.map((g) => g.id)).toEqual(['readers'])
+    expect(groups.map((g) => g.id)).toEqual([readerGroupId('ACS ACR39U')])
   })
 
   it('maps reader states to row statuses', () => {
     const cards: Record<string, SmartCard> = { AAAA000000000001: { name: 'A', iccid: '01' } }
     const rows = buildGroups(
       [
-        reader({ name: 'empty' }),
+        reader({ name: 'empty', status: 'EMPTY' }),
         reader({ name: 'unknown', iccid: 'FF' }),
+        reader({ name: 'unreadable' }),
         reader({ name: 'offline', iccid: '01', card_number: 'AAAA000000000001' }),
         reader({ name: 'online', iccid: '01', card_number: 'AAAA000000000001', online: true }),
         reader({
@@ -70,9 +75,13 @@ describe('buildGroups', () => {
       ],
       [],
       cards,
-    )[0]!.entries
+    )
+      .filter((g) => g.kind === 'reader')
+      .flatMap((g) => g.entries)
+      .sort((a, b) => a.slot - b.slot)
     expect(rows.map((e) => e.status)).toEqual([
       'empty',
+      'unlinked',
       'unlinked',
       'offline',
       'online',
@@ -90,6 +99,30 @@ describe('buildGroups', () => {
       {},
     )[0]!.entries
     expect(rows[0]?.status).toBe('offline')
+  })
+
+  it('groups matching reader models while retaining physical reader identities and statuses', () => {
+    const inputs = [
+      reader({ name: 'ACS ACR39U ICC Reader 00 00', iccid: '01', card_number: 'A', online: true }),
+      reader({ name: 'Alcor Micro AU9540 00 00', iccid: '02' }),
+      reader({ name: 'ACS ACR39U ICC Reader 01 00', status: 'EMPTY' }),
+    ]
+    const groups = buildGroups(inputs, [], { A: { name: 'Card A', iccid: '01' } })
+    const acs = groups.find((g) => g.id === readerGroupId('ACS ACR39U ICC Reader'))!
+    expect(acs.entries.map((e) => e.slotLabel)).toEqual(['R1', 'R3'])
+    expect(acs.title).toBe('USB Readers')
+    expect(acs.subtitle).toBe('2 readers · 1 with a card')
+    expect(acs.entries[0]?.readerModel).toBe('ACS ACR39U ICC Reader')
+    expect(acs.entries[0]?.readerName).toBe(inputs[0]!.name)
+    expect(acs.entries[0]?.status).toBe('online')
+    expect(acs.entries[1]?.status).toBe('empty')
+    const alcor = groups.find((g) => g.id === readerGroupId('Alcor Micro AU9540'))!
+    expect(alcor.title).toBe('USB Readers')
+    expect(alcor.entries[0]?.status).toBe('unlinked')
+    expect(matchesSearch(acs.entries[0]!, 'acr39u')).toBe(true)
+    expect(matchesSearch(acs.entries[0]!, '00 00')).toBe(true)
+    const afterRemoval = buildGroups(inputs.slice(0, 2), [], { A: { iccid: '01' } })
+    expect(afterRemoval.find((g) => g.id === acs.id)?.entries[0]?.key).toBe(acs.entries[0]?.key)
   })
 
   it('sorts rack slots and marks the cards of a disconnected rack offline', () => {
@@ -147,6 +180,17 @@ describe('buildGroups', () => {
     // Sorted by name for the default (slot) order.
     expect(none.entries.map((e) => e.number)).toEqual(['YYY0000000000001', 'ZZZ0000000000001'])
     expect(none.entries.every((e) => e.status === 'absent')).toBe(true)
+  })
+})
+
+describe('readerModelName', () => {
+  it('removes common instance suffixes without removing numeric model versions', () => {
+    expect(readerModelName('Alcor Micro AU9540 01 00')).toBe('Alcor Micro AU9540')
+    expect(readerModelName('ACS ACR39U ICC Reader 2')).toBe('ACS ACR39U ICC Reader')
+    expect(readerModelName('OMNIKEY CardMan 3121')).toBe('OMNIKEY CardMan 3121')
+    expect(readerModelName('Identiv SCR3310 v2.0')).toBe('Identiv SCR3310 v2.0')
+    expect(readerModelName('Generic USB2.0-CRW')).toBe('Generic USB2.0-CRW')
+    expect(readerModelName('')).toBe('Unknown reader')
   })
 })
 
@@ -295,7 +339,7 @@ describe('summarize', () => {
       NOW,
     )
     expect(s.total).toBe(3)
-    expect(s.counts).toEqual({ active: 0, online: 1, offline: 1, unlinked: 1, absent: 0 })
+    expect(s.counts).toEqual({ active: 0, online: 1, offline: 1, unlinked: 1, absent: 0, error: 0 })
     expect(s.attention).toBe(1)
   })
 })
@@ -404,5 +448,214 @@ describe('view prefs', () => {
       seen.push(slot)
     }
     expect(seen).toEqual(['narrow', 'wide', 'wide', 'wide', 'wide', 'wide', 'wide', 'wide'])
+  })
+})
+
+describe('slotBlocks', () => {
+  const table = {
+    hi: 36,
+    total: 26,
+    occupied: 3,
+    free: 23,
+    states: {
+      free: [1, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 34, 36],
+      faulty: [3, 7, 35],
+      card: [31, 33],
+      discovered: [],
+      error: [32],
+      absent: [21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+    },
+  }
+
+  it('is empty without a table', () => {
+    expect(slotBlocks(rack(), [])).toEqual([])
+    expect(slotsLine(rack())).toBe('')
+  })
+
+  it('splits the chain into blocks at the addressing gaps, rows of ten', () => {
+    const blocks = slotBlocks(rack({ slots: table }), [])
+    expect(blocks.map((b) => [b.from, b.to, b.gapBefore])).toEqual([
+      [1, 20, undefined],
+      [31, 36, [21, 30]],
+    ])
+    expect(blocks[0]!.rows.map((r) => r.length)).toEqual([10, 10])
+    expect(blocks[0]!.counts).toEqual({ total: 20, used: 0, free: 18, faulty: 2, error: 0 })
+    expect(blocks[0]!.summary).toBe('20 slots · 0 used · 18 free · 2 faulty')
+    expect(blocks[1]!.counts).toEqual({ total: 6, used: 3, free: 2, faulty: 1, error: 1 })
+    expect(blocks[1]!.summary).toBe('6 slots · 3 used · 2 free · 1 faulty · 1 error')
+    expect(slotsLine(rack({ slots: table }))).toBe(
+      '26 slots · 3 used · 20 free · 3 faulty · 1 error',
+    )
+    expect(blocks[1]!.rows.map((r) => r.map((c) => c.slot))).toEqual([[31, 32, 33, 34, 35, 36]])
+    expect(blocks[1]!.rows[0]!.map((c) => c.cls)).toEqual([
+      'card',
+      'error',
+      'card',
+      'free',
+      'faulty',
+      'free',
+    ])
+    expect(blocks[0]!.rows[0]![2]!.title).toBe('Slot 3 · empty reader, not answering')
+  })
+
+  it('carries the session state of a discovered card from its row', () => {
+    const r = rack({
+      cards: [{ slot: 5, iccid: 'I5', card_number: 'AAAA000000000005', online: true }],
+      slots: {
+        hi: 5,
+        total: 5,
+        occupied: 1,
+        free: 4,
+        states: {
+          free: [1, 2, 3, 4],
+          faulty: [],
+          card: [],
+          discovered: [5],
+          error: [],
+          absent: [],
+        },
+      },
+    })
+    const cards: Record<string, SmartCard> = { AAAA000000000005: { name: 'Fleet 5', iccid: 'I5' } }
+    const entries = buildGroups([], [r], cards).find((g) => g.id === 'rack:r1')!.entries
+    const [block] = slotBlocks(r, entries)
+    const cell = block!.rows[0]![4]!
+    expect(cell.cls).toBe('discovered')
+    expect(cell.status).toBe('online')
+    expect(cell.title).toBe('Slot 5 · card · AAAA000000000005 (Fleet 5) · online')
+    expect(slotsLine(r)).toBe('5 slots · 1 used · 4 free')
+  })
+
+  it('treats an address of an unknown class as a gap, not a shifted cell', () => {
+    const r = rack({
+      slots: {
+        hi: 3,
+        total: 3,
+        occupied: 0,
+        free: 3,
+        states: { free: [1, 3], faulty: [], card: [], discovered: [], error: [], absent: [] },
+      },
+    })
+    const blocks = slotBlocks(r, [])
+    expect(blocks.map((b) => [b.from, b.to, b.gapBefore])).toEqual([
+      [1, 1, undefined],
+      [3, 3, [2, 2]],
+    ])
+  })
+})
+
+describe('slots in error', () => {
+  const table = (error: number[], errors?: { slot: number; reason: string }[]) => ({
+    hi: 6,
+    total: 6,
+    occupied: 3,
+    free: 3,
+    states: { free: [1, 3, 5], faulty: [], card: [], discovered: [2, 6], error, absent: [] },
+    ...(errors ? { errors } : {}),
+  })
+  const cards: Record<string, SmartCard> = { AAAA000000000006: { name: 'Fleet 6', iccid: 'I6' } }
+  const entriesOf = (r: RackState) => buildGroups([], [r], cards).find((g) => g.id === 'rack:r1')!
+
+  it('gives a slot in error without an identified card its own row', () => {
+    const r = rack({
+      cards: [
+        { slot: 2, iccid: 'I2' },
+        { slot: 6, iccid: 'I6', card_number: 'AAAA000000000006', online: true },
+      ],
+      slots: table([4], [{ slot: 4, reason: 'unexpected_reply' }]),
+    })
+    const group = entriesOf(r)
+    expect(group.entries.map((e) => [e.slot, e.status])).toEqual([
+      [2, 'unlinked'],
+      [4, 'error'],
+      [6, 'online'],
+    ])
+    const row = group.entries[1]!
+    expect(row.slotLabel).toBe('004')
+    expect(row.iccid).toBe('')
+    expect(row.fault).toBe('unexpected_reply')
+    expect(needsAttention(row, NOW)).toBe(true)
+    expect(matchesStatus(row, 'attention', NOW)).toBe(true)
+    expect(matchesStatus(row, 'unlinked', NOW)).toBe(false)
+    expect(authLine(row, NOW)).toEqual({ text: 'identification failed', tone: 'danger' })
+    expect(expiryLine(row, NOW).text).toBe('')
+    expect(tileLine(row, NOW)).toEqual({ text: 'identification failed', tone: 'danger' })
+    expect(summarize(group, NOW).counts.error).toBe(1)
+    const cell = slotBlocks(r, group.entries)[0]!.rows[0]![3]!
+    expect(cell.title).toBe(
+      'Slot 4 · card in error · the reader of the slot answered with an unexpected reply',
+    )
+  })
+
+  it('marks an identified card whose slot the rack reports in error', () => {
+    const r = rack({
+      cards: [{ slot: 6, iccid: 'I6', card_number: 'AAAA000000000006', online: true }],
+      slots: table([6], [{ slot: 6, reason: 'rack_error' }]),
+    })
+    const [row] = entriesOf(r).entries
+    expect(row!.status).toBe('online')
+    expect(row!.fault).toBe('rack_error')
+    expect(authLine(row!, NOW)).toEqual({ text: 'card error', tone: 'danger' })
+  })
+
+  it('works without reasons and ignores the table of a disconnected rack', () => {
+    const noReasons = entriesOf(rack({ slots: table([4]) })).entries
+    expect(noReasons.map((e) => [e.slot, e.status, e.fault])).toEqual([[4, 'error', '']])
+    expect(entriesOf(rack({ connected: false, slots: table([4]) })).entries).toEqual([])
+  })
+})
+
+describe('a rack card the server does not serve', () => {
+  const cards: Record<string, SmartCard> = { AAAA000000000001: { name: 'A', iccid: '01' } }
+  const row = (problem: string | null) =>
+    buildGroups(
+      [],
+      [
+        rack({
+          cards: [{ slot: 1, iccid: '01', card_number: 'AAAA000000000001', online: true, problem }],
+        }),
+      ],
+      cards,
+    )
+      .flatMap((g) => g.entries)
+      .find((e) => e.slot === 1) as CardEntry
+
+  it('is online once the server confirmed it', () => {
+    const e = row(null)
+    expect(e.status).toBe('online')
+    expect(e.unserved).toBeUndefined()
+  })
+
+  it('is offline, explained and needs attention when the server has no device for it', () => {
+    const e = row('not_registered')
+    expect(e.status).toBe('offline')
+    expect(authLine(e, NOW)).toEqual({ text: 'not created on the server', tone: 'danger' })
+    expect(needsAttention(e, NOW)).toBe(true)
+  })
+
+  it('waits quietly for the confirmation', () => {
+    const e = row('unconfirmed')
+    expect(e.status).toBe('offline')
+    expect(authLine(e, NOW)).toEqual({ text: 'waiting for the server', tone: 'muted' })
+    expect(needsAttention(e, NOW)).toBe(false)
+  })
+})
+
+describe('a reader card the server does not serve', () => {
+  it('is offline and explained instead of online', () => {
+    const e = buildGroups(
+      [
+        reader({
+          iccid: '01',
+          card_number: 'AAAA000000000001',
+          online: true,
+          problem: 'not_registered',
+        }),
+      ],
+      [],
+      { AAAA000000000001: { name: 'A', iccid: '01' } },
+    ).flatMap((g) => g.entries)[0] as CardEntry
+    expect(e.status).toBe('offline')
+    expect(authLine(e, NOW)).toEqual({ text: 'not created on the server', tone: 'danger' })
   })
 })

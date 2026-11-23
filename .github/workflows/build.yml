@@ -34,7 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.ref_name }}
+          # Full ref, not the short name: the release branches share their
+          # names with tags (v0.8.1), and a short name would be ambiguous.
+          ref: ${{ github.ref }}
           # Full history: the changelog generator walks back to the previous
           # version-bump commit to collect what the push actually changed.
           fetch-depth: 0
@@ -56,7 +58,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock CHANGELOG.md
           git commit -m "ci: version ${{ steps.bump.outputs.version }}"
-          git push origin "HEAD:${{ github.ref_name }}"
+          git push origin "HEAD:refs/heads/${{ github.ref_name }}"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   macos-universal:
@@ -197,6 +199,68 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build
+
+      # The AppImage is built on Ubuntu 22.04 and bundles that release's
+      # libwayland-*. On newer distributions the host Mesa uses the host
+      # libwayland, so two copies meet in one process and WebKitGTK aborts at
+      # startup in a Wayland session ("Could not create default EGL display:
+      # EGL_BAD_PARAMETER"). Without the bundled copies the app loads the host
+      # ones, which every desktop system has (GTK and Mesa depend on them) and
+      # which are backward compatible with the 22.04 build.
+      #
+      # The image is rebuilt from its own parts — the original runtime plus a
+      # re-packed squashfs with the original compression — so nothing but the
+      # removed libraries changes. The updater signature is regenerated,
+      # because it covers the file bytes.
+      - name: Strip bundled libwayland from the AppImage
+        working-directory: src-tauri/target/release/bundle/appimage
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          images=( *.AppImage )
+          if [ "${#images[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one AppImage, found ${#images[@]}"
+            exit 1
+          fi
+          app="${images[0]}"
+          chmod +x "$app"
+
+          offset=$("./$app" --appimage-offset)
+          rm -rf squashfs-root
+          "./$app" --appimage-extract > /dev/null
+
+          removed=$(find squashfs-root -name 'libwayland-*.so*' -print -delete)
+          if [ -z "$removed" ]; then
+            echo "::warning::No bundled libwayland found in $app; the AppImage is left as built"
+            rm -rf squashfs-root
+            exit 0
+          fi
+          echo "Removed from $app:"
+          echo "$removed"
+
+          comp=$(unsquashfs -s -o "$offset" "$app" | awk '/^Compression/ { print $2 }')
+          head -c "$offset" "$app" > runtime
+          mksquashfs squashfs-root root.squashfs \
+            -root-owned -noappend -no-xattrs -comp "${comp:-gzip}" > /dev/null
+          cat runtime root.squashfs > "$app"
+          chmod +x "$app"
+          rm -rf squashfs-root runtime root.squashfs
+
+          # Prove the rebuilt image is readable and really lacks the libraries.
+          "./$app" --appimage-extract > /dev/null
+          test -x squashfs-root/AppRun
+          if find squashfs-root -name 'libwayland-*.so*' | grep -q .; then
+            echo "::error::libwayland is still present in the rebuilt AppImage"
+            exit 1
+          fi
+          rm -rf squashfs-root
+
+          rm -f "$app.sig"
+          npx tauri signer sign "$app"
+          test -s "$app.sig"
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v6

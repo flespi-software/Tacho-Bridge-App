@@ -36,7 +36,7 @@ const PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// the reply is slow, so duplicates must not start a second upload.
 static ACTIVE_REQUEST: Mutex<Option<u64>> = Mutex::new(None);
 
-/// Poison-recovering lock, matching the convention in config.rs: a panic in
+/// Poison-recovering lock, matching the convention in the config module: a panic in
 /// one holder must not make every later fetch_logs dispatch panic in turn.
 fn lock_active_request() -> std::sync::MutexGuard<'static, Option<u64>> {
     ACTIVE_REQUEST
@@ -381,8 +381,11 @@ fn filter_log_lines<W: Write>(
     let mut written = 0usize;
     let mut buf = Vec::new();
     while let Some(line) = next_lossy_line(&mut reader, &mut buf)? {
-        if let Some(ts) = line_timestamp(&line) {
-            include = ts >= cutoff;
+        // The file is written in time order: once a line is inside the slice,
+        // so is the rest. A clock stepped back (NTP, DST) must not drop the
+        // lines that follow it.
+        if !include {
+            include = line_timestamp(&line).is_some_and(|ts| ts >= cutoff);
         }
         if include {
             if already_written + written + line.len() + 1 > MAX_SLICE_BYTES {

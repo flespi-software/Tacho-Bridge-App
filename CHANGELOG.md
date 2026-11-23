@@ -184,3 +184,24 @@ All notable changes to this project will be documented in this file.
 - Logging: compact one-line events with correct severity, runtime rotation at 50 MB with a zipped archive (10 generations kept), TBA_LOG environment variable for verbosity, extended debug log on demand, driver names kept out of logs.
 - Performance: the smart card monitor and all disk I/O run off the UI and network threads; a failed PC/SC context retries with backoff instead of spinning at full CPU; rack UI updates are emitted outside locks; log records are formatted before taking the logger lock.
 - Internal: the rack module split into discovery, transport, connection, sessions and state; one shared reconnect backoff for all connections; standard Rust formatting; about 160 backend unit tests and a first frontend test suite; updated Rust and frontend dependencies including security advisories; CI builds signed installers and publishes releases with notes automatically.
+
+### [0.8.1] - 2026-11-23
+
+🛠 Fixes
+
+- Card racks: cards are identified when the rack answers a command with two frames in one read; cards moved between slots are no longer lost; sessions survive a settings change, a brief misread, a late reply and an app reconnect in local mode; card sets are applied in order; slot lights no longer stay on without a card; the scan indicator runs without pauses until the cards appear; removed card rows no longer come back.
+- Card sessions: a status retry no longer drops a session mid-authentication; cards are served again after a transient PC/SC error or a PC/SC service restart; no session is started or reconnected during shutdown.
+- Card data and configuration: card details are read when the card answers through GET RESPONSE (61 XX); cards with an unquoted numeric ICCID or name in config.yaml are readable; a failed version stamp or a repeated corrupt-file backup no longer breaks the config load; a damaged config no longer loses the server settings.
+- Security: credentials are no longer sent without TLS or written to the log.
+- Self-update: a manual update is no longer refused for a minute after launch - only an authentication actually in progress postpones it; quitting during an update install is handled correctly.
+- UI: an unreadable card is no longer shown as an empty reader; "COM port busy" notifications no longer pile up; a settings update from the server no longer resets the authentication switch; card groups reopen after clearing a filter; an opened card no longer closes by itself.
+- Linux: the application starts on newer distributions in a Wayland session ('Could not create default EGL display').
+
+🆕 Features / Improvements
+
+- Rack slot map: address blocks with used, free, faulty and error counters; slots in error are listed with the reason the card could not be identified; any slot can be blinked from the map to find it.
+- A card that is not created on the server or has a wrong device type is no longer shown as connected: red rack slot, the reason and a hint in its row, picked up automatically after the device is created.
+- Safe shutdown: quitting and update installs show their progress while rack indicators are switched off and connections are closed.
+- Refreshed design: themes, card board layout with equal margins and a scrollbar, responsive slot map, unified card names, identifiers and statuses, reader models in the list, more readable settings, a taller main window.
+- set_server and set_credentials with the values already in effect no longer reconnect the application and its cards.
+- Internal: the backend is restructured into smaller modules.

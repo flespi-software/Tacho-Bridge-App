@@ -23,9 +23,9 @@ follow one rule:
 
 - MQTT v5 (`rumqttc`), host and port taken from the app configuration
   (`server.host`, entered in the UI).
-- Keep-alive: 120 seconds.
-- Reconnect: exponential backoff, 10 s initial, doubling up to a 300 s cap,
-  reset after a successful connection.
+- Keep-alive: 60 seconds.
+- Reconnect: exponential backoff with jitter, 10 s initial, doubling up to a
+  300 s cap, reset once a connection has held for 60 seconds.
 
 ## 3. Connection types
 
@@ -123,11 +123,12 @@ segment: the server is the only sender on this path.
 | TBA → server | `rack/<serial>/link`             | link snapshot (below)                 | the rack's port is open; repeated for every open rack after each CONNACK of the app connection |
 | TBA → server | `rack/<serial>/link`             | `{"state":"down"}`                     | the rack's port was closed or lost                                                |
 | TBA → server | `rack/<serial>/response/<id>`    | response envelope (below)              | reply to `request/<id>` of this rack                                              |
-| TBA → server | `rack/<serial>/watch`            | response envelope (below)              | the presence watch saw a change (below)                                           |
+| TBA → server | `rack/<serial>/watch`            | response envelope (below)              | the presence watch report: the baseline, then every byte change and refresh (below) |
 | server → TBA | `rack/<serial>/request/<id>`     | command envelope (below)               | one serial exchange with the rack                                                 |
-| server → TBA | `rack/<serial>/watch`            | watch envelope (below)                 | arm or re-arm the presence watch                                                  |
+| server → TBA | `rack/<serial>/watch`            | watch envelope (below)                 | arm the presence watch, after every discovery pass                                             |
 | server → TBA | `rack/<serial>/release`          | `{"slot":N,"request_id":N}`             | release the matching discovery reservation                                      |
-| server → TBA | `rack/<serial>/cards`            | `[{"slot":N,"iccid":"<16 hex>"},...]` | the complete set of cards of this rack to serve                                   |
+| server → TBA | `rack/<serial>/cards`            | `[{"slot":N,"iccid":"<16 hex>"},...]` | the complete set of cards of this rack to serve, after every discovery pass    |
+| server → TBA | `rack/<serial>/profile`          | rack profile (below)                   | local mode: answer to a `link up` that reports `local_ops`, instead of everything above |
 
 `<id>` is counted by the server per rack. The request idempotency of section
 4 applies per rack too, and its cache is reset on every CONNACK. A reply or a
@@ -145,18 +146,22 @@ transparent byte pipe between the server and the serial port.
 sessions, including sessions that survived the app connection:
 
 ```json
-{"state":"up","guarded_discovery":true,"cards":[{"slot":1,"iccid":"<16 hex>"}]}
+{"state":"up","guarded_discovery":true,"serial_transactions":true,"local_ops":true,"cards":[{"slot":1,"iccid":"<16 hex>"}]}
 ```
 
-The server restores this inventory before checking the rack. A global status
-omission must be confirmed by a per-slot status request before removing a
-known card. Failed identity reads remain pending and retry on watch refresh.
+`local_ops` says this build can run a rack by itself (see "Local mode"
+below); a server that supports it answers with a `profile`, any other server
+ignores the field and drives the rack as described in this section.
+
+The server restores this inventory before checking the rack. A slot missing
+from a whole-rack reading must be confirmed by a per-slot query before removing
+a known card. Failed identity reads remain pending and retry on watch refresh.
 The physical port disappearing closes its card sessions on TBA; `link down`
 parks server state and preserves request numbering. A new app connection
 starts new server state and therefore needs the inventory again.
 
-`guarded_discovery` enables slot ownership across the reset/select/read
-sequence. The server adds `discovery_slot` to its discovery envelopes. TBA
+`guarded_discovery` enables slot ownership across the server's multi-step
+discovery sequence. The server adds `discovery_slot` to its discovery envelopes. TBA
 returns `serial_err:"card_busy"` without writing to a slot in authentication;
 the server defers it without removing the card or repainting its LED. Otherwise
 TBA reserves the slot until `rack/<serial>/release` with the slot and the last
@@ -267,8 +272,9 @@ and checksum for every received buffer.
 
 ### Card set (`cards`) and the rack link report
 
-At the end of every discovery pass over a rack the server publishes the
-complete set of cards it wants served — topic `rack/<serial>/cards`:
+After the inventory that follows a `link up` the server publishes the
+complete set of cards it wants served — topic `rack/<serial>/cards`, repeated
+at the end of every discovery pass:
 
 ```json
 [{ "slot": 1, "iccid": "<16 hex>" }, { "slot": 3, "iccid": "<16 hex>" }]
@@ -296,8 +302,37 @@ of the tracker exchanges — on a full rack that is minutes of the serial link
 per set, and a set closes every discovery pass:
 
 ```json
-{ "iccid": "<16 hex>", "slot": 3, "rack": "<serial>" }
+{ "iccid": "<16 hex>", "slot": 3, "rack": "<serial>", "serial_transactions": true, "local_ops": false, "status": true }
 ```
+
+`local_ops` is `true` when the rack of the card is run in local mode: the
+slot indicator is then written by TBA, and the server sends no indicator
+frames on this connection.
+
+`status` asks the server to answer the report on the `status` topic of the
+card connection:
+
+```json
+{ "served": true }
+{ "served": false, "reason": "not_registered" }
+```
+
+`reason` is `not_registered` (no device for the card number) or
+`wrong_device_type` (the device is not a 'Tacho Bridge Card'). The server
+accepts the connection of such a card and only warns about it, so CONNACK
+alone does not mean the card is served. When the rack profile carries
+`"card_status": true`, TBA shows a card as served (slot indicator, row state)
+only after `served: true`; until then, and after a refusal, the slot is shown
+unserved and the row names the reason. With no answer by the next keep-alive
+ping TBA repeats the report. A refused card reconnects to ask again
+after 60 s, doubling up to 300 s, because the server binds a connection to its
+device at connect only. Without `card_status` in the profile (an older
+server) a card is served from its CONNACK, as before.
+
+A reader-backed card session has no link report and asks the same question
+with a publish of `{}` to the `status` topic right after every CONNACK; the
+answer is the same. Such a card is shown online from its CONNACK and turns
+unserved, with the reason, on a refusal; it retries on the same schedule.
 
 It binds the card session to its slot on the server; without it the server
 treats the card as reader-backed. `rack` is diagnostics only. On this
@@ -306,32 +341,112 @@ the section 5 card payloads; their topics keep the section 4 shape
 `request/<id>/<sender>` — the `rack/` prefix exists on the app connection
 only. All rack-backed card connections are closed when the rack disconnects.
 
+### Local mode (`profile`)
+
+A server-driven rack costs one MQTT round trip per serial exchange: the
+status poll, every step of a card identification, every indicator write. In
+local mode TBA runs this routine work itself and the server keeps only what
+must stay remote, the exchanges of the card sessions (section 5 over the
+serial envelope, unchanged).
+
+A TBA that supports it reports `"local_ops": true` in `link up`. A server
+that supports it (and has the mode enabled for the channel) answers with one
+publish — topic `rack/<serial>/profile` — and sends nothing else for that
+rack: no `request`, `watch` or `cards`. Any other combination works as
+before: an older server ignores the field, an older TBA never sends it, and
+a server with local mode switched off starts its own discovery. A server
+command of the server-driven path (`request`, `watch`, `cards`) arriving for
+a rack in local mode switches that rack back to the server-driven path.
+
+The profile is the only knowledge of the device TBA ever holds. It is kept
+in memory, never written to the config or the log, and consists of frame
+templates and byte rules that TBA applies blindly:
+
+```json
+{
+  "version": 1,
+  "check": "sum8",
+  "status": {
+    "cmd": "<hex>", "interval_ms": 2000, "idle_ms": 300, "deadline_ms": 3000,
+    "head": "<hex>", "len": <n>, "offset": <n>, "length": <slots>,
+    "mask": "<hex byte>", "stable": 2, "gap": 10,
+    "classes": { "free": "<hex bytes>", "none": "<hex bytes>", "idle": "<hex bytes>", "error": "<hex bytes>" }
+  },
+  "slot": {
+    "idle_ms": 50, "deadline_ms": 500,
+    "probe": { "cmd": "<template>", "empty": ["<template>"] },
+    "led": { "served": "<template>", "unserved": "<template>", "off": "<template>" },
+    "poll": { "cmd": "<template>", "while": "<template>", "interval_ms": 20, "deadline_ms": 5000 },
+    "identify": [
+      { "cmd": "<template>", "expect": "<template>", "deadline_ms": 1500,
+        "ok": { "len": <n>, "head": "<template>", "match": [{ "at": <n>, "mask": "<hex>", "eq": "<hex>" }],
+                "take_at": <n>, "take_len": <n> } }
+    ]
+  }
+}
+```
+
+- A **template** is a hex string with two placeholders: `{a}` is replaced
+  with the slot address byte, a trailing `{c}` with the checksum byte.
+  `check` names the integrity rule the profile uses (one of the rules TBA
+  implements); it both fills `{c}` and validates replies.
+- `status`: the command polled every `interval_ms`. A reply is used only if
+  its first `len` bytes pass the check and start with `head`; `length` bytes
+  from `offset` are then one status byte per slot, slot 1 first. Each byte,
+  masked, is classed by the byte sets of `classes`: `none` (no reader
+  answers), `free` (a reader without a card), `idle` (a card that can be
+  worked with), `error` (a card in error); any other value is a card that
+  must be left alone. A class becomes the state of its slot after `stable`
+  equal polls in a row; a rejected reply is a missed poll, never a change.
+  `gap` aligned `none` addresses in a row below the highest occupied address
+  are a hole in the addressing, not readers.
+- `slot.identify`: the commands run in order on a slot whose card is not
+  known yet (`idle` or `error`). Each is a serial exchange of this section
+  (`cmd`, `expect`, the shared `poll`); its result must satisfy `ok`: the
+  first `len` bytes (the whole reply without `len`) pass the check, start
+  with `head` and carry `eq` at `at` (each byte masked with `mask` when
+  given). The bytes `take_len` at `take_at` of the last step are the card id
+  (the ICCID). A failed identification is repeated with a growing pause.
+- `slot.probe`: asked before a known card is given up. The removal is
+  confirmed only by a reply that starts with one of the `empty` frames of
+  that very slot.
+- `slot.led`: written when a card session comes up (`served`), when a card
+  is identified but not served, or could not be identified (`unserved`), and
+  when a card is removed (`off`); re-written after every authentication.
+
+A slot an authentication owns (see "Link") is never probed, identified or
+repainted. The identified cards are reconciled with the card sessions
+exactly as a `cards` set of the server is (see "Card set"), so the card
+connections and their rack link reports are the same in both modes. The
+engine of a rack does not depend on the app connection once it has the
+profile: a reconnect re-delivers the same profile and changes nothing.
+
+From the status polls TBA builds the slot table of the UI: counters (slots,
+used, free, faulty readers, cards in error) and a numbered slot grid, split
+into the contiguous address ranges the rack actually has. The table exists
+in local mode only.
+
 ### Card presence watch (`watch`)
 
-After discovery the server arms a client-side presence watch — topic
-`rack/<serial>/watch`:
+After the inventory the server arms a client-side presence watch — topic
+`rack/<serial>/watch`, once per link life:
 
 ```json
 { "cmd": "<hex>", "interval_ms": 2000, "idle_ms": 300, "deadline_ms": 3000, "refresh_ms": 30000 }
 ```
 
 TBA re-executes the opaque `cmd` every `interval_ms` through the same FIFO
-port queue and publishes the reply back (topic `rack/<serial>/watch`, the
-standard `serial_resp`/`serial_err` envelope) **when its bytes change or the refresh interval has elapsed** (`refresh_ms`,
-default 30 seconds). The periodic snapshot retries failed discovery and
-unconfirmed removals without a baseline re-arm loop.
-Arming again replaces the loop and resets the change baseline, so the first
-reply after (re)arming is always published — this is how the server catches
-states that changed while it was busy. TBA compares bytes blindly; what the
-command means and what changed is decided entirely by the server. Inserted
-and removed cards need no special message: the server learns of them from a
-watch report and publishes the updated card set.
+port queue. The first reply after arming is always published back on
+`rack/<serial>/watch` (the standard `serial_resp`/`serial_err` envelope): it
+is the baseline the server checks its card set against. After that TBA
+compares the reply bytes blindly and publishes the whole reply when its bytes
+change or `refresh_ms` elapsed; the server re-arms the watch after every
+discovery pass to reset the baseline. The watch ends with the rack link or
+the app connection, and a new app connection arms its own.
 
-The timings are the server's to choose and are not the same for every command.
-A rack built of several blocks answers a whole-rack query (the watch command is
-one) with pauses inside the frame, while it polls its blocks: the reply is one
-frame but not one burst, so the server sends a wider `idle_ms` for it than for
-a single-reader exchange. TBA logs why each read ended (`end=silence` — the
+The timings are the server's to choose and are not the same for every command:
+a reply can arrive in several bursts with pauses between them, so the server
+sends a wider `idle_ms` for such a command than for a short exchange. TBA logs why each read ended (`end=silence` — the
 device finished, `end=deadline` — a bound cut the reply), which is what makes a
 too-narrow bound visible on the client side.
 
@@ -474,8 +589,10 @@ becomes the command failure reason on the server:
 { "error": "no log entries for the last 1 day(s)" }
 ```
 
-Idempotency: while an upload is running, a re-sent `fetch_logs` with any
-`request_id` is dropped — the upload in flight produces the reply. Chunks of
+Idempotency: while an upload is running, a re-sent `fetch_logs` with the same
+`request_id` is dropped — the upload in flight produces the reply; one with
+another `request_id` is answered at once with
+`{ "error": "another log upload is already in progress" }`. Chunks of
 an abandoned exchange are discarded by the server via the `request_id` check.
 
 ### Extended debug log (`debug_log`)
@@ -541,7 +658,8 @@ command arrived on **before** every connection is rebuilt with the new pair:
 There is no rollback: what the server pushes is what the application uses
 from then on. A pair that does not match the channel configuration locks the
 application out until the fields are fixed in its settings dialog or on the
-channel.
+channel. A command that sets the pair already in effect is answered the same
+way and reconnects nothing.
 
 ### Server address (`set_server`)
 
@@ -564,7 +682,9 @@ arrived on **before** every connection is rebuilt against the new address:
 
 The address is persisted in `server.host` of config.yaml. There is no
 rollback: after the reply the application, its cards and racks reconnect to
-the new address and the old server hears nothing from them any more.
+the new address and the old server hears nothing from them any more. A
+command carrying the address already in effect is answered the same way and
+reconnects nothing.
 
 ### Command replies
 

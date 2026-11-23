@@ -1,10 +1,11 @@
 //! Card racks over COM (serial) ports.
 //!
-//! This module is intentionally a **thin wrapper**: it watches the USB-serial
-//! bus for supported devices, logs connect/disconnect transitions, and bridges
-//! bytes between the server and each serial port. It contains **no command/wire
-//! protocol** — every command is built and interpreted by the server; the
-//! client only forwards raw bytes.
+//! This module watches the USB-serial bus for supported devices, logs
+//! connect/disconnect transitions, and bridges bytes between the server and
+//! each serial port. It holds **no device wire protocol of its own**: the
+//! server either builds every command and the client forwards raw bytes, or
+//! hands over a profile (byte templates and reply rules) that the local engine
+//! runs (`local`).
 //!
 //! A rack is a peripheral of the application, like a PC/SC reader: it has no
 //! MQTT connection of its own. Its traffic rides the application connection
@@ -23,10 +24,13 @@
 //! - `rack` — the rack traffic of the application connection (link, requests)
 //! - `cards` — per-card MQTT sessions and the per-rack presence watches
 //! - `state` — the per-rack card lists shown in the UI
+//! - `access` — slot ownership between discovery and authentication
+//! - `local` — the rack run locally from a server profile
 
 mod access;
 mod cards;
 mod discovery;
+mod local;
 mod rack;
 mod state;
 mod transport;
@@ -49,6 +53,7 @@ use transport::SharedPort;
 pub use cards::abort_rack_card_session;
 pub use cards::connect_pending_rack_cards;
 pub use cards::disconnect_rack_card;
+pub use discovery::replay_port_busy;
 pub use rack::{handle_app_publish, on_app_connack, on_app_offline, register_app_client};
 pub(crate) use state::any_card_authenticating;
 
@@ -63,6 +68,16 @@ static MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 /// serial ports after `shutdown()` released them (its self-heal branch would
 /// grab a port again within one poll tick).
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+pub struct ShutdownEstimate {
+    pub slots: usize,
+    pub estimated_ms: u64,
+}
+
+pub fn shutdown_estimate() -> ShutdownEstimate {
+    local::shutdown_estimate()
+}
 
 /// One rack linked to the server: its open serial port plus the request
 /// idempotency of its exchanges. The server counts request ids per rack, so
@@ -147,8 +162,23 @@ pub(super) fn set_active_rack_port_for_test(rack_id: &str, port_name: Option<&st
 /// permanently kill the rack stack. Every guarded value in this module is safe
 /// to reuse after a panic — plain collections replaced in whole assignments,
 /// never left half-updated. Shared by all `com_port` submodules.
-fn lock<T>(m: &'static std::sync::Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Highest slot address a rack can have.
+const SLOT_MAX: u16 = 240;
+
+/// `interval`, doubled per consecutive failure up to `cap` (never below the
+/// interval): the pause of a poll loop whose exchanges keep failing.
+fn backoff_delay(
+    interval: std::time::Duration,
+    failures: u32,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    interval
+        .saturating_mul(1u32 << failures.min(10))
+        .min(cap.max(interval))
 }
 
 /// The linked rack with this id, if its port is open.
@@ -183,6 +213,15 @@ fn rack_port_is_live(rack_id: &str, port: &SharedPort) -> bool {
         .unwrap_or(false)
 }
 
+/// The `transport::port_key` of the rack's open port, while `port` is still
+/// that port.
+fn rack_io_key(rack_id: &str, port: &SharedPort) -> Option<usize> {
+    lock(&RACKS)
+        .get(rack_id)
+        .filter(|rack| Arc::ptr_eq(&rack.port, port))
+        .map(|rack| rack.io_key)
+}
+
 /// Forgets the cached replies of every rack. Called on every CONNACK of the
 /// application connection: the server starts a new instance per connection,
 /// and with it every rack's request id counter restarts at 1.
@@ -190,6 +229,17 @@ fn reset_all_rack_idempotency() {
     for rack in lock(&RACKS).values_mut() {
         // A request in flight keeps the old slot; the new one starts empty.
         rack.idempotency = Arc::new(AsyncMutex::new(IdempotencySlot::default()));
+    }
+}
+
+/// Ends the retained serial operation parked in every rack's slot, freeing the
+/// ports for the card sessions queued behind them. A slot locked by a request
+/// in flight is skipped, as in `unlink_rack`.
+fn drop_idle_rack_leases() {
+    for rack in lock(&RACKS).values() {
+        if let Ok(mut slot) = rack.idempotency.try_lock() {
+            slot.drop_lease();
+        }
     }
 }
 
@@ -221,6 +271,28 @@ fn link_rack(rack_id: String, port: SharedPort, io_key: usize) -> Vec<(String, b
     vec![(rack_id, true)]
 }
 
+/// Blinks the indicator of one slot of a rack the app runs locally, so the
+/// operator finds that slot on the rack. Resolves once the rack took the first
+/// indicator write, with the length of the whole blink in milliseconds.
+#[tauri::command]
+pub async fn blink_rack_slot(
+    rack_id: String,
+    slot: u16,
+    until_stopped: Option<bool>,
+) -> Result<u64, String> {
+    local::blink(&rack_id, slot, until_stopped.unwrap_or(false))
+        .await
+        .map(|length| length.as_millis() as u64)
+        .map_err(String::from)
+}
+
+#[tauri::command]
+pub async fn stop_blink_rack_slot(rack_id: String, slot: u16) -> Result<(), String> {
+    local::stop_blink(&rack_id, slot)
+        .await
+        .map_err(String::from)
+}
+
 /// Tears down the sessions of every rack so they are rebuilt with fresh
 /// config, and asks the server to walk every rack again. The card session
 /// loops resolve the broker host once at start, so a server-host change must
@@ -239,19 +311,31 @@ pub fn restart_rack_links(reason: &str) {
     );
     for id in &ids {
         stop_rack_watch(id);
+        // The local engine goes too: the server re-sends the same profile,
+        // which an engine still running would take as nothing new and never
+        // hand the cards over again, leaving the rack without sessions.
+        local::stop(id, "links_restarted");
         stop_rack_cards(id);
+        // The card list is empty until the re-discovery ends: show it as a scan.
+        crate::global_app_handle::rack_mark_scan_started(id);
     }
     reset_all_rack_idempotency();
     announce_links(ids.into_iter().map(|id| (id, true)).collect());
 }
 
-/// Releases the serial ports and stops all rack tasks. Called when the app is
-/// closing: the process may linger briefly (WebView children, blocking PC/SC
-/// thread), and an undisposed COM handle makes a relaunched instance fail with
-/// "Access is denied" until the old process fully dies.
-pub fn shutdown() {
+/// Darkens the indicators, releases serial ports and stops all rack tasks.
+/// Called when the app is closing: it may linger briefly (WebView children,
+/// blocking PC/SC thread), and an undisposed COM handle makes a relaunched
+/// instance fail with "Access is denied" until the old process fully dies.
+pub async fn shutdown() {
+    // Quit during updater preparation must wait for its LED cleanup too.
+    let _shutdown = SHUTDOWN_LOCK.lock().await;
     SHUTTING_DOWN.store(true, Ordering::SeqCst);
+    let indicators = local::prepare_indicator_shutdown();
     stop_all_racks();
+    // Snapshot handles keep ports open until the final off commands finish.
+    // Normal traffic is now blocked, so nothing can light them again.
+    local::turn_off_indicators(indicators).await;
     log::info!("RACK | phase=shutdown status=ports_released");
 }
 
@@ -308,6 +392,7 @@ fn unlink_rack(rack_id: &str, links: &mut Vec<(String, bool)>) -> Option<SharedP
         rack.port
     });
     stop_rack_watch(rack_id);
+    local::stop(rack_id, "rack_gone");
     stop_rack_cards(rack_id);
     if port.is_some() {
         links.push((rack_id.to_string(), false));
@@ -376,6 +461,7 @@ fn stop_all_racks() {
     }
     announce_links(links);
     stop_all_rack_watches();
+    local::stop_all();
     stop_all_rack_cards();
 }
 

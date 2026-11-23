@@ -4,38 +4,42 @@
   <div class="card-board" :class="{ 'card-board--tiles': cardView !== 'list' }">
     <div class="cb-toolbar">
       <div class="cb-toolbar__inner">
-        <div class="row no-wrap items-center q-gutter-x-sm">
-          <div class="col cb-toolbar__total">{{ totalLine }}</div>
-          <div class="cb-viewswitch" role="group" aria-label="View">
-            <button
-              v-for="v in VIEW_BUTTONS"
-              :key="v.id"
-              type="button"
-              :class="{ 'cb-viewswitch__on': cardView === v.id }"
-              :aria-pressed="cardView === v.id"
-              :aria-label="v.label"
-              :title="v.label"
-              @click="pickView(v.id)"
-            >
-              <q-icon :name="v.icon" size="18px" />
-            </button>
+        <div class="cb-toolbar__heading">
+          <div class="cb-toolbar__summary">
+            <h1 class="cb-toolbar__title">Cards</h1>
+            <div class="cb-toolbar__total">{{ totalLine }}</div>
           </div>
-          <q-btn
-            unelevated
-            rounded
-            no-caps
-            dense
-            color="positive"
-            icon="mdi-plus"
-            label="Add card"
-            class="q-px-md"
-            @click="openAddDialog"
-          />
+          <div class="cb-toolbar__actions">
+            <div class="cb-viewswitch" role="group" aria-label="View">
+              <button
+                v-for="v in VIEW_BUTTONS"
+                :key="v.id"
+                type="button"
+                :class="{ 'cb-viewswitch__on': cardView === v.id }"
+                :aria-pressed="cardView === v.id"
+                :aria-label="v.label"
+                :title="v.label"
+                @click="pickView(v.id)"
+              >
+                <q-icon :name="v.icon" size="18px" />
+                <span>{{ v.id === 'mini' ? 'Mini' : v.label }}</span>
+              </button>
+            </div>
+            <q-btn
+              unelevated
+              no-caps
+              dense
+              icon="mdi-plus"
+              label="Add card"
+              class="cb-btn-primary cb-add-button"
+              @click="openAddDialog"
+            />
+          </div>
         </div>
-        <div class="row no-wrap q-gutter-x-sm">
+        <div class="cb-toolbar__filters">
           <q-input
             v-model="search"
-            class="col"
+            class="cb-toolbar__search"
             outlined
             dense
             clearable
@@ -89,7 +93,7 @@
             :key="c.id"
             type="button"
             class="cb-chip"
-            :class="{ 'cb-chip--on': status === c.id }"
+            :class="[`cb-chip--${c.id}`, { 'cb-chip--on': status === c.id }]"
             :aria-pressed="status === c.id"
             @click="status = status === c.id ? 'all' : c.id"
           >
@@ -124,9 +128,8 @@
           :remove="remove"
           @toggle="toggleGroup(v.group.id, !v.open)"
           @show-all="showAll[v.group.id] = true"
-          @pick-issue="(st) => pickIssue(v.group.id, st)"
           @row-toggle="(key) => (openRow = openRow === key ? null : key)"
-          @row-close="openRow = null"
+          @row-close="(key) => openRow === key && (openRow = null)"
         />
         <div v-if="narrowing && !views.some((v) => v.visible)" class="cb-nothing">
           No cards match the filter.
@@ -136,7 +139,7 @@
     </div>
 
     <q-dialog v-model="addOpen">
-      <q-card style="min-width: 420px">
+      <q-card class="cb-add-dialog">
         <q-card-section class="row items-center q-pb-sm">
           <q-icon name="mdi-card-plus" size="28px" color="primary" class="q-mr-sm" />
           <div class="text-h6">Add card</div>
@@ -211,7 +214,9 @@ import {
   nextViewSlot,
   viewSlot,
   NOT_INSERTED_GROUP,
+  READERS_GROUP,
   SORTERS,
+  plural,
   type CardView,
   type SortKey,
   type StatusFilter,
@@ -282,6 +287,10 @@ function loadOpenGroups(): Record<string, boolean> {
 }
 
 function toggleGroup(id: string, open: boolean): void {
+  // A filtered view shows every matching group open whatever was saved, so a
+  // click there would save "collapsed" for a group that stays open on screen
+  // and then comes back folded once the filter is cleared.
+  if (narrowing.value) return
   openGroups[id] = open
   try {
     localStorage.setItem(OPEN_GROUPS_KEY, JSON.stringify(openGroups))
@@ -293,7 +302,11 @@ function toggleGroup(id: string, open: boolean): void {
 // Readers and racks start expanded, the not-inserted list collapsed — the
 // same as the old screen, where the card list was folded.
 function isGroupOpen(id: string): boolean {
-  return openGroups[id] ?? id !== NOT_INSERTED_GROUP
+  return (
+    openGroups[id] ??
+    (id.startsWith(`${READERS_GROUP}:`) ? openGroups[READERS_GROUP] : undefined) ??
+    id !== NOT_INSERTED_GROUP
+  )
 }
 
 // The view is remembered separately for a normal and a stretched window, so
@@ -402,10 +415,6 @@ const views = computed(() => {
   })
 })
 
-function plural(n: number, one: string): string {
-  return `${n} ${n === 1 ? one : `${one}s`}`
-}
-
 const totalLine = computed(() => {
   const total = groups.value.reduce(
     (n, g) => n + g.entries.filter((e) => e.status !== 'empty').length,
@@ -416,13 +425,6 @@ const totalLine = computed(() => {
   parts.push(plural(props.readers.length, 'reader'))
   return parts.join(' · ')
 })
-
-function pickIssue(groupId: string, st: StatusFilter): void {
-  search.value = ''
-  location.value = groupId
-  status.value = st
-  openRow.value = null
-}
 
 function resetFilters(): void {
   search.value = ''

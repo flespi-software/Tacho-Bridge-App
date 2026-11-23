@@ -171,8 +171,13 @@ impl RackInfo {
             pid: Some(self.pid),
             cards: Vec::new(),
             // A freshly (re)connected rack has not been enumerated yet; the
-            // server's `watch` instruction flips this once discovery is done.
+            // first card set flips this (`rack_mark_scan_complete`): the
+            // server's at the end of its discovery, or the local engine's
+            // after its first identification walk.
             scan_complete: false,
+            // The server publishes the table at the end of the discovery
+            // that follows the link report; nothing to show before that.
+            slots: None,
         }
     }
 }
@@ -189,13 +194,8 @@ impl ChangeGuard {
 
     /// Store `value` and report whether it differs from the previous one.
     fn changed(&self, value: &str) -> bool {
-        // Poison-recovering like every other lock in the backend (see
-        // `super::lock`; this one is inline because the mutex lives inside
-        // `self`, not in a static).
-        let mut last = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // poison-recovering like every other lock of the rack stack
+        let mut last = super::lock(&self.0);
         if *last == value {
             false
         } else {
@@ -656,6 +656,19 @@ fn notify_port_busy(port_name: &str) {
         }
         notified.push(port_name.to_string());
     }
+    emit_port_busy(port_name);
+}
+
+/// Repeats the "COM port busy" notification of every port still busy: one
+/// raised before the webview listened (the discovery starts first) was lost.
+pub fn replay_port_busy() {
+    let ports = super::lock(&BUSY_PORT_NOTICES).clone();
+    for port_name in &ports {
+        emit_port_busy(port_name);
+    }
+}
+
+fn emit_port_busy(port_name: &str) {
     emit_notification_event(
         "global-notification",
         NotificationPayload {

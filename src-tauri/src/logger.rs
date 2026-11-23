@@ -113,7 +113,7 @@ pub fn replay_access_warning() {
 }
 
 /// Whether the "cannot write the log" warning is in effect (and replayed on
-/// `frontend-loaded`) — config.rs skips its own, identical-looking `access`
+/// `frontend-loaded`) — the config module skips its own, identical-looking `access`
 /// warning then.
 pub fn access_warning_active() -> bool {
     LOG_ACCESS_FAILED.load(std::sync::atomic::Ordering::SeqCst)
@@ -387,10 +387,16 @@ fn archive_log_generation(dir: &Path, archived: &Path, keep: usize) -> std::io::
             Err(e) => return Err(e),
         }
     };
-    let zip_result = zip_log_entry(
-        &mut File::open(archived)?,
-        std::io::BufWriter::new(part_file),
-    )
+    let mut source = match File::open(archived) {
+        Ok(file) => file,
+        Err(e) => {
+            // Closed first: an open file cannot be removed on Windows.
+            drop(part_file);
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+    };
+    let zip_result = zip_log_entry(&mut source, std::io::BufWriter::new(part_file))
     .and_then(|mut sink| sink.flush());
     if let Err(e) = zip_result {
         let _ = std::fs::remove_file(&part);

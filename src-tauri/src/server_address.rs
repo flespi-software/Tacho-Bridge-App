@@ -32,6 +32,11 @@ pub fn handle(client: &AsyncClient, log_header: &str, request_id: u64, payload: 
     let client = client.clone();
     let log_header = log_header.to_string();
     async_runtime::spawn(async move {
+        // The address in effect: setting the same one again changes nothing to reconnect for.
+        let before = crate::config::get_from_cache(crate::config::CacheSection::Server, "host");
+        let changed = parsed
+            .as_ref()
+            .is_ok_and(|host| host.trim() != before.trim());
         let reply = match parsed {
             Err(e) => json!({"error": e}),
             Ok(host) => {
@@ -60,6 +65,7 @@ pub fn handle(client: &AsyncClient, log_header: &str, request_id: u64, payload: 
             &done_topic,
             reply,
             "set_server_command",
+            changed,
         )
         .await;
     });

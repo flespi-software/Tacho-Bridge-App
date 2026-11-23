@@ -1,6 +1,6 @@
-//! Module for working with MQTT connections.
-//!
-//! This module provides functionality for creating and managing MQTT connections.
+//! The application's own MQTT connection to the broker: server commands,
+//! settings reports and the rack traffic ride it, unlike the per-card
+//! connections of `mqtt`.
 
 // ───── Std Lib ─────
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -97,8 +97,15 @@ pub async fn app_connection() {
         return;
     }
 
-    // Unlock task_pool mutex
     let mut task_pool = TASK_POOL.lock().await;
+
+    // Exit (or an update install) has drained the pool already: a connection
+    // registered now would outlive the teardown. Same gate as the card
+    // sessions (`mqtt::ensure_connection`).
+    if crate::shutdown::in_progress() {
+        log::info!("[CONN] phase=app_connection status=skip_shutdown");
+        return;
+    }
 
     // Take over before the predecessor is told to close, so its teardown
     // already sees itself superseded.
@@ -139,7 +146,7 @@ pub async fn app_connection() {
     // them the new client right away, so a rack linking before the first
     // CONNACK queues its report into the right connection.
     crate::com_port::register_app_client(&mqtt_client);
-    let mqtt_clinet_cloned = mqtt_client.clone();
+    let mqtt_client_cloned = mqtt_client.clone();
     let mqtt_client_for_task = mqtt_client.clone();
     let log_header: String = format!("{} |", client_id);
     let client_id_for_task = client_id.clone();
@@ -185,9 +192,17 @@ pub async fn app_connection() {
                         app_emit_event(true);
                     }
 
-                    // The full notification embeds publish payloads (rack
-                    // envelopes included): trace only, never in the debug log.
-                    log::trace!("App {} Notification: {:?}", log_header, notification);
+                    // A publish payload is never logged, not even at trace: it
+                    // carries rack envelopes and the `set_credentials` password.
+                    match &notification {
+                        Event::Incoming(Incoming::Publish(publish)) => log::trace!(
+                            "App {} Notification: publish topic={:?} bytes={}",
+                            log_header,
+                            publish.topic,
+                            publish.payload.len()
+                        ),
+                        other => log::trace!("App {} Notification: {:?}", log_header, other),
+                    }
 
                     match notification {
                         Event::Incoming(Incoming::Publish(publish)) => {
@@ -287,6 +302,10 @@ pub async fn app_connection() {
                     );
 
                     tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
+                    // Replaced during the sleep: a reconnect would kick its successor.
+                    if !is_current_app_session(session_id) {
+                        break;
+                    }
                 }
             }
         }
@@ -308,7 +327,7 @@ pub async fn app_connection() {
         session_id,
         reader_name: None,
         atr: None,
-        mqtt_client: mqtt_clinet_cloned,
+        mqtt_client: mqtt_client_cloned,
         task_handle: handle,
     });
 

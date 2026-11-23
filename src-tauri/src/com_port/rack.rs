@@ -5,15 +5,17 @@
 //! connection under the `rack/<id>/` topic prefix, `<id>` being the rack id
 //! (the device serial, see `discovery.rs`). This module owns that prefix:
 //! the link reports (`rack/<id>/link`), the dispatch of the server's rack
-//! publishes (`request/<n>`, `watch`, `cards`) and the reply path of the
-//! serial exchanges. Per-card sessions live in `cards.rs`; the wire is in
-//! `transport.rs`.
+//! publishes (`request/<n>`, `release`, `watch`, `cards`, `profile`) and the reply path of the
+//! serial exchanges. Per-card sessions live in `cards`; the wire is in
+//! `transport`.
 //!
 //! Topics, TBA -> server: `rack/<id>/link` (`{"state":"up"|"down"}`),
 //! `rack/<id>/response/<n>` (reply to `request/<n>`), `rack/<id>/watch`
 //! (presence watch report). Server -> TBA: `rack/<id>/request/<n>` (one serial
-//! exchange), `rack/<id>/watch` (arm the presence watch), `rack/<id>/cards`
-//! (the set of cards to serve). No `/<sender>` tail on this path: the sender
+//! exchange), `rack/<id>/release` (end the discovery lease of a slot),
+//! `rack/<id>/watch` (arm the presence watch), `rack/<id>/cards`
+//! (the set of cards to serve), `rack/<id>/profile` (the rack is run locally
+//! from now on, see `local`). No `/<sender>` tail on this path: the sender
 //! is always the server.
 
 use rumqttc::v5::mqttbytes::QoS;
@@ -24,11 +26,13 @@ use tauri::async_runtime;
 
 use crate::mqtt::{request_id_from_topic, request_to_response_topic};
 
-use super::cards::{handle_cards_set, start_rack_watch, stop_all_rack_watches};
+use super::cards::{
+    bump_card_epoch, handle_cards_set, parse_cards_set, start_rack_watch, stop_all_rack_watches,
+};
 use super::state::set_rack_card_state;
 use super::transport::{
     execute_envelope, parse_envelope, SerialEnvelope, SerialExchange, SerialLease, SharedPort,
-    SERIAL_ERR_BAD_CONTROL, SERIAL_ERR_BAD_JSON, SERIAL_ERR_BAD_REQUEST_ID, SERIAL_ERR_CARD_BUSY,
+    SERIAL_ERR_BAD_CONTROL, SERIAL_ERR_BAD_HEX, SERIAL_ERR_BAD_JSON, SERIAL_ERR_BAD_REQUEST_ID, SERIAL_ERR_CARD_BUSY,
     SERIAL_ERR_REQUEST_CONFLICT, SERIAL_ERR_STALE_REQUEST, SERIAL_ERR_TRANSACTION_ACTIVE,
     SERIAL_ERR_TRANSACTION_EXPIRED,
 };
@@ -143,6 +147,8 @@ pub fn on_app_offline() {
     super::access::cancel_discovery();
     if APP_ONLINE.swap(false, Ordering::SeqCst) {
         log::info!("RACK | [LINK] status=app_offline");
+        // The owner of a retained rack operation is gone: nobody can continue or release it.
+        super::drop_idle_rack_leases();
     }
 }
 
@@ -210,8 +216,9 @@ async fn publish_links(client: &AsyncClient, links: Vec<(String, bool)>) {
     for (rack_id, up) in links {
         let state = if up { "up" } else { "down" };
         let payload = if up {
+                // `local_ops`: this build runs a rack by itself from a server profile (see `local`)
                 serde_json::json!({"state": state, "guarded_discovery": true, "serial_transactions": true,
-                    "cards": super::cards::inventory(&rack_id)})
+                    "local_ops": true, "cards": super::cards::inventory(&rack_id)})
             } else {
                 serde_json::json!({"state": state})
             }
@@ -312,6 +319,16 @@ pub fn handle_app_publish(client: &AsyncClient, topic: &str, payload: &[u8]) -> 
     // The server instance behind this publish: a reply is delivered to it or
     // not at all (see `app_link_is`).
     let generation = app_generation();
+    if tail == "profile" {
+        // the server hands the rack over: it is polled, its cards identified
+        // and its indicators written locally from now on
+        super::local::start(payload, rack_id, &rack.port, &log_header);
+        return true;
+    }
+    if tail.starts_with("request/") || tail == "watch" || tail == "cards" {
+        // a server that sends its own rack commands drives the rack itself
+        super::local::stop(rack_id, "server_driven");
+    }
     if tail.starts_with("request/") {
         // Enqueue before yielding so a new hold cannot overtake its preceding release.
         let requests = rack.requests.clone();
@@ -337,7 +354,7 @@ pub fn handle_app_publish(client: &AsyncClient, topic: &str, payload: &[u8]) -> 
             if let Some(slot) = json
                 .get("slot")
                 .and_then(|v| v.as_u64())
-                .filter(|s| (1..=240).contains(s))
+                .filter(|s| (1..=u64::from(super::SLOT_MAX)).contains(s))
             {
                 if let Some(request_id) = json.get("request_id").and_then(|v| v.as_u64()) {
                     // Queued behind the rack's requests: a release that answers
@@ -369,13 +386,25 @@ pub fn handle_app_publish(client: &AsyncClient, topic: &str, payload: &[u8]) -> 
             &log_header,
         );
     } else if tail == "cards" {
-        // the set of cards of this rack to serve: reconcile the card sessions
-        async_runtime::spawn(handle_cards_set(
-            payload.to_vec(),
-            rack_id.to_string(),
-            rack.port.clone(),
-            log_header,
-        ));
+        // the set of cards of this rack to serve: reconcile the card sessions.
+        // The epoch is taken here, in arrival order: the spawned tasks of two
+        // sets read in one go may start in either order, and the older one
+        // must not win by running last.
+        match parse_cards_set(payload) {
+            Ok(cards) => {
+                let epoch = bump_card_epoch(rack_id);
+                async_runtime::spawn(handle_cards_set(
+                    cards,
+                    epoch,
+                    rack_id.to_string(),
+                    rack.port.clone(),
+                    log_header,
+                ));
+            }
+            Err(reason) => {
+                log::warn!("{} [CARDS] status=ignored reason={}", log_header, reason);
+            }
+        }
     } else {
         // An unknown rack topic (a newer server feature, or a retained stray)
         // must not fall through to the serial path: its payload would be
@@ -649,26 +678,31 @@ fn slot_ownership(
     }
 }
 
-/// Shows and records the authentication activity the `finish` flag of a card envelope tells.
+/// Shows the authentication activity the `finish` flag of a card envelope tells.
 /// Authentication boundaries come from the server's flag alone — the same contract the PC/SC
-/// path uses (see `auth_process` in mqtt.rs); nothing is inferred from the traffic itself. An
+/// path uses (see `auth_process` in `mqtt::card_session`); nothing is inferred from the traffic itself. An
 /// envelope without the flag is plain signalling on the same serial path (e.g. a slot
 /// indicator repaint), never shown or recorded as authentication activity. The one gap — a closing
-/// `finish:true` that never arrives — is covered by the keep-alive PingResp reset in cards.rs.
-fn record_card_activity(iccid: &str, card_number: &str, finish: Option<bool>, log_header: &str) {
+/// `finish:true` that never arrives — is covered by the keep-alive PingResp reset in `cards::session`.
+/// The outcome of a finished session is recorded separately, once its closing exchange has run.
+fn show_card_activity(iccid: &str, finish: Option<bool>) {
     match finish {
-        Some(true) => {
-            set_rack_card_state(iccid, true, false);
-            // Same bookkeeping as the reader path (mqtt.rs): persist the auth timestamp so a
-            // card that only ever authenticates through a rack still shows "Last auth" in the
-            // UI. Detached — the config write must not park the serial bridge before the reply.
-            crate::config::record_auth_result_detached(card_number, true);
-            log::info!("{} [MQTT] status=auth_finished", log_header);
-        }
+        Some(true) => set_rack_card_state(iccid, true, false),
         // a command of the session is in flight, so the card is busy
         Some(false) => set_rack_card_state(iccid, true, true),
         None => {}
     }
+}
+
+/// Records the outcome of a finished session in the card config — the "Last auth" line of the
+/// UI, the same bookkeeping as the reader path (`mqtt::card_session`) — once the closing exchange has run.
+/// The closing exchange is the last word of the session: a reset the rack never answered is a
+/// failed session, not an authenticated card. Detached — the config write must not park the
+/// serial bridge before the reply.
+fn record_card_auth(card_number: &str, exchange: &SerialExchange, log_header: &str) {
+    let success = exchange.err.is_empty();
+    crate::config::record_auth_result_detached(card_number, success);
+    log::info!("{} [MQTT] status=auth_finished success={}", log_header, success);
 }
 
 /// A reply with an error code and no data, ready to publish on `resp_topic`.
@@ -732,6 +766,10 @@ pub(super) async fn run_serial_request(
         None => {}
     }
     let Some(parsed) = parse_envelope(&json) else {
+        // A `serial_cmd` of the wrong type is still a request: it gets its reply.
+        if json.get("serial_cmd").is_some() {
+            return failure(&resp_topic, SERIAL_ERR_BAD_HEX);
+        }
         log::warn!("{} [MQTT] status=ignored reason=no_serial_cmd", log_header);
         return None;
     };
@@ -742,7 +780,7 @@ pub(super) async fn run_serial_request(
             let discovery_slot = json
                 .get("discovery_slot")
                 .and_then(|v| v.as_u64())
-                .filter(|s| (1..=240).contains(s))
+                .filter(|s| (1..=u64::from(super::SLOT_MAX)).contains(s))
                 .map(|s| s as u16);
             // Debug log identity of this exchange, taken before the envelope
             // is consumed: what the server can match against its own copy.
@@ -777,8 +815,8 @@ pub(super) async fn run_serial_request(
                     return failure(&resp_topic, SERIAL_ERR_CARD_BUSY);
                 }
             }
-            if let Some((iccid, card_number, _, _)) = card {
-                record_card_activity(iccid, card_number, envelope.finish, log_header);
+            if let Some((iccid, _, _, _)) = card {
+                show_card_activity(iccid, envelope.finish);
             }
             let finished = envelope.finish == Some(true);
             let exchange = if envelope.cmd_hex.is_empty() {
@@ -797,8 +835,9 @@ pub(super) async fn run_serial_request(
                     .await
             };
             if finished {
-                if let Some((_, _, slot, session)) = card {
+                if let Some((_, card_number, slot, session)) = card {
                     super::access::release(serial_port, slot, false, Some(session));
+                    record_card_auth(card_number, &exchange, log_header);
                 }
             }
             // One line per exchange with everything the server's own log

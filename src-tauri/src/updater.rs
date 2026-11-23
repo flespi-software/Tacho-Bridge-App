@@ -448,6 +448,14 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
     install_parked(&app, false).await.map_err(String::from)
 }
 
+/// Set while the bundle is being replaced: an exit in the middle could leave it half-written.
+static INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the bundle is being replaced right now (see `shutdown::request_exit`).
+pub fn is_installing() -> bool {
+    INSTALLING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// The install itself, with a postponement told apart from a failure.
 /// `unattended` (the auto-update loop) picks the stricter card-activity rule,
 /// see `card_link_busy`.
@@ -473,10 +481,20 @@ async fn install_parked(app: &AppHandle, unattended: bool) -> Result<(), Install
     // on success, just before the restart.
     let update = {
         let guard = PENDING_UPDATE.lock().await;
-        guard
+        let pending = guard
             .as_ref()
-            .map(|pending| pending.update.clone())
-            .ok_or_else(|| InstallError::Failed("no pending update".to_string()))?
+            .ok_or_else(|| InstallError::Failed("no pending update".to_string()))?;
+        // A pre-release parked before the user went back to stable is not installed
+        // by a click on its old notification either (the auto-loop drops it the same way).
+        let beta_now =
+            crate::config::get_from_cache(crate::config::CacheSection::Updates, "beta_updates")
+                == "true";
+        if pending.beta != beta_now {
+            return Err(InstallError::Failed(
+                "the update channel changed; check for updates again".to_string(),
+            ));
+        }
+        pending.update.clone()
     };
 
     log::info!(
@@ -527,19 +545,30 @@ async fn install_parked(app: &AppHandle, unattended: bool) -> Result<(), Install
     // Release the rack's serial port and close the broker sessions before
     // installing: on Windows the NSIS install exits the process from inside
     // `install`, so the regular exit cleanup never runs there.
-    crate::com_port::shutdown();
-    crate::mqtt::remove_connections_all().await;
+    crate::shutdown::prepare().await;
+    // Raised before the exit check: a Quit either sees it and waits, or is seen here.
+    INSTALLING.store(true, std::sync::atomic::Ordering::SeqCst);
+    if crate::shutdown::is_exiting() {
+        INSTALLING.store(false, std::sync::atomic::Ordering::SeqCst);
+        return Err(InstallError::Postponed(
+            "the application is exiting".to_string(),
+        ));
+    }
+    crate::shutdown::set_phase(crate::shutdown::Phase::Installing);
 
     // Unpacking and replacing the bundle takes seconds of blocking file I/O.
     let installed = tauri::async_runtime::spawn_blocking(move || update.install(bytes))
         .await
         .map_err(|e| e.to_string())
         .and_then(|result| result.map_err(|e| e.to_string()));
+    INSTALLING.store(false, std::sync::atomic::Ordering::SeqCst);
     if let Err(e) = installed {
         log::error!("{TAG} phase=install status=failed step=install err={e}");
         // Bring back what was torn down for the install.
-        crate::com_port::resume();
-        crate::app_connect::reconnect_everything("update_install_failed").await;
+        if crate::shutdown::reset_after_failed_update().await {
+            crate::com_port::resume();
+            crate::app_connect::reconnect_everything("update_install_failed").await;
+        }
         return Err(InstallError::Failed(e));
     }
 

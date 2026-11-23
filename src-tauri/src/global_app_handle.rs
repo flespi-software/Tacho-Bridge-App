@@ -57,8 +57,7 @@ fn emit_to_frontend<P: Serialize + Clone>(event_name: &str, payload: P) {
 ///
 /// # Fields
 ///
-/// * `atr` - A string representing the Answer To Reset (ATR) of the card. The ATR is a sequence
-///   of bytes returned by the card upon reset, identifying the card's communication parameters.
+/// * `iccid` - The card's extended serial number read from `EF_ICC`.
 /// * `reader_name` - The name of the smart card reader through which the card is being accessed.
 /// * `card_state` - A string describing the current state of the card (e.g., "Inserted", "Removed").
 /// * `card_number` - The identification number of the tachograph card.
@@ -70,6 +69,16 @@ pub struct TachoState {
     pub card_number: String,
     pub online: Option<bool>,
     pub authentication: Option<bool>,
+    /// Why the server does not serve this card although its session is up
+    /// (`not_registered`, `wrong_device_type`); `None` when it does.
+    pub problem: Option<String>,
+}
+
+/// Whether a reader state means the reader left the bus: its UI row goes for
+/// good. One rule for the replay map here and the sweep's list of reported
+/// readers (`smart_card::note_reported_reader`).
+pub fn is_reader_gone_state(card_state: &str) -> bool {
+    card_state.contains("UNKNOWN") || card_state.contains("IGNORE")
 }
 
 pub fn card_emit_event(
@@ -81,6 +90,11 @@ pub fn card_emit_event(
     online: Option<bool>,
     authentication: Option<bool>,
 ) {
+    let problem = CARD_PROBLEMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&card_number)
+        .cloned();
     let payload = TachoState {
         iccid,
         reader_name,
@@ -88,18 +102,18 @@ pub fn card_emit_event(
         card_number,
         online,
         authentication,
+        problem,
     };
 
-    {
-        let mut readers = READER_STATES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A reader that left the bus is dropped from the UI for good.
-        if payload.card_state.contains("UNKNOWN") || payload.card_state.contains("IGNORE") {
-            readers.remove(&payload.reader_name);
-        } else {
-            readers.insert(payload.reader_name.clone(), payload.clone());
-        }
+    // Emitted under the lock: a replay must not land an older state after this one.
+    let mut readers = READER_STATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A reader that left the bus is dropped from the UI for good.
+    if is_reader_gone_state(&payload.card_state) {
+        readers.remove(&payload.reader_name);
+    } else {
+        readers.insert(payload.reader_name.clone(), payload.clone());
     }
     emit_to_frontend(event_name, payload);
 }
@@ -111,6 +125,40 @@ pub fn card_emit_event(
 lazy_static! {
     static ref READER_STATES: Mutex<std::collections::BTreeMap<String, TachoState>> =
         Mutex::new(std::collections::BTreeMap::new());
+}
+
+lazy_static! {
+    /// Reader cards the server refused to serve, by card number, with the
+    /// reason. Kept apart from the reader states: every state event of the
+    /// card carries it, whichever task emits the event.
+    static ref CARD_PROBLEMS: Mutex<std::collections::HashMap<String, String>> =
+        Mutex::new(std::collections::HashMap::new());
+}
+
+/// Sets or clears the reason the server does not serve a reader card and
+/// re-emits the state of the reader that holds it.
+pub fn set_card_problem(card_number: &str, problem: Option<String>) {
+    {
+        let mut problems = CARD_PROBLEMS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if problems.get(card_number) == problem.as_ref() {
+            return;
+        }
+        match &problem {
+            Some(reason) => problems.insert(card_number.to_string(), reason.clone()),
+            None => problems.remove(card_number),
+        };
+    }
+    let mut readers = READER_STATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for state in readers.values_mut() {
+        if state.card_number == card_number {
+            state.problem = problem.clone();
+            emit_to_frontend("global-cards-sync", state.clone());
+        }
+    }
 }
 
 /// Whether any reader currently shows an authentication in progress (the
@@ -125,14 +173,12 @@ pub fn any_reader_authenticating() -> bool {
 
 /// Re-emits the last reported state of every reader (`global-cards-sync`).
 pub fn emit_current_reader_states() {
-    let states: Vec<TachoState> = READER_STATES
+    // Emitted under the lock, in order with `card_emit_event`.
+    let readers = READER_STATES
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .cloned()
-        .collect();
-    for state in states {
-        emit_to_frontend("global-cards-sync", state);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for state in readers.values() {
+        emit_to_frontend("global-cards-sync", state.clone());
     }
 }
 
@@ -162,9 +208,14 @@ pub struct NotificationPayload {
 // listener and be lost — the status is cached here and replayed on
 // `frontend-loaded` (and pulled via the `get_app_connection_status` command).
 static APP_ONLINE: AtomicBool = AtomicBool::new(false);
+// Orders the status emits: a replay must not land an older status after a live one.
+static APP_STATUS_ORDER: Mutex<()> = Mutex::new(());
 
 /// Emits the app connection status to the frontend and caches it for replay.
 pub fn app_emit_event(online: bool) {
+    let _order = APP_STATUS_ORDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     APP_ONLINE.store(online, Ordering::SeqCst);
     emit_to_frontend("app-connection-status", online);
 }
@@ -173,6 +224,9 @@ pub fn app_emit_event(online: bool) {
 /// freshly loaded webview shows the real status without waiting for the next
 /// OFFLINE<->ONLINE transition.
 pub fn emit_current_app_connection() {
+    let _order = APP_STATUS_ORDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     emit_to_frontend("app-connection-status", APP_ONLINE.load(Ordering::SeqCst));
 }
 
@@ -190,7 +244,7 @@ pub fn emit_notification_event(event_name: &str, payload: NotificationPayload) {
 /// One card currently held in a rack slot, as reported by the server's rack
 /// discovery. `card_number`/`name` are `None` when the card's ICCID is not in
 /// the local config — the card is visible in the rack but not served.
-#[derive(Clone, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct RackCard {
     pub slot: u16,
     pub iccid: Option<String>,
@@ -203,6 +257,57 @@ pub struct RackCard {
     /// the blinking activity icon, same as `Reader.authentication` does for a
     /// card in a plain PC/SC reader.
     pub authentication: Option<bool>,
+    /// Why the server does not serve this card although its session is up:
+    /// `unconfirmed` until the server answers the link report, then the reason
+    /// it gave (`not_registered`, `wrong_device_type`). `None` once the server
+    /// confirmed the card, and with a server that sends no confirmations.
+    pub problem: Option<String>,
+}
+
+/// Slots of one rack per class, as the local rack engine classes them from
+/// the status polls (`com_port::local`): every address of the reader chain
+/// is in exactly one list. Slot numbers, not wire bytes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RackSlotStates {
+    /// A working reader without a card: a card can go here.
+    pub free: Vec<u16>,
+    /// An empty reader that does not answer the rack.
+    pub faulty: Vec<u16>,
+    /// A card the server has not identified (yet): discovery pending, or busy.
+    pub card: Vec<u16>,
+    /// A card the server identified and handed over in the card set.
+    pub discovered: Vec<u16>,
+    /// A card in error: the rack reports it failed, or its discovery did.
+    pub error: Vec<u16>,
+    /// A gap in the addressing (a DIP-set block boundary), not a slot.
+    pub absent: Vec<u16>,
+}
+
+/// Why a slot of the rack is in error: `rack_error` when the rack reports the
+/// card in error itself, otherwise the reason its identification failed
+/// (`unexpected_reply`, `no_reply`, ...).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RackSlotError {
+    pub slot: u16,
+    pub reason: String,
+}
+
+/// Slot table of one rack: what every address of its reader chain holds and
+/// the counters the UI shows. Informational: nothing is opened or closed
+/// through it. `None` for a rack the server drives itself.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RackSlots {
+    /// Highest address that answered: the end of the reader chain.
+    pub hi: u16,
+    /// Readers in the chain (addressing gaps excluded).
+    pub total: u16,
+    /// Readers holding a card, in any state.
+    pub occupied: u16,
+    /// `total - occupied`: working and faulty empty readers alike.
+    pub free: u16,
+    pub states: RackSlotStates,
+    /// One entry per slot of `states.error`.
+    pub errors: Vec<RackSlotError>,
 }
 
 /// State of one connected card rack, pushed to the frontend. Carries only
@@ -226,6 +331,9 @@ pub struct RackState {
     /// timeout. Set when the server publishes the rack's card set, which
     /// closes its discovery chain (see `handle_cards_set`).
     pub scan_complete: bool,
+    /// The slot table of this rack, built by its local engine; `None` until
+    /// the first status poll, and for a rack the server drives itself.
+    pub slots: Option<RackSlots>,
 }
 
 // Last known state of every rack reported this session, keyed by rack id.
@@ -248,22 +356,19 @@ fn emit_rack_states(states: Vec<RackState>) {
 
 /// Applies one mutation to the rack map under its lock and emits the full list
 /// when the mutation reports a change. The single lock-mutate-snapshot-emit
-/// sequence every per-rack update goes through — the snapshot is taken inside
+/// sequence every per-rack update goes through — the list is emitted inside
 /// the lock, so concurrent updates cannot emit lists that reorder each other's
 /// changes.
 fn mutate_rack_states_and_emit(
     mutate: impl FnOnce(&mut std::collections::BTreeMap<String, RackState>) -> bool,
 ) {
-    let states = {
-        let mut guard = RACK_STATES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !mutate(&mut guard) {
-            return;
-        }
-        guard.values().cloned().collect::<Vec<_>>()
-    };
-    emit_rack_states(states);
+    let mut guard = RACK_STATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !mutate(&mut guard) {
+        return;
+    }
+    emit_rack_states(guard.values().cloned().collect());
 }
 
 /// Upserts one rack's state (keyed by its rack id) and emits the full rack
@@ -279,14 +384,28 @@ pub fn rack_emit_event(state: RackState) {
 
 /// Updates the card list of one rack and re-emits the full list. Called by the
 /// rack module as rack-backed card sessions are spawned and closed; a no-op
-/// when that rack has never been reported.
+/// when that rack has never been reported, or the list did not change (every
+/// card set re-lists the cards that stayed where they were).
 pub fn rack_update_cards(rack_id: &str, cards: Vec<RackCard>) {
     mutate_rack_states_and_emit(|states| match states.get_mut(rack_id) {
-        Some(state) => {
+        Some(state) if state.cards != cards => {
             state.cards = cards;
             true
         }
-        None => false,
+        _ => false,
+    });
+}
+
+/// Replaces the slot table of one rack and re-emits the full list; a no-op
+/// when that rack has never been reported, or the table did not change (the
+/// engine hands one over after every status poll).
+pub fn rack_update_slots(rack_id: &str, slots: RackSlots) {
+    mutate_rack_states_and_emit(|states| match states.get_mut(rack_id) {
+        Some(state) if state.slots.as_ref() != Some(&slots) => {
+            state.slots = Some(slots);
+            true
+        }
+        _ => false,
     });
 }
 
@@ -305,17 +424,38 @@ pub fn rack_mark_scan_complete(rack_id: &str) {
     });
 }
 
+/// Drops one rack's slot table: its local engine stopped, and a table nobody
+/// updates would keep showing stale slot states.
+pub fn rack_clear_slots(rack_id: &str) {
+    mutate_rack_states_and_emit(|states| match states.get_mut(rack_id) {
+        Some(state) if state.slots.is_some() => {
+            state.slots = None;
+            true
+        }
+        _ => false,
+    });
+}
+
+/// Marks one rack's scan as running again: its cards are being re-discovered.
+pub fn rack_mark_scan_started(rack_id: &str) {
+    mutate_rack_states_and_emit(|states| match states.get_mut(rack_id) {
+        Some(state) if state.scan_complete => {
+            state.scan_complete = false;
+            true
+        }
+        _ => false,
+    });
+}
+
 /// Re-emits the cached rack list to the frontend, if any. Called on
 /// `frontend-loaded` so the UI shows the racks immediately on (re)load, without
 /// waiting for the next connect/disconnect transition.
 pub fn emit_current_rack_state() {
-    let states: Vec<RackState> = RACK_STATES
+    // Emitted under the lock, in order with `mutate_rack_states_and_emit`.
+    let guard = RACK_STATES
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .values()
-        .cloned()
-        .collect();
-    if !states.is_empty() {
-        emit_rack_states(states);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !guard.is_empty() {
+        emit_rack_states(guard.values().cloned().collect());
     }
 }

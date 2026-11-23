@@ -18,12 +18,13 @@ export const EXPIRY_WARN_DAYS = 30
  * State of one row:
  *   active   — an APDU exchange is running right now
  *   online   — its MQTT session is up, idle
- *   offline  — inserted and configured, but no session
+ *   offline  — inserted and configured, but no session, or the server does not serve it
  *   unlinked — inserted, but its ICCID is not in the configuration
  *   absent   — configured, but not inserted anywhere
  *   empty    — a reader with no card in it
+ *   error    — a rack slot holds a card that could not be identified
  */
-export type CardStatus = 'active' | 'online' | 'offline' | 'unlinked' | 'absent' | 'empty'
+export type CardStatus = 'active' | 'online' | 'offline' | 'unlinked' | 'absent' | 'empty' | 'error'
 
 /** Status filter of the chip row; `attention` is a cross-cutting check. */
 export type StatusFilter = 'all' | 'active' | 'online' | 'offline' | 'unlinked' | 'attention'
@@ -49,10 +50,25 @@ export interface CardEntry {
   /** Configured card number; empty for an unlinked card or an empty reader. */
   number: string
   name: string
+  /** Reader model as reported by PC/SC, without common instance suffixes. */
+  readerModel?: string
+  /** Full PC/SC device name, retained to distinguish identical readers. */
+  readerName?: string
   /** Configuration entry, when the card is configured. */
   card?: SmartCard | undefined
   /** The card sits in a rack that is disconnected. */
   rackDown: boolean
+  /**
+   * The rack slot of the card is in error: the reason code from the slot
+   * table ('' when the backend gave none). Set on every `error` row, and on
+   * an identified card whose slot the rack reports in error.
+   */
+  fault?: string | undefined
+  /**
+   * The session of the card is up but the server does not serve it: the
+   * reason code it gave, or 'unconfirmed' while its answer is awaited.
+   */
+  unserved?: string | undefined
 }
 
 export interface CardGroup {
@@ -68,7 +84,8 @@ export interface CardGroup {
   rack?: RackState | undefined
 }
 
-function plural(n: number, one: string, many = `${one}s`): string {
+/** "1 card", "3 cards". */
+export function plural(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`
 }
 
@@ -82,62 +99,300 @@ function sessionStatus(
   return authentication ? 'active' : 'online'
 }
 
+export function readerModelName(name: string): string {
+  return (
+    name
+      .trim()
+      .replace(/\s+\d{2}\s+\d{2}$/, '')
+      .replace(/(\breader)\s+\d{1,2}$/i, '$1')
+      .replace(/\s+/g, ' ')
+      .trim() || 'Unknown reader'
+  )
+}
+
+export function readerGroupId(model: string): string {
+  return `${READERS_GROUP}:${encodeURIComponent(model.toLowerCase())}`
+}
+
 function readerEntry(reader: Reader, index: number, cards: Record<string, SmartCard>): CardEntry {
+  const model = readerModelName(reader.name)
   const base = {
     key: `${READERS_GROUP}:${reader.name}`,
-    groupId: READERS_GROUP,
+    groupId: readerGroupId(model),
     slot: index + 1,
     slotLabel: `R${index + 1}`,
     place: `${reader.name} reader`,
     iccid: reader.iccid,
     rackDown: false,
+    readerModel: model,
+    readerName: reader.name,
   }
-  // A reader that PC/SC no longer knows, or one without a readable card, is
-  // shown as an empty slot — the same rule the old readers list applied.
-  if (reader.status === 'UNKNOWN' || (!reader.iccid && !reader.card_number)) {
+  // A reader that PC/SC no longer knows, or one without a card, is shown as
+  // an empty slot. A card that is present but whose ICCID could not be read
+  // is not: it stays an unlinked card with the hint to reinsert it.
+  if (
+    reader.status === 'UNKNOWN' ||
+    (reader.status !== 'PRESENT' && !reader.iccid && !reader.card_number)
+  ) {
     return { ...base, status: 'empty', iccid: '', number: '', name: reader.name }
   }
   if (!reader.card_number) {
     return { ...base, status: 'unlinked', number: '', name: '' }
   }
   const card = cards[reader.card_number]
+  // A card the server does not serve is not online, whatever its session says.
+  const unserved = reader.online && reader.problem ? reader.problem : undefined
   return {
     ...base,
-    status: sessionStatus(reader.online, reader.authentication),
+    status: unserved ? 'offline' : sessionStatus(reader.online, reader.authentication),
+    unserved,
     number: reader.card_number,
     name: card?.name ?? '',
     card,
   }
 }
 
+/** Short text of a slot fault, for the row and the tile. */
+export function faultShort(reason: string): string {
+  return reason === 'rack_error' ? 'card error' : 'identification failed'
+}
+
+/** What went wrong in a slot, in a sentence fragment for the opened row. */
+export function faultDetail(reason: string): string {
+  switch (reason) {
+    case 'rack_error':
+      return 'the rack reports the card in this slot in error'
+    case 'unexpected_reply':
+      return 'the reader of the slot answered with an unexpected reply'
+    case 'no_reply':
+    case 'serial_queue_timeout':
+      return 'the reader of the slot did not answer'
+    case 'truncated':
+      return 'the reply of the reader was cut off'
+    default:
+      return 'the card in this slot could not be read'
+  }
+}
+
+/** Short text of why the server does not serve a card, for the row and the tile. */
+export function unservedShort(reason: string): string {
+  switch (reason) {
+    case 'unconfirmed':
+      return 'waiting for the server'
+    case 'not_registered':
+      return 'not created on the server'
+    case 'wrong_device_type':
+      return 'wrong device type on the server'
+    default:
+      return 'not served by the server'
+  }
+}
+
+/** What is wrong on the server side and what to do about it, for the opened row. */
+export function unservedDetail(reason: string): string {
+  switch (reason) {
+    case 'unconfirmed':
+      return 'The server has not confirmed this card yet.'
+    case 'not_registered':
+      return "There is no device for this card on the server. Create a device of the 'Tacho Bridge Card' type with the card number as its ident; the app asks the server again every few minutes."
+    case 'wrong_device_type':
+      return "The device of this card on the server has another device type. It must be 'Tacho Bridge Card'; the app asks the server again every few minutes."
+    default:
+      return 'The server does not serve this card. Check its device on the server.'
+  }
+}
+
 function rackEntries(rack: RackState, cards: Record<string, SmartCard>): CardEntry[] {
   const groupId = rackGroupId(rack)
-  return [...rack.cards]
-    .sort((a, b) => a.slot - b.slot)
-    .map((rc) => {
-      const slotLabel = String(rc.slot).padStart(3, '0')
-      const base = {
-        key: `${groupId}:${rc.slot}`,
-        groupId,
-        slot: rc.slot,
-        slotLabel,
-        place: `${rack.name}, slot ${slotLabel}`,
-        iccid: rc.iccid ?? '',
-        rackDown: !rack.connected,
+  // Slots in error, with their reasons. Only a connected rack has a live
+  // table; a disconnected one keeps its card rows, nothing more.
+  const faults = new Map<number, string>()
+  if (rack.connected && rack.slots) {
+    for (const slot of rack.slots.states.error) faults.set(slot, '')
+    for (const e of rack.slots.errors ?? []) if (faults.has(e.slot)) faults.set(e.slot, e.reason)
+  }
+  const base = (slot: number, iccid: string) => {
+    const slotLabel = String(slot).padStart(3, '0')
+    return {
+      key: `${groupId}:${slot}`,
+      groupId,
+      slot,
+      slotLabel,
+      place: `${rack.name}, slot ${slotLabel}`,
+      iccid,
+      rackDown: !rack.connected,
+      fault: faults.get(slot),
+    }
+  }
+  const rows: CardEntry[] = rack.cards.map((rc): CardEntry => {
+    const b = base(rc.slot, rc.iccid ?? '')
+    if (!rc.card_number) {
+      return { ...b, status: 'unlinked', number: '', name: '' }
+    }
+    const card = cards[rc.card_number]
+    // A card the server does not serve is not online, whatever its session says.
+    const unserved = rack.connected && rc.online && rc.problem ? rc.problem : undefined
+    return {
+      ...b,
+      status: rack.connected && !unserved ? sessionStatus(rc.online, rc.authentication) : 'offline',
+      unserved,
+      number: rc.card_number,
+      // The live config wins over the name the rack snapshot carried.
+      name: card?.name ?? rc.name ?? '',
+      card,
+    }
+  })
+  // A slot in error without an identified card still gets a row: the card is
+  // physically there, and the operator has to find and fix it.
+  const taken = new Set(rows.map((e) => e.slot))
+  for (const slot of faults.keys()) {
+    if (!taken.has(slot)) rows.push({ ...base(slot, ''), status: 'error', number: '', name: '' })
+  }
+  return rows.sort((a, b) => a.slot - b.slot)
+}
+
+/** Class of one slot of the rack's slot table, as the backend sent it. */
+export type SlotClass = 'free' | 'faulty' | 'card' | 'discovered' | 'error'
+
+export interface SlotCell {
+  slot: number
+  cls: SlotClass
+  /** Session state of a discovered card, from the card rows of the group. */
+  status?: CardStatus | undefined
+  /** Tooltip: slot, state, card. */
+  title: string
+}
+
+/** One contiguous run of readers of the rack: a block, drawn as rows of ten. */
+export interface SlotBlock {
+  from: number
+  to: number
+  /** The addressing gap right before this block, when there is one. */
+  gapBefore?: [number, number] | undefined
+  rows: SlotCell[][]
+  counts: SlotCounts
+  /** "20 slots · 3 used · 16 free · 1 faulty" for the frame of the block. */
+  summary: string
+}
+
+/** Slots of a block or of a whole rack per what the operator can do with them. */
+export interface SlotCounts {
+  total: number
+  /** Slots holding a card, in any state (cards in error included). */
+  used: number
+  /** Working readers without a card: a card can go here. */
+  free: number
+  /** Empty readers that do not answer the rack. */
+  faulty: number
+  /** Cards in error, a part of `used`. */
+  error: number
+}
+
+/** "20 slots · 3 used · 16 free", plus the faulty readers and cards in error when there are any. */
+function countsLine(c: SlotCounts): string {
+  const parts = [plural(c.total, 'slot'), `${c.used} used`, `${c.free} free`]
+  if (c.faulty) parts.push(`${c.faulty} faulty`)
+  if (c.error) parts.push(plural(c.error, 'error'))
+  return parts.join(' · ')
+}
+
+const SLOT_CLASS_TEXT: Record<SlotClass, string> = {
+  free: 'free',
+  faulty: 'empty reader, not answering',
+  card: 'unknown / not identified',
+  discovered: 'card',
+  error: 'card in error',
+}
+
+const SESSION_TEXT: Partial<Record<CardStatus, string>> = {
+  active: 'authenticating',
+  online: 'online',
+  offline: 'offline',
+  unlinked: 'unknown / not identified',
+}
+
+/**
+ * Lays the slot table of a rack out as blocks of rows of ten slots, in
+ * address order. A block is a contiguous run of readers; the addressing gaps
+ * the backend marks `absent` separate the blocks (a DIP-set block sits at
+ * 211..240 on its own, for instance) and are shown as a caption, not as
+ * cells. Rows break on the address decade, so slot 31 always starts a row.
+ * Discovered cards carry the session state of their card row, so the grid
+ * and the list never disagree.
+ */
+export function slotBlocks(rack: RackState, entries: CardEntry[]): SlotBlock[] {
+  const table = rack.slots
+  if (!table) return []
+  const cls = new Map<number, SlotClass>()
+  for (const c of ['free', 'faulty', 'card', 'discovered', 'error'] as const)
+    for (const slot of table.states[c]) cls.set(slot, c)
+  const absent = new Set(table.states.absent)
+  const bySlot = new Map(entries.map((e) => [e.slot, e]))
+
+  const blocks: SlotBlock[] = []
+  let block: SlotBlock | undefined
+  let gap: [number, number] | undefined
+  for (let slot = 1; slot <= table.hi; slot++) {
+    if (absent.has(slot) || !cls.has(slot)) {
+      // an address the table does not classify is a gap too: a class this
+      // code does not know must not shift the grid
+      gap = gap ? [gap[0], slot] : [slot, slot]
+      block = undefined
+      continue
+    }
+    const c = cls.get(slot) as SlotClass
+    const entry = c === 'discovered' || c === 'error' ? bySlot.get(slot) : undefined
+    const status = c === 'discovered' ? entry?.status : undefined
+    const parts = [`Slot ${slot}`, SLOT_CLASS_TEXT[c]]
+    if (c === 'error' && entry?.fault !== undefined) parts.push(faultDetail(entry.fault))
+    if (entry) {
+      if (entry.number) parts.push(entry.name ? `${entry.number} (${entry.name})` : entry.number)
+      const text = status ? SESSION_TEXT[status] : undefined
+      if (text) parts.push(text)
+    }
+    const cell: SlotCell = { slot, cls: c, status, title: parts.join(' · ') }
+    if (!block) {
+      block = {
+        from: slot,
+        to: slot,
+        gapBefore: gap,
+        rows: [],
+        counts: { total: 0, used: 0, free: 0, faulty: 0, error: 0 },
+        summary: '',
       }
-      if (!rc.card_number) {
-        return { ...base, status: 'unlinked' as const, number: '', name: '' }
-      }
-      const card = cards[rc.card_number]
-      return {
-        ...base,
-        status: rack.connected ? sessionStatus(rc.online, rc.authentication) : ('offline' as const),
-        number: rc.card_number,
-        // The live config wins over the name the rack snapshot carried.
-        name: card?.name ?? rc.name ?? '',
-        card,
-      }
-    })
+      blocks.push(block)
+      gap = undefined
+    }
+    block.to = slot
+    block.counts.total++
+    if (c === 'free') block.counts.free++
+    else if (c === 'faulty') block.counts.faulty++
+    else block.counts.used++
+    if (c === 'error') block.counts.error++
+    const row = block.rows[block.rows.length - 1]
+    if (!row || (slot - 1) % 10 === 0) block.rows.push([cell])
+    else row.push(cell)
+  }
+  for (const b of blocks) b.summary = countsLine(b.counts)
+  return blocks
+}
+
+/**
+ * "26 slots · 3 used · 20 free · 3 faulty · 1 error" for the rack header; ''
+ * without a table. The table counts every empty reader as free; here the
+ * faulty ones are told apart, since a card cannot be put to work there.
+ */
+export function slotsLine(rack: RackState): string {
+  const t = rack.slots
+  if (!t) return ''
+  const faulty = t.states.faulty.length
+  return countsLine({
+    total: t.total,
+    used: t.occupied,
+    free: Math.max(0, t.free - faulty),
+    faulty,
+    error: t.states.error.length,
+  })
 }
 
 export function rackGroupId(rack: RackState): string {
@@ -146,7 +401,7 @@ export function rackGroupId(rack: RackState): string {
 }
 
 /**
- * Builds the location groups: USB readers first, then every rack, then the
+ * Builds the location groups: USB reader models first, then every rack, then the
  * configured cards that are not inserted anywhere (only when there are any).
  */
 export function buildGroups(
@@ -155,20 +410,39 @@ export function buildGroups(
   cards: Record<string, SmartCard>,
 ): CardGroup[] {
   const readerRows = readers.map((r, i) => readerEntry(r, i, cards))
-  const withCard = readerRows.filter((e) => e.status !== 'empty').length
-  const groups: CardGroup[] = [
-    {
+  const readerGroups = new Map<string, CardGroup>()
+  for (const entry of readerRows) {
+    let group = readerGroups.get(entry.groupId)
+    if (!group) {
+      group = {
+        id: entry.groupId,
+        kind: 'reader',
+        title: 'USB Readers',
+        label: `USB · ${entry.readerModel!}`,
+        subtitle: '',
+        down: false,
+        entries: [],
+      }
+      readerGroups.set(entry.groupId, group)
+    }
+    group.entries.push(entry)
+  }
+  const groups = [...readerGroups.values()].sort((a, b) => a.label.localeCompare(b.label))
+  for (const group of groups) {
+    const withCard = group.entries.filter((e) => e.status !== 'empty').length
+    group.subtitle = `${plural(group.entries.length, 'reader')} · ${withCard} with a card`
+  }
+  if (!groups.length) {
+    groups.push({
       id: READERS_GROUP,
       kind: 'reader',
-      title: 'USB readers',
+      title: 'USB Readers',
       label: 'USB readers',
-      subtitle: readers.length
-        ? `${plural(readers.length, 'reader')} · ${withCard} with a card`
-        : 'no readers connected',
+      subtitle: 'no readers connected',
       down: false,
       entries: readerRows,
-    },
-  ]
+    })
+  }
 
   const nameCount = new Map<string, number>()
   for (const rack of racks) nameCount.set(rack.name, (nameCount.get(rack.name) ?? 0) + 1)
@@ -235,6 +509,8 @@ export function daysToExpiry(entry: CardEntry, now: number): number | null {
 
 /** Expired or expiring soon, or the last authentication failed. */
 export function needsAttention(entry: CardEntry, now: number): boolean {
+  if (entry.fault !== undefined) return true
+  if (entry.unserved !== undefined && entry.unserved !== 'unconfirmed') return true
   if (entry.status === 'unlinked' || entry.status === 'empty') return false
   const days = daysToExpiry(entry, now)
   if (days !== null && days <= EXPIRY_WARN_DAYS) return true
@@ -259,6 +535,8 @@ export function matchesSearch(entry: CardEntry, query: string): boolean {
     entry.card?.company_name ?? '',
     entry.place,
     entry.slotLabel,
+    entry.readerModel ?? '',
+    entry.readerName ?? '',
   ]
     .join(' ')
     .toLowerCase()
@@ -305,6 +583,12 @@ export function authLine(entry: CardEntry, now: number): ToneText {
   if (entry.status === 'empty') return { text: '', tone: 'muted' }
   if (entry.rackDown) return { text: 'rack disconnected', tone: 'danger' }
   if (entry.status === 'active') return { text: 'authenticating…', tone: 'active' }
+  if (entry.fault !== undefined) return { text: faultShort(entry.fault), tone: 'danger' }
+  if (entry.unserved !== undefined)
+    return {
+      text: unservedShort(entry.unserved),
+      tone: entry.unserved === 'unconfirmed' ? 'muted' : 'danger',
+    }
   if (entry.status === 'unlinked') return { text: 'not in configuration', tone: 'muted' }
   const last = entry.card?.last_auth
   if (!last) return { text: 'no auth yet', tone: 'muted' }
@@ -320,7 +604,8 @@ export function authLine(entry: CardEntry, now: number): ToneText {
 /** The right-hand bottom line of a collapsed row: card expiry. */
 export function expiryLine(entry: CardEntry, now: number): ToneText {
   const days = daysToExpiry(entry, now)
-  if (days === null || entry.status === 'unlinked') return { text: '', tone: 'muted' }
+  if (days === null || entry.status === 'unlinked' || entry.status === 'error')
+    return { text: '', tone: 'muted' }
   const date = formatExpire(entry.card?.expire)
   if (days < 0) return { text: `expired ${date}`, tone: 'danger' }
   if (days <= EXPIRY_WARN_DAYS) return { text: `expires in ${days} d`, tone: 'warn' }
@@ -334,7 +619,8 @@ export function expiryLine(entry: CardEntry, now: number): ToneText {
  */
 export function tileLine(entry: CardEntry, now: number): ToneText {
   if (entry.status === 'empty') return { text: 'empty reader', tone: 'muted' }
-  if (entry.status === 'unlinked') {
+  if (entry.status === 'error') return authLine(entry, now)
+  if (entry.status === 'unlinked' && entry.fault === undefined) {
     return { text: entry.iccid ? 'not configured · click to link' : 'ICCID not read', tone: 'warn' }
   }
   const session = authLine(entry, now)
@@ -415,7 +701,7 @@ export interface GroupSummary {
 }
 
 export function summarize(group: CardGroup, now: number): GroupSummary {
-  const counts = { active: 0, online: 0, offline: 0, unlinked: 0, absent: 0 }
+  const counts = { active: 0, online: 0, offline: 0, unlinked: 0, absent: 0, error: 0 }
   let total = 0
   let attention = 0
   for (const e of group.entries) {

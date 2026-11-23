@@ -1,9 +1,13 @@
 <template>
   <q-layout view="lHh Lpr lFf">
-    <q-header elevated>
-      <q-toolbar>
-        <q-icon name="mdi-steering" size="24px" class="q-ml-md q-mr-sm" style="opacity: 0.8" />
-        <q-toolbar-title> Tacho Bridge </q-toolbar-title>
+    <q-header class="app-header">
+      <q-toolbar class="app-toolbar">
+        <div class="app-brand">
+          <q-icon name="mdi-steering" size="22px" class="app-brand__icon" />
+          <span>Tacho Bridge</span>
+          <span class="app-brand__version">v{{ appVersion }}</span>
+        </div>
+        <q-space />
 
         <q-btn
           v-if="!appConnected && serverConfigured"
@@ -12,21 +16,31 @@
           icon="mdi-refresh"
           color="warning"
           size="sm"
+          aria-label="Reconnect"
           @click="reconnect"
         >
           <q-tooltip>Reconnect</q-tooltip>
         </q-btn>
-        <q-icon
-          :name="appConnected ? 'mdi-server-network' : 'mdi-server-network-off'"
-          :color="appConnected ? 'light-green-13' : 'grey-5'"
-          size="20px"
-          class="q-mr-xs"
+        <span
+          class="app-connection"
+          :class="{ 'app-connection--offline': !appConnected }"
+          role="status"
         >
-          <q-tooltip>{{ appConnected ? 'Connected' : 'Disconnected' }}</q-tooltip>
-        </q-icon>
-        <q-btn flat round icon="mdi-cog" color="grey-4" size="sm" @click="configOpen = true">
-          <q-tooltip>Settings</q-tooltip>
-        </q-btn>
+          <q-icon
+            :name="appConnected ? 'mdi-server-network' : 'mdi-server-network-off'"
+            size="16px"
+          />
+          <span>{{ appConnected ? 'Connected' : 'Disconnected' }}</span>
+        </span>
+        <q-btn
+          flat
+          no-caps
+          dense
+          icon="mdi-cog-outline"
+          label="Settings"
+          class="app-settings-button"
+          @click="configOpen = true"
+        />
         <ServerConfigDialog v-model="configOpen" :config="serverConfig" />
         <CredentialsPromptDialog v-model="credentialsPromptOpen" />
       </q-toolbar>
@@ -35,6 +49,7 @@
     <q-page-container>
       <router-view />
     </q-page-container>
+    <ShutdownDialog :state="shutdownState" />
   </q-layout>
 </template>
 
@@ -52,6 +67,9 @@ import { invoke } from '@tauri-apps/api/core'
 import 'animate.css'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
 import CredentialsPromptDialog from 'src/components/CredentialsPromptDialog.vue'
+import ShutdownDialog from 'src/components/ShutdownDialog.vue'
+import { isShutdownState, type ShutdownState } from 'src/components/shutdownProgress'
+import { version as appVersion } from '../../package.json'
 
 defineOptions({
   name: 'MainLayout',
@@ -59,6 +77,16 @@ defineOptions({
 
 const $q = useQuasar()
 const configOpen = ref(false)
+const shutdownState = shallowRef<ShutdownState | null>(null)
+let shutdownEventSeen = false
+function handleShutdown(raw: unknown): void {
+  if (raw !== null && !isShutdownState(raw)) return
+  shutdownState.value = raw
+  if (raw) {
+    configOpen.value = false
+    credentialsPromptOpen.value = false
+  }
+}
 // Startup sign-in: shown once per webview load when authentication is on but
 // no credentials are in effect (they were entered for a previous run only).
 const credentialsPromptOpen = ref(false)
@@ -87,8 +115,6 @@ const { on } = useTauriListeners()
 const ACCESS_NOTIFICATION_TEXT =
   "The application cannot access the directory '~/Documents/tba' and cannot continue to operate. Perhaps such a directory has already been created by another version of the program, therefore it has local access restrictions. A possible solution may be: rename the current directory, for example, to tba1 and restart the application. It will create a new directory with the necessary access rights."
 
-/// Notification kinds the backend can raise, and how each is surfaced.
-/// Keyed lookup rather than an if/else ladder so adding a kind is one entry.
 /// The update toast. Clicking an action dismisses it, so a failed install
 /// brings it back: the backend announces a version only once.
 function showUpdateNotification(message: string): void {
@@ -128,6 +154,8 @@ function showUpdateNotification(message: string): void {
 // so the latest create() result always closes the one on screen.
 let dismissAccess: (() => void) | null = null
 
+/// Notification kinds the backend can raise, and how each is surfaced.
+/// Keyed lookup rather than an if/else ladder so adding a kind is one entry.
 const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
   access: () => {
     dismissAccess = Notify.create({
@@ -154,9 +182,12 @@ const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
   update: showUpdateNotification,
 
   // Backend message names the COM port occupied by another application.
+  // Grouped: every webview reload replays it, and one toast is enough.
   port_busy: (message) =>
     Notify.create({
       message: message || 'The card rack COM port is busy by another application.',
+      group: 'tba-port-busy',
+      badgeStyle: 'display: none',
       color: 'orange',
       position: 'bottom',
       timeout: 999000,
@@ -168,6 +199,8 @@ const NOTIFICATION_HANDLERS: Record<string, (message: string) => void> = {
   auth_rejected: (message) =>
     Notify.create({
       message: message || 'The server rejected the authentication.',
+      group: 'tba-auth-rejected',
+      badgeStyle: 'display: none',
       color: 'red',
       position: 'bottom',
       timeout: 15000,
@@ -236,11 +269,20 @@ const listenersReady = Promise.all([
     appConnected.value = raw === true
   }),
   on('global-notification', handleGlobalNotification),
+  on('app-shutdown', (raw) => {
+    shutdownEventSeen = true
+    handleShutdown(raw)
+  }),
 ]).then(() => undefined)
 provide(LAYOUT_LISTENERS_READY, listenersReady)
 
 onMounted(async () => {
   await listenersReady
+  void invoke<unknown>('get_shutdown_state')
+    .then((raw) => {
+      if (!shutdownEventSeen) handleShutdown(raw)
+    })
+    .catch((error) => console.error('get_shutdown_state failed:', error))
   try {
     const online = await invoke<boolean>('get_app_connection_status')
     if (!statusEventSeen) appConnected.value = online === true

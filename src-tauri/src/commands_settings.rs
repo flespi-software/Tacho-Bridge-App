@@ -132,12 +132,16 @@ pub fn dispatch_request(
 /// link to go quiet first: a set_server/set_credentials arriving during a VU
 /// authentication must not cut it mid-way. The settings themselves are
 /// already persisted by the caller; only the switch-over is deferred.
+///
+/// `changed` is false when the command set what was already in effect: the
+/// reply is all there is to do, no session is dropped for it.
 pub(crate) async fn reply_then_reconnect(
     client: &AsyncClient,
     log_header: &str,
     done_topic: &str,
     reply: Value,
     reason: &'static str,
+    changed: bool,
 ) {
     if let Err(e) = publish_bounded(client, done_topic, reply.to_string()).await {
         // Not fatal: the settings are applied, and the server learns about
@@ -156,6 +160,14 @@ pub(crate) async fn reply_then_reconnect(
         if let Err(e) = crate::config::emit_global_config_server(&app) {
             log::warn!("{} [CONN] status=config_emit_failed err={}", log_header, e);
         }
+    }
+    if !changed {
+        log::info!(
+            "{} [CONN] status=reconnect_skipped reason=settings_unchanged command={}",
+            log_header,
+            reason
+        );
+        return;
     }
     wait_for_card_quiet(log_header, RECONNECT_QUIET_WAIT_MAX).await;
     crate::app_connect::reconnect_everything(reason).await;

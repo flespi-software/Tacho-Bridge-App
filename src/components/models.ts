@@ -18,6 +18,9 @@ export interface Reader {
   card_number: string
   online?: boolean | undefined
   authentication?: boolean | undefined
+  // Why the server does not serve the card although its session is up:
+  // 'not_registered', 'wrong_device_type'. Unset when it does.
+  problem?: string | undefined
 }
 
 // One card held in a rack slot, as reported by the server's rack discovery.
@@ -34,6 +37,37 @@ export interface RackCard {
   // Both absent for a card the rack reports but TBA does not serve.
   online?: boolean | null
   authentication?: boolean | null
+  // Why the server does not serve the card although its session is up:
+  // 'unconfirmed', 'not_registered', 'wrong_device_type'. Unset once confirmed.
+  problem?: string | null
+}
+
+// Slot table of a rack, as the backend classes the rack's status polls:
+// every address of the reader chain is in exactly one list. Slot numbers.
+export interface RackSlotStates {
+  free: number[] // working empty reader: a card can go here
+  faulty: number[] // empty reader that does not answer the rack
+  card: number[] // a card the server has not identified (yet), or a busy one
+  discovered: number[] // identified card, handed over in the card set
+  error: number[] // card in error: the rack reports it failed, or its discovery did
+  absent: number[] // addressing gap between DIP-set blocks, not a slot
+}
+
+// Why a slot is in error: 'rack_error' when the rack itself reports the card
+// in error, otherwise the reason its identification failed ('unexpected_reply',
+// 'no_reply', ...).
+export interface RackSlotError {
+  slot: number
+  reason: string
+}
+
+export interface RackSlots {
+  hi: number // highest address that answered: the end of the reader chain
+  total: number // readers in the chain, gaps excluded
+  occupied: number // readers holding a card, in any state
+  free: number // total - occupied: working and faulty empty readers alike
+  states: RackSlotStates
+  errors?: RackSlotError[] // one per slot of states.error; absent on older backends
 }
 
 // State of one connected card rack. The backend pushes the full rack list as
@@ -54,6 +88,9 @@ export interface RackState {
   // True once the server has finished enumerating the rack. Absent on older
   // backends, where the UI falls back to its silence timeout.
   scan_complete?: boolean
+  // The slot table of the rack; absent or null until its first status poll
+  // (or for a rack the server drives itself), then no slot view.
+  slots?: RackSlots | null
 }
 
 /// The app identifier the backend generates and the server registers a device
@@ -62,7 +99,7 @@ export interface RackState {
 /// what counts as a valid identity.
 export const TBA_IDENT_REGEXP = /^TBA\d{13}$/
 
-// Payload of the `global-config-server` event (config.rs
+// Payload of the `global-config-server` event (the config module
 // `emit_global_config_server`): every value is a string, booleans as
 // "true"/"false", timestamps as decimal unix seconds.
 export interface GlobalConfigServerPayload {
@@ -110,4 +147,57 @@ export type ThemeMode = 'Auto' | 'Light' | 'Dark'
 /// without an appearance section) yields null so callers keep the current mode.
 export function parseThemeMode(value: string | undefined): ThemeMode | null {
   return value === 'Auto' || value === 'Light' || value === 'Dark' ? value : null
+}
+
+const SLOT_CLASSES = ['free', 'faulty', 'card', 'discovered', 'error', 'absent'] as const
+
+/// Runtime guard for the slot table of a rack: counters are numbers, every
+/// class list is a list of numbers. A malformed table fails the whole rack
+/// payload closed, like any other shape mismatch.
+function isRackSlotsPayload(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false
+  const p = raw as Record<string, unknown>
+  const states = p.states as Record<string, unknown> | undefined
+  return (
+    ['hi', 'total', 'occupied', 'free'].every((k) => typeof p[k] === 'number') &&
+    !!states &&
+    typeof states === 'object' &&
+    SLOT_CLASSES.every(
+      (k) => Array.isArray(states[k]) && states[k].every((n) => typeof n === 'number'),
+    ) &&
+    (p.errors === undefined || Array.isArray(p.errors))
+  )
+}
+
+/// Runtime guard for one rack of the `rack-state` payload — fails closed on a
+/// malformed shape.
+export function isRackStatePayload(raw: unknown): raw is RackState {
+  if (!raw || typeof raw !== 'object') return false
+  const p = raw as Record<string, unknown>
+  return (
+    typeof p.id === 'string' &&
+    typeof p.connected === 'boolean' &&
+    typeof p.name === 'string' &&
+    Array.isArray(p.cards) &&
+    (p.slots === undefined || p.slots === null || isRackSlotsPayload(p.slots))
+  )
+}
+
+/// Payload of `global-card-config-updated`: the card's config, or no content
+/// when the card was removed.
+export interface CardConfigPayload {
+  card_number: string
+  content?: SmartCard | null
+}
+
+/// Runtime guard for `global-card-config-updated`: a non-empty card number,
+/// and a content that is an object when present.
+export function isCardConfigPayload(raw: unknown): raw is CardConfigPayload {
+  if (!raw || typeof raw !== 'object') return false
+  const p = raw as Record<string, unknown>
+  return (
+    typeof p.card_number === 'string' &&
+    p.card_number.length > 0 &&
+    (p.content === undefined || p.content === null || typeof p.content === 'object')
+  )
 }

@@ -1,7 +1,7 @@
 // Passive APDU sniffer.
 //
 // TBA is a transparent proxy between flespi (VU role) and the smart card.
-// After Gen1 mutual authentication flespi wraps every APDU in Secure Messaging
+// After Gen1 mutual authentication the VU wraps every APDU in Secure Messaging
 // (CLA=0C), but for tachograph cards the SM wrapper uses DO'81 (plain value) +
 // DO'8E (MAC) — no DO'87 (encrypted value). That means the file content flows
 // through TBA in cleartext; only integrity is protected.
@@ -17,29 +17,117 @@ use lazy_static::lazy_static;
 
 use crate::config::CardConfig;
 
+/// A Secure Messaging command a T=0 card answered with a bare `61 XX`: its
+/// real response comes with the GET RESPONSE the server sends next.
+enum Pending {
+    /// SELECT of this EF (`None`: a file the sniffer does not track).
+    Select(Option<u16>),
+    /// READ BINARY from offset 0 of this EF.
+    Read(u16),
+}
+
+#[derive(Default)]
 struct SniffState {
     /// FID of the most recently SELECTed EF (plain or SM-wrapped).
     last_selected_ef: Option<u16>,
+    /// The command whose response is still to be fetched with GET RESPONSE.
+    pending: Option<Pending>,
+    /// Response data collected for `pending` so far: a card may hand it out in several chunks.
+    pending_data: Vec<u8>,
 }
+
+/// More than any response of a tracked command: a pending one that grows past it is dropped.
+const PENDING_DATA_MAX: usize = 4096;
 
 lazy_static! {
     /// Per-client_id sniffer state. client_id == card number.
     static ref STATE: Mutex<HashMap<String, SniffState>> = Mutex::new(HashMap::new());
 }
 
+/// The state map; a poisoned lock is recovered, the map holds no invariant a panic could break.
+fn states() -> std::sync::MutexGuard<'static, HashMap<String, SniffState>> {
+    STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Drop the per-client sniffer state. Call when a card/connection is being
 /// removed so the global HashMap does not grow without bound over long runs.
 pub fn forget(client_id: &str) {
-    if let Ok(mut state) = STATE.lock() {
-        state.remove(client_id);
-    }
+    states().remove(client_id);
 }
 
 /// Drop sniffer state for every client. Used when wiping the whole task pool.
 pub fn forget_all() {
-    if let Ok(mut state) = STATE.lock() {
-        state.clear();
+    states().clear();
+}
+
+/// Whether a SELECT changed the card's selection: status 9000, and under SM
+/// (where the outer 9000 only covers the wrapping) no failure in DO'99.
+fn select_succeeded(resp: &[u8], secure_messaging: bool) -> bool {
+    let Some(body) = resp.strip_suffix(&[0x90, 0x00]) else {
+        return false;
+    };
+    !secure_messaging || sm_status(body).is_none_or(|sw| sw == [0x90, 0x00])
+}
+
+/// Hands the decoded content of a tracked EF to its parser.
+fn parse_ef(client_id: &str, fid: u16, data: &[u8]) {
+    match fid {
+        0x0520 => parse_ef_identification(client_id, data),
+        0x0501 => parse_ef_application_identification(client_id, data),
+        _ => {}
     }
+}
+
+/// GET RESPONSE: the response of the pending command, possibly one chunk of it.
+fn sniff_get_response(client_id: &str, resp: &[u8]) {
+    let read = {
+        let mut states = states();
+        let Some(entry) = states.get_mut(client_id) else {
+            return;
+        };
+        if entry.pending.is_none() {
+            return;
+        }
+        // `61 XX` again: this chunk is followed by another GET RESPONSE.
+        if resp.len() >= 2 && resp[resp.len() - 2] == 0x61 {
+            entry
+                .pending_data
+                .extend_from_slice(&resp[..resp.len() - 2]);
+            if entry.pending_data.len() > PENDING_DATA_MAX {
+                abandon_pending(entry);
+            }
+            return;
+        }
+        let mut full = std::mem::take(&mut entry.pending_data);
+        full.extend_from_slice(resp);
+        match entry.pending.take() {
+            Some(Pending::Select(fid)) => {
+                // A failed SELECT leaves the card's selection, and the tracked FID, unchanged.
+                if select_succeeded(&full, true) {
+                    entry.last_selected_ef = fid;
+                }
+                None
+            }
+            Some(Pending::Read(fid)) => Some((fid, full)),
+            None => None,
+        }
+    };
+    if let Some((fid, full)) = read {
+        if let Some(data) = extract_plain_body(&full, true) {
+            parse_ef(client_id, fid, &data);
+        }
+    }
+}
+
+/// Gives up on the pending command: its response was never fetched. A SELECT
+/// with an unseen outcome leaves the current file unknown.
+fn abandon_pending(entry: &mut SniffState) {
+    if let Some(Pending::Select(_)) = entry.pending.take() {
+        entry.last_selected_ef = None;
+    }
+    entry.pending_data.clear();
 }
 
 /// Observe a CAPDU/RAPDU exchange. client_id is the card number.
@@ -52,6 +140,24 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
         Ok(v) => v,
         Err(_) => return,
     };
+    if cmd.len() < 2 {
+        return;
+    }
+
+    if cmd[0] == 0x00 && cmd[1] == 0xC0 {
+        sniff_get_response(client_id, &resp);
+        return;
+    }
+    // Any other command ends the wait for a GET RESPONSE.
+    if let Some(entry) = states().get_mut(client_id) {
+        abandon_pending(entry);
+    }
+
+    // CLA bits b4-b3 = 11: the command (and so its response) is SM-wrapped.
+    let secure_messaging = cmd[0] & 0x0C == 0x0C;
+    // A T=0 card answers a command carrying both data and Le (every SM command)
+    // with a bare `61 XX`; the response itself follows in a GET RESPONSE.
+    let deferred = secure_messaging && resp.len() == 2 && resp[0] == 0x61;
 
     // Track the card's currently selected file. Two guards keep a later
     // READ BINARY from being parsed against the wrong EF (which would persist
@@ -61,26 +167,15 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
     //  * a successful SELECT the sniffer does not recognize (by AID, by path,
     //    MF) DID change the selection to something unknown — the tracked FID
     //    must be cleared, not left stale.
-    let is_select = cmd.len() >= 2 && (cmd[0] == 0x00 || cmd[0] == 0x0C) && cmd[1] == 0xA4;
+    let is_select = (cmd[0] == 0x00 || cmd[0] == 0x0C) && cmd[1] == 0xA4;
     if is_select {
-        let sw_ok = resp.len() >= 2 && resp[resp.len() - 2] == 0x90 && resp[resp.len() - 1] == 0x00;
-        // Under SM the outer 9000 only covers the wrapping: the command's own
-        // status is in DO'99.
-        let secure_messaging = cmd[0] & 0x0C == 0x0C;
-        let inner_ok = !sw_ok
-            || !secure_messaging
-            || sm_status(&resp[..resp.len() - 2]).is_none_or(|sw| sw == [0x90, 0x00]);
-        if !sw_ok || !inner_ok {
-            return; // selection unchanged on the card: keep the tracked state
-        }
         let fid = select_ef_fid(&cmd); // None for recognized-but-untracked selects
-        if let Ok(mut state) = STATE.lock() {
-            state
-                .entry(client_id.to_string())
-                .or_insert(SniffState {
-                    last_selected_ef: None,
-                })
-                .last_selected_ef = fid;
+        let mut states = states();
+        let entry = states.entry(client_id.to_string()).or_default();
+        if deferred {
+            entry.pending = Some(Pending::Select(fid));
+        } else if select_succeeded(&resp, secure_messaging) {
+            entry.last_selected_ef = fid;
         }
         return;
     }
@@ -99,10 +194,8 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
     let Some(offset) = read_binary_offset(&cmd) else {
         // The short-EF-identifier form selects another EF implicitly: the
         // tracked FID no longer names the current file.
-        if let Ok(mut state) = STATE.lock() {
-            if let Some(entry) = state.get_mut(client_id) {
-                entry.last_selected_ef = None;
-            }
+        if let Some(entry) = states().get_mut(client_id) {
+            entry.last_selected_ef = None;
         }
         return;
     };
@@ -110,27 +203,21 @@ pub fn sniff(client_id: &str, command_hex: &str, response_hex: &str) {
         return;
     }
 
-    let fid = {
-        let Ok(state) = STATE.lock() else {
-            return;
-        };
-        state.get(client_id).and_then(|s| s.last_selected_ef)
-    };
-    let Some(fid) = fid else {
+    let Some(fid) = states().get(client_id).and_then(|s| s.last_selected_ef) else {
         return;
     };
 
-    // CLA bits b4-b3 = 11: the command (and so its response) is SM-wrapped.
-    let secure_messaging = cmd.first().is_some_and(|cla| cla & 0x0C == 0x0C);
+    if deferred {
+        if let Some(entry) = states().get_mut(client_id) {
+            entry.pending = Some(Pending::Read(fid));
+        }
+        return;
+    }
+
     let Some(data) = extract_plain_body(&resp, secure_messaging) else {
         return;
     };
-
-    match fid {
-        0x0520 => parse_ef_identification(client_id, &data),
-        0x0501 => parse_ef_application_identification(client_id, &data),
-        _ => {}
-    }
+    parse_ef(client_id, fid, &data);
 }
 
 /// Returns the FID if `cmd` is a SELECT EF under current DF.
@@ -573,6 +660,15 @@ mod tests {
 
     /// A CardConfig with every sniffed field empty — the starting point for the
     /// `set_if_changed` / `version_is_higher` cases below.
+    /// Serializes the tests that use the shared state map (one of them empties it).
+    static STATE_TESTS: Mutex<()> = Mutex::new(());
+
+    fn state_test() -> std::sync::MutexGuard<'static, ()> {
+        STATE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn blank_card() -> CardConfig {
         CardConfig {
             iccid: "0123456789ABCDEF".to_string(),
@@ -845,6 +941,7 @@ mod tests {
 
     #[test]
     fn forget_removes_only_target_client() {
+        let _serial = state_test();
         forget_all();
         // Push state for two clients via SELECT
         sniff(
@@ -858,21 +955,21 @@ mod tests {
             "9000",
         );
         {
-            let state = STATE.lock().unwrap();
+            let state = states();
             assert!(state.contains_key("clientA"));
             assert!(state.contains_key("clientB"));
         }
 
         forget("clientA");
         {
-            let state = STATE.lock().unwrap();
+            let state = states();
             assert!(!state.contains_key("clientA"));
             assert!(state.contains_key("clientB"));
         }
 
         forget_all();
         {
-            let state = STATE.lock().unwrap();
+            let state = states();
             assert!(state.is_empty());
         }
     }
@@ -897,6 +994,73 @@ mod tests {
         let mut buf2 = vec![0x01];
         buf2.extend_from_slice(&[0xFF; 35]);
         assert_eq!(extract_name(&buf2), None);
+    }
+
+    #[test]
+    fn t0_select_deferred_to_get_response_is_tracked() {
+        let _serial = state_test();
+        let client = "t0-select";
+        forget(client);
+        // SM SELECT 0520 answered with a bare 61 XX, then its response via GET RESPONSE.
+        sniff(client, "0CA4020C0D810205208E08112233445566778800", "610E");
+        assert_eq!(
+            states().get(client).and_then(|s| s.last_selected_ef),
+            None,
+            "the outcome of the SELECT is not known yet"
+        );
+        sniff(client, "00C000000E", "990290008E0811223344556677889000");
+        assert_eq!(
+            states().get(client).and_then(|s| s.last_selected_ef),
+            Some(0x0520)
+        );
+        // A deferred SELECT the card refused in DO'99 leaves the tracked file alone.
+        sniff(client, "0CA4020C0D810205018E08112233445566778800", "610E");
+        sniff(client, "00C000000E", "99026A828E0811223344556677889000");
+        assert_eq!(
+            states().get(client).and_then(|s| s.last_selected_ef),
+            Some(0x0520)
+        );
+        forget(client);
+    }
+
+    #[test]
+    fn t0_deferred_select_never_fetched_clears_the_tracked_file() {
+        let _serial = state_test();
+        let client = "t0-abandoned";
+        forget(client);
+        sniff(client, "00A4020C020520", "9000");
+        sniff(client, "0CA4020C0D810205018E08112233445566778800", "610E");
+        // Another command instead of GET RESPONSE: which file is selected is unknown.
+        sniff(client, "0084000008", "11223344556677889000");
+        assert_eq!(
+            states().get(client).and_then(|s| s.last_selected_ef),
+            None
+        );
+        forget(client);
+    }
+
+    #[test]
+    fn t0_deferred_read_waits_for_get_response() {
+        let _serial = state_test();
+        let client = "t0-read";
+        forget(client);
+        sniff(client, "00A4020C020520", "9000");
+        // SM READ BINARY from offset 0 answered with a bare 61 XX.
+        sniff(client, "0CB000000D9701418E08112233445566778800", "6150");
+        assert!(matches!(
+            states().get(client).and_then(|s| s.pending.as_ref()),
+            Some(Pending::Read(0x0520))
+        ));
+        // First chunk ends with 61 XX again: collected, still pending.
+        sniff(client, "00C0000002", "81026102");
+        assert_eq!(
+            states().get(client).map(|s| s.pending_data.clone()),
+            Some(vec![0x81, 0x02])
+        );
+        // A GET RESPONSE with nothing pending is ignored.
+        forget(client);
+        sniff(client, "00C0000002", "AABB9000");
+        assert!(states().get(client).is_none());
     }
 
     #[test]

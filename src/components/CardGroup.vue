@@ -10,7 +10,9 @@
           class="cb-group__chevron"
           :class="{ 'cb-group__chevron--open': open }"
         />
-        <q-icon :name="icon" size="22px" :class="iconClass" />
+        <span class="cb-group__icon" :class="iconClass">
+          <q-icon :name="icon" size="20px" />
+        </span>
         <span class="cb-group__titles">
           <span class="cb-group__titleline">
             <span class="cb-group__title">{{ group.title }}</span>
@@ -18,32 +20,36 @@
               {{ scanning ? 'scanning slots…' : group.subtitle }}
             </span>
           </span>
-          <span class="cb-segs">
-            <span
-              v-for="s in segments"
-              :key="s.status"
-              :class="`cb-seg--${s.status}`"
-              :style="{ flexGrow: s.n }"
-            />
-          </span>
         </span>
       </button>
       <div class="cb-group__stats">
         <span class="cb-group__count">{{ countLine }}</span>
-        <span class="cb-group__issues">
-          <button
-            v-for="i in issues"
-            :key="i.status"
-            type="button"
-            class="cb-issue"
-            :class="`cb-issue--${i.status}`"
-            @click="emit('pick-issue', i.status)"
-          >
-            {{ i.label }}
-          </button>
-          <span v-if="allGood" class="cb-tone--ok">all good</span>
-        </span>
+        <!-- The slot table of a rack: counters here, the slot grid on click.
+             Nothing to show until the server has sent a table. -->
+        <button
+          v-if="slotsLineText"
+          type="button"
+          class="cb-slots-toggle"
+          :class="{ 'cb-slots-toggle--open': slotsOpen }"
+          :aria-expanded="slotsOpen"
+          :aria-label="slotsOpen ? 'Hide the slot map' : 'Show the slot map'"
+          :title="slotsOpen ? 'Hide the slot map' : 'Show the slot map'"
+          @click="slotsOpen = !slotsOpen"
+        >
+          <q-icon name="mdi-view-grid-outline" size="14px" />
+          <span>{{ slotsLineText }}</span>
+          <q-icon name="mdi-chevron-down" size="16px" class="cb-slots-toggle__chevron" />
+        </button>
+        <span v-if="allGood" class="cb-tone--ok">all good</span>
       </div>
+      <span class="cb-segs" aria-hidden="true">
+        <span
+          v-for="s in segments"
+          :key="s.status"
+          :class="`cb-seg--${s.status}`"
+          :style="{ flexGrow: s.n }"
+        />
+      </span>
     </div>
     <!-- Indeterminate: the server sends no total, so there is no honest
          percentage to show while the rack is still being enumerated. -->
@@ -54,6 +60,41 @@
       color="primary"
       class="rack-scan-bar"
     />
+
+    <!-- A single wrapping map: cells keep their size and address order. -->
+    <div v-if="slotsOpen && slotCells.length" class="cb-slots">
+      <div class="cb-slots__grid">
+        <!-- Spans keep their status colours instead of the board's button reset. -->
+        <span
+          v-for="c in slotCells"
+          :key="c.slot"
+          class="cb-slot"
+          :class="[
+            `cb-slot--${c.cls}`,
+            c.status ? `cb-slot--${c.status}` : '',
+            { 'cb-slot--pick': canBlink(c) },
+          ]"
+          :title="canBlink(c) ? `${c.title} · click to blink it on the rack` : c.title"
+          :role="canBlink(c) ? 'button' : undefined"
+          :tabindex="canBlink(c) ? 0 : undefined"
+          @click="canBlink(c) && (blinkSlot = c.slot)"
+          @keydown.enter.prevent="canBlink(c) && (blinkSlot = c.slot)"
+          @keydown.space.prevent="canBlink(c) && (blinkSlot = c.slot)"
+        >
+          {{ c.slot }}
+        </span>
+      </div>
+      <div class="cb-slots__hint">Click a slot to blink it on the rack.</div>
+      <div class="cb-slots__legend">
+        <span><i class="cb-slot cb-slot--free" /> free</span>
+        <span><i class="cb-slot cb-slot--faulty" /> reader not answering</span>
+        <span><i class="cb-slot cb-slot--card" /> unknown / not identified</span>
+        <span><i class="cb-slot cb-slot--discovered cb-slot--online" /> card online</span>
+        <span><i class="cb-slot cb-slot--discovered cb-slot--active" /> authenticating</span>
+        <span><i class="cb-slot cb-slot--discovered cb-slot--offline" /> card offline</span>
+        <span><i class="cb-slot cb-slot--error" /> error</span>
+      </div>
+    </div>
 
     <div v-if="open">
       <!-- In the tile views the rows flow in a grid, and an opened card's
@@ -73,7 +114,7 @@
           :save="save"
           :remove="remove"
           @toggle="emit('row-toggle', e.key)"
-          @close="emit('row-close')"
+          @close="emit('row-close', e.key)"
         />
       </div>
       <div v-if="rows.length === 0" class="cb-group__empty">{{ emptyText }}</div>
@@ -86,19 +127,30 @@
         Show all {{ rows.length }} cards
       </button>
     </div>
+    <SlotBlinkDialog
+      v-if="group.rack"
+      :rack-id="group.rack.id"
+      :rack-name="group.rack.name"
+      :slot-number="blinkSlot"
+      @close="blinkSlot = null"
+    />
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
 import CardRow from './CardRow.vue'
+import SlotBlinkDialog from './SlotBlinkDialog.vue'
 import type { SmartCard } from './models'
 import {
+  plural,
+  slotBlocks,
+  slotsLine,
   summarize,
   type CardEntry,
   type CardGroup,
   type CardView,
-  type StatusFilter,
+  type SlotCell,
 } from './cardBoard'
 
 const props = defineProps<{
@@ -119,9 +171,9 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'toggle'): void
   (e: 'show-all'): void
-  (e: 'pick-issue', status: StatusFilter): void
   (e: 'row-toggle', key: string): void
-  (e: 'row-close'): void
+  // the row that asked: another row opened meanwhile stays open
+  (e: 'row-close', key: string): void
 }>()
 
 // An opened card stays rendered even past the limit: the limit shrinks when
@@ -132,6 +184,25 @@ const shownRows = computed(() => {
   return props.rows.slice(0, Math.max(props.limit, openAt + 1))
 })
 const summary = computed(() => summarize(props.group, props.now))
+
+// The slot grid of a rack is opened per group and survives the parent
+// replacing the rack list on every `rack-state` event: the toggle lives here,
+// the cells are recomputed from the fresh table.
+const slotsOpen = ref(false)
+
+// A slot can be blinked on the rack to find it there: any working reader of a
+// connected rack, except one whose card is authenticating right now (the
+// indicator writes must not slip into its session).
+const blinkSlot = ref<number | null>(null)
+function canBlink(c: SlotCell): boolean {
+  return !props.group.down && c.cls !== 'faulty' && c.status !== 'active'
+}
+const slotsLineText = computed(() => (props.group.rack ? slotsLine(props.group.rack) : ''))
+const slotCells = computed(() =>
+  props.group.rack
+    ? slotBlocks(props.group.rack, props.group.entries).flatMap((block) => block.rows.flat())
+    : [],
+)
 
 const icon = computed(() =>
   props.group.kind === 'rack'
@@ -145,7 +216,9 @@ const iconClass = computed(() =>
     ? 'cb-tone--icon'
     : props.group.down
       ? 'cb-tone--danger'
-      : 'cb-tone--ok',
+      : props.group.kind === 'rack'
+        ? 'cb-tone--active'
+        : 'cb-tone--ok',
 )
 
 const segments = computed(() => {
@@ -155,6 +228,7 @@ const segments = computed(() => {
       { status: 'active', n: c.active },
       { status: 'online', n: c.online },
       { status: 'unlinked', n: c.unlinked },
+      { status: 'error', n: c.error },
       { status: 'offline', n: c.offline },
       { status: 'absent', n: c.absent },
     ] as const
@@ -164,27 +238,18 @@ const segments = computed(() => {
 const countLine = computed(() => {
   const { counts, total } = summary.value
   const online = counts.online + counts.active
-  if (props.group.kind === 'none') return `${total} ${total === 1 ? 'card' : 'cards'}`
+  if (props.group.kind === 'none') return plural(total, 'card')
   if (props.group.kind === 'reader') return `${online} online`
   return `${online} / ${total} online`
 })
 
-// Shortcuts into the filters: each badge narrows the list to this group and
-// that status. A disconnected rack is offline as a whole, so its per-card
-// offline/attention counts would only repeat the header.
-const issues = computed(() => {
-  const { counts, attention } = summary.value
-  const out: { status: StatusFilter; label: string }[] = []
-  if (counts.unlinked) out.push({ status: 'unlinked', label: `${counts.unlinked} unknown` })
-  if (attention && !props.group.down)
-    out.push({ status: 'attention', label: `${attention} attention` })
-  if (counts.offline && props.group.kind !== 'none' && !props.group.down)
-    out.push({ status: 'offline', label: `${counts.offline} offline` })
-  return out
-})
+// The header carries no per-status badges: the status chips on top of the
+// list filter by status. It only says so when nothing in the group needs a look.
 const allGood = computed(
   () =>
-    issues.value.length === 0 &&
+    summary.value.attention === 0 &&
+    summary.value.counts.unlinked === 0 &&
+    summary.value.counts.offline === 0 &&
     !props.group.down &&
     props.group.kind !== 'none' &&
     summary.value.total > 0,
