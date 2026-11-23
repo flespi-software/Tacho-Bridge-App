@@ -250,6 +250,38 @@ If the card has never been authenticated through TBA, these fields stay `null` i
 
 `last_auth` and `expire` are stored as UTC unix seconds. The UI renders them in the **local timezone of the machine**, so the same config file shown on computers in different regions displays the corresponding local time. Format: `YYYY-MM-DD HH:MM:SS`.
 
+### Running without a window (headless mode)
+
+Started with `--headless`, the application runs the card bridge alone: no
+window, no tray icon and nothing of the graphical stack. It needs no logged-in
+user and no display, so the OS can start it at boot, and it can also be run
+from a terminal.
+
+```
+tacho-bridge-application --headless
+```
+
+What to know:
+
+- The server address, the cards and, if authentication is on, the credentials
+  must already be saved in `config.yaml` (configure the application once in
+  its window, or edit the file). The file is read from the profile of the
+  account the process runs under, see [Config and log location](#config-and-log-location).
+- The server commands keep working: `set_server`, `set_credentials`,
+  `get_settings`, `fetch_logs`, `debug_log`.
+- There is no self-update in this mode.
+- Do not run a headless instance and the window application at the same time:
+  they would fight for the rack COM port and the server connections.
+- `Ctrl+C` / `SIGTERM` stop it cleanly (rack indicators off, connections
+  closed). The Windows build has no console, so there it is stopped by ending
+  the process.
+
+On Windows, to start it at boot without anyone logged in, create a Task
+Scheduler task: trigger **At startup**, the Windows account the application
+was configured under, **Run whether user is logged on or not**, action
+`tacho-bridge-application.exe --headless`, and in the task settings clear
+**Stop the task if it runs longer than**.
+
 ### Config and log location
 
 Both files live in the user's Documents directory:

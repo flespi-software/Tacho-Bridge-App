@@ -8,6 +8,7 @@ mod config; // Configuration handling.
 mod credentials; // MQTT credentials: settings/prompt command and the set_credentials server command.
 mod debug_log; // Extended debug log switched by the server (debug_log command).
 mod global_app_handle; // Global access to app state and emitters.
+mod headless; // Windowless run: the backend alone, without Tauri.
 mod logger; // Logging functionality.
 mod logs_upload; // Log upload to the server (fetch_logs command).
 mod mqtt; // MQTT communication.
@@ -93,33 +94,42 @@ fn shutdown_cleanup() {
     log::info!("-== Application is closed by user ==-\n");
 }
 
+/// Waits for a catchable termination request (SIGINT/SIGTERM, Ctrl+C on
+/// Windows) and returns its name. `None`: the handler could not be installed.
+/// Forced termination (SIGKILL / TerminateProcess) cannot run application code.
+pub(crate) async fn shutdown_signal() -> Option<&'static str> {
+    #[cfg(unix)]
+    let signal = {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut interrupt), Ok(mut terminate)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) else {
+            log::error!("[SHUTDOWN] status=signal_handler_failed");
+            return None;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        }
+    };
+    #[cfg(not(unix))]
+    let signal = {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            log::error!("[SHUTDOWN] status=signal_handler_failed err={}", e);
+            return None;
+        }
+        "Ctrl+C"
+    };
+    Some(signal)
+}
+
 /// Terminal interrupts/termination do not produce Tauri's Exit event on
 /// their own. Route catchable signals through the same ordered cleanup as Quit.
-/// Forced termination (SIGKILL / TerminateProcess) cannot run application code.
 fn install_shutdown_signals(app: tauri::AppHandle) {
     async_runtime::spawn(async move {
-        #[cfg(unix)]
-        let signal = {
-            use tokio::signal::unix::{signal, SignalKind};
-            let (Ok(mut interrupt), Ok(mut terminate)) = (
-                signal(SignalKind::interrupt()),
-                signal(SignalKind::terminate()),
-            ) else {
-                log::error!("[SHUTDOWN] status=signal_handler_failed");
-                return;
-            };
-            tokio::select! {
-                _ = interrupt.recv() => "SIGINT",
-                _ = terminate.recv() => "SIGTERM",
-            }
-        };
-        #[cfg(not(unix))]
-        let signal = {
-            if let Err(e) = tokio::signal::ctrl_c().await {
-                log::error!("[SHUTDOWN] status=signal_handler_failed err={}", e);
-                return;
-            }
-            "Ctrl+C"
+        let Some(signal) = shutdown_signal().await else {
+            return;
         };
         log::info!("[SHUTDOWN] phase=request signal={}", signal);
         app.exit(0);
@@ -129,8 +139,9 @@ fn install_shutdown_signals(app: tauri::AppHandle) {
 /// Starts every backend subsystem: logging, configuration, the PC/SC card
 /// monitor, the app-level MQTT connection, the rack monitor and the updater.
 /// Called once from `setup()`, before the webview has loaded — card bridging is
-/// then live regardless of what the frontend does.
-fn initialize_backend(app_handle: tauri::AppHandle) {
+/// then live regardless of what the frontend does. Without an app handle
+/// (headless mode) the updater, which lives in a Tauri plugin, is left out.
+fn initialize_backend(app_handle: Option<tauri::AppHandle>) {
     // Initialize logging (fern). Must be first so everything below logs.
     logger::setup_logging();
 
@@ -172,6 +183,10 @@ fn initialize_backend(app_handle: tauri::AppHandle) {
     // the PCSC reader monitor — a plugged-in reader and a connected rack work
     // in parallel.
     supervise("rack_connection", com_port::rack_connection);
+
+    let Some(app_handle) = app_handle else {
+        return;
+    };
 
     // One-shot update check against the release endpoint.
     let updater_handle = app_handle.clone();
@@ -344,6 +359,13 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Decided before anything of Tauri is touched: a headless run needs no
+    // display, no webview and no window session.
+    if headless::requested() {
+        headless::run();
+        return;
+    }
+
     tauri::Builder::default()
         // Must be the first registered plugin, so a second instance exits
         // before any other plugin initializes. A second instance cannot work
@@ -376,7 +398,7 @@ pub fn run() {
             // from the tray with no window in sight. Tauri calls setup() exactly
             // once, which is also why none of the subsystems below need their
             // own duplicate-spawn latch any more.
-            initialize_backend(app_handle.clone());
+            initialize_backend(Some(app_handle.clone()));
             install_shutdown_signals(app_handle.clone());
 
             // System tray: with it active, closing the window hides the app

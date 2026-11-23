@@ -25,6 +25,15 @@ fn lock_handle() -> std::sync::MutexGuard<'static, Option<AppHandle>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Set in a headless run: there is no frontend, so an emit without an app
+/// handle is the normal case there, not a warning.
+static HEADLESS: AtomicBool = AtomicBool::new(false);
+
+/// Marks the process as running without a frontend.
+pub fn set_headless() {
+    HEADLESS.store(true, Ordering::Relaxed);
+}
+
 // initialize the global app handle
 pub fn set_app_handle(handle: AppHandle) {
     *lock_handle() = Some(handle);
@@ -41,7 +50,9 @@ pub fn get_app_handle() -> Option<AppHandle> {
 /// a silent drop.
 fn emit_to_frontend<P: Serialize + Clone>(event_name: &str, payload: P) {
     let Some(app_handle) = get_app_handle() else {
-        log::warn!("emit '{}' skipped: app handle not set", event_name);
+        if !HEADLESS.load(Ordering::Relaxed) {
+            log::warn!("emit '{}' skipped: app handle not set", event_name);
+        }
         return;
     };
     match app_handle.emit(event_name, payload) {
