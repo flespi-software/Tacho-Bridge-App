@@ -521,6 +521,8 @@ export function matchesStatus(entry: CardEntry, filter: StatusFilter, now: numbe
   if (filter === 'all') return true
   if (entry.status === 'empty') return false
   if (filter === 'attention') return needsAttention(entry, now)
+  // An authenticating card keeps its session, so it stays among the online ones.
+  if (filter === 'online') return entry.status === 'online' || entry.status === 'active'
   return entry.status === filter
 }
 

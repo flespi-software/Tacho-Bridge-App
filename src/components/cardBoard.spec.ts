@@ -244,6 +244,13 @@ describe('filters', () => {
     expect(matchesStatus(entry({ status: 'absent' }), 'offline', NOW)).toBe(false)
     expect(matchesStatus(entry({ status: 'unlinked' }), 'unlinked', NOW)).toBe(true)
   })
+
+  it('counts an authenticating card as online', () => {
+    expect(matchesStatus(entry({ status: 'active' }), 'online', NOW)).toBe(true)
+    expect(matchesStatus(entry({ status: 'active' }), 'active', NOW)).toBe(true)
+    expect(matchesStatus(entry({ status: 'online' }), 'active', NOW)).toBe(false)
+    expect(matchesStatus(entry({ status: 'offline' }), 'online', NOW)).toBe(false)
+  })
 })
 
 describe('SORTERS', () => {
