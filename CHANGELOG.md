@@ -223,3 +223,9 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed the card rack COM port staying locked by the previous app instance after quit or update: the app now waits for the port to close before exiting.
+
+### [0.8.3-beta.3] - 2026-11-24
+
+🛠 Fixes
+
+- Fixed the Online counter dropping by the number of cards being authenticated: an authenticating card is now counted as online.
