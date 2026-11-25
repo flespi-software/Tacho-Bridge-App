@@ -46,7 +46,11 @@ const RECONNECT_QUIET_SECS: u64 = 60;
 const RECONNECT_QUIET_WAIT_MAX: Duration = Duration::from_secs(90);
 
 /// Publishes under `PUBLISH_TIMEOUT`; the error text (or "timeout") on failure.
-pub(crate) async fn publish_bounded(client: &AsyncClient, topic: &str, payload: String) -> Result<(), String> {
+pub(crate) async fn publish_bounded(
+    client: &AsyncClient,
+    topic: &str,
+    payload: String,
+) -> Result<(), String> {
     let publish = client.publish(topic, QoS::AtLeastOnce, false, payload);
     match tokio::time::timeout(PUBLISH_TIMEOUT, publish).await {
         Ok(Ok(())) => Ok(()),

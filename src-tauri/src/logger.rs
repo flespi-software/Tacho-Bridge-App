@@ -397,7 +397,7 @@ fn archive_log_generation(dir: &Path, archived: &Path, keep: usize) -> std::io::
         }
     };
     let zip_result = zip_log_entry(&mut source, std::io::BufWriter::new(part_file))
-    .and_then(|mut sink| sink.flush());
+        .and_then(|mut sink| sink.flush());
     if let Err(e) = zip_result {
         let _ = std::fs::remove_file(&part);
         return Err(e);

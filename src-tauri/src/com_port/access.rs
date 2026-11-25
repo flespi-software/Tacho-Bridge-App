@@ -54,8 +54,7 @@ pub(super) async fn acquire(port: &SharedPort, slot: u16, discovery: bool, token
     let slots = slots(port);
     let started = Instant::now();
     let granted = loop {
-        if super::lock(&slots).acquire(slot, discovery, Instant::now(), token)
-        {
+        if super::lock(&slots).acquire(slot, discovery, Instant::now(), token) {
             break true;
         }
         // Discovery defers an active card; a new tracker waits for the short

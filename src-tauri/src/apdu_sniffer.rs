@@ -1032,10 +1032,7 @@ mod tests {
         sniff(client, "0CA4020C0D810205018E08112233445566778800", "610E");
         // Another command instead of GET RESPONSE: which file is selected is unknown.
         sniff(client, "0084000008", "11223344556677889000");
-        assert_eq!(
-            states().get(client).and_then(|s| s.last_selected_ef),
-            None
-        );
+        assert_eq!(states().get(client).and_then(|s| s.last_selected_ef), None);
         forget(client);
     }
 

@@ -374,7 +374,10 @@ async fn await_ports_closed(ports: Vec<(String, SharedPort)>) {
     // Closes each OS handle whose last reference this is.
     drop(ports);
     if referenced == 0 {
-        log::info!("RACK | phase=shutdown status=ports_released ports={}", count);
+        log::info!(
+            "RACK | phase=shutdown status=ports_released ports={}",
+            count
+        );
     } else {
         log::warn!(
             "RACK | phase=shutdown status=ports_not_released ports={} referenced={}",

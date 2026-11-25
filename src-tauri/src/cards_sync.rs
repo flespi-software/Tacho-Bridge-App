@@ -296,7 +296,11 @@ async fn push(client: &AsyncClient, log_header: &str, rev: u64) {
         let key = (rev, hash.clone());
         if pushed.contains(&key) {
             // Published already and the server still holds another copy.
-            log::warn!("{} [SYNC] status=push_skipped reason=repeat rev={}", log_header, rev);
+            log::warn!(
+                "{} [SYNC] status=push_skipped reason=repeat rev={}",
+                log_header,
+                rev
+            );
             return;
         }
         pushed.push(key);
@@ -443,7 +447,11 @@ async fn resolve(choice: Choice) -> Result<(), String> {
         return Err("no card list conflict to resolve".to_string());
     };
     emit_conflict(serde_json::Value::Null);
-    log::info!("[SYNC] status=resolved choice={:?} server_rev={}", choice, server.rev);
+    log::info!(
+        "[SYNC] status=resolved choice={:?} server_rev={}",
+        choice,
+        server.rev
+    );
     match choice {
         Choice::Server => apply_server_copy("sync |", server).await,
         Choice::Local => {
@@ -485,13 +493,19 @@ mod tests {
         assert_eq!(decide("a", false, None, 0, ""), Decision::Push(0));
         assert_eq!(decide("a", true, None, 0, ""), Decision::Nothing);
         // a server that lost its copy gets it back
-        assert_eq!(decide("a", false, Some(&base(5, "a")), 0, ""), Decision::Push(0));
+        assert_eq!(
+            decide("a", false, Some(&base(5, "a")), 0, ""),
+            Decision::Push(0)
+        );
     }
 
     #[test]
     fn equal_lists_are_in_sync_whatever_the_history() {
         assert_eq!(decide("a", false, None, 3, "a"), Decision::InSync);
-        assert_eq!(decide("a", false, Some(&base(1, "b")), 3, "a"), Decision::InSync);
+        assert_eq!(
+            decide("a", false, Some(&base(1, "b")), 3, "a"),
+            Decision::InSync
+        );
     }
 
     #[test]
@@ -499,14 +513,23 @@ mod tests {
         // a fresh copy of the application: no cards, never synchronized
         assert_eq!(decide("e", true, None, 3, "a"), Decision::Take);
         // the server moved on, nothing was changed here
-        assert_eq!(decide("a", false, Some(&base(5, "a")), 6, "b"), Decision::Take);
+        assert_eq!(
+            decide("a", false, Some(&base(5, "a")), 6, "b"),
+            Decision::Take
+        );
         // changed here, the server still holds the base revision
-        assert_eq!(decide("b", false, Some(&base(5, "a")), 5, "a"), Decision::Push(5));
+        assert_eq!(
+            decide("b", false, Some(&base(5, "a")), 5, "a"),
+            Decision::Push(5)
+        );
     }
 
     #[test]
     fn both_sides_changed_is_a_conflict() {
-        assert_eq!(decide("b", false, Some(&base(5, "a")), 6, "c"), Decision::Conflict);
+        assert_eq!(
+            decide("b", false, Some(&base(5, "a")), 6, "c"),
+            Decision::Conflict
+        );
         // cards entered before the first synchronization against a stored copy
         assert_eq!(decide("b", false, None, 3, "a"), Decision::Conflict);
     }

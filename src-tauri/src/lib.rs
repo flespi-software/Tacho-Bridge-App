@@ -14,8 +14,8 @@ mod logger; // Logging functionality.
 mod logs_upload; // Log upload to the server (fetch_logs command).
 mod mqtt; // MQTT communication.
 mod server_address; // Server address change pushed by the server (set_server command).
-mod smart_card; // PCSC module for smart card operations.
 mod shutdown; // Exit preparation and progress, without blocking the UI.
+mod smart_card; // PCSC module for smart card operations.
 mod updater; // Self-update from GitHub releases.
 
 // ───── External Crates ─────

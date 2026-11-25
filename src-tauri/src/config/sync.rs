@@ -102,7 +102,10 @@ pub fn replace_synced_cards(cards: SyncedCards, state: SyncState) -> Result<Vec<
         // Same rules as a card saved from the form: the number becomes an
         // MQTT client id, the ICCID is matched against what a card reports.
         if !is_valid_card_number(&number) || !synced.iccid.bytes().all(|b| b.is_ascii_hexdigit()) {
-            log::error!("[SYNC] status=card_skipped reason=invalid card_number={}", number);
+            log::error!(
+                "[SYNC] status=card_skipped reason=invalid card_number={}",
+                number
+            );
             continue;
         }
         match config.cards.get_mut(&number) {

@@ -32,9 +32,9 @@ use super::cards::{
 use super::state::set_rack_card_state;
 use super::transport::{
     execute_envelope, parse_envelope, SerialEnvelope, SerialExchange, SerialLease, SharedPort,
-    SERIAL_ERR_BAD_CONTROL, SERIAL_ERR_BAD_HEX, SERIAL_ERR_BAD_JSON, SERIAL_ERR_BAD_REQUEST_ID, SERIAL_ERR_CARD_BUSY,
-    SERIAL_ERR_REQUEST_CONFLICT, SERIAL_ERR_STALE_REQUEST, SERIAL_ERR_TRANSACTION_ACTIVE,
-    SERIAL_ERR_TRANSACTION_EXPIRED,
+    SERIAL_ERR_BAD_CONTROL, SERIAL_ERR_BAD_HEX, SERIAL_ERR_BAD_JSON, SERIAL_ERR_BAD_REQUEST_ID,
+    SERIAL_ERR_CARD_BUSY, SERIAL_ERR_REQUEST_CONFLICT, SERIAL_ERR_STALE_REQUEST,
+    SERIAL_ERR_TRANSACTION_ACTIVE, SERIAL_ERR_TRANSACTION_EXPIRED,
 };
 use super::{
     linked_rack, linked_rack_ids, lock, rack_port_is_live, reset_all_rack_idempotency, LinkedRack,
@@ -702,7 +702,11 @@ fn show_card_activity(iccid: &str, finish: Option<bool>) {
 fn record_card_auth(card_number: &str, exchange: &SerialExchange, log_header: &str) {
     let success = exchange.err.is_empty();
     crate::config::record_auth_result_detached(card_number, success);
-    log::info!("{} [MQTT] status=auth_finished success={}", log_header, success);
+    log::info!(
+        "{} [MQTT] status=auth_finished success={}",
+        log_header,
+        success
+    );
 }
 
 /// A reply with an error code and no data, ready to publish on `resp_topic`.
