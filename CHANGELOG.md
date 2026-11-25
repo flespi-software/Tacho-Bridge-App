@@ -229,3 +229,10 @@ All notable changes to this project will be documented in this file.
 🛠 Fixes
 
 - Fixed the Online counter dropping by the number of cards being authenticated: an authenticating card is now counted as online.
+
+### [0.8.3-beta.4] - 2026-11-25
+
+🆕 Features / Improvements
+
+- Card list synchronization: a new copy of the application connecting with the same ident gets its cards from the server; when both lists were changed the application asks which one to keep.
+- Formatted the Rust sources with rustfmt.
