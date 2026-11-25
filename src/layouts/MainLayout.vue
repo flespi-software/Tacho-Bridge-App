@@ -43,6 +43,7 @@
         />
         <ServerConfigDialog v-model="configOpen" :config="serverConfig" />
         <CredentialsPromptDialog v-model="credentialsPromptOpen" />
+        <CardsSyncDialog :conflict="cardsSyncConflict" />
       </q-toolbar>
     </q-header>
 
@@ -59,14 +60,17 @@ import { ref, shallowRef, computed, onMounted, provide } from 'vue'
 import { useTauriListeners, LAYOUT_LISTENERS_READY } from 'src/composables/useTauriListeners'
 import {
   TBA_IDENT_REGEXP,
+  isCardsSyncConflict,
   isGlobalConfigServerPayload,
   parseThemeMode,
+  type CardsSyncConflict,
   type GlobalConfigServerPayload,
 } from 'src/components/models'
 import { invoke } from '@tauri-apps/api/core'
 import 'animate.css'
 import ServerConfigDialog from 'src/components/ServerConfigDialog.vue'
 import CredentialsPromptDialog from 'src/components/CredentialsPromptDialog.vue'
+import CardsSyncDialog from 'src/components/CardsSyncDialog.vue'
 import ShutdownDialog from 'src/components/ShutdownDialog.vue'
 import { isShutdownState, type ShutdownState } from 'src/components/shutdownProgress'
 import { version as appVersion } from '../../package.json'
@@ -77,6 +81,8 @@ defineOptions({
 
 const $q = useQuasar()
 const configOpen = ref(false)
+// The card list conflict the backend waits a choice for; null = none.
+const cardsSyncConflict = shallowRef<CardsSyncConflict | null>(null)
 const shutdownState = shallowRef<ShutdownState | null>(null)
 let shutdownEventSeen = false
 function handleShutdown(raw: unknown): void {
@@ -269,6 +275,9 @@ const listenersReady = Promise.all([
     appConnected.value = raw === true
   }),
   on('global-notification', handleGlobalNotification),
+  on('cards-sync-conflict', (raw) => {
+    cardsSyncConflict.value = isCardsSyncConflict(raw) ? raw : null
+  }),
   on('app-shutdown', (raw) => {
     shutdownEventSeen = true
     handleShutdown(raw)

@@ -141,6 +141,31 @@ export function isGlobalConfigServerPayload(raw: unknown): raw is GlobalConfigSe
   return GLOBAL_CONFIG_SERVER_KEYS.every((k) => p[k] === undefined || typeof p[k] === 'string')
 }
 
+/// A card list conflict (`cards-sync-conflict` event): the list was changed
+/// both locally and on the server, and the user chooses which one to keep.
+export interface CardsSyncConflict {
+  server_rev: number
+  /// Unix time the server stored its copy at; 0 = unknown.
+  server_updated: number
+  server_cards: number
+  local_cards: number
+}
+
+const CARDS_SYNC_CONFLICT_KEYS = [
+  'server_rev',
+  'server_updated',
+  'server_cards',
+  'local_cards',
+] as const
+
+/// Runtime guard for the `cards-sync-conflict` payload; null (no conflict) and
+/// any other shape fail it.
+export function isCardsSyncConflict(raw: unknown): raw is CardsSyncConflict {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  const p = raw as Record<string, unknown>
+  return CARDS_SYNC_CONFLICT_KEYS.every((k) => typeof p[k] === 'number')
+}
+
 export type ThemeMode = 'Auto' | 'Light' | 'Dark'
 
 /// Narrows the persisted `dark_theme` value; empty/unknown (an old config

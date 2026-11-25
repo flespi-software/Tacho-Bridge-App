@@ -31,6 +31,7 @@ mod cards;
 mod init;
 mod settings;
 mod store;
+mod sync;
 mod types;
 
 // Re-exported for the rest of the app: these are the only entry points.
@@ -45,7 +46,8 @@ pub use init::{emit_access_warning, init_config, is_initialized, replay_access_w
 pub use settings::{
     emit_global_config_server, set_debug_log_until, set_server_credentials, set_server_host,
 };
-pub use types::{split_host_to_parts, CardConfig};
+pub use sync::{replace_synced_cards, set_sync_state, sync_state, synced_cards, SyncedCards};
+pub use types::{split_host_to_parts, CardConfig, SyncState};
 
 use cards::{persist_card, remove_card_from_config};
 use settings::{update_appearance_config, update_server_config};
@@ -73,6 +75,7 @@ pub async fn update_card(cardnumber: String, content: CardConfig) -> Result<(), 
         // connected cards are untouched: both paths skip cards with a live session.
         crate::smart_card::request_rescan();
         crate::com_port::connect_pending_rack_cards().await;
+        crate::cards_sync::on_local_change();
     }
 
     updated
@@ -95,6 +98,7 @@ pub async fn remove_card(cardnumber: String) -> Result<(), String> {
         })?;
 
     log::info!("Card {} removed from config", cardnumber);
+    crate::cards_sync::on_local_change();
 
     Ok(())
 }
@@ -286,6 +290,7 @@ mod test_support {
             beta_updates: None,
             auto_install_updates: None,
             debug_log_until: None,
+            sync: None,
         }
     }
 }

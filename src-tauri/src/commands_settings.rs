@@ -17,7 +17,8 @@
 //! The payload is a JSON object keyed by setting name (`app_info`, `debug_log`
 //! — the state of the extended debug log, `server` — the address in use,
 //! `authentication` — the switch, username and whether the pair is saved,
-//! never the password), so more settings can be reported later without
+//! never the password, `sync` — the state of the card list synchronization,
+//! see `cards_sync`), so more settings can be reported later without
 //! changing the topic or the format. The same object answers the
 //! `get_settings` command on `settings/<request_id>/done`.
 
@@ -45,7 +46,7 @@ const RECONNECT_QUIET_SECS: u64 = 60;
 const RECONNECT_QUIET_WAIT_MAX: Duration = Duration::from_secs(90);
 
 /// Publishes under `PUBLISH_TIMEOUT`; the error text (or "timeout") on failure.
-async fn publish_bounded(client: &AsyncClient, topic: &str, payload: String) -> Result<(), String> {
+pub(crate) async fn publish_bounded(client: &AsyncClient, topic: &str, payload: String) -> Result<(), String> {
     let publish = client.publish(topic, QoS::AtLeastOnce, false, payload);
     match tokio::time::timeout(PUBLISH_TIMEOUT, publish).await {
         Ok(Ok(())) => Ok(()),
@@ -195,6 +196,7 @@ fn settings_report_payload() -> String {
             "username": auth.username,
             "saved": auth.saved,
         },
+        "sync": crate::cards_sync::report_json(),
     })
     .to_string()
 }
@@ -274,5 +276,8 @@ mod tests {
         assert!(authentication["username"].is_string());
         assert!(authentication["saved"].is_boolean());
         assert!(authentication.get("password").is_none());
+        let sync = &report["sync"];
+        assert!(sync["rev"].is_u64());
+        assert_eq!(sync["hash"].as_str().expect("hash is a string").len(), 64);
     }
 }

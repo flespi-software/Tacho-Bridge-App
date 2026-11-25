@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use lazy_static::lazy_static;
 
 // ───── Local Modules ─────
-use super::types::{AppearanceConfig, CardConfig, ConfigurationFile, ServerConfig};
+use super::types::{AppearanceConfig, CardConfig, ConfigurationFile, ServerConfig, SyncState};
 
 /// In-memory copy of config.yaml, refreshed after every save.
 #[derive(Default, Debug)]
@@ -24,6 +24,7 @@ pub struct CacheConfigData {
     pub beta_updates: Option<bool>,
     pub auto_install_updates: Option<bool>,
     pub debug_log_until: Option<u64>,
+    pub sync: Option<SyncState>,
 }
 
 lazy_static! {
@@ -165,6 +166,7 @@ pub(super) fn load_config_to_cache(
         beta_updates: config.beta_updates,
         auto_install_updates: config.auto_install_updates,
         debug_log_until: config.debug_log_until,
+        sync: config.sync.clone(),
     };
 
     Ok(())

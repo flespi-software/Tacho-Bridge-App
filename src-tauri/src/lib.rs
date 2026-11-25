@@ -2,6 +2,7 @@
 mod apdu_sniffer; // Passive sniffer for plaintext EF data in proxied APDUs.
 mod app_connect; // Application connection to the MQTT broker.
 mod backoff; // Shared exponential reconnect backoff.
+mod cards_sync; // Card list synchronization with the server.
 mod com_port; // Card rack over the COM (serial) port.
 mod commands_settings; // Settings reporting to the server.
 mod config; // Configuration handling.
@@ -459,6 +460,9 @@ pub fn run() {
                     // have fired with no listener.
                     global_app_handle::emit_current_app_connection();
 
+                    // A card list conflict raised before the webview listened.
+                    cards_sync::emit_current();
+
                     // Notifications raised before the webview listened.
                     logger::replay_access_warning();
                     com_port::replay_port_busy();
@@ -513,6 +517,7 @@ pub fn run() {
             debug_log::set_debug_log,       // extended debug log switch from the settings dialog
             config::update_theme,           // persist theme from the header button
             config::remove_card,            // remove card from config
+            cards_sync::resolve_cards_sync, // card list conflict: take the server copy or keep the local one
             smart_card::manual_sync_cards,  // manual sync cards from the frontend
             app_connect::app_connection,    // App connection to the MQTT broker
             global_app_handle::get_app_connection_status, // cached connection status for a late-mounting webview

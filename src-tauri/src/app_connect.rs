@@ -231,6 +231,9 @@ pub async fn app_connection() {
                             // awaiting would deadlock the connection permanently.
                             let client = mqtt_client_for_task.clone();
                             let header = log_header.clone();
+                            // Before the report: its `sync` key is what a
+                            // synchronizing server answers.
+                            crate::cards_sync::on_app_connack();
                             async_runtime::spawn(async move {
                                 crate::commands_settings::publish_settings_report(&client, &header)
                                     .await;
@@ -448,6 +451,11 @@ fn handle_publish(mqtt_client: &AsyncClient, log_header: &str, publish: &Publish
     // Rack traffic rides this connection under the `rack/<id>/` prefix; its
     // payloads are handled as raw bytes by the rack module.
     if crate::com_port::handle_app_publish(mqtt_client, topic, &publish.payload) {
+        return;
+    }
+
+    // The server copy of the card list, on the `sync` topic.
+    if crate::cards_sync::handle_publish(mqtt_client, log_header, topic, &publish.payload) {
         return;
     }
 

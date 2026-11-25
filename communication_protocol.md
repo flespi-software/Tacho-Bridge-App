@@ -526,7 +526,8 @@ the format:
   },
   "debug_log": {"enabled": false, "until": 0},
   "server": {"host": "mqtt.flespi.io:8883"},
-  "authentication": {"enabled": false, "username": "", "saved": false}
+  "authentication": {"enabled": false, "username": "", "saved": false},
+  "sync": {"rev": 0, "hash": "e3b0..."}
 }
 ```
 
@@ -557,6 +558,64 @@ connection). On the server the values are exposed as a read-only "Application
 Information" device setting; unknown top-level keys are ignored. Servers
 without settings-report support reject the unknown topic, so the server side
 must be deployed before a TBA release that sends it.
+
+### Card list synchronization (`sync`)
+
+The server keeps a copy of the card list per application ident, so a new copy
+of the application connecting with the same ident gets its cards back. Only
+the fields that link a card to its number or were set by hand are
+synchronized: `iccid`, `name`, `t_protocol`. Credentials are never part of it.
+
+The settings report carries the `sync` key:
+
+```json
+"sync": {"rev": 5, "hash": "9f2c..."}
+```
+
+- `rev` - revision of the server copy the local list was last synchronized
+  with, `0` = never;
+- `hash` - hash of the local list as it is now (opaque to the server).
+
+A server without the feature ignores the key and nothing else happens. A
+server with it answers on the `sync` topic with its copy:
+
+```json
+{"rev": 6, "updated": 1795700000, "hash": "41ab...", "cards": {"<card number>": {"iccid": "...", "name": "...", "t_protocol": "T0"}}}
+```
+
+- `rev` - a counter only the server advances, `0` = nothing stored (then the
+  other fields are absent);
+- `updated` - unix time the server stored that revision at, by its own clock;
+- `cards` - present when the server hash differs from the reported one.
+
+TBA publishes to `sync` only after the server has spoken there on the current
+connection. To replace the server copy it publishes its list together with the
+revision the list is based on:
+
+```json
+{"rev": 6, "hash": "77d0...", "cards": {...}}
+```
+
+The server stores it as `rev + 1` only when `rev` is its current revision, and
+answers with its copy again in either case: without `cards` when the list was
+taken, with them when somebody else changed the copy meanwhile.
+
+TBA decides by who changed since the last synchronization (the local list:
+its hash is not the recorded one; the server copy: its revision is not the
+recorded one):
+
+| local | server | action |
+| --- | --- | --- |
+| unchanged | unchanged | none |
+| changed | unchanged | publish the local list |
+| unchanged, or no cards and never synchronized | changed | take the server copy |
+| changed | changed | ask the user |
+
+Equal hashes are always in sync, and a server with nothing stored gets the
+local list. The question is shown in the window, or on the console of a
+headless run started from a terminal; a run without either keeps the local
+list and logs the conflict. Before the local list is replaced, the config is
+copied to `config.yaml.before-sync`.
 
 ### Log fetch (`fetch_logs`)
 
@@ -703,6 +762,8 @@ What TBA needs to know locally to serve the protocol:
 - `server.auth_enabled`, `server.username`, `server.password` — the MQTT
   authentication switch and the saved pair (see "Authentication");
 - `debug_log_until` — the extended debug log window deadline;
+- `sync` (`rev`, `updated`, `hash`) — the server copy the card list was last
+  synchronized with (see "Card list synchronization");
 - per-card entries in the config: company card number (used as the card
   connection `client_id`), ICCID (to match an inserted card to its number),
   `t_protocol` (see §5);

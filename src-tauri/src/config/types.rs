@@ -47,6 +47,39 @@ pub struct ConfigurationFile {
     // off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) debug_log_until: Option<u64>,
+    // The server copy of the card list this config was last synchronized with
+    // (see `cards_sync`); absent = never synchronized.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "sync_lenient"
+    )]
+    pub(super) sync: Option<SyncState>,
+}
+
+/// The server copy of the card list the local one was last synchronized with.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SyncState {
+    /// Revision of the server copy: a counter the server alone advances.
+    pub rev: u64,
+    /// Unix time the server stored that revision at; shown to the user only.
+    #[serde(default)]
+    pub updated: u64,
+    /// `cards_sync::cards_hash` of the list at that moment: a different hash
+    /// of the current list means it was changed locally since.
+    pub hash: String,
+}
+
+/// A damaged `sync:` section reads as "never synchronized" instead of failing
+/// the whole config parse (which resets the file).
+fn sync_lenient<'de, D>(deserializer: D) -> Result<Option<SyncState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(deserializer)?;
+    Ok(serde_yaml::from_value::<Option<SyncState>>(value)
+        .ok()
+        .flatten())
 }
 
 /// Treats an explicitly empty `cards:` key (YAML null) as an empty map instead
@@ -293,6 +326,7 @@ pub(super) fn generate_default_config() -> ConfigurationFile {
         beta_updates: None,
         auto_install_updates: None,
         debug_log_until: None,
+        sync: None,
     }
 }
 
