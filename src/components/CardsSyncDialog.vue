@@ -20,7 +20,7 @@
       </q-card-section>
 
       <q-card-actions align="right" class="q-px-md q-pb-md">
-        <q-btn flat label="Later" color="grey-7" :disable="resolving" @click="postponed = true">
+        <q-btn flat label="Later" color="grey-7" :disable="resolving !== null" @click="postponed = true">
           <q-tooltip>Keep working with the local list; asked again on the next connection.</q-tooltip>
         </q-btn>
         <q-btn
