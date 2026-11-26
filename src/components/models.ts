@@ -147,23 +147,22 @@ export interface CardsSyncConflict {
   server_rev: number
   /// Unix time the server stored its copy at; 0 = unknown.
   server_updated: number
-  server_cards: number
+  /// null = the server copy came without its list: it cannot be taken.
+  server_cards: number | null
   local_cards: number
 }
 
-const CARDS_SYNC_CONFLICT_KEYS = [
-  'server_rev',
-  'server_updated',
-  'server_cards',
-  'local_cards',
-] as const
+const CARDS_SYNC_CONFLICT_KEYS = ['server_rev', 'server_updated', 'local_cards'] as const
 
 /// Runtime guard for the `cards-sync-conflict` payload; null (no conflict) and
 /// any other shape fail it.
 export function isCardsSyncConflict(raw: unknown): raw is CardsSyncConflict {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
   const p = raw as Record<string, unknown>
-  return CARDS_SYNC_CONFLICT_KEYS.every((k) => typeof p[k] === 'number')
+  return (
+    CARDS_SYNC_CONFLICT_KEYS.every((k) => typeof p[k] === 'number') &&
+    (p.server_cards === null || typeof p.server_cards === 'number')
+  )
 }
 
 export type ThemeMode = 'Auto' | 'Light' | 'Dark'

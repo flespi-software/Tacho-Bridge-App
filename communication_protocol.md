@@ -600,22 +600,24 @@ The server stores it as `rev + 1` only when `rev` is its current revision, and
 answers with its copy again in either case: without `cards` when the list was
 taken, with them when somebody else changed the copy meanwhile.
 
-TBA decides by who changed since the last synchronization (the local list:
-its hash is not the recorded one; the server copy: its revision is not the
-recorded one):
+Equal hashes are always in sync (TBA records the server revision), and a
+server with nothing stored gets the local list. Otherwise TBA decides by who
+changed since the last synchronization (the local list: its hash is not the
+recorded one; the server copy: its revision is not the recorded one):
 
 | local | server | action |
 | --- | --- | --- |
-| unchanged | unchanged | none |
 | changed | unchanged | publish the local list |
 | unchanged, or no cards and never synchronized | changed | take the server copy |
 | changed | changed | ask the user |
+| unchanged | unchanged | ask the user (the hashes differ although neither side counts as changed, e.g. a server that lost its copy and counted up to the same revision again) |
 
-Equal hashes are always in sync, and a server with nothing stored gets the
-local list. The question is shown in the window, or on the console of a
-headless run started from a terminal; a run without either keeps the local
-list and logs the conflict. Before the local list is replaced, the config is
-copied to `config.yaml.before-sync`.
+The question is shown in the window, or on the console of a headless run
+started from a terminal; a run without either keeps the local list and logs
+the conflict. A server copy that came without `cards` (the list was changed
+here after the settings report) cannot be taken: until the next connection
+only the local list can be chosen. Before the local list is replaced, the
+config is copied to `config.yaml.before-sync`.
 
 ### Log fetch (`fetch_logs`)
 

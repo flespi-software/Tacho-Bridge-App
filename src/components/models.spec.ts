@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isGlobalConfigServerPayload } from './models'
+import { isCardsSyncConflict, isGlobalConfigServerPayload } from './models'
 
 describe('isGlobalConfigServerPayload', () => {
   it('accepts the backend payload, every value a string', () => {
@@ -25,5 +25,21 @@ describe('isGlobalConfigServerPayload', () => {
     expect(isGlobalConfigServerPayload(['host'])).toBe(false)
     expect(isGlobalConfigServerPayload({ host: 1 })).toBe(false)
     expect(isGlobalConfigServerPayload({ auth_enabled: true })).toBe(false)
+  })
+})
+
+describe('isCardsSyncConflict', () => {
+  const conflict = { server_rev: 6, server_updated: 1795700000, server_cards: 3, local_cards: 2 }
+
+  it('accepts a conflict with or without the server card count', () => {
+    expect(isCardsSyncConflict(conflict)).toBe(true)
+    expect(isCardsSyncConflict({ ...conflict, server_cards: null })).toBe(true)
+  })
+
+  it('rejects no conflict and other shapes', () => {
+    expect(isCardsSyncConflict(null)).toBe(false)
+    expect(isCardsSyncConflict({ ...conflict, server_cards: undefined })).toBe(false)
+    expect(isCardsSyncConflict({ ...conflict, local_cards: null })).toBe(false)
+    expect(isCardsSyncConflict([conflict])).toBe(false)
   })
 })

@@ -3,7 +3,7 @@
 //! synchronization, and the replacement of the local list by the server copy.
 
 // ───── Std Lib ─────
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 
 // ───── External Crates ─────
@@ -98,6 +98,7 @@ pub fn replace_synced_cards(cards: SyncedCards, state: SyncState) -> Result<Vec<
         config.cards.remove(number);
     }
     let mut updated: Vec<String> = Vec::new();
+    let mut linked_iccids: HashSet<String> = HashSet::new();
     for (number, synced) in cards {
         // Same rules as a card saved from the form: the number becomes an
         // MQTT client id, the ICCID is matched against what a card reports.
@@ -105,6 +106,16 @@ pub fn replace_synced_cards(cards: SyncedCards, state: SyncState) -> Result<Vec<
             log::error!(
                 "[SYNC] status=card_skipped reason=invalid card_number={}",
                 number
+            );
+            continue;
+        }
+        // One physical card belongs to one number (see `update_card_config`):
+        // of two entries with the same ICCID the first in number order keeps it.
+        if !synced.iccid.is_empty() && !linked_iccids.insert(synced.iccid.clone()) {
+            log::error!(
+                "[SYNC] status=card_skipped reason=duplicate_iccid card_number={} iccid={}",
+                number,
+                synced.iccid
             );
             continue;
         }

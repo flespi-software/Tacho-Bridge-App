@@ -69,6 +69,12 @@ static PUSHED: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
 /// A console question is open (headless run): one at a time.
 static ASKING: AtomicBool = AtomicBool::new(false);
 
+/// Taken for every step that reads the synchronization state and acts on it
+/// (a server copy, a local change, the user's choice), so each one decides on
+/// what the previous one left: server copies arrive in their own tasks, and an
+/// older answer must not record its revision over a newer one taken meanwhile.
+static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn lock<T>(mutex: &'static Mutex<T>) -> MutexGuard<'static, T> {
     mutex
         .lock()
@@ -175,6 +181,7 @@ pub fn handle_publish(client: &AsyncClient, log_header: &str, topic: &str, paylo
     let client = client.clone();
     let log_header = log_header.to_string();
     async_runtime::spawn(async move {
+        let _turn = TURN.lock().await;
         process(&client, &log_header, server).await;
     });
     true
@@ -216,12 +223,14 @@ async fn process(client: &AsyncClient, log_header: &str, server: ServerCopy) {
             save_state(log_header, &server).await;
             clear_conflict();
         }
+        // A failure is logged inside; the next server copy decides again.
+        // Either way an older conflict is superseded by this copy.
         Decision::Take => {
-            apply_server_copy(log_header, server).await;
+            let _ = apply_server_copy(log_header, server).await;
             clear_conflict();
         }
         Decision::Push(rev) => {
-            push(client, log_header, rev).await;
+            let _ = push(client, log_header, rev).await;
             clear_conflict();
         }
         Decision::Conflict => raise_conflict(log_header, server, cards.len()),
@@ -247,12 +256,16 @@ async fn save_state(log_header: &str, server: &ServerCopy) {
 }
 
 /// Replaces the local list by the server copy and brings the card sessions
-/// in line with it.
-async fn apply_server_copy(log_header: &str, server: ServerCopy) {
+/// in line with it. A failure is logged; its text is for the user.
+async fn apply_server_copy(log_header: &str, server: ServerCopy) -> Result<(), String> {
     let Some(cards) = server.cards else {
-        // The server sends the cards whenever the hashes differ.
+        // The server sends the cards when its hash differs from the reported
+        // one; a list changed here after the report gets an answer without.
         log::error!("{} [SYNC] status=take_failed reason=no_cards", log_header);
-        return;
+        return Err(
+            "the server copy came without its card list; it is sent again on the next connection"
+                .to_string(),
+        );
     };
     let count = cards.len();
     let state = SyncState {
@@ -268,7 +281,7 @@ async fn apply_server_copy(log_header: &str, server: ServerCopy) {
         Ok(removed) => removed,
         Err(e) => {
             log::error!("{} [SYNC] status=take_failed err={}", log_header, e);
-            return;
+            return Err(format!("cannot replace the card list: {e}"));
         }
     };
     log::info!(
@@ -285,15 +298,17 @@ async fn apply_server_copy(log_header: &str, server: ServerCopy) {
     crate::mqtt::remove_connections(removed).await;
     crate::smart_card::request_rescan();
     crate::com_port::connect_pending_rack_cards().await;
+    Ok(())
 }
 
 /// Publishes the local list to replace the server copy of revision `rev`.
-async fn push(client: &AsyncClient, log_header: &str, rev: u64) {
+/// A failure is logged; its text is for the user.
+async fn push(client: &AsyncClient, log_header: &str, rev: u64) -> Result<(), String> {
     let cards = crate::config::synced_cards();
     let hash = cards_hash(&cards);
+    let key = (rev, hash.clone());
     {
         let mut pushed = lock(&PUSHED);
-        let key = (rev, hash.clone());
         if pushed.contains(&key) {
             // Published already and the server still holds another copy.
             log::warn!(
@@ -301,38 +316,53 @@ async fn push(client: &AsyncClient, log_header: &str, rev: u64) {
                 log_header,
                 rev
             );
-            return;
+            return Ok(());
         }
-        pushed.push(key);
+        pushed.push(key.clone());
     }
     let payload = serde_json::json!({"rev": rev, "hash": hash, "cards": cards}).to_string();
     match crate::commands_settings::publish_bounded(client, SYNC_TOPIC, payload).await {
-        Ok(()) => log::info!(
-            "{} [SYNC] status=pushed base_rev={} cards={}",
-            log_header,
-            rev,
-            cards.len()
-        ),
-        Err(e) => log::error!("{} [SYNC] status=push_failed err={}", log_header, e),
+        Ok(()) => {
+            log::info!(
+                "{} [SYNC] status=pushed base_rev={} cards={}",
+                log_header,
+                rev,
+                cards.len()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Not published, so a retry of the same list must not be taken
+            // for a repeat.
+            lock(&PUSHED).retain(|pushed| *pushed != key);
+            log::error!("{} [SYNC] status=push_failed err={}", log_header, e);
+            Err(format!("cannot send the card list to the server: {e}"))
+        }
     }
 }
 
-/// The local card list was changed by the user: publish it when the server
-/// synchronizes and no conflict is open. Otherwise the next connection does.
+/// The local card list was changed (by the user, or a value read off a card):
+/// publish it when the server synchronizes and no conflict is open. Otherwise
+/// the next connection does.
 pub fn on_local_change() {
-    let Some(client) = lock(&LINK).clone() else {
-        return;
-    };
-    if lock(&PENDING).is_some() {
+    if lock(&LINK).is_none() {
         return;
     }
     async_runtime::spawn(async move {
+        let _turn = TURN.lock().await;
+        let Some(client) = lock(&LINK).clone() else {
+            return;
+        };
+        if lock(&PENDING).is_some() {
+            return;
+        }
         let base = crate::config::sync_state();
         let hash = cards_hash(&crate::config::synced_cards());
         if base.as_ref().is_some_and(|state| state.hash == hash) {
             return;
         }
-        push(&client, "sync |", base.map_or(0, |state| state.rev)).await;
+        // A failure is logged inside; the next connection publishes it.
+        let _ = push(&client, "sync |", base.map_or(0, |state| state.rev)).await;
     });
 }
 
@@ -345,14 +375,23 @@ enum Choice {
     Local,
 }
 
-/// What the user is shown about a conflict.
+/// What the user is shown about a conflict. `server_cards` is null when the
+/// server copy came without its list: it cannot be taken then.
 fn conflict_json(server: &ServerCopy, local_cards: usize) -> serde_json::Value {
     serde_json::json!({
         "server_rev": server.rev,
         "server_updated": server.updated,
-        "server_cards": server.cards.as_ref().map_or(0, |cards| cards.len()),
+        "server_cards": server.cards.as_ref().map(|cards| cards.len()),
         "local_cards": local_cards,
     })
+}
+
+/// Card count of a server copy for the log: "unknown" without its list.
+fn server_cards_text(server: &ServerCopy) -> String {
+    server
+        .cards
+        .as_ref()
+        .map_or_else(|| "unknown".to_string(), |cards| cards.len().to_string())
 }
 
 fn emit_conflict(payload: serde_json::Value) {
@@ -387,7 +426,7 @@ fn raise_conflict(log_header: &str, server: ServerCopy, local_cards: usize) {
          hint=\"the card list was changed both here and on the server; the local one stays in use until a choice is made\"",
         log_header,
         server.rev,
-        server.cards.as_ref().map_or(0, |cards| cards.len()),
+        server_cards_text(&server),
         local_cards
     );
     let payload = conflict_json(&server, local_cards);
@@ -400,9 +439,8 @@ fn raise_conflict(log_header: &str, server: ServerCopy, local_cards: usize) {
                 .unwrap_or(None);
             ASKING.store(false, Ordering::SeqCst);
             if let Some(choice) = choice {
-                if let Err(e) = resolve(choice).await {
-                    log::error!("[SYNC] status=resolve_failed err={}", e);
-                }
+                // A failure is logged inside and leaves the conflict open.
+                let _ = resolve(choice).await;
             }
         });
     }
@@ -417,14 +455,18 @@ fn ask_on_console(conflict: &serde_json::Value) -> Option<Choice> {
     if !stdin.is_terminal() {
         return None;
     }
+    // Without its list the server copy cannot be taken (see `conflict_json`).
+    let server_known = conflict["server_cards"].is_u64();
+    let server_cards = if server_known {
+        conflict["server_cards"].to_string()
+    } else {
+        "an unknown number of".to_string()
+    };
     println!(
         "\nThe card list differs from the copy on the server and both were changed.\n  \
          server: revision {}, {} card(s), stored at unix time {}\n  \
          local:  {} card(s)",
-        conflict["server_rev"],
-        conflict["server_cards"],
-        conflict["server_updated"],
-        conflict["local_cards"]
+        conflict["server_rev"], server_cards, conflict["server_updated"], conflict["local_cards"]
     );
     loop {
         print!("Take the list from the [s]erver or keep the [l]ocal one and update the server? ");
@@ -433,7 +475,11 @@ fn ask_on_console(conflict: &serde_json::Value) -> Option<Choice> {
         match stdin.lock().read_line(&mut line) {
             Ok(0) | Err(_) => return None,
             Ok(_) => match line.trim().to_ascii_lowercase().as_str() {
-                "s" | "server" => return Some(Choice::Server),
+                "s" | "server" if server_known => return Some(Choice::Server),
+                "s" | "server" => println!(
+                    "The server sent no card list this time; it can be taken after the next \
+                     connection."
+                ),
                 "l" | "local" => return Some(Choice::Local),
                 _ => {}
             },
@@ -441,28 +487,45 @@ fn ask_on_console(conflict: &serde_json::Value) -> Option<Choice> {
     }
 }
 
-/// Applies the user's choice to the open conflict.
+/// Applies the user's choice to the open conflict. The conflict stays open
+/// until the choice is carried out, so a failed one can be made again.
 async fn resolve(choice: Choice) -> Result<(), String> {
-    let Some(server) = lock(&PENDING).take() else {
+    let _turn = TURN.lock().await;
+    let Some(server) = lock(&PENDING).clone() else {
         return Err("no card list conflict to resolve".to_string());
     };
-    emit_conflict(serde_json::Value::Null);
-    log::info!(
-        "[SYNC] status=resolved choice={:?} server_rev={}",
-        choice,
-        server.rev
-    );
-    match choice {
+    let server_rev = server.rev;
+    let outcome = match choice {
         Choice::Server => apply_server_copy("sync |", server).await,
         Choice::Local => {
-            let Some(client) = lock(&LINK).clone() else {
-                return Err("not connected to the server".to_string());
-            };
-            // On top of the server revision the user has just been shown.
-            push(&client, "sync |", server.rev).await;
+            // Bound first: the guard must not live across the publish.
+            let link = lock(&LINK).clone();
+            match link {
+                // On top of the server revision the user has just been shown.
+                Some(client) => push(&client, "sync |", server_rev).await,
+                None => Err(
+                    "not connected to the server; try again once the connection is up".to_string(),
+                ),
+            }
         }
+    };
+    match &outcome {
+        Ok(()) => {
+            log::info!(
+                "[SYNC] status=resolved choice={:?} server_rev={}",
+                choice,
+                server_rev
+            );
+            clear_conflict();
+        }
+        Err(e) => log::error!(
+            "[SYNC] status=resolve_failed choice={:?} server_rev={} err={}",
+            choice,
+            server_rev,
+            e
+        ),
     }
-    Ok(())
+    outcome
 }
 
 /// The conflict dialog of the window: `choice` is "server" or "local".
@@ -550,6 +613,18 @@ mod tests {
             r#"{"A000000000000000":{"iccid":"11","name":"first"},"B000000000000000":{"iccid":"22","name":"renamed"}}"#,
         );
         assert_ne!(cards_hash(&one), cards_hash(&renamed));
+    }
+
+    #[test]
+    fn conflict_without_the_server_list_reports_its_count_as_unknown() {
+        let without: ServerCopy = serde_json::from_str(r#"{"rev":6,"hash":"aa"}"#).unwrap();
+        assert!(conflict_json(&without, 2)["server_cards"].is_null());
+        assert_eq!(server_cards_text(&without), "unknown");
+
+        let with: ServerCopy =
+            serde_json::from_str(r#"{"rev":6,"hash":"aa","cards":{"A000000000000000":{}}}"#)
+                .unwrap();
+        assert_eq!(conflict_json(&with, 2)["server_cards"], 1);
     }
 
     #[test]

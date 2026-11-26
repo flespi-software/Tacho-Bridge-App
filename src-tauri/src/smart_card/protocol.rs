@@ -86,6 +86,9 @@ pub(super) fn resolve_t_protocol(card_number: &str, atr: &AtrProtocol) -> Protoc
                     "Card {}: stored ATR-derived T protocol {} in config",
                     card_number, value
                 );
+                // `t_protocol` is a synchronized field: the server copy has
+                // to learn it, or the next server change reads as a conflict.
+                crate::cards_sync::on_local_change();
             }
             atr_protocol
         }

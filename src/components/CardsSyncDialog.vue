@@ -14,14 +14,27 @@
           keep; until then the local list stays in use.
         </div>
         <div class="text-body2">
-          Server: {{ conflict.server_cards }} card(s), saved {{ serverUpdated }}
+          Server:
+          {{ conflict.server_cards === null ? 'unknown number of' : conflict.server_cards }}
+          card(s), saved {{ serverUpdated }}
         </div>
         <div class="text-body2">Local: {{ conflict.local_cards }} card(s)</div>
+        <div v-if="conflict.server_cards === null" class="text-caption text-grey-7 q-mt-sm">
+          The server sent no card list this time, so it can be taken after the next connection.
+        </div>
       </q-card-section>
 
       <q-card-actions align="right" class="q-px-md q-pb-md">
-        <q-btn flat label="Later" color="grey-7" :disable="resolving !== null" @click="postponed = true">
-          <q-tooltip>Keep working with the local list; asked again on the next connection.</q-tooltip>
+        <q-btn
+          flat
+          label="Later"
+          color="grey-7"
+          :disable="resolving !== null"
+          @click="postponed = true"
+        >
+          <q-tooltip>
+            Keep working with the local list; asked again on the next connection.
+          </q-tooltip>
         </q-btn>
         <q-btn
           outline
@@ -29,7 +42,7 @@
           label="Take from server"
           color="primary"
           :loading="resolving === 'server'"
-          :disable="resolving !== null"
+          :disable="resolving !== null || conflict?.server_cards === null"
           @click="resolve('server')"
         >
           <q-tooltip>
