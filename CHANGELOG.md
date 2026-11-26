@@ -236,3 +236,10 @@ All notable changes to this project will be documented in this file.
 
 - Card list synchronization: a new copy of the application connecting with the same ident gets its cards from the server; when both lists were changed the application asks which one to keep.
 - Formatted the Rust sources with rustfmt.
+
+### [0.8.3-beta.5] - 2026-11-26
+
+🛠 Fixes
+
+- fix UI bug.
+- Fixed the card list synchronization: a failed choice in the conflict dialog is reported and can be repeated, a server copy without the card list can no longer be taken by mistake, and a card's protocol detected on insertion reaches the server.
